@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -38,8 +37,6 @@ pub async fn proxy_handler(
     body: axum::body::Bytes,
 ) -> Response {
     let start = Instant::now();
-    static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
-    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let _token = extract_bearer_token(&headers);
 
     let (streaming, modified_body) = if body.is_empty() {
@@ -56,18 +53,14 @@ pub async fn proxy_handler(
     let result = proxy_with_retry(&state, &path, &method, &modified_body, streaming).await;
 
     match result {
-        Ok(mut resp) => {
+        Ok(resp) => {
             let elapsed = start.elapsed();
             let status_u16 = resp.status().as_u16();
             state.token_bucket.record_success();
             state.upstream_health.record(status_u16);
             state.metrics.record_request(elapsed.as_millis() as u64, body_len, status_u16, false);
-            if state.config.benchmark_mode {
-                resp.headers_mut().insert("x-zen-request-id", HeaderValue::from_str(&request_id.to_string()).unwrap());
-                resp.headers_mut().insert("x-zen-duration-ms", HeaderValue::from_str(&elapsed.as_millis().to_string()).unwrap());
-            }
             info!(
-                method = %method, path = %path, request_id = request_id,
+                method = %method, path = %path,
                 status = status_u16,
                 duration_ms = elapsed.as_millis(),
                 "proxy OK"
@@ -82,7 +75,7 @@ pub async fn proxy_handler(
                 state.token_bucket.record_429();
             }
             warn!(
-                method = %method, path = %path, request_id = request_id,
+                method = %method, path = %path,
                 status = status, duration_ms = elapsed.as_millis(),
                 "proxy FAIL"
             );
@@ -129,6 +122,7 @@ async fn proxy_with_retry(
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }
+        state.metrics.record_bytes_sent(body.len() as u64);
 
         match req.send().await {
             Ok(up_resp) => {
@@ -138,6 +132,7 @@ async fn proxy_with_retry(
                 state.upstream_health.record(status);
 
                 if status < 400 {
+                    state.metrics.record_node_success();
                     state.node_db.record(&node_url_dbg, true, 0);
                     if streaming && status == 200 {
                         return Ok(stream_to_axum(up_resp).await);
@@ -146,6 +141,7 @@ async fn proxy_with_retry(
                 }
 
                 state.node_db.record(&node_url_dbg, false, 0);
+                state.metrics.record_node_error();
 
                 if !should_retry(status, attempt, max) {
                     return Err(status);
@@ -158,6 +154,7 @@ async fn proxy_with_retry(
             }
             Err(e) => {
                 last_status = 502;
+                state.metrics.record_timeout();
                 state.node_db.record(&node_url_dbg, false, 0);
                 warn!(attempt, error = %e, "upstream request error");
                 if attempt < max {
@@ -203,7 +200,7 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("text/event-stream"));
+        .map_or(false, |ct| ct.contains("text/event-stream"));
 
     if !is_sse {
         return read_full_body(response).await;
