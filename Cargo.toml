@@ -4,18 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.7"
-reqwest = { version = "0.11", features = ["socks", "stream", "json"] }
+axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.12", features = ["socks", "stream", "json"] }
 tokio = { version = "1", features = ["full"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "request-id", "trace", "limit"] }
+hyper = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+prometheus-client = "0.22"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+tokio-util = { version = "0.7", features = ["full"] }
 futures = "0.3"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 http = "1"
-http-body = "1"
+notify = "7"
 tokio-stream = "0.1"

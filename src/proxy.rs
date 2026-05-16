@@ -8,9 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures::stream::StreamExt;
 use serde_json::Value;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
 
 use crate::state::AppState;
@@ -207,7 +205,9 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
     let mut upstream_stream = response.bytes_stream();
 
     tokio::spawn(async move {
-        while let Some(chunk_result) = upstream_stream.next().await {
+        use futures::stream::StreamExt;
+        let mut s = std::pin::pin!(upstream_stream);
+        while let Some(chunk_result) = s.next().await {
             match chunk_result {
                 Ok(chunk) => {
                     let patched = patch_sse_line(&chunk);
@@ -220,8 +220,7 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
         }
     });
 
-    let stream = UnboundedReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
+    let body = Body::from_stream(tokio_stream::wrappers::UnboundedReceiverStream::new(rx));
 
     let mut resp = Response::new(body);
     *resp.status_mut() = http::StatusCode::from_u16(status.as_u16()).unwrap();
