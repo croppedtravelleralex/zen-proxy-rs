@@ -8,7 +8,7 @@ use crate::pool::SessionPool;
 pub struct AppState {
     pub config: Config,
     pub token_bucket: TokenBucket,
-    pub proxy_selector: ProxySelector,
+    pub proxy_selector: Arc<ProxySelector>,
     pub session_pool: SessionPool,
     pub startup_time: Instant,
     pub node_urls: Vec<String>,

@@ -152,12 +152,12 @@ async fn main() {
     );
     let node_urls = config.load_nodes();
     tracing::info!(count = node_urls.len(), "loaded proxy nodes");
-    let proxy_selector = selector::ProxySelector::new(
+    let proxy_selector = Arc::new(selector::ProxySelector::new(
         node_urls.clone(),
         config.proxy_error_threshold,
         config.proxy_cooldown_seconds,
         config.proxy_recovery_interval,
-    );
+    ));
     let session_pool = pool::SessionPool::new(
         config.pool_max_size,
         config.request_timeout_secs,
@@ -192,6 +192,22 @@ async fn main() {
         bandwidth,
         admin,
     });
+
+    // Background: probe all nodes every 30s
+    {
+        let prober = node_probe::NodeProber::new(
+            app_state.proxy_selector.clone(),
+            app_state.config.connect_timeout_secs,
+        );
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            interval.tick().await; // skip first
+            loop {
+                interval.tick().await;
+                node_probe::orchestrator_loop(&prober).await;
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/", get(index_handler))
