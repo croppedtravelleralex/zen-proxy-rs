@@ -42,6 +42,9 @@ pub fn build_admin_stats(
         "bandwidth": {
             "bps": bandwidth.bps(),
         },
+        "node_db": {
+            "node_count": node_db.node_count(),
+        },
         "proxy_selector": {
             "total_nodes": proxy_selector.map(|ps| ps.total_nodes()).unwrap_or(0),
             "available_nodes": proxy_selector.map(|ps| ps.available_nodes()).unwrap_or(0),

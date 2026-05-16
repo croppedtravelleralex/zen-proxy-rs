@@ -401,7 +401,7 @@ impl PoolSelector {
             cumulative += pool.weight;
             if pick < cumulative {
                 // Pick a node from this pool (round-robin within pool)
-                let node = pool.nodes.get(0).map(|n| n.url.clone());
+                let node = pool.nodes.first().map(|n| n.url.clone());
                 return node.map(|u| (pool.name.clone(), u));
             }
         }
