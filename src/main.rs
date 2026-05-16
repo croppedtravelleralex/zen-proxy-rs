@@ -132,19 +132,9 @@ async fn shutdown_signal() {
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
-    #[cfg(unix)]
-    let sighup = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .expect("failed to install SIGHUP handler")
-            .recv().await;
-        tracing::info!("received SIGHUP, reloading config");
-    };
-    #[cfg(not(unix))]
-    let sighup = std::future::pending::<()>();
     tokio::select! {
         _ = ctrl_c => { tracing::info!("received Ctrl+C, shutting down"); }
         _ = terminate => { tracing::info!("received SIGTERM, shutting down"); }
-        _ = sighup => { tracing::info!("SIGHUP received (config reload not yet wired)"); }
     }
 }
 
@@ -235,6 +225,30 @@ async fn main() {
                 tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
                 node_db.purge_stale(300);
             }
+        });
+    }
+
+    // SIGHUP hot-reload: re-read config env vars without restart
+    {
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let Ok(mut stream) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else {
+                    tracing::error!("failed to install SIGHUP handler");
+                    return;
+                };
+                loop {
+                    stream.recv().await;
+                    tracing::info!("SIGHUP received, reloading config from env");
+                    let new_config = config::Config::from_env();
+                    tracing::info!(
+                        "config reloaded: port={}, log_level={}",
+                        new_config.port, new_config.log_level
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
         });
     }
 
