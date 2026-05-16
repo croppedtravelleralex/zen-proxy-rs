@@ -49,14 +49,14 @@ impl Metrics {
     }
 
     pub fn encode(&self) -> String {
+        let t = self.total_requests.load(Ordering::Relaxed);
+        let ok = self.success_count.load(Ordering::Relaxed);
+        let err = self.error_count.load(Ordering::Relaxed);
+        let c429 = self.count_429.load(Ordering::Relaxed);
+        let bytes = self.bytes_received.load(Ordering::Relaxed);
+        let rpm = self.rpm();
         format!(
-            "zen_proxy_requests_total {}\nzen_proxy_requests_ok {}\nzen_proxy_requests_error {}\nzen_proxy_requests_429 {}\nzen_proxy_bytes_received {}\nzen_proxy_rpm {}\n",
-            self.total_requests.load(Ordering::Relaxed),
-            self.success_count.load(Ordering::Relaxed),
-            self.error_count.load(Ordering::Relaxed),
-            self.count_429.load(Ordering::Relaxed),
-            self.bytes_received.load(Ordering::Relaxed),
-            self.rpm(),
+            "# HELP zen_proxy_requests_total Total proxy requests\n# TYPE zen_proxy_requests_total counter\nzen_proxy_requests_total {t}\n             # HELP zen_proxy_requests_ok Successful proxy requests\n# TYPE zen_proxy_requests_ok counter\nzen_proxy_requests_ok {ok}\n             # HELP zen_proxy_requests_error Failed proxy requests\n# TYPE zen_proxy_requests_error counter\nzen_proxy_requests_error {err}\n             # HELP zen_proxy_requests_429 Rate-limited (429) requests\n# TYPE zen_proxy_requests_429 counter\nzen_proxy_requests_429 {c429}\n             # HELP zen_proxy_bytes_received Total response bytes received\n# TYPE zen_proxy_bytes_received counter\nzen_proxy_bytes_received {bytes}\n             # HELP zen_proxy_rpm Requests per minute\n# TYPE zen_proxy_rpm gauge\nzen_proxy_rpm {rpm}\n"
         )
     }
 }

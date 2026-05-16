@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -37,6 +38,8 @@ pub async fn proxy_handler(
     body: axum::body::Bytes,
 ) -> Response {
     let start = Instant::now();
+    static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+    let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let _token = extract_bearer_token(&headers);
 
     let (streaming, modified_body) = if body.is_empty() {
@@ -53,14 +56,18 @@ pub async fn proxy_handler(
     let result = proxy_with_retry(&state, &path, &method, &modified_body, streaming).await;
 
     match result {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let elapsed = start.elapsed();
             let status_u16 = resp.status().as_u16();
             state.token_bucket.record_success();
             state.upstream_health.record(status_u16);
             state.metrics.record_request(elapsed.as_millis() as u64, body_len, status_u16, false);
+            if state.config.benchmark_mode {
+                resp.headers_mut().insert("x-zen-request-id", HeaderValue::from_str(&request_id.to_string()).unwrap());
+                resp.headers_mut().insert("x-zen-duration-ms", HeaderValue::from_str(&elapsed.as_millis().to_string()).unwrap());
+            }
             info!(
-                method = %method, path = %path,
+                method = %method, path = %path, request_id = request_id,
                 status = status_u16,
                 duration_ms = elapsed.as_millis(),
                 "proxy OK"
@@ -75,7 +82,7 @@ pub async fn proxy_handler(
                 state.token_bucket.record_429();
             }
             warn!(
-                method = %method, path = %path,
+                method = %method, path = %path, request_id = request_id,
                 status = status, duration_ms = elapsed.as_millis(),
                 "proxy FAIL"
             );
