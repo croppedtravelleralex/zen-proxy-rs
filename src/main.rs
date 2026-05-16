@@ -132,9 +132,19 @@ async fn shutdown_signal() {
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
+    #[cfg(unix)]
+    let sighup = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("failed to install SIGHUP handler")
+            .recv().await;
+        tracing::info!("received SIGHUP, reloading config");
+    };
+    #[cfg(not(unix))]
+    let sighup = std::future::pending::<()>();
     tokio::select! {
         _ = ctrl_c => { tracing::info!("received Ctrl+C, shutting down"); }
         _ = terminate => { tracing::info!("received SIGTERM, shutting down"); }
+        _ = sighup => { tracing::info!("SIGHUP received (config reload not yet wired)"); }
     }
 }
 

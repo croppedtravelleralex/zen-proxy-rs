@@ -113,3 +113,119 @@ fn now_ns() -> u64 {
     let epoch = EPOCH.get_or_init(Instant::now);
     Instant::now().duration_since(*epoch).as_nanos() as u64
 }
+
+
+/// Upstream behavior state machine (normal -> slow -> circuit-break)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamState {
+    Normal,
+    Slow,
+    CircuitBreak,
+}
+
+pub struct UpstreamBehaviorAnalyzer {
+    state: std::sync::RwLock<UpstreamState>,
+    error_window: std::sync::RwLock<std::collections::VecDeque<(Instant, u16)>>,
+    window_size: usize,
+    error_threshold: f64,
+    slow_threshold: f64,
+    circuit_break_threshold: f64,
+}
+
+impl UpstreamBehaviorAnalyzer {
+    pub fn new(window_size: usize, error_threshold: f64, slow_threshold: f64, circuit_break_threshold: f64) -> Self {
+        Self {
+            state: std::sync::RwLock::new(UpstreamState::Normal),
+            error_window: std::sync::RwLock::new(std::collections::VecDeque::with_capacity(window_size)),
+            window_size,
+            error_threshold,
+            slow_threshold,
+            circuit_break_threshold,
+        }
+    }
+
+    pub fn record(&self, status: u16) {
+        let now = Instant::now();
+        if let Ok(mut w) = self.error_window.write() {
+            w.push_back((now, status));
+            while w.len() > self.window_size { w.pop_front(); }
+        }
+    }
+
+    pub fn analyze(&self) -> UpstreamState {
+        let error_rate = self.error_rate();
+        let new_state = if error_rate > self.circuit_break_threshold {
+            UpstreamState::CircuitBreak
+        } else if error_rate > self.slow_threshold {
+            UpstreamState::Slow
+        } else {
+            UpstreamState::Normal
+        };
+        if let Ok(mut s) = self.state.write() {
+            *s = new_state;
+        }
+        new_state
+    }
+
+    pub fn state(&self) -> UpstreamState {
+        self.state.read().map(|g| *g).unwrap_or(UpstreamState::Normal)
+    }
+
+    pub fn error_rate(&self) -> f64 {
+        if let Ok(w) = self.error_window.read() {
+            let cutoff = Instant::now() - Duration::from_secs(60);
+            let recent: Vec<_> = w.iter().filter(|(t, _)| *t > cutoff).collect();
+            let total = recent.len();
+            if total == 0 { return 0.0; }
+            let errors = recent.iter().filter(|(_, s)| *s >= 500 || *s == 429).count();
+            errors as f64 / total as f64
+        } else { 0.0 }
+    }
+
+    pub fn circuit_break_until(&self) -> Option<Instant> {
+        if self.state() == UpstreamState::CircuitBreak {
+            Some(Instant::now() + Duration::from_secs(30))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod analyzer_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_upstream_analyzer_initial_state() {
+        let a = UpstreamBehaviorAnalyzer::new(10, 0.3, 0.5, 0.8);
+        assert_eq!(a.state(), UpstreamState::Normal);
+        assert_eq!(a.error_rate(), 0.0);
+        assert!(a.circuit_break_until().is_none());
+    }
+
+    #[test]
+    fn test_upstream_analyzer_normal_stays_normal() {
+        let a = UpstreamBehaviorAnalyzer::new(10, 0.3, 0.5, 0.8);
+        for _ in 0..10 { a.record(200); }
+        assert_eq!(a.analyze(), UpstreamState::Normal);
+    }
+
+    #[test]
+    fn test_upstream_analyzer_high_error_triggers_circuit_break() {
+        let a = UpstreamBehaviorAnalyzer::new(10, 0.3, 0.5, 0.5);
+        for _ in 0..6 { a.record(503); }
+        for _ in 0..4 { a.record(200); }
+        assert_eq!(a.analyze(), UpstreamState::CircuitBreak);
+        assert!(a.circuit_break_until().is_some());
+    }
+
+    #[test]
+    fn test_upstream_analyzer_error_rate_calculation() {
+        let a = UpstreamBehaviorAnalyzer::new(20, 0.3, 0.5, 0.8);
+        for _ in 0..5 { a.record(200); }
+        for _ in 0..5 { a.record(429); }
+        let rate = a.error_rate();
+        assert!((rate - 0.5).abs() < 0.001, "expected 0.5, got {}", rate);
+    }
+}
