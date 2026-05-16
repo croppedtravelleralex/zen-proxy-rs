@@ -164,3 +164,18 @@ pub fn should_retry(status: u16, attempt: u32, max_retries: u32) -> bool {
     }
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
+
+
+/// Rotating User-Agent strings
+pub fn next_user_agent() -> String {
+    let agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    ];
+    static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let idx = IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % agents.len();
+    agents[idx].to_string()
+}
