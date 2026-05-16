@@ -1,17 +1,26 @@
+#![allow(dead_code)]
+mod admin;
+mod bandwidth;
 mod config;
-mod token_bucket;
-mod selector;
+mod health;
+mod metrics;
+mod node_db;
+mod node_probe;
 mod pool;
-mod utils;
-mod state;
 mod proxy;
+mod selector;
+mod state;
+mod token_bucket;
+mod utils;
 
 use std::sync::Arc;
+use std::time::Instant;
 use axum::{
     Router,
     routing::{get, any},
     response::Json,
     extract::State,
+    http::{HeaderMap, StatusCode},
 };
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
@@ -19,18 +28,114 @@ use tracing_subscriber::EnvFilter;
 use state::AppState;
 
 async fn health_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let uptime = st.startup_time.elapsed().as_secs();
+    let stats = st.proxy_selector.stats();
+    let backoff = st.upstream_health.is_backoff();
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": uptime,
+        "pid": std::process::id(),
         "nodes": {
-            "total": st.proxy_selector.total_nodes(),
-            "available": st.proxy_selector.available_nodes()
+            "total": stats.total_nodes,
+            "available": stats.available_nodes,
+            "blacklisted": stats.blacklisted_nodes
+        },
+        "upstream": {
+            "backoff": backoff
         }
     }))
 }
 
 async fn index_handler() -> Json<Value> {
     Json(json!({"service": "zen-proxy-rs", "status": "ok"}))
+}
+
+async fn metrics_handler(State(st): State<Arc<AppState>>) -> String {
+    st.metrics.encode()
+}
+
+async fn models_handler() -> Json<Value> {
+    Json(json!({
+        "object": "list",
+        "data": [
+            {"id": "deepseek-v4-flash", "object": "model"},
+            {"id": "deepseek-v4-pro", "object": "model"}
+        ]
+    }))
+}
+
+fn check_admin_auth(headers: &HeaderMap, state: &AppState) -> bool {
+    if state.admin.api_key.is_empty() {
+        return true;
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |key| key == state.admin.api_key)
+}
+
+async fn admin_models_handler(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    if !check_admin_auth(&headers, &st) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let models = st.model_health.get_all();
+    Ok(Json(json!({"models": models, "status": "ok"})))
+}
+
+async fn admin_pools_handler(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    if !check_admin_auth(&headers, &st) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let stats_value = st.proxy_selector.pool_stats_json();
+    Ok(Json(json!({"pools": stats_value, "status": "ok"})))
+}
+
+async fn admin_stats_handler(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    if !check_admin_auth(&headers, &st) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let stats_value = admin::build_admin_stats(&st.node_db, &st.metrics, &st.bandwidth, &st.upstream_health, Some(&st.proxy_selector));
+    Ok(Json(json!({"stats": stats_value, "status": "ok"})))
+}
+
+async fn admin_events_handler(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    if !check_admin_auth(&headers, &st) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let events: Vec<serde_json::Value> = Vec::new();
+    Ok(Json(json!({"events": events, "status": "ok"})))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => { tracing::info!("received Ctrl+C, shutting down"); }
+        _ = terminate => { tracing::info!("received SIGTERM, shutting down"); }
+    }
 }
 
 #[tokio::main]
@@ -58,24 +163,46 @@ async fn main() {
         config.request_timeout_secs,
         config.connect_timeout_secs,
     );
+
+    let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
+    let model_health = Arc::new(health::ModelHealth::new());
+    let metrics = Arc::new(metrics::Metrics::new());
+    let node_db = Arc::new(node_db::NodeDB::new());
+    let ip_stats_tracker = Arc::new(node_db::IPStatsTracker::new());
+    let bandwidth = Arc::new(bandwidth::BandwidthCollector::new());
+    let admin = Arc::new(admin::AdminState::new());
+
     let addr = config.bind_addr();
     let app_state = Arc::new(AppState {
         config,
         token_bucket,
         proxy_selector,
         session_pool,
-        startup_time: std::time::Instant::now(),
+        startup_time: Instant::now(),
         node_urls,
+        upstream_health,
+        model_health,
+        metrics,
+        node_db,
+        ip_stats_tracker,
+        bandwidth,
+        admin,
     });
 
     let app = Router::new()
-        .route("/health", get(health_handler))
         .route("/", get(index_handler))
-        .route("/v1/*path", any(proxy::proxy_handler))
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/v1/models", get(models_handler))
+        .route("/v1/{*path}", any(proxy::proxy_handler))
+        .route("/admin/models", get(admin_models_handler))
+        .route("/admin/pools", get(admin_pools_handler))
+        .route("/admin/stats", get(admin_stats_handler))
+        .route("/admin/events", get(admin_events_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
     tracing::info!("starting on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await.unwrap();
 }

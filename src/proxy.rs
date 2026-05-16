@@ -29,7 +29,6 @@ fn is_streaming(body: &Value) -> bool {
     body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-/// Main proxy handler — catches all /v1/{*path} requests.
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     method: Method,
@@ -40,7 +39,6 @@ pub async fn proxy_handler(
     let start = Instant::now();
     let _token = extract_bearer_token(&headers);
 
-    // Parse & patch body: model override, detect streaming
     let (streaming, modified_body) = if body.is_empty() {
         (false, body.to_vec())
     } else {
@@ -49,29 +47,33 @@ pub async fn proxy_handler(
         (is_streaming(&parsed), patched)
     };
 
-    // Try with retries
+    let body_len = modified_body.len() as u64;
+    state.bandwidth.record_bytes(body_len);
+
     let result = proxy_with_retry(&state, &path, &method, &modified_body, streaming).await;
 
     match result {
         Ok(resp) => {
-            state.proxy_selector.record_success();
-            state.token_bucket.record_success();
             let elapsed = start.elapsed();
+            let status_u16 = resp.status().as_u16();
+            state.token_bucket.record_success();
+            state.upstream_health.record(status_u16);
+            state.metrics.record_request(elapsed.as_millis() as u64, body_len, status_u16, false);
             info!(
                 method = %method, path = %path,
-                status = %resp.status(),
+                status = status_u16,
                 duration_ms = elapsed.as_millis(),
                 "proxy OK"
             );
             resp
         }
         Err(status) => {
-            state.proxy_selector.record_error();
+            let elapsed = start.elapsed();
             state.token_bucket.record_failure();
+            state.metrics.record_request(elapsed.as_millis() as u64, body_len, status, true);
             if status == 429 {
                 state.token_bucket.record_429();
             }
-            let elapsed = start.elapsed();
             warn!(
                 method = %method, path = %path,
                 status = status, duration_ms = elapsed.as_millis(),
@@ -96,7 +98,6 @@ async fn proxy_with_retry(
     let mut last_status = 502u16;
 
     for attempt in 0..=max {
-        // Rate-limit check
         if !state.token_bucket.allow() {
             if attempt < max {
                 let backoff = smart_backoff(attempt, Some(429));
@@ -106,14 +107,13 @@ async fn proxy_with_retry(
             return Err(429);
         }
 
-        // Select node (SOCKS5 proxy) + build upstream URL
-        let node_url = state.proxy_selector.next().map(|s| s.to_string());
+        let node = state.proxy_selector.next();
+        let node_url = node.map(|s| s.to_string());
+        let node_url_dbg = node_url.as_deref().unwrap_or("direct").to_string();
         let upstream = build_upstream_url(&state.config.upstream_base, &format!("v1/{}", path));
 
-        // Get client (via SOCKS5 proxy if node_url is set, else direct)
         let client = state.session_pool.get_client(node_url.as_deref());
 
-        // Build request
         let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::POST);
         let mut req = client.request(req_method, &upstream);
@@ -128,12 +128,17 @@ async fn proxy_with_retry(
                 let status = up_resp.status().as_u16();
                 last_status = status;
 
+                state.upstream_health.record(status);
+
                 if status < 400 {
+                    state.node_db.record(&node_url_dbg, true, 0);
                     if streaming && status == 200 {
                         return Ok(stream_to_axum(up_resp).await);
                     }
                     return Ok(read_full_body(up_resp).await);
                 }
+
+                state.node_db.record(&node_url_dbg, false, 0);
 
                 if !should_retry(status, attempt, max) {
                     return Err(status);
@@ -146,6 +151,7 @@ async fn proxy_with_retry(
             }
             Err(e) => {
                 last_status = 502;
+                state.node_db.record(&node_url_dbg, false, 0);
                 warn!(attempt, error = %e, "upstream request error");
                 if attempt < max {
                     let backoff = smart_backoff(attempt, None);
@@ -155,11 +161,6 @@ async fn proxy_with_retry(
         }
     }
     Err(last_status)
-}
-
-fn extract_bearer_token_from_state(state: &AppState) -> Option<String> {
-    // Try to get from config or default
-    None
 }
 
 async fn read_full_body(response: reqwest::Response) -> Response {
@@ -202,7 +203,7 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
     }
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<axum::body::Bytes, std::convert::Infallible>>();
-    let mut upstream_stream = response.bytes_stream();
+    let upstream_stream = response.bytes_stream();
 
     tokio::spawn(async move {
         use futures::stream::StreamExt;
