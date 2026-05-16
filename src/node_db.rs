@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::time::{Duration, Instant};
+use tracing::{info, trace};
 
 pub struct NodeDB {
     nodes: RwLock<HashMap<String, NodeStats>>,
@@ -45,8 +47,21 @@ impl NodeDB {
             else { entry.score = (entry.score * 0.2 + 100.0 * 0.8).min(100.0); }
         }
     }
-    pub fn persist(&self) {}
-    pub fn purge_stale(&self, _max_age_secs: u64) {}
+    pub fn persist(&self) {
+        // TODO: serialize nodes to disk file
+        info!("node_db persist skipped (disk persistence not yet wired)");
+    }
+    pub fn purge_stale(&self, max_age_secs: u64) {
+        if let Ok(nodes) = self.nodes.write() {
+            let _cutoff = Instant::now() - Duration::from_secs(max_age_secs);
+            // Stale purge not implemented yet - nodes are kept
+            let before = nodes.len();
+            // For now just log
+            if before > 0 {
+                trace!("node_db purge_stale: {} nodes, keeping all", before);
+            }
+        }
+    }
     pub fn node_count(&self) -> usize {
         self.nodes.read().map(|n| n.len()).unwrap_or(0)
     }

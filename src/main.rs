@@ -183,7 +183,7 @@ async fn main() {
         upstream_health,
         model_health,
         metrics,
-        node_db,
+        node_db: node_db.clone(),
         ip_stats_tracker,
         bandwidth,
         admin,
@@ -202,7 +202,29 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
-    tracing::info!("starting on {}", addr);
+    // Background: persist node_db every 60s
+    {
+        let node_db = node_db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                node_db.persist();
+            }
+        });
+    }
+
+    // Background: purge stale nodes every 300s
+    {
+        let node_db = node_db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+                node_db.purge_stale(300);
+            }
+        });
+    }
+
+            tracing::info!("starting on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await.unwrap();
 }
