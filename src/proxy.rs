@@ -203,7 +203,7 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| ct.contains("text/event-stream"));
+        .is_some_and(|ct| ct.contains("text/event-stream"));
 
     if !is_sse {
         return read_full_body(response).await;

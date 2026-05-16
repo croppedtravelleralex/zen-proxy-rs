@@ -52,12 +52,9 @@ impl TokenBucket {
 
     pub fn allow(&self) -> bool {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        match self.mode {
-            TokenMode::Unlimited => {
-                self.total_allowed.fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-            _ => {}
+        if self.mode == TokenMode::Unlimited {
+            self.total_allowed.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
         let effective_rate = if self.mode == TokenMode::Adaptive {
             Self::from_fixed(self.adaptive_rate.load(Ordering::Acquire))

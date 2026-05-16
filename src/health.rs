@@ -227,5 +227,49 @@ mod analyzer_tests {
         for _ in 0..5 { a.record(429); }
         let rate = a.error_rate();
         assert!((rate - 0.5).abs() < 0.001, "expected 0.5, got {}", rate);
+
+
+    #[test]
+    fn test_analyzer_triggers_slow_at_threshold() {
+        let analyzer = UpstreamBehaviorAnalyzer::new(100, 0.3, 0.3, 0.8);
+        for _ in 0..30 { analyzer.record(200); }
+        for _ in 0..20 { analyzer.record(502); }
+        assert_eq!(analyzer.analyze(), UpstreamState::Slow, "40% errors should trigger Slow");
+    }
+
+    #[test]
+    fn test_analyzer_triggers_circuit_break() {
+        let analyzer = UpstreamBehaviorAnalyzer::new(100, 0.3, 0.3, 0.5);
+        for _ in 0..40 { analyzer.record(200); }
+        for _ in 0..60 { analyzer.record(502); }
+        assert_eq!(analyzer.analyze(), UpstreamState::CircuitBreak, "60% errors should trigger CircuitBreak");
+    }
+
+    #[test]
+    fn test_analyzer_recovers_to_normal() {
+        let analyzer = UpstreamBehaviorAnalyzer::new(100, 0.3, 0.3, 0.8);
+        for _ in 0..30 { analyzer.record(200); }
+        for _ in 0..20 { analyzer.record(502); }
+        assert_eq!(analyzer.analyze(), UpstreamState::Slow);
+        for _ in 0..50 { analyzer.record(200); }
+        assert_eq!(analyzer.analyze(), UpstreamState::Normal);
+    }
+
+    #[test]
+    fn test_analyzer_circuit_break_returns_some() {
+        let analyzer = UpstreamBehaviorAnalyzer::new(10, 0.3, 0.3, 0.3);
+        for _ in 0..10 { analyzer.record(502); }
+        analyzer.analyze();
+        assert!(analyzer.circuit_break_until().is_some(), "circuit-break state should return Some");
+    }
+
+    #[test]
+    fn test_analyzer_normal_returns_none() {
+        let analyzer = UpstreamBehaviorAnalyzer::new(10, 0.3, 0.3, 0.8);
+        for _ in 0..10 { analyzer.record(200); }
+        analyzer.analyze();
+        assert!(analyzer.circuit_break_until().is_none(), "normal state should return None");
+    }
+
     }
 }

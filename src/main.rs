@@ -72,7 +72,7 @@ fn check_admin_auth(headers: &HeaderMap, state: &AppState) -> bool {
     headers
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |key| key == state.admin.api_key)
+        .is_some_and(|key| key == state.admin.api_key)
 }
 
 async fn admin_models_handler(

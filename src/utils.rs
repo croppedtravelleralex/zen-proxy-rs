@@ -97,7 +97,7 @@ pub fn patch_response_content(content: &[u8]) -> Vec<u8> {
         Err(_) => return content.to_vec(),
     };
     match root.get_mut("choices").and_then(|c| c.as_array_mut()) {
-        None => return content.to_vec(),
+        None => content.to_vec(),
         Some(choices) => {
             let mut changed = false;
             for choice in choices.iter_mut() {
@@ -112,7 +112,7 @@ pub fn patch_response_content(content: &[u8]) -> Vec<u8> {
                     .get(delta_key)
                     .and_then(|d| d.get("content"))
                     .and_then(|v| v.as_str())
-                    .map_or(true, |c| c.is_empty());
+                    .is_none_or(|c| c.is_empty());
 
                 if let Some(r) = reasoning {
                     if content_empty {
