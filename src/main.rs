@@ -177,7 +177,11 @@ async fn main() {
     let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
     let model_health = Arc::new(health::ModelHealth::new());
     let metrics = Arc::new(metrics::Metrics::new());
-    let node_db = Arc::new(node_db::NodeDB::new());
+
+    let node_db_path = std::env::var("NODE_DB_PATH").unwrap_or_else(|_| "/tmp/zen-proxy-node-db.json".into());
+    let ip_stats_path = std::env::var("IP_STATS_PATH").unwrap_or_else(|_| "/tmp/zen-proxy-ip-stats.json".into());
+    let node_db = Arc::new(node_db::NodeDB::new(&node_db_path, &ip_stats_path));
+
     let ip_stats_tracker = Arc::new(node_db::IPStatsTracker::new());
     let bandwidth = Arc::new(bandwidth::BandwidthCollector::new());
     let admin = Arc::new(admin::AdminState::new());
