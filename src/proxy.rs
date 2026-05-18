@@ -11,10 +11,12 @@ use axum::{
 use serde_json::Value;
 use tracing::{error, info, warn};
 
+use crate::collector::RequestTelemetry;
+use crate::pool::{DispatchError, ErrorKind, RequestMeta};
 use crate::state::AppState;
 use crate::utils::{
-    apply_model_override, build_upstream_url, patch_response_content, patch_sse_line,
-    should_retry, smart_backoff,
+    apply_model_override, build_upstream_url, patch_response_content, patch_sse_line, should_retry,
+    smart_backoff,
 };
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -26,7 +28,9 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 fn is_streaming(body: &Value) -> bool {
-    body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false)
+    body.get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 pub async fn proxy_handler(
@@ -37,7 +41,7 @@ pub async fn proxy_handler(
     body: axum::body::Bytes,
 ) -> Response {
     let start = Instant::now();
-    let _token = extract_bearer_token(&headers);
+    let client_id = extract_bearer_token(&headers).unwrap_or_default();
 
     let (streaming, modified_body) = if body.is_empty() {
         (false, body.to_vec())
@@ -48,71 +52,111 @@ pub async fn proxy_handler(
     };
 
     let body_len = modified_body.len() as u64;
-    state.bandwidth.record_bytes(body_len);
+    let model = serde_json::from_slice::<Value>(&modified_body)
+        .ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or_default();
 
-    let result = proxy_with_retry(&state, &path, &method, &modified_body, streaming).await;
+    let req_meta = RequestMeta {
+        model: model.clone(),
+        stream: streaming,
+        body_size: body_len,
+    };
+
+    let result = proxy_with_retry(
+        &state,
+        &path,
+        &method,
+        &modified_body,
+        streaming,
+        &req_meta,
+        &client_id,
+    )
+    .await;
 
     match result {
-        Ok(resp) => {
-            let elapsed = start.elapsed();
-            let status_u16 = resp.status().as_u16();
-            state.token_bucket.record_success();
-            state.upstream_health.record(status_u16);
-            state.metrics.record_request(elapsed.as_millis() as u64, body_len, status_u16, false);
+        Ok((resp, node_url, status, latency)) => {
+            state.collector.record_request(&RequestTelemetry {
+                rid: uuid::Uuid::new_v4().to_string(),
+                ts: chrono::Utc::now().timestamp_millis(),
+                model,
+                client_id,
+                path: path.clone(),
+                method: method.to_string(),
+                is_streaming: streaming,
+                node_url,
+                pool: String::new(),
+                exit_ip: String::new(),
+                status: status as u16,
+                rate_limited: false,
+                retry_count: 0,
+                latency_total_ms: latency,
+                upstream_ms: latency,
+                ttft_ms: 0,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                bytes_sent: body_len,
+                bytes_received: 0,
+            });
+            state.upstream_health.record(status);
             info!(
                 method = %method, path = %path,
-                status = status_u16,
-                duration_ms = elapsed.as_millis(),
+                status = status,
+                duration_ms = latency,
                 "proxy OK"
             );
             resp
         }
         Err(status) => {
-            let elapsed = start.elapsed();
-            state.token_bucket.record_failure();
-            state.metrics.record_request(elapsed.as_millis() as u64, body_len, status, true);
-            if status == 429 {
-                state.token_bucket.record_429();
-            }
+            let elapsed = start.elapsed().as_millis() as u64;
+            state.upstream_health.record(status);
             warn!(
                 method = %method, path = %path,
-                status = status, duration_ms = elapsed.as_millis(),
+                status = status, duration_ms = elapsed,
                 "proxy FAIL"
             );
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            (code, Json(serde_json::json!({
-                "error": { "message": format!("upstream error {}", status) }
-            }))).into_response()
+            (
+                code,
+                Json(serde_json::json!({
+                    "error": { "message": format!("upstream error {}", status) }
+                })),
+            )
+                .into_response()
         }
     }
 }
 
 async fn proxy_with_retry(
-    state: &AppState,
+    state: &Arc<AppState>,
     path: &str,
     method: &Method,
     body: &[u8],
     streaming: bool,
-) -> Result<Response, u16> {
+    req_meta: &RequestMeta,
+    _client_id: &str,
+) -> Result<(Response, String, u16, u64), u16> {
     let max = state.config.pool_max_retries.max(1);
     let mut last_status = 502u16;
 
     for attempt in 0..=max {
-        if !state.token_bucket.allow() {
-            if attempt < max {
-                let backoff = smart_backoff(attempt, Some(429));
-                tokio::time::sleep(Duration::from_secs_f64(backoff)).await;
-                continue;
+        let dispatch_result = match state.pool_manager.dispatch(req_meta) {
+            Ok(r) => r,
+            Err(DispatchError::NoResource) => {
+                if attempt < max {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                return Err(503);
             }
-            return Err(429);
-        }
+        };
 
-        let node = state.proxy_selector.next();
-        let node_url = node.map(|s| s.to_string());
-        let node_url_dbg = node_url.as_deref().unwrap_or("direct").to_string();
+        let node_url = dispatch_result.url.clone();
+        let node_id = dispatch_result.node.id.clone();
+        let client = dispatch_result.client;
         let upstream = build_upstream_url(&state.config.upstream_base, &format!("v1/{}", path));
-
-        let client = state.session_pool.get_client(node_url.as_deref());
+        let request_start = Instant::now();
 
         let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::POST);
@@ -122,40 +166,57 @@ async fn proxy_with_retry(
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }
-        state.metrics.record_bytes_sent(body.len() as u64);
 
         match req.send().await {
             Ok(up_resp) => {
                 let status = up_resp.status().as_u16();
+                let latency = request_start.elapsed().as_millis() as u64;
                 last_status = status;
 
-                state.upstream_health.record(status);
-
                 if status < 400 {
-                    state.metrics.record_node_success();
-                    state.node_db.record(&node_url_dbg, true, 0);
+                    state.pool_manager.report(
+                        node_id,
+                        crate::pool::ResultKind::Success(status),
+                        latency,
+                    );
                     if streaming && status == 200 {
-                        return Ok(stream_to_axum(up_resp).await);
+                        return Ok((stream_to_axum(up_resp).await, node_url, status, latency));
                     }
-                    return Ok(read_full_body(up_resp).await);
+                    return Ok((read_full_body(up_resp).await, node_url, status, latency));
                 }
 
-                state.node_db.record(&node_url_dbg, false, 0);
-                state.metrics.record_node_error();
+                if status == 429 {
+                    state.pool_manager.report(
+                        node_id,
+                        crate::pool::ResultKind::RateLimited,
+                        latency,
+                    );
+                } else {
+                    state.pool_manager.report(
+                        node_id,
+                        crate::pool::ResultKind::Error {
+                            kind: ErrorKind::Upstream5xx,
+                        },
+                        latency,
+                    );
+                }
 
                 if !should_retry(status, attempt, max) {
                     return Err(status);
-                }
-                if status == 429 {
-                    state.token_bucket.record_429();
                 }
                 let backoff = smart_backoff(attempt, Some(status));
                 tokio::time::sleep(Duration::from_secs_f64(backoff)).await;
             }
             Err(e) => {
+                let latency = request_start.elapsed().as_millis() as u64;
                 last_status = 502;
-                state.metrics.record_timeout();
-                state.node_db.record(&node_url_dbg, false, 0);
+                state.pool_manager.report(
+                    node_id,
+                    crate::pool::ResultKind::Error {
+                        kind: ErrorKind::Timeout,
+                    },
+                    latency,
+                );
                 warn!(attempt, error = %e, "upstream request error");
                 if attempt < max {
                     let backoff = smart_backoff(attempt, None);
@@ -187,9 +248,13 @@ async fn read_full_body(response: reqwest::Response) -> Response {
         }
         Err(e) => {
             error!(error = %e, "failed to read upstream body");
-            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                "error": "failed to read upstream response"
-            }))).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "failed to read upstream response"
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -206,7 +271,9 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
         return read_full_body(response).await;
     }
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<axum::body::Bytes, std::convert::Infallible>>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+        Result<axum::body::Bytes, std::convert::Infallible>,
+    >();
     let upstream_stream = response.bytes_stream();
 
     tokio::spawn(async move {
@@ -229,8 +296,10 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
 
     let mut resp = Response::new(body);
     *resp.status_mut() = http::StatusCode::from_u16(status.as_u16()).unwrap();
-    resp.headers_mut()
-        .insert("content-type", HeaderValue::from_static("text/event-stream"));
+    resp.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
     resp.headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-cache"));
     resp

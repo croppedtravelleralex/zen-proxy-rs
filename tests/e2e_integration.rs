@@ -1,4 +1,4 @@
-use std::process::{Command, Child};
+use std::process::{Child, Command};
 use std::time::Duration;
 
 fn start_server(port: u16) -> (Child, u16) {
@@ -49,15 +49,18 @@ mod e2e {
             .expect("metrics endpoint");
         assert_eq!(resp.status(), 200);
         let text = resp.text().unwrap();
-        assert!(text.contains("zen_proxy_requests_total"), "metrics should contain counter");
+        assert!(
+            text.contains("zen_proxy_requests_total"),
+            "metrics should contain counter"
+        );
         stop_server(child, port);
     }
 
     #[test]
     fn test_index() {
         let (child, port) = start_server(19783);
-        let resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/", port))
-            .expect("index endpoint");
+        let resp =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/", port)).expect("index endpoint");
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().unwrap();
         assert_eq!(body["service"], "zen-proxy-rs");

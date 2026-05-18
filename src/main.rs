@@ -1,58 +1,68 @@
 #![allow(dead_code)]
-mod admin;
-mod bandwidth;
+
+mod collector;
 mod config;
 mod health;
-mod metrics;
-mod node_db;
-mod node_probe;
 mod pool;
+mod provider;
 mod proxy;
-mod selector;
+mod server;
 mod state;
-mod token_bucket;
 mod utils;
 
 use std::sync::Arc;
 use std::time::Instant;
+
 use axum::{
-    Router,
-    routing::{get, any},
-    response::Json,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    response::Json,
+    routing::{any, get},
+    Router,
 };
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
+
+use collector::default::DefaultCollector;
+use collector::export::JsonBackend;
+use collector::DataCollector;
+use pool::active::ActivePool;
+use pool::dead::DeadPoolImpl;
+use pool::dispatch::DispatchPool;
+use pool::manager::PoolManagerImpl;
+use pool::ratelimited::RateLimitedPoolImpl;
+use provider::webshare::WebShareProvider;
 use state::AppState;
 
 async fn health_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
     let uptime = st.startup_time.elapsed().as_secs();
-    let stats = st.proxy_selector.stats();
+    let pools = st.pool_manager.pool_stats();
     let backoff = st.upstream_health.is_backoff();
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": uptime,
         "pid": std::process::id(),
-        "nodes": {
-            "total": stats.total_nodes,
-            "available": stats.available_nodes,
-            "blacklisted": stats.blacklisted_nodes
+        "pools": {
+            "dispatch": pools.dispatch_size,
+            "active": pools.active_size,
+            "ratelimited": pools.ratelimited_size,
+            "dead": pools.dead_size,
+            "total": pools.total(),
+            "fuse": pools.fuse,
         },
-        "upstream": {
-            "backoff": backoff
-        }
+        "upstream": { "backoff": backoff }
     }))
 }
 
 async fn index_handler() -> Json<Value> {
-    Json(json!({"service": "zen-proxy-rs", "status": "ok"}))
+    Json(json!({"service": "zen-proxy-rs", "version": "0.2.0", "status": "ok"}))
 }
 
 async fn metrics_handler(State(st): State<Arc<AppState>>) -> String {
-    st.metrics.encode()
+    let snapshot = st.collector.snapshot();
+    let backend = collector::export::PrometheusBackend;
+    backend.encode(&snapshot)
 }
 
 async fn models_handler() -> Json<Value> {
@@ -63,60 +73,6 @@ async fn models_handler() -> Json<Value> {
             {"id": "deepseek-v4-pro", "object": "model"}
         ]
     }))
-}
-
-fn check_admin_auth(headers: &HeaderMap, state: &AppState) -> bool {
-    if state.admin.api_key.is_empty() {
-        return true;
-    }
-    headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|key| key == state.admin.api_key)
-}
-
-async fn admin_models_handler(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, StatusCode> {
-    if !check_admin_auth(&headers, &st) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let models = st.model_health.get_all();
-    Ok(Json(json!({"models": models, "status": "ok"})))
-}
-
-async fn admin_pools_handler(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, StatusCode> {
-    if !check_admin_auth(&headers, &st) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let stats_value = st.proxy_selector.pool_stats_json();
-    Ok(Json(json!({"pools": stats_value, "status": "ok"})))
-}
-
-async fn admin_stats_handler(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, StatusCode> {
-    if !check_admin_auth(&headers, &st) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let stats_value = admin::build_admin_stats(&st.node_db, &st.metrics, &st.bandwidth, &st.upstream_health, Some(&st.proxy_selector));
-    Ok(Json(json!({"stats": stats_value, "status": "ok"})))
-}
-
-async fn admin_events_handler(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, StatusCode> {
-    if !check_admin_auth(&headers, &st) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let events: Vec<serde_json::Value> = Vec::new();
-    Ok(Json(json!({"events": events, "status": "ok"})))
 }
 
 async fn shutdown_signal() {
@@ -145,67 +101,72 @@ async fn main() {
         .init();
 
     let config = config::Config::from_env();
-    let mode = config.parse_token_mode();
-    let token_bucket = token_bucket::TokenBucket::new(
-        config.token_rate, config.token_burst, mode,
-        config.adaptive_min_rate, config.adaptive_max_rate, config.adaptive_window,
-    );
     let node_urls = config.load_nodes();
+
     tracing::info!(count = node_urls.len(), "loaded proxy nodes");
-    let proxy_selector = Arc::new(selector::ProxySelector::new(
-        node_urls.clone(),
-        config.proxy_error_threshold,
-        config.proxy_cooldown_seconds,
-        config.proxy_recovery_interval,
+
+    let _provider = Arc::new(WebShareProvider::new(node_urls.clone()));
+    let dispatch = DispatchPool::new();
+    let active = ActivePool::new();
+    let ratelimited = RateLimitedPoolImpl::new();
+    let dead = DeadPoolImpl::new();
+
+    let collector = Arc::new(DefaultCollector::new());
+    {
+        let json_backend = JsonBackend::new("/tmp/zen-proxy-snapshot.json");
+        collector.set_backend(Box::new(json_backend));
+    }
+
+    let pool_manager = Arc::new(PoolManagerImpl::new(
+        dispatch,
+        active,
+        ratelimited,
+        dead,
+        collector.clone(),
+        config.upstream_base.clone(),
+        config.probe_timeout_secs,
     ));
-    let session_pool = pool::SessionPool::new(
-        config.pool_max_size,
-        config.request_timeout_secs,
-        config.connect_timeout_secs,
-    );
 
     let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
-    let model_health = Arc::new(health::ModelHealth::new());
-    let metrics = Arc::new(metrics::Metrics::new());
 
-    let node_db_path = std::env::var("NODE_DB_PATH").unwrap_or_else(|_| "/tmp/zen-proxy-node-db.json".into());
-    let ip_stats_path = std::env::var("IP_STATS_PATH").unwrap_or_else(|_| "/tmp/zen-proxy-ip-stats.json".into());
-    let node_db = Arc::new(node_db::NodeDB::new(&node_db_path, &ip_stats_path));
-
-    let ip_stats_tracker = Arc::new(node_db::IPStatsTracker::new());
-    let bandwidth = Arc::new(bandwidth::BandwidthCollector::new());
-    let admin = Arc::new(admin::AdminState::new());
-
-    let addr = config.bind_addr();
     let app_state = Arc::new(AppState {
-        config,
-        token_bucket,
-        proxy_selector,
-        session_pool,
-        startup_time: Instant::now(),
-        node_urls,
+        config: config.clone(),
+        pool_manager,
+        collector,
         upstream_health,
-        model_health,
-        metrics,
-        node_db: node_db.clone(),
-        ip_stats_tracker,
-        bandwidth,
-        admin,
+        startup_time: Instant::now(),
     });
 
-    // Background: probe all nodes every 30s
+    // Background: snapshot persist every 60s
     {
-        let prober = node_probe::NodeProber::new(
-            app_state.proxy_selector.clone(),
-            app_state.config.connect_timeout_secs,
-        );
+        let state = app_state.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            interval.tick().await; // skip first
             loop {
-                interval.tick().await;
-                node_probe::orchestrator_loop(&prober).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                let _snap = state.collector.snapshot();
             }
+        });
+    }
+
+    // SIGHUP hot-reload
+    {
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                let Ok(mut stream) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                else {
+                    tracing::error!("failed to install SIGHUP handler");
+                    return;
+                };
+                loop {
+                    stream.recv().await;
+                    tracing::info!("SIGHUP received, reloading config from env");
+                    let _new_config = config::Config::from_env();
+                }
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
         });
     }
 
@@ -215,60 +176,18 @@ async fn main() {
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/{*path}", any(proxy::proxy_handler))
-        .route("/admin/models", get(admin_models_handler))
-        .route("/admin/pools", get(admin_pools_handler))
-        .route("/admin/stats", get(admin_stats_handler))
-        .route("/admin/events", get(admin_events_handler))
+        .route("/admin/pools", get(server::admin_pools_handler))
+        .route("/admin/fuse", get(server::admin_fuse_handler))
+        .route("/admin/health", get(server::admin_health_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
-    // Background: persist node_db every 60s
-    {
-        let node_db = node_db.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                node_db.persist();
-            }
-        });
-    }
+    let addr = config.bind_addr();
+    tracing::info!("starting on {}", addr);
 
-    // Background: purge stale nodes every 300s
-    {
-        let node_db = node_db.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
-                node_db.purge_stale(300);
-            }
-        });
-    }
-
-    // SIGHUP hot-reload: re-read config env vars without restart
-    {
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                let Ok(mut stream) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else {
-                    tracing::error!("failed to install SIGHUP handler");
-                    return;
-                };
-                loop {
-                    stream.recv().await;
-                    tracing::info!("SIGHUP received, reloading config from env");
-                    let new_config = config::Config::from_env();
-                    tracing::info!(
-                        "config reloaded: port={}, log_level={}",
-                        new_config.port, new_config.log_level
-                    );
-                }
-            }
-            #[cfg(not(unix))]
-            std::future::pending::<()>().await;
-        });
-    }
-
-            tracing::info!("starting on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
 }

@@ -1,6 +1,6 @@
-use std::sync::LazyLock;
-use std::collections::HashMap;
 use crate::config::Config;
+use std::collections::HashMap;
+use std::sync::LazyLock;
 
 pub static MODEL_MAPPING: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
     HashMap::from([
@@ -32,7 +32,10 @@ pub fn apply_model_override(body: &[u8], config: &Config) -> Vec<u8> {
         root["model"] = serde_json::Value::String(resolved.to_string());
         if resolved.ends_with("-nothinking") {
             let mut thinking = serde_json::Map::new();
-            thinking.insert("type".to_string(), serde_json::Value::String("disabled".to_string()));
+            thinking.insert(
+                "type".to_string(),
+                serde_json::Value::String("disabled".to_string()),
+            );
             root["thinking"] = serde_json::Value::Object(thinking);
         }
     }
@@ -43,7 +46,10 @@ pub fn apply_model_override(body: &[u8], config: &Config) -> Vec<u8> {
         });
         if has_assistant_without_reasoning && root.get("thinking").is_none() {
             let mut thinking = serde_json::Map::new();
-            thinking.insert("type".to_string(), serde_json::Value::String("disabled".to_string()));
+            thinking.insert(
+                "type".to_string(),
+                serde_json::Value::String("disabled".to_string()),
+            );
             root["thinking"] = serde_json::Value::Object(thinking);
         }
     }
@@ -89,8 +95,6 @@ pub fn patch_sse_line(line: &[u8]) -> Vec<u8> {
     out
 }
 
-// patch_response_content: Move reasoning_content into content when content is empty.
-// Uses indexing-based access to avoid Rust borrow-checker conflicts with serde_json::Value.
 pub fn patch_response_content(content: &[u8]) -> Vec<u8> {
     let mut root: serde_json::Value = match serde_json::from_slice(content) {
         Ok(v) => v,
@@ -101,8 +105,11 @@ pub fn patch_response_content(content: &[u8]) -> Vec<u8> {
         Some(choices) => {
             let mut changed = false;
             for choice in choices.iter_mut() {
-                // Extract needed data as owned values first, then mutate separately.
-                let delta_key = if choice.get("delta").is_some() { "delta" } else { "message" };
+                let delta_key = if choice.get("delta").is_some() {
+                    "delta"
+                } else {
+                    "message"
+                };
                 let reasoning = choice
                     .get(delta_key)
                     .and_then(|d| d.get("reasoning_content"))
@@ -113,7 +120,6 @@ pub fn patch_response_content(content: &[u8]) -> Vec<u8> {
                     .and_then(|d| d.get("content"))
                     .and_then(|v| v.as_str())
                     .is_none_or(|c| c.is_empty());
-
                 if let Some(r) = reasoning {
                     if content_empty {
                         choice[delta_key]["content"] = serde_json::Value::String(r);
@@ -165,8 +171,6 @@ pub fn should_retry(status: u16, attempt: u32, max_retries: u32) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
-
-/// Rotating User-Agent strings
 pub fn next_user_agent() -> String {
     let agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
