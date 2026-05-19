@@ -18,8 +18,7 @@ use crate::pool::{DispatchError, ErrorKind, RequestMeta};
 use crate::sse::SseBuffer;
 use crate::state::AppState;
 use crate::utils::{
-    apply_model_override, build_upstream_url, patch_response_content, should_retry,
-    smart_backoff,
+    apply_model_override, build_upstream_url, patch_response_content, should_retry, smart_backoff,
 };
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -170,7 +169,9 @@ async fn proxy_with_retry(
         let mut req = client.request(req_method, &upstream);
         req = req.header("Content-Type", "application/json");
         req = req.header("x-api-key", &state.config.upstream_api_key);
-        if let Some(opencode_headers) = build_opencode_headers(headers, &state.config, client_id, model) {
+        if let Some(opencode_headers) =
+            build_opencode_headers(headers, &state.config, client_id, model)
+        {
             req = apply_opencode_headers(req, &opencode_headers);
         }
         if !body.is_empty() {
@@ -201,7 +202,9 @@ async fn proxy_with_retry(
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        upstream_api_key_hash: LedgerEvent::short_hash(
+                            &state.config.upstream_api_key,
+                        ),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,
@@ -238,7 +241,9 @@ async fn proxy_with_retry(
                         retry_after: None,
                         error_type: Some("upstream_429".into()),
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        upstream_api_key_hash: LedgerEvent::short_hash(
+                            &state.config.upstream_api_key,
+                        ),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,
@@ -271,7 +276,9 @@ async fn proxy_with_retry(
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        upstream_api_key_hash: LedgerEvent::short_hash(
+                            &state.config.upstream_api_key,
+                        ),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,

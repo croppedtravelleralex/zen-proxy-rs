@@ -94,7 +94,8 @@ fn patch_sse_line(line: &[u8]) -> Vec<u8> {
                     if let Some(delta_val) = delta {
                         if let Some(delta_obj) = delta_val.as_object_mut() {
                             let content = delta_obj.get("content").and_then(|v| v.as_str());
-                            let reasoning = delta_obj.get("reasoning_content").and_then(|v| v.as_str());
+                            let reasoning =
+                                delta_obj.get("reasoning_content").and_then(|v| v.as_str());
                             if let Some(rc) = reasoning {
                                 if !rc.is_empty() && content.is_none_or(|c| c.is_empty()) {
                                     delta_obj.insert(
@@ -126,7 +127,9 @@ mod tests {
     fn preserves_done_event() {
         let mut buf = SseBuffer::new();
         let result = buf.push_bytes(b"data: [DONE]\n\n");
-        assert!(result.iter().any(|r| r.windows(b"DONE".len()).any(|w| w == b"DONE")));
+        assert!(result
+            .iter()
+            .any(|r| r.windows(b"DONE".len()).any(|w| w == b"DONE")));
     }
 
     #[test]
@@ -134,7 +137,12 @@ mod tests {
         let mut buf = SseBuffer::new();
         buf.push_bytes(b"data: [DONE]\n");
         let lines = buf.push_bytes(b"\ndata: extra\n");
-        assert!(lines.is_empty() || lines.iter().all(|r| !r.windows(b"extra".len()).any(|w| w == b"extra")));
+        assert!(
+            lines.is_empty()
+                || lines
+                    .iter()
+                    .all(|r| !r.windows(b"extra".len()).any(|w| w == b"extra"))
+        );
     }
 
     #[test]
@@ -171,7 +179,11 @@ mod tests {
         // total is 4: [data-with-a\n, \n, data-with-b\n, \n]; or 2 filtered payloads.
         // Test that we got multiple payloads, not just one:
         let payload_count = result.iter().filter(|r| r.starts_with(b"data")).count();
-        assert!(payload_count >= 2, "got {} data lines, expected >= 2", payload_count);
+        assert!(
+            payload_count >= 2,
+            "got {} data lines, expected >= 2",
+            payload_count
+        );
     }
 
     #[test]

@@ -103,16 +103,12 @@ impl LedgerCounters {
         self.inc_dimension(&self.by_key, &event.upstream_api_key_hash, event.status);
         self.inc_dimension_bool(&self.by_stream, event.stream, event.status);
 
-        let is_429 = event.status == 429
-            || event.error_type.as_deref() == Some("rate_limited");
+        let is_429 = event.status == 429 || event.error_type.as_deref() == Some("rate_limited");
         let is_5xx = event.status >= 500 && event.status != 429;
         let is_network = event.error_type.as_deref() == Some("network")
             || event.error_type.as_deref() == Some("timeout");
 
-        if is_429 || is_5xx || is_network
-            || event.pool_from.is_some()
-            || event.pool_to.is_some()
-        {
+        if is_429 || is_5xx || is_network || event.pool_from.is_some() || event.pool_to.is_some() {
             if let Some(path) = self.events_path.read().unwrap().as_ref() {
                 if let Ok(json) = serde_json::to_string(event) {
                     use std::io::Write;
@@ -230,9 +226,7 @@ mod tests {
             rid: "test-rid".into(),
             event_type: "rate_limited".into(),
             node_id: "node-1".into(),
-            node_url_redacted: LedgerEvent::redact_node_url(
-                "socks5h://u:p@host:1080",
-            ),
+            node_url_redacted: LedgerEvent::redact_node_url("socks5h://u:p@host:1080"),
             model: "big-pickle".into(),
             stream: true,
             status: 429,
