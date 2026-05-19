@@ -32,6 +32,8 @@ pub struct Config {
     pub benchmark_mode: bool,
     pub log_level: String,
     pub sticky_ttl_secs: f64,
+    pub proxy_api_key: Option<String>,
+    pub upstream_api_key: String,
     pub nodes_file: String,
 }
 
@@ -73,6 +75,11 @@ impl Config {
             sticky_ttl_secs: load_env_var("STICKY_TTL_SECS", 180.0f64),
             nodes_file: env::var("NODES_FILE")
                 .unwrap_or_else(|_| "/etc/zen-proxy/nodes.json".into()),
+            proxy_api_key: match env::var("PROXY_API_KEY") {
+                Ok(v) if !v.is_empty() => Some(v),
+                _ => None,
+            },
+            upstream_api_key: env::var("UPSTREAM_API_KEY").unwrap_or_else(|_| "public".into()),
         }
     }
 
@@ -152,6 +159,10 @@ impl Config {
             }
         }
     }
+    pub fn proxy_auth_required(&self) -> bool {
+        self.proxy_api_key.is_some()
+    }
+
 }
 
 pub fn load_env_var<T: FromStr>(key: &str, default: T) -> T {

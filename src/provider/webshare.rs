@@ -10,7 +10,8 @@ impl WebShareProvider {
         let creds = nodes
             .first()
             .and_then(|url| {
-                let stripped = url.strip_prefix("socks5://")?;
+                let stripped = url.strip_prefix("socks5://")
+                    .or_else(|| url.strip_prefix("socks5h://"))?;
                 let (user_pass, _rest) = stripped.split_once('@')?;
                 let (user, pass) = user_pass.split_once(':')?;
                 Some((user.to_string(), pass.to_string()))

@@ -162,7 +162,7 @@ async fn proxy_with_retry(
             .unwrap_or(reqwest::Method::POST);
         let mut req = client.request(req_method, &upstream);
         req = req.header("Content-Type", "application/json");
-        req = req.header("x-api-key", "public");
+        req = req.header("x-api-key", &state.config.upstream_api_key);
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }

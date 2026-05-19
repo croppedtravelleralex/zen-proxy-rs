@@ -25,6 +25,8 @@ where
     clients: RwLock<HashMap<NodeId, reqwest::Client>>,
     upstream_base: String,
     probe_timeout_secs: u64,
+    allow_direct_fallback: bool,
+    direct_client: std::sync::Mutex<Option<reqwest::Client>>,
 }
 
 impl<D, A, R, K> PoolManagerImpl<D, A, R, K>
@@ -42,6 +44,7 @@ where
         collector: Arc<dyn DataCollector>,
         upstream_base: String,
         probe_timeout_secs: u64,
+        allow_direct_fallback: bool,
     ) -> Self {
         Self {
             dispatch: Arc::new(dispatch),
@@ -54,6 +57,8 @@ where
             clients: RwLock::new(HashMap::new()),
             upstream_base,
             probe_timeout_secs,
+            allow_direct_fallback,
+            direct_client: std::sync::Mutex::new(None),
         }
     }
 
@@ -85,7 +90,23 @@ where
         if self.fuse.load(Ordering::Acquire) {
             return Err(DispatchError::NoResource);
         }
-        let node = self.dispatch.acquire().ok_or(DispatchError::NoResource)?;
+        let node = self.dispatch.acquire().ok_or(DispatchError::NoResource).or_else(|_| {
+            if self.allow_direct_fallback {
+                let mut dc = self.direct_client.lock().unwrap();
+                if dc.is_none() {
+                    *dc = Some(reqwest::Client::builder()
+                        .no_proxy()
+                        .connect_timeout(Duration::from_secs(30))
+                        .timeout(Duration::from_secs(120))
+                        .build()
+                        .unwrap());
+                }
+                let direct_id = "direct".to_string();
+                Ok(NodeRef { id: direct_id, url: "direct".to_string() })
+            } else {
+                Err(DispatchError::NoResource)
+            }
+        })?;
         self.active.add(node.clone());
 
         {
@@ -96,7 +117,11 @@ where
         }
 
         let url = node.url.clone();
-        let client = self.get_or_create_client(&node.id, &url);
+        let client = if node.id == "direct" {
+            self.direct_client.lock().unwrap().as_ref().cloned().unwrap()
+        } else {
+            self.get_or_create_client(&node.id, &url)
+        };
 
         Ok(DispatchResult { node, client, url })
     }

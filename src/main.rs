@@ -31,6 +31,7 @@ use pool::dead::DeadPoolImpl;
 use pool::dispatch::DispatchPool;
 use pool::manager::PoolManagerImpl;
 use pool::ratelimited::RateLimitedPoolImpl;
+use pool::{NodeRef, Pool};
 use provider::webshare::WebShareProvider;
 use state::AppState;
 
@@ -111,6 +112,11 @@ async fn main() {
     let ratelimited = RateLimitedPoolImpl::new();
     let dead = DeadPoolImpl::new();
 
+    for url in &node_urls {
+        dispatch.add(NodeRef::new(url.clone()));
+    }
+    tracing::info!(count = node_urls.len(), "nodes added to dispatch pool");
+
     let collector = Arc::new(DefaultCollector::new());
     {
         let json_backend = JsonBackend::new("/tmp/zen-proxy-snapshot.json");
@@ -125,6 +131,7 @@ async fn main() {
         collector.clone(),
         config.upstream_base.clone(),
         config.probe_timeout_secs,
+        config.allow_direct_fallback,
     ));
 
     let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
@@ -185,7 +192,10 @@ async fn main() {
     let addr = config.bind_addr();
     tracing::info!("starting on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_reuseaddr(true).unwrap();
+    socket.bind(addr.parse::<std::net::SocketAddr>().unwrap()).unwrap();
+    let listener = socket.listen(1024).unwrap();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
