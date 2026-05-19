@@ -12,6 +12,7 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::collector::RequestTelemetry;
+use crate::ledger::{LedgerCounters, LedgerEvent};
 use crate::pool::{DispatchError, ErrorKind, RequestMeta};
 use crate::state::AppState;
 use crate::utils::{
@@ -71,6 +72,7 @@ pub async fn proxy_handler(
         streaming,
         &req_meta,
         &client_id,
+        &model,
     )
     .await;
 
@@ -135,7 +137,8 @@ async fn proxy_with_retry(
     body: &[u8],
     streaming: bool,
     req_meta: &RequestMeta,
-    _client_id: &str,
+    client_id: &str,
+    model: &str,
 ) -> Result<(Response, String, u16, u64), u16> {
     let max = state.config.pool_max_retries.max(1);
     let mut last_status = 502u16;
@@ -175,10 +178,35 @@ async fn proxy_with_retry(
 
                 if status < 400 {
                     state.pool_manager.report(
-                        node_id,
+                        node_id.clone(),
                         crate::pool::ResultKind::Success(status),
                         latency,
                     );
+                    state.ledger.record(&LedgerEvent {
+                        ts: chrono::Utc::now().timestamp_millis(),
+                        rid: uuid::Uuid::new_v4().to_string(),
+                        event_type: "success".into(),
+                        node_id: node_id.clone(),
+                        node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                        model: model.to_string(),
+                        stream: streaming,
+                        status: status as u16,
+                        retry_after: None,
+                        error_type: None,
+                        latency_ms: latency,
+                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        user_agent_hash: None,
+                        client_hash: None,
+                        project_hash: None,
+                        session_hash: None,
+                        request_hash: None,
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                        total_tokens: None,
+                        pool_from: None,
+                        pool_to: None,
+                        attempt: attempt as u32,
+                    });
                     if streaming && status == 200 {
                         return Ok((stream_to_axum(up_resp).await, node_url, status, latency));
                     }
@@ -187,18 +215,68 @@ async fn proxy_with_retry(
 
                 if status == 429 {
                     state.pool_manager.report(
-                        node_id,
+                        node_id.clone(),
                         crate::pool::ResultKind::RateLimited,
                         latency,
                     );
+                    state.ledger.record(&LedgerEvent {
+                        ts: chrono::Utc::now().timestamp_millis(),
+                        rid: uuid::Uuid::new_v4().to_string(),
+                        event_type: "rate_limited".into(),
+                        node_id: node_id.clone(),
+                        node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                        model: model.to_string(),
+                        stream: streaming,
+                        status: status as u16,
+                        retry_after: None,
+                        error_type: Some("upstream_429".into()),
+                        latency_ms: latency,
+                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        user_agent_hash: None,
+                        client_hash: None,
+                        project_hash: None,
+                        session_hash: None,
+                        request_hash: None,
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                        total_tokens: None,
+                        pool_from: Some("dispatch".into()),
+                        pool_to: Some("ratelimited".into()),
+                        attempt: attempt as u32,
+                    });
                 } else {
                     state.pool_manager.report(
-                        node_id,
+                        node_id.clone(),
                         crate::pool::ResultKind::Error {
                             kind: ErrorKind::Upstream5xx,
                         },
                         latency,
                     );
+                    state.ledger.record(&LedgerEvent {
+                        ts: chrono::Utc::now().timestamp_millis(),
+                        rid: uuid::Uuid::new_v4().to_string(),
+                        event_type: "upstream_5xx".into(),
+                        node_id: node_id.clone(),
+                        node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                        model: model.to_string(),
+                        stream: streaming,
+                        status: status as u16,
+                        retry_after: None,
+                        error_type: None,
+                        latency_ms: latency,
+                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        user_agent_hash: None,
+                        client_hash: None,
+                        project_hash: None,
+                        session_hash: None,
+                        request_hash: None,
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                        total_tokens: None,
+                        pool_from: Some("dispatch".into()),
+                        pool_to: None,
+                        attempt: attempt as u32,
+                    });
                 }
 
                 if !should_retry(status, attempt, max) {
@@ -211,12 +289,37 @@ async fn proxy_with_retry(
                 let latency = request_start.elapsed().as_millis() as u64;
                 last_status = 502;
                 state.pool_manager.report(
-                    node_id,
+                    node_id.clone(),
                     crate::pool::ResultKind::Error {
                         kind: ErrorKind::Timeout,
                     },
                     latency,
                 );
+                state.ledger.record(&LedgerEvent {
+                    ts: chrono::Utc::now().timestamp_millis(),
+                    rid: uuid::Uuid::new_v4().to_string(),
+                    event_type: "network_error".into(),
+                    node_id: node_id.clone(),
+                    node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                    model: model.to_string(),
+                    stream: streaming,
+                    status: 502,
+                    retry_after: None,
+                    error_type: Some("timeout".into()),
+                    latency_ms: latency,
+                    upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                    user_agent_hash: None,
+                    client_hash: None,
+                    project_hash: None,
+                    session_hash: None,
+                    request_hash: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    total_tokens: None,
+                    pool_from: Some("dispatch".into()),
+                    pool_to: None,
+                    attempt: attempt as u32,
+                });
                 warn!(attempt, error = %e, "upstream request error");
                 if attempt < max {
                     let backoff = smart_backoff(attempt, None);
