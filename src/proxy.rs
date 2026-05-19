@@ -15,9 +15,10 @@ use crate::collector::RequestTelemetry;
 use crate::ledger::{LedgerCounters, LedgerEvent};
 use crate::opencode_headers::{apply_opencode_headers, build_opencode_headers};
 use crate::pool::{DispatchError, ErrorKind, RequestMeta};
+use crate::sse::SseBuffer;
 use crate::state::AppState;
 use crate::utils::{
-    apply_model_override, build_upstream_url, patch_response_content, patch_sse_line, should_retry,
+    apply_model_override, build_upstream_url, patch_response_content, should_retry,
     smart_backoff,
 };
 
@@ -388,12 +389,18 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
     tokio::spawn(async move {
         use futures::stream::StreamExt;
         let mut s = std::pin::pin!(upstream_stream);
+        let mut sse_buf = SseBuffer::new();
         while let Some(chunk_result) = s.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    let patched = patch_sse_line(&chunk);
-                    if !patched.is_empty() {
-                        let _ = tx.send(Ok(axum::body::Bytes::from(patched)));
+                    let lines = sse_buf.push_bytes(&chunk);
+                    for line in lines {
+                        if !line.is_empty() {
+                            let _ = tx.send(Ok(axum::body::Bytes::from(line)));
+                        }
+                    }
+                    if sse_buf.done() {
+                        break;
                     }
                 }
                 Err(_) => break,

@@ -9,6 +9,7 @@ mod pool;
 mod provider;
 mod proxy;
 mod server;
+mod sse;
 mod state;
 mod utils;
 
