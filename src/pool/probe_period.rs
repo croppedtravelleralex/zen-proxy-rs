@@ -10,7 +10,7 @@ impl ProbePeriod {
         _node: &NodeRef,
         upstream_base: &str,
         timeout_secs: u64,
-        _api_key: &str,
+        api_key: &str,
     ) -> bool {
         let probe_url = format!(
             "{}/v1/chat/completions",
@@ -29,7 +29,7 @@ impl ProbePeriod {
 
             let result = tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
-                client.post(&probe_url).json(&body).send(),
+                client.post(&probe_url).header("x-api-key", api_key).json(&body).send(),
             )
             .await;
 

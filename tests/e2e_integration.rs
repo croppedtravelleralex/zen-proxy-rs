@@ -90,8 +90,8 @@ mod e2e {
             .expect("admin/stats endpoint");
         assert_eq!(resp.status(), 200, "valid API key should be accepted");
         let body: serde_json::Value = resp.json().unwrap();
-        assert_eq!(body["status"], "ok");
-        assert!(body["stats"].is_object());
+        assert!(body["success"].as_bool().unwrap_or(false));
+        assert!(body["data"].is_object());
         stop_server(child, port);
     }
 
@@ -129,8 +129,8 @@ mod e2e {
             .expect("admin/nodes endpoint");
         assert_eq!(resp.status(), 200, "valid API key should be accepted");
         let body: serde_json::Value = resp.json().unwrap();
-        assert_eq!(body["status"], "ok");
-        assert!(body["ledger"]["total_requests"].is_number());
+        assert!(body["success"].as_bool().unwrap_or(false));
+        assert!(body["data"]["total_requests"].is_number());
         stop_server(child, port);
     }
 }

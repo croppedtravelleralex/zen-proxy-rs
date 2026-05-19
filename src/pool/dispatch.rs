@@ -124,6 +124,15 @@ impl Pool for DispatchPool {
         None
     }
 
+    fn try_acquire_sticky(&self, _meta: &RequestMeta, node_id: &NodeId) -> Result<NodeRef, DispatchError> {
+        let nodes = self.nodes.read().unwrap();
+        nodes
+            .iter()
+            .find(|n| n.node.id == *node_id)
+            .map(|n| n.node.clone())
+            .ok_or(DispatchError::NoResource)
+    }
+
     fn release(&self, node_id: &NodeId, result: &ResultKind) {
         let mut nodes = self.nodes.write().unwrap();
         if let Some(pn) = nodes.iter_mut().find(|n| n.node.id == *node_id) {

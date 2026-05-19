@@ -79,6 +79,9 @@ pub struct RequestMeta {
 
 pub trait Pool: Send + Sync {
     fn acquire(&self) -> Option<NodeRef>;
+    fn try_acquire_sticky(&self, _meta: &RequestMeta, _node_id: &NodeId) -> Result<NodeRef, DispatchError> {
+        Err(DispatchError::NoResource)
+    }
     fn release(&self, node_id: &NodeId, result: &ResultKind);
     fn remove(&self, node_id: &NodeId);
     fn add(&self, node: NodeRef);
@@ -88,10 +91,16 @@ pub trait Pool: Send + Sync {
 
 pub trait PoolManager: Send + Sync {
     fn dispatch(&self, req: &RequestMeta) -> Result<DispatchResult, DispatchError>;
+    fn dispatch_sticky(&self, meta: &RequestMeta, node_id: &str) -> Result<DispatchResult, DispatchError>;
     fn report(&self, node_id: NodeId, result: ResultKind, latency_us: u64);
     fn pool_stats(&self) -> PoolStats;
     fn fuse_all(&self);
     fn unfuse_all(&self);
+    fn add_node(&self, url: &str);
+    fn remove_node(&self, node_id: &str);
+    fn probe_node(&self, node_id: &str) -> Option<ProbeResult>;
+    fn recover_node(&self, node_id: &str);
+    fn probe_all(&self);
 }
 
 pub trait RateLimitedPool: Pool {
@@ -116,6 +125,11 @@ pub trait NodeProvider: Send + Sync {
     fn all_urls(&self) -> Vec<String>;
     fn id_for_url(&self, url: &str) -> Self::NodeId;
     fn name(&self) -> &'static str;
+}
+
+pub struct ProbeResult {
+    pub success: bool,
+    pub latency_ms: u64,
 }
 
 pub fn sha256_first8(input: &str) -> String {

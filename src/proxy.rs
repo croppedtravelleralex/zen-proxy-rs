@@ -12,7 +12,6 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::collector::RequestTelemetry;
-use crate::ledger::LedgerCounters;
 use crate::ledger::LedgerEvent;
 use crate::opencode_headers::{apply_opencode_headers, build_opencode_headers};
 use crate::pool::{DispatchError, ErrorKind, RequestMeta};
@@ -21,6 +20,18 @@ use crate::state::AppState;
 use crate::utils::{
     apply_model_override, build_upstream_url, patch_response_content, should_retry, smart_backoff,
 };
+
+pub struct ProxyResult {
+    pub response: Response,
+    pub body_bytes: Vec<u8>,
+    pub retry_count: u32,
+    pub was_rate_limited: bool,
+    pub pool: String,
+    pub upstream_ms: u64,
+    pub ttft_ms: u64,
+    pub model: String,
+    pub node_url: String,
+}
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
@@ -45,11 +56,23 @@ pub async fn proxy_handler(
 ) -> Response {
     let start = Instant::now();
     let client_id = extract_bearer_token(&headers).unwrap_or_default();
+    let conf = state.config.read().unwrap().clone();
+
+    // PROXY_API_KEY 校验
+    if let Some(ref key) = conf.proxy_api_key {
+        let provided = extract_bearer_token(&headers);
+        if provided.as_deref() != Some(key.as_str()) {
+            warn!("proxy authentication failed");
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+                "error": { "message": "invalid proxy api key" }
+            }))).into_response();
+        }
+    }
 
     let (streaming, modified_body) = if body.is_empty() {
         (false, body.to_vec())
     } else {
-        let patched = apply_model_override(&body, &state.config);
+        let patched = apply_model_override(&body, &conf);
         let parsed: Value = serde_json::from_slice(&patched).unwrap_or(Value::Null);
         (is_streaming(&parsed), patched)
     };
@@ -80,30 +103,35 @@ pub async fn proxy_handler(
     .await;
 
     match result {
-        Ok((resp, node_url, status, latency)) => {
-            state.collector.record_request(&RequestTelemetry {
+        Ok(pr) => {
+            let status = pr.response.status().as_u16();
+            let latency = start.elapsed().as_millis() as u64;
+
+            let tele = RequestTelemetry {
                 rid: uuid::Uuid::new_v4().to_string(),
                 ts: chrono::Utc::now().timestamp_millis(),
-                model,
-                client_id,
+                model: pr.model.clone(),
+                client_id: client_id.clone(),
                 path: path.clone(),
                 method: method.to_string(),
                 is_streaming: streaming,
-                node_url,
-                pool: String::new(),
+                node_url: pr.node_url.clone(),
+                pool: pr.pool.clone(),
                 exit_ip: String::new(),
-                status: status as u16,
-                rate_limited: false,
-                retry_count: 0,
+                status,
+                rate_limited: pr.was_rate_limited,
+                retry_count: pr.retry_count,
                 latency_total_ms: latency,
-                upstream_ms: latency,
-                ttft_ms: 0,
+                upstream_ms: pr.upstream_ms,
+                ttft_ms: pr.ttft_ms,
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
                 bytes_sent: body_len,
-                bytes_received: 0,
-            });
+                bytes_received: pr.body_bytes.len() as u64,
+            };
+
+            state.collector.record_request(&tele);
             state.upstream_health.record(status);
             info!(
                 method = %method, path = %path,
@@ -111,7 +139,7 @@ pub async fn proxy_handler(
                 duration_ms = latency,
                 "proxy OK"
             );
-            resp
+            pr.response
         }
         Err(status) => {
             let elapsed = start.elapsed().as_millis() as u64;
@@ -133,8 +161,8 @@ pub async fn proxy_handler(
             };
 
             let retry_after = match status {
-                999 => Some(state.config.pool_starvation_retry_after_secs.to_string()),
-                998 => Some(state.config.global_backoff_cooldown_secs.to_string()),
+                999 => Some(conf.pool_starvation_retry_after_secs.to_string()),
+                998 => Some(conf.global_backoff_cooldown_secs.to_string()),
                 _ => None,
             };
 
@@ -167,46 +195,82 @@ async fn proxy_with_retry(
     client_id: &str,
     headers: &HeaderMap,
     model: &str,
-) -> Result<(Response, String, u16, u64), u16> {
-    let max = state.config.pool_max_retries.max(1);
+) -> Result<ProxyResult, u16> {
+    let conf = state.config.read().unwrap().clone();
+    let max = conf.pool_max_retries.max(1);
     let mut last_status = 502u16;
+    let mut was_rate_limited = false;
+    let mut last_node_id = String::new();
 
     for attempt in 0..=max {
-        let dispatch_result = match state.pool_manager.dispatch(req_meta) {
-            Ok(r) => r,
-            Err(DispatchError::CircuitOpen) => {
-                return Err(998);
-            }
-            Err(DispatchError::NoResource) => {
-                if attempt < max {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+        let dispatch_result = if attempt == 0 {
+            match state.pool_manager.dispatch(req_meta) {
+                Ok(r) => r,
+                Err(DispatchError::CircuitOpen) => return Err(998),
+                Err(DispatchError::NoResource) => {
+                    if attempt < max {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    return Err(999);
                 }
-                return Err(999);
+            }
+        } else {
+            // Sticky retry: try same node first, fall back to fresh dispatch
+            let sticky = state.pool_manager.dispatch_sticky(req_meta, &last_node_id);
+            match sticky {
+                Ok(r) => r,
+                Err(_) => match state.pool_manager.dispatch(req_meta) {
+                    Ok(r) => r,
+                    Err(DispatchError::CircuitOpen) => return Err(998),
+                    Err(DispatchError::NoResource) => {
+                        if attempt < max {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        return Err(999);
+                    }
+                },
             }
         };
 
         let node_url = dispatch_result.url.clone();
         let node_id = dispatch_result.node.id.clone();
+        last_node_id = node_id.clone();
         let client = dispatch_result.client;
-        let upstream = build_upstream_url(&state.config.upstream_base, &format!("v1/{}", path));
+        let upstream = build_upstream_url(&conf.upstream_base, &format!("v1/{}", path));
         let request_start = Instant::now();
 
         let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
             .unwrap_or(reqwest::Method::POST);
-        let mut req = client.request(req_method, &upstream);
-        req = req.header("Content-Type", "application/json");
-        req = req.header("x-api-key", &state.config.upstream_api_key);
-        if let Some(opencode_headers) =
-            build_opencode_headers(headers, &state.config, client_id, model)
-        {
-            req = apply_opencode_headers(req, &opencode_headers);
-        }
-        if !body.is_empty() {
-            req = req.body(body.to_vec());
+        let mut upstream_req = client.request(req_method, &upstream);
+        upstream_req = upstream_req.header("Content-Type", "application/json");
+
+        // Forward original headers (whitelist)
+        for (key, value) in headers.iter() {
+            match key.as_str() {
+                "content-type" | "content-length" | "host" | "authorization" => continue,
+                _ => {
+                    upstream_req = upstream_req.header(key, value.clone());
+                }
+            }
         }
 
-        match req.send().await {
+        // Inject opencode headers
+        if let Some(opencode_headers) =
+            build_opencode_headers(headers, &conf, client_id, model)
+        {
+            upstream_req = apply_opencode_headers(upstream_req, &opencode_headers);
+        }
+
+        // Set API key
+        upstream_req = upstream_req.header("x-api-key", &conf.upstream_api_key);
+
+        if !body.is_empty() {
+            upstream_req = upstream_req.body(body.to_vec());
+        }
+
+        match upstream_req.send().await {
             Ok(up_resp) => {
                 let status = up_resp.status().as_u16();
                 let latency = request_start.elapsed().as_millis() as u64;
@@ -231,7 +295,7 @@ async fn proxy_with_retry(
                         error_type: None,
                         latency_ms: latency,
                         upstream_api_key_hash: LedgerEvent::short_hash(
-                            &state.config.upstream_api_key,
+                            &conf.upstream_api_key,
                         ),
                         user_agent_hash: None,
                         client_hash: None,
@@ -248,18 +312,62 @@ async fn proxy_with_retry(
                         attempt: attempt as u32,
                     });
                     if streaming && status == 200 {
-                        return Ok((stream_to_axum(up_resp).await, node_url, status, latency));
+                        let resp = stream_to_axum(up_resp).await;
+                        return Ok(ProxyResult {
+                            response: resp,
+                            body_bytes: Vec::new(),
+                            retry_count: attempt as u32,
+                            was_rate_limited,
+                            pool: "dispatch".into(),
+                            upstream_ms: latency,
+                            ttft_ms: 0,
+                            model: model.to_string(),
+                            node_url,
+                        });
                     }
-                    return Ok((read_full_body(up_resp).await, node_url, status, latency));
+                    // Non-streaming success: read body and build response
+                    let resp_status = http::StatusCode::from_u16(status).unwrap();
+                    let ct = up_resp
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("application/json")
+                        .to_string();
+                    let body_bytes = up_resp.bytes().await;
+                    match body_bytes {
+                        Ok(bytes) => {
+                            let patched = patch_response_content(&bytes);
+                            let mut resp = Response::new(Body::from(patched));
+                            *resp.status_mut() = resp_status;
+                            resp.headers_mut()
+                                .insert("content-type", HeaderValue::from_str(&ct).unwrap());
+                            return Ok(ProxyResult {
+                                response: resp,
+                                body_bytes: bytes.to_vec(),
+                                retry_count: attempt as u32,
+                                was_rate_limited,
+                                pool: "dispatch".into(),
+                                upstream_ms: latency,
+                                ttft_ms: 0,
+                                model: model.to_string(),
+                                node_url,
+                            });
+                        }
+                        Err(e) => {
+                            error!(error = %e, "failed to read upstream body");
+                            return Err(502);
+                        }
+                    }
                 }
 
                 if status == 429 {
+                    was_rate_limited = true;
                     state.pool_manager.report(
                         node_id.clone(),
                         crate::pool::ResultKind::RateLimited,
                         latency,
                     );
-                    let retry_after_secs = up_resp
+                    let _retry_after_secs = up_resp
                         .headers()
                         .get("retry-after")
                         .and_then(|v| v.to_str().ok())
@@ -286,7 +394,7 @@ async fn proxy_with_retry(
                         error_type: Some("upstream_429".into()),
                         latency_ms: latency,
                         upstream_api_key_hash: LedgerEvent::short_hash(
-                            &state.config.upstream_api_key,
+                            &conf.upstream_api_key,
                         ),
                         user_agent_hash: None,
                         client_hash: None,
@@ -323,7 +431,7 @@ async fn proxy_with_retry(
                         error_type: None,
                         latency_ms: latency,
                         upstream_api_key_hash: LedgerEvent::short_hash(
-                            &state.config.upstream_api_key,
+                            &conf.upstream_api_key,
                         ),
                         user_agent_hash: None,
                         client_hash: None,
@@ -371,7 +479,7 @@ async fn proxy_with_retry(
                     error_body_summary: None,
                     exit_ip: None,
                     latency_ms: latency,
-                    upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                    upstream_api_key_hash: LedgerEvent::short_hash(&conf.upstream_api_key),
                     user_agent_hash: None,
                     client_hash: None,
                     project_hash: None,

@@ -22,6 +22,7 @@ pub struct DefaultCollector {
     wal: Option<WAL>,
     backend: RwLock<Option<Box<dyn StorageBackend>>>,
     pool_dims: RwLock<PoolDimensionStats>,
+    pool_events: RwLock<VecDeque<PoolEvent>>,
     bandwidth_bytes: AtomicU64,
     bandwidth_ts: Mutex<Instant>,
     current_bps: Mutex<f64>,
@@ -41,7 +42,7 @@ impl DefaultCollector {
             rpm_window: Mutex::new(VecDeque::with_capacity(4096)),
             ring_buffer: RingBuffer::new(10000),
             aggregator: RollingAggregator::new(300_000, 12),
-            wal: None,
+            wal: std::env::var("TELEMETRY_WAL_PATH").ok().as_deref().map(WAL::new),
             backend: RwLock::new(None),
             pool_dims: RwLock::new(PoolDimensionStats {
                 dispatch_size: 0,
@@ -51,6 +52,7 @@ impl DefaultCollector {
                 pool_transitions: 0,
                 active_concurrency: 0,
             }),
+            pool_events: RwLock::new(VecDeque::with_capacity(5000)),
             bandwidth_bytes: AtomicU64::new(0),
             bandwidth_ts: Mutex::new(Instant::now()),
             current_bps: Mutex::new(0.0),
@@ -131,9 +133,29 @@ impl DataCollector for DefaultCollector {
         dims.active_concurrency = dims.active_size;
     }
 
-    fn record_schedule(&self, _event: &ScheduleEvent) {}
+    fn record_schedule(&self, event: &ScheduleEvent) {
+        if let Ok(mut events) = self.pool_events.write() {
+            events.push_back(PoolEvent {
+                ts: event.ts,
+                node_id: event.node_id.clone(),
+                from_pool: event.pool.clone(),
+                to_pool: if event.success { "active".into() } else { "dispatch".into() },
+                reason: format!("schedule: score={}", event.score_before),
+            });
+        }
+    }
 
-    fn record_probe(&self, _event: &ProbeEvent) {}
+    fn record_probe(&self, event: &ProbeEvent) {
+        if let Ok(mut events) = self.pool_events.write() {
+            events.push_back(PoolEvent {
+                ts: event.ts,
+                node_id: event.node_id.clone(),
+                from_pool: event.pool.clone(),
+                to_pool: if event.ok { "dispatch".into() } else { "dead".into() },
+                reason: format!("probe_{}: {}", if event.ok { "ok" } else { "fail" }, event.pool),
+            });
+        }
+    }
 
     fn record_system(&self, event: &SystemEvent) {
         if event.kind == "bps" {
@@ -191,5 +213,35 @@ impl DataCollector for DefaultCollector {
 
     fn set_backend(&self, backend: Box<dyn StorageBackend>) {
         *self.backend.write().unwrap() = Some(backend);
+    }
+
+    fn query_requests(&self, filter: &RequestFilter) -> RequestQueryResult {
+        let (items, cursor) = self.ring_buffer.query(
+            filter.since,
+            filter.limit,
+            filter.cursor,
+        );
+        // Apply post-filter for model/status if set
+        let items = if filter.model.is_some() || filter.status.is_some() {
+            items.into_iter().filter(|r| {
+                let match_model = filter.model.as_ref().map_or(true, |m| r.model == *m);
+                let match_status = filter.status.map_or(true, |s| r.status == s);
+                match_model && match_status
+            }).collect()
+        } else {
+            items
+        };
+        RequestQueryResult { items, next_cursor: cursor }
+    }
+
+    fn aggregator_snapshot(&self) -> serde_json::Value {
+        self.aggregator.snapshot()
+    }
+
+    fn persist(&self) {
+        let snap = self.snapshot();
+        if let Some(ref backend) = *self.backend.read().unwrap() {
+            backend.write(&snap);
+        }
     }
 }

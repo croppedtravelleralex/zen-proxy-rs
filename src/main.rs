@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod admin;
 mod collector;
 mod config;
 mod health;
@@ -13,7 +14,7 @@ mod sse;
 mod state;
 mod utils;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use axum::{
@@ -34,7 +35,7 @@ use pool::dead::DeadPoolImpl;
 use pool::dispatch::DispatchPool;
 use pool::manager::PoolManagerImpl;
 use pool::ratelimited::RateLimitedPoolImpl;
-use pool::{NodeRef, Pool};
+use pool::{DeadPool, NodeRef, Pool, RateLimitedPool};
 use provider::webshare::WebShareProvider;
 use state::AppState;
 
@@ -111,9 +112,9 @@ async fn main() {
 
     let _provider = Arc::new(WebShareProvider::new(node_urls.clone()));
     let dispatch = DispatchPool::new();
-    let active = ActivePool::new();
-    let ratelimited = RateLimitedPoolImpl::new();
-    let dead = DeadPoolImpl::new();
+    let active = Arc::new(ActivePool::new());
+    let ratelimited = Arc::new(RateLimitedPoolImpl::new());
+    let dead = Arc::new(DeadPoolImpl::new());
 
     for url in &node_urls {
         dispatch.add(NodeRef::new(url.clone()));
@@ -128,9 +129,9 @@ async fn main() {
 
     let pool_manager = Arc::new(PoolManagerImpl::new(
         Arc::new(dispatch),
-        Arc::new(active),
-        Arc::new(ratelimited),
-        Arc::new(dead),
+        active.clone(),
+        ratelimited.clone(),
+        dead.clone(),
         collector.clone(),
         config.upstream_base.clone(),
         config.upstream_api_key.clone(),
@@ -144,8 +145,11 @@ async fn main() {
     ledger.set_events_path(Some(config.ledger_events_path.clone()));
 
     let app_state = Arc::new(AppState {
-        config: config.clone(),
+        config: RwLock::new(config.clone()),
         pool_manager,
+        dead_pool: dead.clone() as Arc<dyn DeadPool>,
+        ratelimited_pool: ratelimited.clone() as Arc<dyn RateLimitedPool>,
+        active_pool: active.clone() as Arc<dyn Pool>,
         collector,
         upstream_health,
         ledger,
@@ -158,13 +162,14 @@ async fn main() {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-                let _snap = state.collector.snapshot();
+                state.collector.persist();
             }
         });
     }
 
     // SIGHUP hot-reload
     {
+        let state = app_state.clone();
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -177,7 +182,7 @@ async fn main() {
                 loop {
                     stream.recv().await;
                     tracing::info!("SIGHUP received, reloading config from env");
-                    let _new_config = config::Config::from_env();
+                    *state.config.write().unwrap() = config::Config::from_env();
                 }
             }
             #[cfg(not(unix))]
@@ -186,15 +191,12 @@ async fn main() {
     }
 
     let app = Router::new()
+        .merge(admin::admin_router())
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/{*path}", any(proxy::proxy_handler))
-        .route("/admin/pools", get(server::admin_pools_handler))
-        .route("/admin/fuse", get(server::admin_fuse_handler))
-        .route("/admin/health", get(server::admin_health_handler))
-        .route("/admin/nodes", get(server::admin_nodes_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 

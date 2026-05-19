@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::state::AppState;
 
 fn check_admin_auth(headers: &HeaderMap, state: &AppState) -> bool {
-    let key = match &state.config.admin_api_key {
+    let cfg = state.config.read().unwrap();
+    let key = match &cfg.admin_api_key {
         Some(k) => k,
         None => return false,
     };
@@ -119,5 +120,30 @@ pub async fn admin_nodes_handler(
     Ok(Json(json!({
         "ledger": summary,
         "status": "ok"
+    })))
+}
+
+pub async fn admin_stats_handler(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    if !check_admin_auth(&headers, &st) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let snapshot = st.collector.snapshot();
+    Ok(Json(json!({
+        "status": "ok",
+        "stats": {
+            "total_requests": snapshot.requests.total,
+            "success": snapshot.requests.success,
+            "count_429": snapshot.requests.count_429,
+            "count_4xx": snapshot.requests.count_4xx,
+            "count_5xx": snapshot.requests.count_5xx,
+            "bytes_sent": snapshot.requests.bytes_sent,
+            "bytes_received": snapshot.requests.bytes_received,
+            "rpm": snapshot.requests.rpm,
+            "avg_latency_ms": snapshot.requests.avg_latency_ms,
+            "current_bps": snapshot.system.current_bps,
+        }
     })))
 }

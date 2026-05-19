@@ -143,6 +143,28 @@ where
         Ok(DispatchResult { node, client, url })
     }
 
+    fn dispatch_sticky(&self, meta: &RequestMeta, node_id: &str) -> Result<DispatchResult, DispatchError> {
+        if self.fuse.load(Ordering::Acquire) {
+            return Err(DispatchError::NoResource);
+        }
+        // 先尝试粘滞获取指定节点
+        let nid: NodeId = node_id.to_string();
+        if let Ok(node) = self.dispatch.try_acquire_sticky(meta, &nid) {
+            self.active.add(node.clone());
+            {
+                let mut all = self.nodes.write().unwrap();
+                if !all.contains_key(&node.id) {
+                    all.insert(node.id.clone(), node.clone());
+                }
+            }
+            let url = node.url.clone();
+            let client = self.get_or_create_client(&node.id, &url);
+            return Ok(DispatchResult { node, client, url });
+        }
+        // 回退到普通 dispatch
+        self.dispatch(meta)
+    }
+
     fn report(&self, node_id: NodeId, result: ResultKind, _latency_us: u64) {
         match result {
             ResultKind::Success(_) => {
@@ -258,6 +280,60 @@ where
                 self.dispatch.add(nr.clone());
                 self.dead.recover(id);
             }
+        }
+    }
+
+    fn add_node(&self, url: &str) {
+        let nr = NodeRef::new(url.to_string());
+        self.dispatch.add(nr.clone());
+        self.nodes.write().unwrap().insert(nr.id.clone(), nr);
+    }
+
+    fn remove_node(&self, node_id: &str) {
+        let nid = node_id.to_string();
+        self.dispatch.remove(&nid);
+        self.active.remove(&nid);
+        self.ratelimited.remove(&nid);
+        self.dead.remove(&nid);
+        self.nodes.write().unwrap().remove(&nid);
+    }
+
+    fn probe_node(&self, node_id: &str) -> Option<ProbeResult> {
+        let nid = node_id.to_string();
+        let nodes = self.nodes.read().unwrap();
+        let nr = nodes.get(&nid)?;
+        let client = self.get_or_create_client(&nid, &nr.url);
+        let upstream = self.upstream_base.clone();
+        let timeout = self.probe_timeout_secs;
+        let api_key = self.upstream_api_key.clone();
+        let start = std::time::Instant::now();
+        let ok = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                ProbePeriod::probe_node(&client, nr, &upstream, timeout, &api_key).await
+            })
+        });
+        Some(ProbeResult { success: ok, latency_ms: start.elapsed().as_millis() as u64 })
+    }
+
+    fn recover_node(&self, node_id: &str) {
+        let nid = node_id.to_string();
+        let nodes = self.nodes.read().unwrap();
+        if let Some(nr) = nodes.get(&nid) {
+            self.dead.recover(&nid);
+            self.ratelimited.recover(&nid);
+            if self.fuse.load(Ordering::Acquire) {
+                self.dispatch.remove(&nid);
+            } else {
+                self.dispatch.add(nr.clone());
+                self.dispatch.release(&nid, &ResultKind::Success(200));
+            }
+        }
+    }
+
+    fn probe_all(&self) {
+        let ids: Vec<NodeId> = self.nodes.read().unwrap().keys().cloned().collect();
+        for id in ids {
+            let _ = self.probe_node(&id);
         }
     }
 }

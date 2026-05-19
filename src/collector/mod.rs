@@ -105,11 +105,6 @@ pub struct SystemStats {
     pub uptime_secs: u64,
 }
 
-pub trait StorageBackend: Send + Sync {
-    fn write(&self, snapshot: &DataSnapshot);
-    fn name(&self) -> &'static str;
-}
-
 pub trait DataCollector: Send + Sync {
     fn record_request(&self, tele: &RequestTelemetry);
     fn record_pool(&self, event: &PoolEvent);
@@ -118,4 +113,43 @@ pub trait DataCollector: Send + Sync {
     fn record_system(&self, event: &SystemEvent);
     fn snapshot(&self) -> DataSnapshot;
     fn set_backend(&self, backend: Box<dyn StorageBackend>);
+    fn query_requests(&self, filter: &RequestFilter) -> RequestQueryResult;
+    fn aggregator_snapshot(&self) -> serde_json::Value;
+    fn persist(&self);
+}
+
+pub struct RequestFilter {
+    pub rid: Option<String>,
+    pub model: Option<String>,
+    pub node_url: Option<String>,
+    pub status: Option<u16>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub limit: usize,
+    pub cursor: Option<u64>,
+}
+
+impl Default for RequestFilter {
+    fn default() -> Self {
+        Self {
+            rid: None,
+            model: None,
+            node_url: None,
+            status: None,
+            since: None,
+            until: None,
+            limit: 100,
+            cursor: None,
+        }
+    }
+}
+
+pub struct RequestQueryResult {
+    pub items: Vec<RequestTelemetry>,
+    pub next_cursor: Option<u64>,
+}
+
+pub trait StorageBackend: Send + Sync {
+    fn write(&self, snapshot: &DataSnapshot);
+    fn name(&self) -> &'static str;
 }

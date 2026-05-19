@@ -52,13 +52,13 @@ impl LedgerEvent {
     }
 }
 
-#[derive(Default)]
-struct PerDimensionCounters {
-    requests: u64,
-    success: u64,
-    count_429: u64,
-    count_5xx: u64,
-    count_network_error: u64,
+#[derive(Default, Clone)]
+pub(crate) struct PerDimensionCounters {
+    pub(crate) requests: u64,
+    pub(crate) success: u64,
+    pub(crate) count_429: u64,
+    pub(crate) count_5xx: u64,
+    pub(crate) count_network_error: u64,
 }
 
 #[derive(Default)]
@@ -193,6 +193,18 @@ impl LedgerCounters {
             "network_errors": self.total_network_error.load(Ordering::Relaxed),
             "by_node": by_node,
         })
+    }
+
+    pub fn by_model_summary(&self) -> HashMap<String, PerDimensionCounters> {
+        self.by_model.read().unwrap().clone()
+    }
+
+    pub fn by_key_summary(&self) -> HashMap<String, PerDimensionCounters> {
+        self.by_key.read().unwrap().clone()
+    }
+
+    pub fn by_stream_summary(&self) -> HashMap<bool, PerDimensionCounters> {
+        self.by_stream.read().unwrap().clone()
     }
 }
 
