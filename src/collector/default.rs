@@ -99,7 +99,7 @@ impl DataCollector for DefaultCollector {
             rpm.push_back(Instant::now());
             while rpm
                 .front()
-                .map_or(false, |t| t.elapsed().as_secs_f64() > 60.0)
+                .is_some_and(|t| t.elapsed().as_secs_f64() > 60.0)
             {
                 rpm.pop_front();
             }
@@ -224,8 +224,8 @@ impl DataCollector for DefaultCollector {
         // Apply post-filter for model/status if set
         let items = if filter.model.is_some() || filter.status.is_some() {
             items.into_iter().filter(|r| {
-                let match_model = filter.model.as_ref().map_or(true, |m| r.model == *m);
-                let match_status = filter.status.map_or(true, |s| r.status == s);
+                let match_model = filter.model.as_ref().is_none_or(|m| r.model == *m);
+                let match_status = filter.status.is_none_or(|s| r.status == s);
                 match_model && match_status
             }).collect()
         } else {

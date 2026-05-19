@@ -91,7 +91,7 @@ impl RollingAggregator {
     }
 
     fn merge_row(map: &mut HashMap<String, AggRow>, key: &str, row: &AggRow) {
-        let entry = map.entry(key.to_string()).or_insert_with(AggRow::default);
+        let entry = map.entry(key.to_string()).or_default();
         entry.count += row.count;
         entry.bytes += row.bytes;
         entry.latency_total += row.latency_total;

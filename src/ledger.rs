@@ -135,7 +135,7 @@ impl LedgerCounters {
         let mut m = map.write().unwrap();
         let entry = m.entry(key.to_string()).or_default();
         entry.requests += 1;
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             entry.success += 1;
         }
         if status == 429 {
@@ -154,7 +154,7 @@ impl LedgerCounters {
         let mut m = map.write().unwrap();
         let entry = m.entry(key).or_default();
         entry.requests += 1;
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             entry.success += 1;
         }
         if status == 429 {

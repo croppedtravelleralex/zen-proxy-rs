@@ -79,8 +79,7 @@ impl WAL {
                 *w = BufWriter::new(new_file);
                 Ok(())
             }
-            Ok(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Ok(_) => Err(std::io::Error::other(
                 "gzip failed",
             )),
             Err(e) => Err(e),

@@ -290,7 +290,7 @@ async fn proxy_with_retry(
                         node_url_redacted: LedgerEvent::redact_node_url(&node_url),
                         model: model.to_string(),
                         stream: streaming,
-                        status: status as u16,
+                        status: status,
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
@@ -309,14 +309,14 @@ async fn proxy_with_retry(
                         exit_ip: None,
                         pool_from: None,
                         pool_to: None,
-                        attempt: attempt as u32,
+                        attempt: attempt,
                     });
                     if streaming && status == 200 {
                         let resp = stream_to_axum(up_resp).await;
                         return Ok(ProxyResult {
                             response: resp,
                             body_bytes: Vec::new(),
-                            retry_count: attempt as u32,
+                            retry_count: attempt,
                             was_rate_limited,
                             pool: "dispatch".into(),
                             upstream_ms: latency,
@@ -344,7 +344,7 @@ async fn proxy_with_retry(
                             return Ok(ProxyResult {
                                 response: resp,
                                 body_bytes: bytes.to_vec(),
-                                retry_count: attempt as u32,
+                                retry_count: attempt,
                                 was_rate_limited,
                                 pool: "dispatch".into(),
                                 upstream_ms: latency,
@@ -385,7 +385,7 @@ async fn proxy_with_retry(
                         node_url_redacted: LedgerEvent::redact_node_url(&node_url),
                         model: model.to_string(),
                         stream: streaming,
-                        status: status as u16,
+                        status: status,
                         retry_after: up_resp
                             .headers()
                             .get("retry-after")
@@ -408,7 +408,7 @@ async fn proxy_with_retry(
                         exit_ip: None,
                         pool_from: Some("dispatch".into()),
                         pool_to: Some("ratelimited".into()),
-                        attempt: attempt as u32,
+                        attempt: attempt,
                     });
                 } else {
                     state.pool_manager.report(
@@ -426,7 +426,7 @@ async fn proxy_with_retry(
                         node_url_redacted: LedgerEvent::redact_node_url(&node_url),
                         model: model.to_string(),
                         stream: streaming,
-                        status: status as u16,
+                        status: status,
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
@@ -445,7 +445,7 @@ async fn proxy_with_retry(
                         exit_ip: None,
                         pool_from: Some("dispatch".into()),
                         pool_to: None,
-                        attempt: attempt as u32,
+                        attempt: attempt,
                     });
                 }
 
@@ -490,7 +490,7 @@ async fn proxy_with_retry(
                     total_tokens: None,
                     pool_from: Some("dispatch".into()),
                     pool_to: None,
-                    attempt: attempt as u32,
+                    attempt: attempt,
                 });
                 warn!(attempt, error = %e, "upstream request error");
                 if attempt < max {
@@ -540,7 +540,7 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| ct.contains("text/event-stream"));
+        .is_some_and(|ct| ct.contains("text/event-stream"));
 
     if !is_sse {
         return read_full_body(response).await;
