@@ -54,9 +54,12 @@ auth_h!(ledger_models_h, AdminService::ledger_models);
 auth_h!(ledger_keys_h, AdminService::ledger_keys);
 auth_h!(ledger_streams_h, AdminService::ledger_streams);
 auth_h!(config_h, AdminService::config);
+auth_h!(config_validation_h, AdminService::config_validation);
+auth_h!(config_reload_h, AdminService::config_reload);
 auth_h!(sys_uptime_h, AdminService::system_uptime);
 auth_h!(sys_info_h, AdminService::system_info);
-auth_h!(config_reload_h, AdminService::config_reload);
+auth_h!(events_recent_h, AdminService::events_recent);
+auth_h!(events_probes_h, AdminService::events_probes);
 auth_h!(nodes_list_h, AdminService::ledger_summary);
 
 async fn pool_by_name_h(State(st): State<Arc<AppState>>, h: HeaderMap, Path(n): Path<String>) -> Response {
@@ -104,6 +107,15 @@ async fn probe_now_h(State(st): State<Arc<AppState>>, h: HeaderMap) -> Response 
     if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
     AdminService::probe_now(&st)
 }
+async fn requests_export_h(State(st): State<Arc<AppState>>, h: HeaderMap, Query(p): Query<HashMap<String, String>>) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+    let limit = p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10000);
+    AdminService::requests_export(&st, limit)
+}
+async fn sys_log_level_h(State(st): State<Arc<AppState>>, h: HeaderMap, Path(level): Path<String>) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+    AdminService::system_log_level(&level)
+}
 
 pub fn admin_router() -> Router<Arc<AppState>> {
     let r = Router::new()
@@ -131,8 +143,13 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/ledger/streams", get(ledger_streams_h))
         .route("/admin/config", get(config_h))
         .route("/admin/config/reload", post(config_reload_h))
+        .route("/admin/requests/export", get(requests_export_h))
+        .route("/admin/events/recent", get(events_recent_h))
+        .route("/admin/events/probes", get(events_probes_h))
+        .route("/admin/config/validation", get(config_validation_h))
         .route("/admin/system/uptime", get(sys_uptime_h))
         .route("/admin/system/info", get(sys_info_h))
+        .route("/admin/system/log-level/{level}", post(sys_log_level_h))
         .route("/admin/probe/now", post(probe_now_h));
 
     // Static /admin/nodes and parameterized /admin/nodes/{node_id} in separate

@@ -116,6 +116,7 @@ pub trait DataCollector: Send + Sync {
     fn query_requests(&self, filter: &RequestFilter) -> RequestQueryResult;
     fn aggregator_snapshot(&self) -> serde_json::Value;
     fn persist(&self);
+    fn recent_events(&self, limit: usize) -> Vec<PoolEvent>;
 }
 
 pub struct RequestFilter {

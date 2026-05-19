@@ -147,11 +147,33 @@ impl AdminService {
     }
     pub fn requests_models(state: &AppState) -> Response { Self::stats_models(state) }
     pub fn requests_nodes(state: &AppState) -> Response { Self::stats_nodes(state) }
+    pub fn requests_export(state: &AppState, limit: usize) -> Response {
+        let result = state.collector.query_requests(&RequestFilter { limit, ..Default::default() });
+        let mut body = String::new();
+        for item in &result.items {
+            if let Ok(line) = serde_json::to_string(item) {
+                body.push_str(&line);
+                body.push('\n');
+            }
+        }
+        Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
 
     // --- Events ---
     pub fn events(state: &AppState) -> Response {
         let s = state.collector.snapshot();
         Self::ok_response(json!({"pool_transitions":s.pools.pool_transitions}))
+    }
+    pub fn events_recent(state: &AppState) -> Response {
+        Self::ok_response(state.collector.recent_events(100))
+    }
+    pub fn events_probes(state: &AppState) -> Response {
+        let all = state.collector.recent_events(500);
+        let probes: Vec<_> = all.into_iter().filter(|e| e.reason.starts_with("probe_")).collect();
+        Self::ok_response(probes)
     }
 
     // --- Ledger ---
@@ -187,6 +209,26 @@ impl AdminService {
         tracing::info!("config reloaded from env");
         Self::ok_status()
     }
+    pub fn config_validation(state: &AppState) -> Response {
+        let cfg = state.config.read().unwrap();
+        let mut warnings: Vec<String> = Vec::new();
+        if cfg.admin_api_key.is_none() {
+            warnings.push("ADMIN_API_KEY is not set — admin endpoints have no auth".into());
+        }
+        if cfg.proxy_api_key.is_none() {
+            warnings.push("PROXY_API_KEY is not set — proxy is open to all tokens".into());
+        }
+        if cfg.pool_max_retries == 0 {
+            warnings.push("POOL_MAX_RETRIES is 0 — no retries on failure".into());
+        }
+        if cfg.allow_direct_fallback {
+            warnings.push("ALLOW_DIRECT_FALLBACK is enabled — requests may bypass proxy pool".into());
+        }
+        Self::ok_response(json!({
+            "valid": warnings.is_empty(),
+            "warnings": warnings,
+        }))
+    }
 
     // --- System ---
     pub fn system_uptime(state: &AppState) -> Response {
@@ -196,6 +238,12 @@ impl AdminService {
         let p = state.pool_manager.pool_stats();
         let s = state.collector.snapshot();
         Self::ok_response(json!({"version":env!("CARGO_PKG_VERSION"),"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size,"fuse":p.fuse},"requests":{"total":s.requests.total,"success":s.requests.success,"rpm":s.requests.rpm},"upstream":{"backoff":state.upstream_health.is_backoff()}}))
+    }
+    pub fn system_log_level(level: &str) -> Response {
+        match crate::set_log_level(level) {
+            Ok(()) => Self::ok_status(),
+            Err(e) => Self::error_response(StatusCode::BAD_REQUEST, e),
+        }
     }
 
     // --- Node operations (via sub-pools) ---

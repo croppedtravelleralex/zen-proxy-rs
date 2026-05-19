@@ -14,7 +14,7 @@ mod sse;
 mod state;
 mod utils;
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use axum::{
@@ -25,7 +25,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{prelude::*, reload, EnvFilter, Registry};
 
 use collector::default::DefaultCollector;
 use collector::export::JsonBackend;
@@ -38,6 +38,22 @@ use pool::ratelimited::RateLimitedPoolImpl;
 use pool::{DeadPool, NodeRef, Pool, RateLimitedPool};
 use provider::webshare::WebShareProvider;
 use state::AppState;
+
+static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+
+pub(crate) fn set_log_level(level: &str) -> Result<(), &'static str> {
+    let handle = LOG_RELOAD.get().ok_or("log reload not initialized")?;
+    let new_filter = match level.to_lowercase().as_str() {
+        "off" => EnvFilter::new("off"),
+        "error" => EnvFilter::new("error"),
+        "warn" => EnvFilter::new("warn"),
+        "info" => EnvFilter::new("info"),
+        "debug" => EnvFilter::new("debug"),
+        "trace" => EnvFilter::new("trace"),
+        _ => return Err("invalid log level, use: off/error/warn/info/debug/trace"),
+    };
+    handle.modify(|f| *f = new_filter).map_err(|_| "reload failed")
+}
 
 async fn health_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
     let uptime = st.startup_time.elapsed().as_secs();
@@ -101,8 +117,13 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+    let log_filter = EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+    let (log_filter, log_handle) = reload::Layer::new(log_filter);
+    LOG_RELOAD.set(log_handle).ok();
+    tracing_subscriber::registry()
+        .with(log_filter)
+        .with(tracing_subscriber::fmt::Layer::new())
         .init();
 
     let config = config::Config::from_env();

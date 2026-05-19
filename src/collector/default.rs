@@ -244,4 +244,8 @@ impl DataCollector for DefaultCollector {
             backend.write(&snap);
         }
     }
+
+    fn recent_events(&self, limit: usize) -> Vec<PoolEvent> {
+        self.pool_events.read().unwrap().iter().rev().take(limit).cloned().collect()
+    }
 }
