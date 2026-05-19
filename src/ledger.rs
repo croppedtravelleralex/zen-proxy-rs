@@ -15,7 +15,9 @@ pub struct LedgerEvent {
     pub status: u16,
     pub retry_after: Option<i64>,
     pub error_type: Option<String>,
+    pub error_body_summary: Option<String>,
     pub latency_ms: u64,
+    pub exit_ip: Option<String>,
     pub upstream_api_key_hash: String,
     pub user_agent_hash: Option<String>,
     pub client_hash: Option<String>,
@@ -103,16 +105,12 @@ impl LedgerCounters {
         self.inc_dimension(&self.by_key, &event.upstream_api_key_hash, event.status);
         self.inc_dimension_bool(&self.by_stream, event.stream, event.status);
 
-        let is_429 = event.status == 429
-            || event.error_type.as_deref() == Some("rate_limited");
+        let is_429 = event.status == 429 || event.error_type.as_deref() == Some("rate_limited");
         let is_5xx = event.status >= 500 && event.status != 429;
         let is_network = event.error_type.as_deref() == Some("network")
             || event.error_type.as_deref() == Some("timeout");
 
-        if is_429 || is_5xx || is_network
-            || event.pool_from.is_some()
-            || event.pool_to.is_some()
-        {
+        if is_429 || is_5xx || is_network || event.pool_from.is_some() || event.pool_to.is_some() {
             if let Some(path) = self.events_path.read().unwrap().as_ref() {
                 if let Ok(json) = serde_json::to_string(event) {
                     use std::io::Write;
@@ -230,9 +228,9 @@ mod tests {
             rid: "test-rid".into(),
             event_type: "rate_limited".into(),
             node_id: "node-1".into(),
-            node_url_redacted: LedgerEvent::redact_node_url(
-                "socks5h://u:p@host:1080",
-            ),
+            error_body_summary: None,
+            exit_ip: None,
+            node_url_redacted: LedgerEvent::redact_node_url("socks5h://u:p@host:1080"),
             model: "big-pickle".into(),
             stream: true,
             status: 429,
@@ -271,6 +269,8 @@ mod tests {
             status: 429,
             retry_after: None,
             error_type: None,
+            error_body_summary: None,
+            exit_ip: None,
             latency_ms: 100,
             upstream_api_key_hash: "k1".into(),
             user_agent_hash: None,

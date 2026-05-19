@@ -140,7 +140,7 @@ async fn main() {
     let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
 
     let ledger = ledger::LedgerCounters::new();
-    ledger.set_events_path(Some("/tmp/zen-proxy-ledger-events.jsonl".into()));
+    ledger.set_events_path(Some(config.ledger_events_path.clone()));
 
     let app_state = Arc::new(AppState {
         config: config.clone(),
