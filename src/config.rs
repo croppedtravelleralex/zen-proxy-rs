@@ -40,6 +40,7 @@ pub struct Config {
     pub opencode_project_seed: String,
     pub opencode_session_ttl_secs: u64,
     pub nodes_file: String,
+    pub ledger_events_path: String,
 }
 
 impl Config {
@@ -96,6 +97,8 @@ impl Config {
                 "zen-proxy-rs".to_string(),
             ),
             opencode_session_ttl_secs: load_env_var("OPENCODE_SESSION_TTL_SECS", 1800u64),
+            ledger_events_path: env::var("LEDGER_EVENTS_PATH")
+                .unwrap_or_else(|_| "/tmp/zen-proxy-ledger-events.jsonl".into()),
         }
     }
 
@@ -238,6 +241,7 @@ mod tests {
         assert_eq!(cfg.probe_timeout_secs, 30);
         assert_eq!(cfg.probe_batch_size, 5);
         assert_eq!(cfg.dispatch_capacity, 100);
+        assert_eq!(cfg.ledger_events_path, "/tmp/zen-proxy-ledger-events.jsonl");
         assert_eq!(cfg.opencode_headers_enabled, false);
         assert_eq!(cfg.opencode_client_name, "cli");
         assert_eq!(cfg.opencode_project_seed, "zen-proxy-rs");

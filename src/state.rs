@@ -2,6 +2,7 @@ use crate::collector::DataCollector;
 use crate::config::Config;
 use crate::health::UpstreamHealth;
 use crate::ledger::LedgerCounters;
+
 use crate::pool::PoolManager;
 use std::sync::Arc;
 use std::time::Instant;

@@ -12,14 +12,14 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::collector::RequestTelemetry;
-use crate::ledger::{LedgerCounters, LedgerEvent};
+use crate::ledger::LedgerCounters;
+use crate::ledger::LedgerEvent;
 use crate::opencode_headers::{apply_opencode_headers, build_opencode_headers};
 use crate::pool::{DispatchError, ErrorKind, RequestMeta};
 use crate::sse::SseBuffer;
 use crate::state::AppState;
 use crate::utils::{
-    apply_model_override, build_upstream_url, patch_response_content, should_retry,
-    smart_backoff,
+    apply_model_override, build_upstream_url, patch_response_content, should_retry, smart_backoff,
 };
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -170,7 +170,9 @@ async fn proxy_with_retry(
         let mut req = client.request(req_method, &upstream);
         req = req.header("Content-Type", "application/json");
         req = req.header("x-api-key", &state.config.upstream_api_key);
-        if let Some(opencode_headers) = build_opencode_headers(headers, &state.config, client_id, model) {
+        if let Some(opencode_headers) =
+            build_opencode_headers(headers, &state.config, client_id, model)
+        {
             req = apply_opencode_headers(req, &opencode_headers);
         }
         if !body.is_empty() {
@@ -201,7 +203,9 @@ async fn proxy_with_retry(
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        upstream_api_key_hash: LedgerEvent::short_hash(
+                            &state.config.upstream_api_key,
+                        ),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,
@@ -210,6 +214,8 @@ async fn proxy_with_retry(
                         prompt_tokens: None,
                         completion_tokens: None,
                         total_tokens: None,
+                        error_body_summary: None,
+                        exit_ip: None,
                         pool_from: None,
                         pool_to: None,
                         attempt: attempt as u32,
@@ -226,6 +232,16 @@ async fn proxy_with_retry(
                         crate::pool::ResultKind::RateLimited,
                         latency,
                     );
+                    let retry_after_secs = up_resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<i64>().ok());
+                    let _cf_ray = up_resp
+                        .headers()
+                        .get("cf-ray")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
                     state.ledger.record(&LedgerEvent {
                         ts: chrono::Utc::now().timestamp_millis(),
                         rid: uuid::Uuid::new_v4().to_string(),
@@ -235,10 +251,16 @@ async fn proxy_with_retry(
                         model: model.to_string(),
                         stream: streaming,
                         status: status as u16,
-                        retry_after: None,
+                        retry_after: up_resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<i64>().ok()),
                         error_type: Some("upstream_429".into()),
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        upstream_api_key_hash: LedgerEvent::short_hash(
+                            &state.config.upstream_api_key,
+                        ),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,
@@ -247,6 +269,8 @@ async fn proxy_with_retry(
                         prompt_tokens: None,
                         completion_tokens: None,
                         total_tokens: None,
+                        error_body_summary: None,
+                        exit_ip: None,
                         pool_from: Some("dispatch".into()),
                         pool_to: Some("ratelimited".into()),
                         attempt: attempt as u32,
@@ -271,7 +295,9 @@ async fn proxy_with_retry(
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
+                        upstream_api_key_hash: LedgerEvent::short_hash(
+                            &state.config.upstream_api_key,
+                        ),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,
@@ -280,6 +306,8 @@ async fn proxy_with_retry(
                         prompt_tokens: None,
                         completion_tokens: None,
                         total_tokens: None,
+                        error_body_summary: None,
+                        exit_ip: None,
                         pool_from: Some("dispatch".into()),
                         pool_to: None,
                         attempt: attempt as u32,
@@ -313,6 +341,8 @@ async fn proxy_with_retry(
                     status: 502,
                     retry_after: None,
                     error_type: Some("timeout".into()),
+                    error_body_summary: None,
+                    exit_ip: None,
                     latency_ms: latency,
                     upstream_api_key_hash: LedgerEvent::short_hash(&state.config.upstream_api_key),
                     user_agent_hash: None,
