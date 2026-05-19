@@ -3,6 +3,7 @@
 mod collector;
 mod config;
 mod health;
+mod ledger;
 mod pool;
 mod provider;
 mod proxy;
@@ -141,6 +142,7 @@ async fn main() {
         pool_manager,
         collector,
         upstream_health,
+        ledger: ledger::LedgerCounters::new(),
         startup_time: Instant::now(),
     });
 
