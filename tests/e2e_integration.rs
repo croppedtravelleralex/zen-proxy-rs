@@ -105,4 +105,32 @@ mod e2e {
         assert_eq!(body["object"], "list");
         stop_server(child, port);
     }
+
+    #[test]
+    fn test_admin_nodes_requires_auth() {
+        let (child, port) = start_server(19787);
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .send()
+            .expect("admin/nodes endpoint");
+        assert_eq!(resp.status(), 401, "no API key should be rejected");
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_nodes_returns_summary() {
+        let (child, port) = start_server(19788);
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/nodes endpoint");
+        assert_eq!(resp.status(), 200, "valid API key should be accepted");
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["status"], "ok");
+        assert!(body["ledger"]["total_requests"].is_number());
+        stop_server(child, port);
+    }
 }

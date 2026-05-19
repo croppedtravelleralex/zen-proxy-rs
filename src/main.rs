@@ -190,6 +190,7 @@ async fn main() {
         .route("/admin/pools", get(server::admin_pools_handler))
         .route("/admin/fuse", get(server::admin_fuse_handler))
         .route("/admin/health", get(server::admin_health_handler))
+        .route("/admin/nodes", get(server::admin_nodes_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 

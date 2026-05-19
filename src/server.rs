@@ -95,3 +95,19 @@ pub async fn admin_health_handler(
         },
     })))
 }
+
+pub async fn admin_nodes_handler(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    if !check_admin_auth(&headers, &st) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let summary = st.ledger.summary();
+
+    Ok(Json(json!({
+        "ledger": summary,
+        "status": "ok"
+    })))
+}
