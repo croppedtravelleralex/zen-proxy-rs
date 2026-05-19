@@ -24,6 +24,7 @@ where
     nodes: RwLock<HashMap<NodeId, NodeRef>>,
     clients: RwLock<HashMap<NodeId, reqwest::Client>>,
     upstream_base: String,
+    upstream_api_key: String,
     probe_timeout_secs: u64,
     allow_direct_fallback: bool,
     direct_client: std::sync::Mutex<Option<reqwest::Client>>,
@@ -37,25 +38,27 @@ where
     K: DeadPool,
 {
     pub fn new(
-        dispatch: D,
-        active: A,
-        ratelimited: R,
-        dead: K,
+        dispatch: Arc<D>,
+        active: Arc<A>,
+        ratelimited: Arc<R>,
+        dead: Arc<K>,
         collector: Arc<dyn DataCollector>,
         upstream_base: String,
+        upstream_api_key: String,
         probe_timeout_secs: u64,
         allow_direct_fallback: bool,
     ) -> Self {
         Self {
-            dispatch: Arc::new(dispatch),
-            active: Arc::new(active),
-            ratelimited: Arc::new(ratelimited),
-            dead: Arc::new(dead),
+            dispatch,
+            active,
+            ratelimited,
+            dead,
             collector,
             fuse: AtomicBool::new(false),
             nodes: RwLock::new(HashMap::new()),
             clients: RwLock::new(HashMap::new()),
             upstream_base,
+            upstream_api_key,
             probe_timeout_secs,
             allow_direct_fallback,
             direct_client: std::sync::Mutex::new(None),
@@ -151,6 +154,38 @@ where
                 self.active.release(&node_id, &result);
                 self.dispatch.release(&node_id, &result);
                 self.dispatch.remove(&node_id);
+
+                if let Some(nr) = self.nodes.read().unwrap().get(&node_id).cloned() {
+                    let ratelimited = self.ratelimited.clone();
+                    let dispatch = self.dispatch.clone();
+                    let collector = self.collector.clone();
+                    let client = self.get_or_create_client(&node_id, &nr.url);
+                    let upstream = self.upstream_base.clone();
+                    let timeout = self.probe_timeout_secs;
+                    let api_key = self.upstream_api_key.clone();
+                    let nid = node_id.clone();
+
+                    tokio::spawn(async move {
+                        let ok = ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await;
+
+                        if ok {
+                            ratelimited.recover(&nid);
+                            dispatch.add(NodeRef {
+                                id: nid.clone(),
+                                url: nr.url.clone(),
+                            });
+                            dispatch.release(&nid, &ResultKind::Success(200));
+                        }
+
+                        collector.record_probe(&ProbeEvent {
+                            ts: chrono::Utc::now().timestamp(),
+                            node_id: nid,
+                            pool: "ratelimited_probe".to_string(),
+                            ok,
+                            latency_ms: 0,
+                        });
+                    });
+                }
             }
             ResultKind::Error { .. } => {
                 self.active.release(&node_id, &result);
@@ -164,10 +199,11 @@ where
                     let client = self.get_or_create_client(&node_id, &nr.url);
                     let upstream = self.upstream_base.clone();
                     let timeout = self.probe_timeout_secs;
+                    let api_key = self.upstream_api_key.clone();
                     let nid = node_id.clone();
 
                     tokio::spawn(async move {
-                        let ok = ProbePeriod::probe_node(&client, &nr, &upstream, timeout).await;
+                        let ok = ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await;
 
                         if ok {
                             dispatch.add(NodeRef {

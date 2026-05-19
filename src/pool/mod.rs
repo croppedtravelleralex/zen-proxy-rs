@@ -50,6 +50,7 @@ pub struct DispatchResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchError {
     NoResource,
+    CircuitOpen,
 }
 
 #[derive(Debug, Clone)]
@@ -96,8 +97,10 @@ pub trait PoolManager: Send + Sync {
 pub trait RateLimitedPool: Pool {
     fn quarantine(&self, node_id: NodeId);
     fn select_for_probe(&self, batch_size: usize) -> Vec<NodeId>;
+    fn select_all_for_probe(&self, batch_size: usize) -> Vec<NodeId>;
     fn recover(&self, node_id: &NodeId);
     fn quarantined_today(&self) -> usize;
+    fn get_node_ref(&self, node_id: &NodeId) -> Option<NodeRef>;
 }
 
 pub trait DeadPool: Pool {
@@ -105,6 +108,7 @@ pub trait DeadPool: Pool {
     fn select_all_for_probe(&self) -> Vec<NodeId>;
     fn recover(&self, node_id: &NodeId);
     fn dead_count(&self, node_id: &NodeId) -> u32;
+    fn get_node_ref(&self, node_id: &NodeId) -> Option<NodeRef>;
 }
 
 pub trait NodeProvider: Send + Sync {

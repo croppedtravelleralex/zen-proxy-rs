@@ -127,12 +127,13 @@ async fn main() {
     }
 
     let pool_manager = Arc::new(PoolManagerImpl::new(
-        dispatch,
-        active,
-        ratelimited,
-        dead,
+        Arc::new(dispatch),
+        Arc::new(active),
+        Arc::new(ratelimited),
+        Arc::new(dead),
         collector.clone(),
         config.upstream_base.clone(),
+        config.upstream_api_key.clone(),
         config.probe_timeout_secs,
         config.allow_direct_fallback,
     ));

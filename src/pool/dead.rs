@@ -92,4 +92,8 @@ impl DeadPool for DeadPoolImpl {
             .map(|e| e.dead_count)
             .unwrap_or(0)
     }
+
+    fn get_node_ref(&self, node_id: &NodeId) -> Option<NodeRef> {
+        self.entries.read().unwrap().get(node_id).map(|e| e.node.clone())
+    }
 }

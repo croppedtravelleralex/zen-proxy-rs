@@ -121,14 +121,38 @@ pub async fn proxy_handler(
                 status = status, duration_ms = elapsed,
                 "proxy FAIL"
             );
-            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            (
-                code,
+
+            let (status_code, error_code, message): (StatusCode, i64, String) = match status {
+                999 => (StatusCode::SERVICE_UNAVAILABLE, -999, "no proxy resources available".into()),
+                998 => (StatusCode::SERVICE_UNAVAILABLE, -998, "circuit open: upstream rate limit detected".into()),
+                _ => (
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    status as i64,
+                    format!("upstream error {}", status),
+                ),
+            };
+
+            let retry_after = match status {
+                999 => Some(state.config.pool_starvation_retry_after_secs.to_string()),
+                998 => Some(state.config.global_backoff_cooldown_secs.to_string()),
+                _ => None,
+            };
+
+            let mut resp = (
+                status_code,
                 Json(serde_json::json!({
-                    "error": { "message": format!("upstream error {}", status) }
+                    "error": { "code": error_code, "message": message }
                 })),
-            )
-                .into_response()
+            ).into_response();
+
+            if let Some(secs) = retry_after {
+                resp.headers_mut().insert(
+                    "Retry-After",
+                    HeaderValue::from_str(&secs).unwrap(),
+                );
+            }
+
+            resp
         }
     }
 }
@@ -150,12 +174,15 @@ async fn proxy_with_retry(
     for attempt in 0..=max {
         let dispatch_result = match state.pool_manager.dispatch(req_meta) {
             Ok(r) => r,
+            Err(DispatchError::CircuitOpen) => {
+                return Err(998);
+            }
             Err(DispatchError::NoResource) => {
                 if attempt < max {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
-                return Err(503);
+                return Err(999);
             }
         };
 

@@ -10,6 +10,7 @@ impl ProbePeriod {
         _node: &NodeRef,
         upstream_base: &str,
         timeout_secs: u64,
+        _api_key: &str,
     ) -> bool {
         let probe_url = format!(
             "{}/v1/chat/completions",

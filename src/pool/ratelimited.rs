@@ -107,6 +107,15 @@ impl RateLimitedPool for RateLimitedPoolImpl {
             .collect()
     }
 
+    fn select_all_for_probe(&self, batch_size: usize) -> Vec<NodeId> {
+        let entries = self.entries.read().unwrap();
+        entries
+            .iter()
+            .take(batch_size)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     fn recover(&self, node_id: &NodeId) {
         self.entries.write().unwrap().remove(node_id);
     }
@@ -118,5 +127,9 @@ impl RateLimitedPool for RateLimitedPoolImpl {
             .values()
             .filter(|e| e.last_429_date == today)
             .count()
+    }
+
+    fn get_node_ref(&self, node_id: &NodeId) -> Option<NodeRef> {
+        self.entries.read().unwrap().get(node_id).map(|e| e.node.clone())
     }
 }

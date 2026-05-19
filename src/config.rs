@@ -39,6 +39,8 @@ pub struct Config {
     pub opencode_client_name: String,
     pub opencode_project_seed: String,
     pub opencode_session_ttl_secs: u64,
+    pub pool_starvation_retry_after_secs: u64,
+    pub global_backoff_cooldown_secs: u64,
     pub nodes_file: String,
     pub ledger_events_path: String,
 }
@@ -75,7 +77,7 @@ impl Config {
                 _ => None,
             },
             model_mapping: Self::default_model_mapping(),
-            allow_direct_fallback: load_env_var("ALLOW_DIRECT_FALLBACK", false),
+            allow_direct_fallback: load_env_var("ALLOW_DIRECT_FALLBACK", true),
             benchmark_mode: load_env_var("BENCHMARK_MODE", false),
             log_level: load_env_var("LOG_LEVEL", "info".to_string()),
             sticky_ttl_secs: load_env_var("STICKY_TTL_SECS", 180.0f64),
@@ -86,7 +88,7 @@ impl Config {
                 _ => None,
             },
             upstream_api_key: env::var("UPSTREAM_API_KEY").unwrap_or_else(|_| "public".into()),
-            opencode_headers_enabled: load_env_var("OPENCODE_HEADERS_ENABLED", false),
+            opencode_headers_enabled: load_env_var("OPENCODE_HEADERS_ENABLED", true),
             opencode_user_agent_version: load_env_var(
                 "OPENCODE_USER_AGENT_VERSION",
                 "0.0.0".to_string(),
@@ -97,6 +99,8 @@ impl Config {
                 "zen-proxy-rs".to_string(),
             ),
             opencode_session_ttl_secs: load_env_var("OPENCODE_SESSION_TTL_SECS", 1800u64),
+            pool_starvation_retry_after_secs: load_env_var("POOL_STARVATION_RETRY_AFTER_SECS", 5u64),
+            global_backoff_cooldown_secs: load_env_var("GLOBAL_BACKOFF_COOLDOWN_SECS", 30u64),
             ledger_events_path: env::var("LEDGER_EVENTS_PATH")
                 .unwrap_or_else(|_| "/tmp/zen-proxy-ledger-events.jsonl".into()),
         }
@@ -235,14 +239,14 @@ mod tests {
         assert_eq!(cfg.port, 4000);
         assert!(cfg.admin_api_key.is_none());
         assert!(cfg.model_override.is_none());
-        assert_eq!(cfg.allow_direct_fallback, false);
+        assert_eq!(cfg.allow_direct_fallback, true);
         assert_eq!(cfg.benchmark_mode, false);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.probe_timeout_secs, 30);
         assert_eq!(cfg.probe_batch_size, 5);
         assert_eq!(cfg.dispatch_capacity, 100);
         assert_eq!(cfg.ledger_events_path, "/tmp/zen-proxy-ledger-events.jsonl");
-        assert_eq!(cfg.opencode_headers_enabled, false);
+        assert_eq!(cfg.opencode_headers_enabled, true);
         assert_eq!(cfg.opencode_client_name, "cli");
         assert_eq!(cfg.opencode_project_seed, "zen-proxy-rs");
         assert_eq!(cfg.opencode_session_ttl_secs, 1800);
