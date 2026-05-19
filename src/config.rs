@@ -34,6 +34,11 @@ pub struct Config {
     pub sticky_ttl_secs: f64,
     pub proxy_api_key: Option<String>,
     pub upstream_api_key: String,
+    pub opencode_headers_enabled: bool,
+    pub opencode_user_agent_version: String,
+    pub opencode_client_name: String,
+    pub opencode_project_seed: String,
+    pub opencode_session_ttl_secs: u64,
     pub nodes_file: String,
 }
 
@@ -80,6 +85,17 @@ impl Config {
                 _ => None,
             },
             upstream_api_key: env::var("UPSTREAM_API_KEY").unwrap_or_else(|_| "public".into()),
+            opencode_headers_enabled: load_env_var("OPENCODE_HEADERS_ENABLED", false),
+            opencode_user_agent_version: load_env_var(
+                "OPENCODE_USER_AGENT_VERSION",
+                "0.0.0".to_string(),
+            ),
+            opencode_client_name: load_env_var("OPENCODE_CLIENT_NAME", "cli".to_string()),
+            opencode_project_seed: load_env_var(
+                "OPENCODE_PROJECT_SEED",
+                "zen-proxy-rs".to_string(),
+            ),
+            opencode_session_ttl_secs: load_env_var("OPENCODE_SESSION_TTL_SECS", 1800u64),
         }
     }
 
@@ -162,7 +178,6 @@ impl Config {
     pub fn proxy_auth_required(&self) -> bool {
         self.proxy_api_key.is_some()
     }
-
 }
 
 pub fn load_env_var<T: FromStr>(key: &str, default: T) -> T {
@@ -185,12 +200,33 @@ pub fn load_env_var<T: FromStr>(key: &str, default: T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn remove_env_vars(keys: &[&str]) {
+        for key in keys {
+            env::remove_var(key);
+        }
+    }
 
     #[test]
     fn from_env_uses_defaults_when_unset() {
-        for key in &["PORT", "MODEL_OVERRIDE", "ADMIN_API_KEY"] {
-            env::remove_var(key);
-        }
+        let _guard = env_lock();
+        remove_env_vars(&[
+            "PORT",
+            "MODEL_OVERRIDE",
+            "ADMIN_API_KEY",
+            "LOG_LEVEL",
+            "PROBE_BATCH_SIZE",
+            "OPENCODE_HEADERS_ENABLED",
+            "OPENCODE_CLIENT_NAME",
+            "OPENCODE_PROJECT_SEED",
+            "OPENCODE_SESSION_TTL_SECS",
+        ]);
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 4000);
@@ -202,22 +238,35 @@ mod tests {
         assert_eq!(cfg.probe_timeout_secs, 30);
         assert_eq!(cfg.probe_batch_size, 5);
         assert_eq!(cfg.dispatch_capacity, 100);
+        assert_eq!(cfg.opencode_headers_enabled, false);
+        assert_eq!(cfg.opencode_client_name, "cli");
+        assert_eq!(cfg.opencode_project_seed, "zen-proxy-rs");
+        assert_eq!(cfg.opencode_session_ttl_secs, 1800);
     }
 
     #[test]
     fn from_env_reads_env_overrides() {
+        let _guard = env_lock();
         unsafe { env::set_var("PORT", "8080") };
         unsafe { env::set_var("LOG_LEVEL", "debug") };
         unsafe { env::set_var("PROBE_BATCH_SIZE", "10") };
+        unsafe { env::set_var("OPENCODE_HEADERS_ENABLED", "true") };
+        unsafe { env::set_var("OPENCODE_CLIENT_NAME", "desktop-cli") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.probe_batch_size, 10);
+        assert_eq!(cfg.opencode_headers_enabled, true);
+        assert_eq!(cfg.opencode_client_name, "desktop-cli");
 
-        env::remove_var("PORT");
-        env::remove_var("LOG_LEVEL");
-        env::remove_var("PROBE_BATCH_SIZE");
+        remove_env_vars(&[
+            "PORT",
+            "LOG_LEVEL",
+            "PROBE_BATCH_SIZE",
+            "OPENCODE_HEADERS_ENABLED",
+            "OPENCODE_CLIENT_NAME",
+        ]);
     }
 
     #[test]
