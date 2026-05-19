@@ -99,12 +99,22 @@ pub async fn admin_health_handler(
 pub async fn admin_nodes_handler(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
     if !check_admin_auth(&headers, &st) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let summary = st.ledger.summary();
+    let mut summary = st.ledger.summary();
+
+    // Optional filtering
+    if let Some(model) = query.get("model") {
+        if let Some(by_node) = summary.get_mut("by_node") {
+            if let Some(obj) = by_node.as_object_mut() {
+                obj.retain(|_, v| v.get("model").and_then(|m| m.as_str()) == Some(model));
+            }
+        }
+    }
 
     Ok(Json(json!({
         "ledger": summary,

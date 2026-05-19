@@ -228,8 +228,10 @@ mod tests {
             rid: "test-rid".into(),
             event_type: "rate_limited".into(),
             node_id: "node-1".into(),
+// conflict resolved
             error_body_summary: None,
             exit_ip: None,
+>>>>>>> 7547afb
             node_url_redacted: LedgerEvent::redact_node_url("socks5h://u:p@host:1080"),
             model: "big-pickle".into(),
             stream: true,
