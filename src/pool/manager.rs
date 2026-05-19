@@ -90,23 +90,32 @@ where
         if self.fuse.load(Ordering::Acquire) {
             return Err(DispatchError::NoResource);
         }
-        let node = self.dispatch.acquire().ok_or(DispatchError::NoResource).or_else(|_| {
-            if self.allow_direct_fallback {
-                let mut dc = self.direct_client.lock().unwrap();
-                if dc.is_none() {
-                    *dc = Some(reqwest::Client::builder()
-                        .no_proxy()
-                        .connect_timeout(Duration::from_secs(30))
-                        .timeout(Duration::from_secs(120))
-                        .build()
-                        .unwrap());
+        let node = self
+            .dispatch
+            .acquire()
+            .ok_or(DispatchError::NoResource)
+            .or_else(|_| {
+                if self.allow_direct_fallback {
+                    let mut dc = self.direct_client.lock().unwrap();
+                    if dc.is_none() {
+                        *dc = Some(
+                            reqwest::Client::builder()
+                                .no_proxy()
+                                .connect_timeout(Duration::from_secs(30))
+                                .timeout(Duration::from_secs(120))
+                                .build()
+                                .unwrap(),
+                        );
+                    }
+                    let direct_id = "direct".to_string();
+                    Ok(NodeRef {
+                        id: direct_id,
+                        url: "direct".to_string(),
+                    })
+                } else {
+                    Err(DispatchError::NoResource)
                 }
-                let direct_id = "direct".to_string();
-                Ok(NodeRef { id: direct_id, url: "direct".to_string() })
-            } else {
-                Err(DispatchError::NoResource)
-            }
-        })?;
+            })?;
         self.active.add(node.clone());
 
         {
@@ -118,7 +127,12 @@ where
 
         let url = node.url.clone();
         let client = if node.id == "direct" {
-            self.direct_client.lock().unwrap().as_ref().cloned().unwrap()
+            self.direct_client
+                .lock()
+                .unwrap()
+                .as_ref()
+                .cloned()
+                .unwrap()
         } else {
             self.get_or_create_client(&node.id, &url)
         };

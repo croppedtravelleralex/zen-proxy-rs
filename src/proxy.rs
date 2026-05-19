@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 
 use crate::collector::RequestTelemetry;
 use crate::ledger::{LedgerCounters, LedgerEvent};
+use crate::opencode_headers::{apply_opencode_headers, build_opencode_headers};
 use crate::pool::{DispatchError, ErrorKind, RequestMeta};
 use crate::state::AppState;
 use crate::utils::{
@@ -72,6 +73,7 @@ pub async fn proxy_handler(
         streaming,
         &req_meta,
         &client_id,
+        &headers,
         &model,
     )
     .await;
@@ -138,6 +140,7 @@ async fn proxy_with_retry(
     streaming: bool,
     req_meta: &RequestMeta,
     client_id: &str,
+    headers: &HeaderMap,
     model: &str,
 ) -> Result<(Response, String, u16, u64), u16> {
     let max = state.config.pool_max_retries.max(1);
@@ -166,6 +169,9 @@ async fn proxy_with_retry(
         let mut req = client.request(req_method, &upstream);
         req = req.header("Content-Type", "application/json");
         req = req.header("x-api-key", &state.config.upstream_api_key);
+        if let Some(opencode_headers) = build_opencode_headers(headers, &state.config, client_id, model) {
+            req = apply_opencode_headers(req, &opencode_headers);
+        }
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }

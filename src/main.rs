@@ -4,6 +4,7 @@ mod collector;
 mod config;
 mod health;
 mod ledger;
+mod opencode_headers;
 mod pool;
 mod provider;
 mod proxy;
@@ -196,7 +197,9 @@ async fn main() {
 
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.set_reuseaddr(true).unwrap();
-    socket.bind(addr.parse::<std::net::SocketAddr>().unwrap()).unwrap();
+    socket
+        .bind(addr.parse::<std::net::SocketAddr>().unwrap())
+        .unwrap();
     let listener = socket.listen(1024).unwrap();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
