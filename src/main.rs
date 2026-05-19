@@ -139,12 +139,15 @@ async fn main() {
 
     let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
 
+    let ledger = ledger::LedgerCounters::new();
+    ledger.set_events_path(Some("/tmp/zen-proxy-ledger-events.jsonl".into()));
+
     let app_state = Arc::new(AppState {
         config: config.clone(),
         pool_manager,
         collector,
         upstream_health,
-        ledger: ledger::LedgerCounters::new(),
+        ledger,
         startup_time: Instant::now(),
     });
 

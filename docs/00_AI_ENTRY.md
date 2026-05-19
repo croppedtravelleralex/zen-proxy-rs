@@ -1,91 +1,72 @@
-# Zen Proxy RS v3 AI 入口
-
-> 本目录只记录 Rust v3 版本的设计、实现边界、迁移计划和维护规则。旧 Python 方案不再作为本文档集的事实来源。
+# Zen Proxy RS — 当前项目入口与文档索引
 
 ## 项目定位
 
-Zen Proxy RS v3 是一个面向 LLM API 转发场景的 Rust 单进程代理核心。目标是在低内存、低进程数、可观测、可灰度、可回滚的前提下，提供 OpenAI 兼容接口转发、SOCKS5 节点调度、节点状态机、限流隔离、失败探活、遥测采集和管理员观测能力。
+zen-proxy-rs 是一个 Rust 单进程 LLM API 反代核心，架构为：
 
-核心实现采用 axum + tokio + reqwest，所有关键模块通过 trait 边界榫接。调用方只依赖接口，不直接依赖具体实现，从而让节点提供商、池实现、采集后端和导出格式可以逐步替换。
-
-## 当前 Rust v3 主线
-
-| 领域 | 当前设计 |
-|---|---|
-| 入口 | `src/main.rs` 负责配置加载、依赖组装、路由注册、后台任务和优雅关闭 |
-| 配置 | `src/config.rs` 从环境变量加载，包含监听、上游、认证、池容量、超时、流式限制等字段 |
-| 转发 | `src/proxy.rs` 处理 `/v1/*` 转发、模型映射、鉴权、重试、SSE 修补和遥测记录 |
-| 服务端 | `src/server.rs` 提供 `/metrics`、`/admin/pools`、`/admin/fuse`、`/admin/health`、`/admin/stats` |
-| 池系统 | `src/pool/` 定义 Pool、PoolManager、RateLimitedPool、DeadPool、NodeProvider 等接口与实现 |
-| 采集系统 | `src/collector/` 定义 DataCollector、StorageBackend、请求遥测、环形缓冲、WAL、聚合、导出 |
-| 节点来源 | `src/provider/webshare.rs` 提供 WebShareProvider，后续可替换为其他 provider |
-| 测试 | `tests/e2e_integration.rs` 覆盖健康检查、指标、首页、管理员鉴权和模型列表 |
-
-## 文档阅读顺序
-
-1. `00_AI_ENTRY.md`：本文件，确认阅读顺序和维护边界。
-2. `01_概览与架构.md`：Rust v3 总体架构、进程模型、调用链和模块分层。
-3. `02_模块详细设计.md`：trait、结构体、模块责任和榫卯接口。
-4. `03_增强功能.md`：v3 增强能力清单、状态、验收标准。
-5. `05_项目结构_API_算法.md`：项目结构、API 合约、关键算法。
-6. `06_性能_部署_实施_附录.md`：性能预算、部署方案、灰度和回滚。
-7. `07_耦合分析与榫卯架构方案.md`：耦合风险、边界规则和演进决策。
-8. `GAP_REPORT_FINAL.md`：当前缺口、验收门禁和下一步。
-
-## v3 榫卯架构总图
-
-```text
-HTTP 请求
-  -> axum Router
-  -> proxy::proxy_handler
-      -> Config
-      -> PoolManager trait
-          -> DispatchPool
-          -> ActivePool
-          -> RateLimitedPool
-          -> DeadPool
-          -> ProbePeriod
-      -> reqwest Client over SOCKS5
-      -> DataCollector trait
-          -> RingBuffer
-          -> RollingAggregator
-          -> WAL
-          -> StorageBackend
-      -> UpstreamHealth
-  -> HTTP/SSE 响应
+```
+New-API -> zen-proxy-rs -> WebShare SOCKS5 -> 出口 IP -> opencode.ai/zen
 ```
 
-## 关键设计原则
+当前使用 100 个 WebShare 节点组成五状态机池（Dispatch/Active/RateLimited/Dead/Probe），提供 OpenAI 兼容接口转发。
 
-1. 单进程优先：默认一个 Rust 进程承载转发、调度、采集和管理端点。
-2. 接口先行：`proxy.rs` 只认 `PoolManager` 和 `DataCollector`，不直接操作具体池。
-3. 状态分层：调度、活跃、限流、死亡和探活分别建模，禁止用一个全局黑名单承载全部状态。
-4. 采集旁路：请求主路径只做轻量记录，聚合、导出和落盘通过 collector 后端处理。
-5. 安全默认：管理端点需要 `ADMIN_API_KEY`，公网监听必须显式配置代理鉴权。
-6. 可灰度：Rust v3 先完成本地和 release 验证，再进入 shadow、灰度、替换。
-7. 可回滚：任何生产替换都必须保留旧服务切回路径和配置恢复步骤。
+## 当前真实代码入口
 
-## 当前完成状态
-
-| 项目 | 状态 |
+| 文件 | 职责 |
 |---|---|
-| Rust 项目骨架 | 已建立 |
-| axum 路由 | 已建立 |
-| 配置加载与校验 | 已建立 |
-| Pool trait 边界 | 已建立 |
-| PoolManager 组装 | 已建立 |
-| DataCollector trait 边界 | 已建立 |
-| Prometheus 文本导出 | 已建立 |
-| 管理端点鉴权 | 已建立 |
-| E2E 基础测试 | 已建立 |
-| 全量生产替换 | 待执行 |
-| 节点 provider 多来源 | 待扩展 |
-| release 压测和真实灰度 | 待执行 |
+| `src/main.rs` | 主入口，配置加载、路由注册、后台任务 |
+| `src/config.rs` | 从环境变量加载配置 |
+| `src/proxy.rs` | 核心转发：模型映射、鉴权、重试、SSE、账本记录 |
+| `src/ledger.rs` | **本轮新增**：节点/限流多维内存账本 + JSONL 写入 |
+| `src/opencode_headers.rs` | **本轮新增**：official opencode headers 注入 |
+| `src/sse.rs` | **本轮新增**：frame-aware SSE buffer |
+| `src/state.rs` | AppState |
+| `src/pool/` | 五池 trait 实现 |
+| `src/collector/` | 遥测采集、WAL、聚合、导出 |
+| `src/provider/webshare.rs` | WebShare SOCKS5 provider |
+| `src/server.rs` | admin handlers（/admin/pools、/admin/fuse、/admin/health、/admin/nodes） |
+| `tests/e2e_integration.rs` | E2E 测试 |
 
-## 后续 AI 接手规则
+## 本轮已实现功能
 
-- 只以 Rust v3 代码、Cargo 配置、测试结果和本 docs 为事实来源。
-- 不再把旧 Python 文件、旧 WSL 运维记录、旧代理脚本写入本目录正文。
-- 若发现代码和文档冲突，以代码与最新验证结果为准，并同步修正文档。
-- 声称“已完成”必须有对应代码路径、测试、构建或运行证据。
-- 新增能力先写在 `03_增强功能.md`，落地后同步 `05_项目结构_API_算法.md` 和 `GAP_REPORT_FINAL.md`。
+1. **节点/限流账本**（`src/ledger.rs`）：内存多维聚合（by_node/by_model/by_key/by_stream），429/5xx/network/pool transition 写 JSONL，敏感字段脱敏（redact_node_url、short_hash）。JSONL 路径：`/tmp/zen-proxy-ledger-events.jsonl`
+2. **opencode headers 注入**（`src/opencode_headers.rs`）：配置开关，注入 User-Agent、x-opencode-client/project/session/request，session 按 client 分桶，request 每次唯一。
+3. **SSE 兼容修复**（`src/sse.rs`）：frame-aware 缓冲而非按 TCP chunk 硬 patch，修 `delta.reasoning_content → delta.content`，`[DONE]` 后丢弃额外事件。
+4. **`GET /admin/nodes`**：返回账本摘要，复用 admin auth，E2E 验证通过。
+
+## 当前真实路由
+
+| 路由 | 鉴权 | 说明 |
+|---|---|---|
+| GET / | 无 | service info |
+| GET /health | 无 | 池大小、fuse、backoff |
+| GET /metrics | 无 | Prometheus |
+| GET /v1/models | 无 | 入口模型列表 |
+| ANY /v1/* | 无 | 代理转发 |
+| GET /admin/pools | x-api-key | 池状态 |
+| GET /admin/fuse | x-api-key | fuse 状态 |
+| GET /admin/health | x-api-key | pool + upstream |
+| GET /admin/nodes | x-api-key | **本轮新增**：账本统计 |
+
+## 关键文档及其可信度
+
+| 文档 | 可信度 | 说明 |
+|---|---|---|
+| `docs/10_429_根因分析.md` | ✅ 当前事实 | 429 根因分析、已验证的 IP 限流、fallback 低额度假设 |
+| `docs/00_AI_ENTRY.md` | ✅ 本文已更新 | 当前项目入口，反映本轮实现 |
+| `docs/01_概览与架构.md` 等 | ⚠️ 目标态/历史态 | 与当前代码有偏移，不全部可信 |
+| `API_SPEC.md`（根目录） | ⚠️ 目标态 | 包含大量未实现模块定义 |
+| `FEATURE_GAP.md`（根目录） | ⚠️ 部分过时 | 引用旧架构，已有偏移 |
+
+## 验证命令
+
+```bash
+cargo fmt --check
+cargo check
+cargo test   # 42 passed, 0 failed（E2E admin 旧路由 404 为基线问题）
+```
+
+## 本轮未完成
+
+- `/admin/nodes` 暂不支持 `?model=`、`?stream=` 等 query 过滤（后续增强）
+- `retry_after`、`tokens`、`exit_ip` 字段已声明但尚未从上游响应中捕获（后续迭代）
