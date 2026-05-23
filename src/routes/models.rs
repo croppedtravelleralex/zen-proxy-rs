@@ -18,7 +18,7 @@ pub async fn models_handler(
         .and_then(|v| v.to_str().ok());
 
     if !auth::is_authorized(&state.config, auth_header) {
-        return crate::error::AppError::AuthError.into_response();
+        return crate::error::AppError::auth_error().into_response();
     }
 
     let models: Vec<serde_json::Value> = state

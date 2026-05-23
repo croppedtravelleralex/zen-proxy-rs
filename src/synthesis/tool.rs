@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use crate::protocol::types::{ChatRequest, OpenAITool, OpenAIToolFunction, ToolCall, ToolFunction};
 use rand::Rng;
 use regex::Regex;

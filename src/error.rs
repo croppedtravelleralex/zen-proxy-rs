@@ -12,7 +12,11 @@ pub struct AppError {
 
 impl AppError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into(), upstream_headers: None }
+        Self {
+            status,
+            message: message.into(),
+            upstream_headers: None,
+        }
     }
 
     pub fn auth_error() -> Self {
@@ -20,7 +24,10 @@ impl AppError {
     }
 
     pub fn invalid_json(detail: impl std::fmt::Display) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, format!("request body must be valid JSON: {detail}"))
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            format!("request body must be valid JSON: {detail}"),
+        )
     }
 
     pub fn empty_messages() -> Self {
@@ -28,7 +35,10 @@ impl AppError {
     }
 
     pub fn invalid_model(model: impl std::fmt::Display) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, format!("unsupported free model: {model}"))
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            format!("unsupported free model: {model}"),
+        )
     }
 
     pub fn upstream(status: u16, body_text: String, retry_after: Option<String>) -> Self {

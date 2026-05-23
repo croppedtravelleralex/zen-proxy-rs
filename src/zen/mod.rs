@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 #[derive(Debug, Serialize)]
-struct ZenRequestBody {
+pub(crate) struct ZenRequestBody {
     model: String,
     messages: Vec<Value>,
     stream: bool,
@@ -26,14 +26,21 @@ struct ZenRequestBody {
 pub fn build_zen_body(request: &crate::protocol::types::ChatRequest) -> ZenRequestBody {
     ZenRequestBody {
         model: request.model.clone(),
-        messages: request.messages.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect(),
+        messages: request
+            .messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or_default())
+            .collect(),
         stream: true,
         max_tokens: request.max_tokens.unwrap_or(1024).max(32),
         stream_options: Some(serde_json::json!({"include_usage": true})),
         temperature: request.temperature,
         top_p: request.top_p,
         tools: request.tools.as_ref().map(|tools| {
-            tools.iter().map(|t| serde_json::to_value(t).unwrap_or_default()).collect()
+            tools
+                .iter()
+                .map(|t| serde_json::to_value(t).unwrap_or_default())
+                .collect()
         }),
         tool_choice: request.tool_choice.clone(),
     }
@@ -52,7 +59,10 @@ pub async fn fetch_zen(
         .post(url)
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {}", config.zen_api_key))
-        .header("user-agent", "opencode/1.15.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
+        .header(
+            "user-agent",
+            "opencode/1.15.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
+        )
         .header("x-opencode-client", "cli")
         .header("x-opencode-project", "global")
         .header("x-opencode-request", random_opencode_id("msg"))
@@ -62,11 +72,20 @@ pub async fn fetch_zen(
         .await
         .map_err(|e| {
             if e.is_timeout() {
-                crate::error::AppError::new(StatusCode::GATEWAY_TIMEOUT, format!("opencode zen timeout: {e}"))
+                crate::error::AppError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("opencode zen timeout: {e}"),
+                )
             } else if e.is_connect() {
-                crate::error::AppError::new(StatusCode::BAD_GATEWAY, format!("opencode zen connection error: {e}"))
+                crate::error::AppError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("opencode zen connection error: {e}"),
+                )
             } else {
-                crate::error::AppError::new(StatusCode::BAD_GATEWAY, format!("opencode zen request failed: {e}"))
+                crate::error::AppError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("opencode zen request failed: {e}"),
+                )
             }
         })?;
 
@@ -94,9 +113,11 @@ fn random_opencode_id(prefix: &str) -> String {
     use rand::Rng;
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut rng = rand::thread_rng();
-    let tail: String = (0..26).map(|_| {
-        let idx = rng.gen_range(0..ALPHABET.len());
-        ALPHABET[idx] as char
-    }).collect();
+    let tail: String = (0..26)
+        .map(|_| {
+            let idx = rng.gen_range(0..ALPHABET.len());
+            ALPHABET[idx] as char
+        })
+        .collect();
     format!("{}_{}", prefix, tail)
 }

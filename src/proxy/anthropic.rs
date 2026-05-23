@@ -1,1 +1,1 @@
-// Stub — anthropic proxy handlers will be implemented later
+// Stub -- Anthropic proxy handlers (real implementation in anthropic-proxy branch)

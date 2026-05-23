@@ -21,24 +21,24 @@ pub async fn chat_handler(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     if !auth::is_authorized(&state.config, auth_header) {
-        return AppError::AuthError.into_response();
+        return AppError::auth_error().into_response();
     }
 
     // --- parse JSON ---
     let request: ChatRequest = match serde_json::from_str(&body) {
         Ok(req) => req,
-        Err(e) => return AppError::InvalidJson(e.to_string()).into_response(),
+        Err(e) => return AppError::invalid_json(e.to_string()).into_response(),
     };
 
     // --- validate messages ---
     if request.messages.is_empty() {
-        return AppError::EmptyMessages.into_response();
+        return AppError::empty_messages().into_response();
     }
 
     // --- normalize & validate model ---
     let normalized = normalize_model(&request.model);
     if !state.config.free_models.iter().any(|m| m == normalized) {
-        return AppError::InvalidModel(request.model).into_response();
+        return AppError::invalid_model(request.model).into_response();
     }
 
     // TODO: forward to zen-proxy (OpenAI-format)
@@ -69,24 +69,24 @@ pub async fn messages_handler(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     if !auth::is_authorized(&state.config, auth_header) {
-        return AppError::AuthError.into_response();
+        return AppError::auth_error().into_response();
     }
 
     // --- parse JSON ---
     let request: AnthropicRequest = match serde_json::from_str(&body) {
         Ok(req) => req,
-        Err(e) => return AppError::InvalidJson(e.to_string()).into_response(),
+        Err(e) => return AppError::invalid_json(e.to_string()).into_response(),
     };
 
     // --- validate messages ---
     if request.messages.is_empty() {
-        return AppError::EmptyMessages.into_response();
+        return AppError::empty_messages().into_response();
     }
 
     // --- normalize & validate model ---
     let normalized = normalize_model(&request.model);
     if !state.config.free_models.iter().any(|m| m == normalized) {
-        return AppError::InvalidModel(request.model).into_response();
+        return AppError::invalid_model(request.model).into_response();
     }
 
     // TODO: forward to Anthropic proxy
