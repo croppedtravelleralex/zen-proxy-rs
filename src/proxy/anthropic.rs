@@ -86,7 +86,9 @@ async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result
         if !tcs.is_empty() {
             for (ti,(idx,name,args,cid)) in tcs.iter().enumerate() {
                 let tidx=ti as u64;
-                let tc=ToolCall{id:Some(cid.clone().unwrap_or_else(||format!("call_{idx}"))),call_type:"function".into(),function:ToolFunction{name:name.clone(),arguments:args.clone()},index:Some(*idx)};
+                let clean_id = cid.clone().unwrap_or_else(||format!("call_{idx}"));
+                let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
+                let tc=ToolCall{id:Some(clean_id),call_type:"function".into(),function:ToolFunction{name:name.clone(),arguments:args.clone()},index:Some(*idx)};
                 let ct=synthesis::tool::complete_tool_call(&tc,&body);
                 let input:Value=serde_json::from_str(&ct.function.arguments).unwrap_or_default();
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));

@@ -74,7 +74,9 @@ async fn handle_oa_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Res
                     let n = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
                     let a = tc.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
                     if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { if !n.is_empty() && e.2.is_empty() {e.2=n.clone();} let prev = e.3.take().unwrap_or_default(); e.3 = Some(prev + &a); }
-                    else if !n.is_empty()||!a.is_empty() { tcs.push((idx,n.clone(),a.clone(),Some(tc.id.clone().unwrap_or_default()))); }
+                    else if !n.is_empty()||!a.is_empty() { let clean_id = tc.id.clone().unwrap_or_default();
+                let clean_id = if let Some(pos) = clean_id.find("{") { clean_id[..pos].to_string() } else { clean_id };
+                tcs.push((idx,n.clone(),a.clone(),Some(clean_id))); }
                     yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":idx,"id":tc.id,"type":"function","function":{"name":n,"arguments":a}}]},"finish_reason":null}]}).to_string()));
                 }}
             }}}
