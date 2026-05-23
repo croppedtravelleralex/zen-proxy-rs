@@ -22,7 +22,7 @@ async fn handle_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Re
     let (content, reasoning, _u) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
     if content.trim().is_empty() && has_tools {
         if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
             let tc = synthesis::tool::complete_tool_call(&tc, cr);
@@ -59,13 +59,14 @@ async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result
     let events = crate::zen::client::read_sse_events(resp).await?;
     let has_tools = translate::has_tools(cr);
     let model = cr.model.clone();
-    let msg_id = format!("msg_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    let msg_id = format!("msg_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
     let body = cr.clone();
     let m = model.clone();
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}).to_string()));
         let mut text = String::new();
         let mut tcs: Vec<(i64,String,String,Option<String>)> = Vec::new();
+        let mut synthesized = false;
         for ev in &events {
             if let Some(ref chs) = ev.choices { for ch in chs { if let Some(ref d) = ch.delta {
                 if let Some(ref c) = d.content { if !c.is_empty() {
@@ -77,7 +78,7 @@ async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result
                     let idx = tc.index.unwrap_or(0);
                     let n = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
                     let a = tc.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { if !n.is_empty() && e.2.is_empty() {e.2=n.clone();} let prev = e.3.take().unwrap_or_default(); e.3 = Some(prev + &a); }
+                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { if !n.is_empty() && e.2.is_empty() {e.2 = n.clone();} e.2.push_str(&a); }
                     else if !n.is_empty()||!a.is_empty() { tcs.push((idx,n.clone(),a.clone(),Some(tc.id.clone().unwrap_or_default()))); }
                 }}
             }}}
@@ -97,6 +98,7 @@ async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result
                 yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":tidx}).to_string()));
             }
         } else if text.is_empty() && has_tools {
+            synthesized = true;
             if let Some(tc)=synthesis::tool::synthesize_tool_call(&body) {
                 let ct=synthesis::tool::complete_tool_call(&tc,&body);
                 let input:Value=serde_json::from_str(&ct.function.arguments).unwrap_or_default();
@@ -111,7 +113,8 @@ async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result
             yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":fb}}).to_string()));
             yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string()));
         }
-        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}).to_string()));
+        let stop_reason = if !tcs.is_empty() || synthesized { "tool_use" } else { "end_turn" };
+        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":1}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
     Ok(Sse::new(stream).into_response())

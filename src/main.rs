@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 mod auth;
 mod config;
@@ -37,6 +36,7 @@ async fn main() {
 
     let app = create_router(state)
         .layer(cors)
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             Duration::from_secs(130),

@@ -25,8 +25,8 @@ impl Config {
             zen_api_key: std::env::var("FREE_MODEL_ZEN_API_KEY")
                 .unwrap_or_else(|_| "public".into()),
             require_api_key: std::env::var("FREE_MODEL_REQUIRE_API_KEY")
-                .map(|v| v == "1")
-                .unwrap_or(false),
+                .map(|v| v != "0")
+                .unwrap_or(true),
             api_key: std::env::var("FREE_MODEL_API_KEY").unwrap_or_else(|_| "sk-dev".into()),
             timeout: Duration::from_millis(
                 std::env::var("FREE_MODEL_TIMEOUT_MS")

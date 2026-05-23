@@ -21,7 +21,7 @@ async fn handle_oa_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) ->
     let (content, reasoning, _u) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     if content.trim().is_empty() && has_tools {
         if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
             let tc = synthesis::tool::complete_tool_call(&tc, cr);
@@ -56,39 +56,41 @@ async fn handle_oa_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Res
     let events = crate::zen::client::read_sse_events(resp).await?;
     let has_tools = translate::has_tools(cr);
     let model = cr.model.clone();
-    let cid = format!("chatcmpl_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let cid = format!("chatcmpl_{created}");
     let body = cr.clone();
     let m = model.clone();
     let id = cid.clone();
     let stream = async_stream::stream! {
-        yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+        yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
         let mut text = String::new();
         let mut tcs: Vec<(i64,String,String,Option<String>)> = Vec::new();
+        let mut _synthesized = false;
         for ev in &events {
             if let Some(ref chs) = ev.choices { for ch in chs { if let Some(ref d) = ch.delta {
                 if let Some(ref c) = d.content { if !c.is_empty() { text.push_str(c);
-                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),"model":model,"choices":[{"index":0,"delta":{"content":c},"finish_reason":null}]}).to_string()));
+                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":c},"finish_reason":null}]}).to_string()));
                 }}
                 if let Some(ref td) = d.tool_calls { for tc in td {
                     let idx = tc.index.unwrap_or(0);
                     let n = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
                     let a = tc.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { if !n.is_empty() && e.2.is_empty() {e.2=n.clone();} let prev = e.3.take().unwrap_or_default(); e.3 = Some(prev + &a); }
+                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { if !n.is_empty() && e.2.is_empty() {e.2 = n.clone();} e.2.push_str(&a); }
                     else if !n.is_empty()||!a.is_empty() { let clean_id = tc.id.clone().unwrap_or_default();
                 let clean_id = if let Some(pos) = clean_id.find("{") { clean_id[..pos].to_string() } else { clean_id };
                 tcs.push((idx,n.clone(),a.clone(),Some(clean_id))); }
-                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":idx,"id":tc.id,"type":"function","function":{"name":n,"arguments":a}}]},"finish_reason":null}]}).to_string()));
+                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":idx,"id":tc.id,"type":"function","function":{"name":n,"arguments":a}}]},"finish_reason":null}]}).to_string()));
                 }}
             }}}
         }
         if text.is_empty() && tcs.is_empty() && has_tools {
             if let Some(tc)=synthesis::tool::synthesize_tool_call(&body) {
                 let ct=synthesis::tool::complete_tool_call(&tc,&body);
-                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":ct.id,"type":"function","function":{"name":ct.function.name,"arguments":ct.function.arguments}}]},"finish_reason":"tool_calls"}]}).to_string()));
+                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":ct.id,"type":"function","function":{"name":ct.function.name,"arguments":ct.function.arguments}}]},"finish_reason":"tool_calls"}]}).to_string()));
             }
         } else if text.is_empty() && tcs.is_empty() {
             let fb=synthesis::text::synthesize_text_fallback(&translate::build_prompt_text(&body.messages));
-            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),"model":model,"choices":[{"index":0,"delta":{"content":fb},"finish_reason":"stop"}]}).to_string()));
+            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":fb},"finish_reason":"stop"}]}).to_string()));
         }
         yield Ok(Event::default().data("[DONE]".to_string()));
     };
