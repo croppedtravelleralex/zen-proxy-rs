@@ -52,8 +52,10 @@ fn oa_tool_resp(ts: u64, model: &str, tc: &ToolCall) -> Response {
 async fn handle_oa_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
+        use futures::StreamExt;
     let resp = crate::zen::client::fetch_zen_stream(&state.http_client, &state.config.zen_chat_url, &state.config.zen_api_key, zb).await?;
-    let events = crate::zen::client::read_sse_events(resp).await?;
+    let byte_stream = resp.bytes_stream();
+    let mut event_stream = Box::pin(crate::zen::client::stream_sse_events(byte_stream));
     let has_tools = translate::has_tools(cr);
     let model = cr.model.clone();
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -66,7 +68,8 @@ async fn handle_oa_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Res
         let mut text = String::new();
         let mut tcs: Vec<(i64,String,String,Option<String>)> = Vec::new();
         let mut _synthesized = false;
-        for ev in &events {
+        while let Some(ev) = event_stream.next().await {
+            let Ok(ev) = ev else { return; };
             if let Some(ref chs) = ev.choices { for ch in chs { if let Some(ref d) = ch.delta {
                 if let Some(ref c) = d.content { if !c.is_empty() { text.push_str(c);
                     yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":c},"finish_reason":null}]}).to_string()));

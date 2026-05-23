@@ -160,35 +160,56 @@ pub async fn collect_stream_text(
     Ok((content, reasoning, usage))
 }
 
-pub async fn read_sse_events(
-    resp: reqwest::Response,
-) -> Result<Vec<ZenSseEvent>, crate::error::AppError> {
-    let mut stream = resp.bytes_stream();
-    let mut buffer = BytesMut::new();
-    let mut events = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            crate::error::AppError::new(
-                axum::http::StatusCode::BAD_GATEWAY,
-                format!("stream error: {e}"),
-            )
-        })?;
-        buffer.extend_from_slice(&chunk);
-        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-            let event_bytes = buffer.split_to(pos);
-            let _ = buffer.split_to(2); // consume \n\n
-            let s = String::from_utf8_lossy(&event_bytes);
-            for line in s.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        continue;
+pub fn stream_sse_events(
+    byte_stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+) -> impl futures::Stream<Item = Result<ZenSseEvent, crate::error::AppError>> {
+    use futures::StreamExt;
+    async_stream::stream! {
+        let mut byte_stream = Box::pin(byte_stream);
+        let mut buffer = BytesMut::new();
+        loop {
+            match byte_stream.next().await {
+                Some(Ok(chunk)) => {
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(pos) = buffer.windows(2).position(|w| w == b"
+
+") {
+                        let event_bytes = buffer.split_to(pos);
+                        let _ = buffer.split_to(2);
+                        let s = String::from_utf8_lossy(&event_bytes);
+                        for line in s.lines() {
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if data == "[DONE]" { continue; }
+                                if let Ok(event) = serde_json::from_str::<ZenSseEvent>(data) {
+                                    yield Ok(event);
+                                }
+                            }
+                        }
                     }
-                    if let Ok(event) = serde_json::from_str::<ZenSseEvent>(data) {
-                        events.push(event);
+                }
+                Some(Err(e)) => {
+                    yield Err(crate::error::AppError::new(
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        format!("stream error: {e}"),
+                    ));
+                    return;
+                }
+                None => {
+                    // Process remaining buffer
+                    if !buffer.is_empty() {
+                        let s = String::from_utf8_lossy(&buffer);
+                        for line in s.lines() {
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                if data == "[DONE]" { continue; }
+                                if let Ok(event) = serde_json::from_str::<ZenSseEvent>(data) {
+                                    yield Ok(event);
+                                }
+                            }
+                        }
                     }
+                    return;
                 }
             }
         }
     }
-    Ok(events)
 }

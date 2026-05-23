@@ -55,8 +55,10 @@ fn tool_resp(ts: u128, model: &str, tc: &ToolCall, input: &Value) -> Response {
 async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
+        use futures::StreamExt;
     let resp = crate::zen::client::fetch_zen_stream(&state.http_client, &state.config.zen_chat_url, &state.config.zen_api_key, zb).await?;
-    let events = crate::zen::client::read_sse_events(resp).await?;
+    let byte_stream = resp.bytes_stream();
+    let mut event_stream = Box::pin(crate::zen::client::stream_sse_events(byte_stream));
     let has_tools = translate::has_tools(cr);
     let model = cr.model.clone();
     let msg_id = format!("msg_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
@@ -67,7 +69,8 @@ async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result
         let mut text = String::new();
         let mut tcs: Vec<(i64,String,String,Option<String>)> = Vec::new();
         let mut synthesized = false;
-        for ev in &events {
+        while let Some(ev) = event_stream.next().await {
+            let Ok(ev) = ev else { return; };
             if let Some(ref chs) = ev.choices { for ch in chs { if let Some(ref d) = ch.delta {
                 if let Some(ref c) = d.content { if !c.is_empty() {
                     if text.is_empty() { yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string())); }
