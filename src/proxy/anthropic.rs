@@ -5,6 +5,7 @@ use crate::error::AppError;
 use crate::protocol::{translate, types::*};
 use crate::routes::AppState;
 use crate::synthesis;
+use crate::protocol::translate::estimate_tokens as estimate;
 
 pub async fn handle_anthropic_messages(state: &AppState, body: AnthropicRequest) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
@@ -19,7 +20,7 @@ pub async fn handle_anthropic_messages(state: &AppState, body: AnthropicRequest)
 
 async fn handle_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
     let resp = crate::zen::client::fetch_zen_stream(&state.http_client, &state.config.zen_chat_url, &state.config.zen_api_key, zb).await?;
-    let (content, reasoning, _u) = crate::zen::client::collect_stream_text(resp).await?;
+    let (content, reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
@@ -27,7 +28,7 @@ async fn handle_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Re
         if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
             let tc = synthesis::tool::complete_tool_call(&tc, cr);
             let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-            return Ok(tool_resp(ts, &cr.model, &tc, &input));
+            return Ok(tool_resp(ts, &cr.model, &tc, &input, estimate(&prompt)));
         }
     }
     if content.trim().is_empty() && !reasoning.trim().is_empty() {
@@ -35,21 +36,21 @@ async fn handle_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Re
             if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
                 let tc = synthesis::tool::complete_tool_call(&tc, cr);
                 let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                return Ok(tool_resp(ts, &cr.model, &tc, &input));
+                return Ok(tool_resp(ts, &cr.model, &tc, &input, estimate(&prompt)));
             }
         } else {
-            return Ok(text_resp(ts, &cr.model, &synthesis::text::synthesize_text_fallback(&prompt)));
+            let fb = synthesis::text::synthesize_text_fallback(&prompt); return Ok(text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response());
         }
     }
-    Ok(text_resp(ts, &cr.model, &content))
+    Ok(text_resp(ts, &cr.model, &content, estimate(&prompt), estimate(&content)))
 }
 
-fn text_resp(ts: u128, model: &str, text: &str) -> Response {
-    Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"text","text":text}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}})).into_response()
+fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
+    Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"text","text":text}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":output_tokens}})).into_response()
 }
 
-fn tool_resp(ts: u128, model: &str, tc: &ToolCall, input: &Value) -> Response {
-    Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"tool_use","id":tc.id,"name":tc.function.name,"input":input}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}})).into_response()
+fn tool_resp(ts: u128, model: &str, tc: &ToolCall, input: &Value, input_tokens: u64) -> Response {
+    Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"tool_use","id":tc.id,"name":tc.function.name,"input":input}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}})).into_response()
 }
 
 async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
@@ -81,7 +82,7 @@ async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result
                     let idx = tc.index.unwrap_or(0);
                     let n = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
                     let a = tc.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { if !n.is_empty() && e.2.is_empty() {e.2 = n.clone();} e.2.push_str(&a); }
+                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { e.2.push_str(&a); }
                     else if !n.is_empty()||!a.is_empty() { tcs.push((idx,n.clone(),a.clone(),Some(tc.id.clone().unwrap_or_default()))); }
                 }}
             }}}

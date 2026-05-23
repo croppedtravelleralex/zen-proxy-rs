@@ -5,6 +5,7 @@ use crate::error::AppError;
 use crate::protocol::{translate, types::*};
 use crate::routes::AppState;
 use crate::synthesis;
+use crate::protocol::translate::estimate_tokens as estimate;
 
 pub async fn handle_openai_chat(state: &AppState, body: ChatRequest) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
@@ -18,35 +19,35 @@ pub async fn handle_openai_chat(state: &AppState, body: ChatRequest) -> Result<R
 
 async fn handle_oa_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
     let resp = crate::zen::client::fetch_zen_stream(&state.http_client, &state.config.zen_chat_url, &state.config.zen_api_key, zb).await?;
-    let (content, reasoning, _u) = crate::zen::client::collect_stream_text(resp).await?;
+    let (content, reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     if content.trim().is_empty() && has_tools {
         if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
             let tc = synthesis::tool::complete_tool_call(&tc, cr);
-            return Ok(oa_tool_resp(ts, &cr.model, &tc));
+            return Ok(oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)));
         }
     }
     if content.trim().is_empty() && !reasoning.trim().is_empty() {
         if has_tools {
             if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
                 let tc = synthesis::tool::complete_tool_call(&tc, cr);
-                return Ok(oa_tool_resp(ts, &cr.model, &tc));
+                return Ok(oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)));
             }
         } else {
-            return Ok(oa_text_resp(ts, &cr.model, &synthesis::text::synthesize_text_fallback(&prompt)));
+            let fb = synthesis::text::synthesize_text_fallback(&prompt); return Ok(oa_text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response());
         }
     }
-    Ok(oa_text_resp(ts, &cr.model, &content))
+    Ok(oa_text_resp(ts, &cr.model, &content, estimate(&prompt), estimate(&content)))
 }
 
-fn oa_text_resp(ts: u64, model: &str, text: &str) -> Response {
-    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"cost":"0"})).into_response()
+fn oa_text_resp(ts: u64, model: &str, text: &str, pt: u64, ct: u64) -> Response {
+    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":pt+ct}})).into_response()
 }
 
-fn oa_tool_resp(ts: u64, model: &str, tc: &ToolCall) -> Response {
-    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[tc]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"cost":"0"})).into_response()
+fn oa_tool_resp(ts: u64, model: &str, tc: &ToolCall, pt: u64) -> Response {
+    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[tc]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":pt,"completion_tokens":1,"total_tokens":pt+1}})).into_response()
 }
 
 async fn handle_oa_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
@@ -78,7 +79,7 @@ async fn handle_oa_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Res
                     let idx = tc.index.unwrap_or(0);
                     let n = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
                     let a = tc.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { if !n.is_empty() && e.2.is_empty() {e.2 = n.clone();} e.2.push_str(&a); }
+                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { e.2.push_str(&a); }
                     else if !n.is_empty()||!a.is_empty() { let clean_id = tc.id.clone().unwrap_or_default();
                 let clean_id = if let Some(pos) = clean_id.find("{") { clean_id[..pos].to_string() } else { clean_id };
                 tcs.push((idx,n.clone(),a.clone(),Some(clean_id))); }
@@ -95,6 +96,11 @@ async fn handle_oa_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Res
             let fb=synthesis::text::synthesize_text_fallback(&translate::build_prompt_text(&body.messages));
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":fb},"finish_reason":"stop"}]}).to_string()));
         }
+        let finish_reason = if !tcs.is_empty() || _synthesized { "tool_calls" } else { "stop" };
+        yield Ok(Event::default().data(serde_json::json!({
+            "id": id, "object": "chat.completion.chunk", "created": created,
+            "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+        }).to_string()));
         yield Ok(Event::default().data("[DONE]".to_string()));
     };
     Ok(Sse::new(stream).into_response())

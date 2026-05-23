@@ -14,6 +14,8 @@ use routes::{create_router, AppState};
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 #[tokio::main]
 async fn main() {
@@ -35,6 +37,11 @@ async fn main() {
         .allow_headers(Any);
 
     let app = create_router(state)
+        .layer(TraceLayer::new_for_http())
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::HeaderName::from_static("x-content-type-options"),
+            axum::http::HeaderValue::from_static("nosniff")
+        ))
         .layer(cors)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024))
         .layer(TimeoutLayer::with_status_code(
