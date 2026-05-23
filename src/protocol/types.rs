@@ -95,6 +95,7 @@ pub struct AnthropicMessage {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct OpenAIResponse {
     pub id: String,
     pub object: String,
@@ -113,6 +114,7 @@ pub struct OpenAIChoice {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct OpenAIResponseMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +124,7 @@ pub struct OpenAIResponseMessage {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct AnthropicResponse {
     pub id: String,
     #[serde(rename = "type")]

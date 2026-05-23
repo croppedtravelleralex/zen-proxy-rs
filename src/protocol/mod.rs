@@ -1,2 +1,2 @@
-pub mod types;
 pub mod translate;
+pub mod types;
