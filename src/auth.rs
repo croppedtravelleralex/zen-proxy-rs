@@ -7,8 +7,8 @@ pub fn is_authorized(config: &Config, auth_header: Option<&str>) -> bool {
     if !config.require_api_key {
         return true;
     }
-    let expected_key = format!("Bearer {}", config.api_key);
-    auth_header == Some(&expected_key)
+    let expected_bearer = format!("Bearer {}", config.api_key);
+    auth_header == Some(&expected_bearer) || auth_header == Some(&config.api_key)
 }
 
 #[cfg(test)]
