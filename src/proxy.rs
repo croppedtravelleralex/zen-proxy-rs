@@ -42,6 +42,30 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn extract_proxy_token(headers: &HeaderMap) -> Option<String> {
+    extract_bearer_token(headers)
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            headers
+                .get("api-key")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|s| s.to_string())
+        })
+}
+
 fn is_streaming(body: &Value) -> bool {
     body.get("stream")
         .and_then(|v| v.as_bool())
@@ -56,12 +80,12 @@ pub async fn proxy_handler(
     body: axum::body::Bytes,
 ) -> Response {
     let start = Instant::now();
-    let client_id = extract_bearer_token(&headers).unwrap_or_default();
+    let client_id = extract_proxy_token(&headers).unwrap_or_default();
     let conf = state.config.read().unwrap().clone();
 
     // PROXY_API_KEY 校验
     if let Some(ref key) = conf.proxy_api_key {
-        let provided = extract_bearer_token(&headers);
+        let provided = extract_proxy_token(&headers);
         if provided.as_deref() != Some(key.as_str()) {
             warn!("proxy authentication failed");
             return (

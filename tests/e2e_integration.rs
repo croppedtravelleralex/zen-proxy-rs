@@ -308,6 +308,35 @@ mod e2e {
     }
 
     #[test]
+    fn test_v4_proxy_api_key_accepts_x_api_key_header() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19798,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("PROXY_API_KEY", "sk-dev"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-api-key", "sk-dev")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 openai request with x-api-key");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        stop_server(child, port);
+    }
+
+    #[test]
     fn test_v4_upstream_429_returns_retry_after() {
         let (upstream_base, observed) = start_mock_zen();
         let (child, port) = start_server_with_env(
