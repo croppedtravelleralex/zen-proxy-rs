@@ -82,6 +82,13 @@ pub async fn proxy_handler(
         )
         .await;
     }
+    if conf.zen_provider_mode == ProviderMode::NewApi && matches!(path.as_str(), "chat/completions")
+    {
+        return crate::v4::newapi::handle_newapi_proxy(
+            &state, &path, &method, &headers, body, &client_id, start,
+        )
+        .await;
+    }
 
     let (streaming, modified_body) = if body.is_empty() {
         (false, body.to_vec())

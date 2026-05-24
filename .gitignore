@@ -3,3 +3,4 @@ nodes.json
 .env
 .claude/
 false/
+data/webshare_nodes.json

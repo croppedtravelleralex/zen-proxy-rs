@@ -110,6 +110,66 @@ fn start_mock_zen() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
     (format!("http://{addr}/zen"), observed)
 }
 
+fn start_mock_newapi() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let state = observed.clone();
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            async fn handler(
+                State(observed): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                headers: axum::http::HeaderMap,
+                Json(body): Json<serde_json::Value>,
+            ) -> impl IntoResponse {
+                observed.lock().unwrap().push(serde_json::json!({
+                    "body": body,
+                    "authorization": headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default(),
+                }));
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    Json(serde_json::json!({
+                        "id": "chatcmpl-newapi",
+                        "object": "chat.completion",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "newapi ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 11,
+                            "completion_tokens": 7,
+                            "total_tokens": 18
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+
+            let app = Router::new()
+                .route("/v1/chat/completions", post(handler))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+
+    (format!("http://{addr}"), observed)
+}
+
 #[cfg(test)]
 mod e2e {
     use super::*;
@@ -279,6 +339,72 @@ mod e2e {
         assert_eq!(openai_record["selected_node_url_redacted"], "direct");
         assert_eq!(openai_record["observed_exit_ip"], "direct");
         assert_eq!(openai_record["outcome"], "success");
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_newapi_channel_serves_two_models_and_records_usage() {
+        let (newapi_base, observed) = start_mock_newapi();
+        let conn =
+            format!(r#"{{"_type":"newapi_channel_conn","key":"sk-dev","url":"{newapi_base}"}}"#);
+        let (child, port) = start_server_with_env(
+            19795,
+            &[
+                ("ZEN_PROVIDER_MODE", "newapi"),
+                ("NEWAPI_CHANNEL_CONN", conn.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        for model in ["deepseek-v4-flash", "deepseek-v4-flash-lite"] {
+            let resp = client
+                .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": [
+                        {"role": "user", "content": "混合 token 输入: English words, 中文字符, 12345. Reply ok."}
+                    ],
+                    "stream": false,
+                    "max_tokens": 16
+                }))
+                .send()
+                .expect("newapi request");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            assert_eq!(body["choices"][0]["message"]["content"], "newapi ok");
+        }
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["authorization"], "Bearer sk-dev");
+        assert_eq!(seen[0]["body"]["model"], "deepseek-v4-flash-free");
+        assert_eq!(seen[1]["body"]["model"], "big-pickle");
+        drop(seen);
+
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let items = requests_body["data"].as_array().unwrap();
+        for model in ["deepseek-v4-flash", "deepseek-v4-flash-lite"] {
+            let record = items
+                .iter()
+                .find(|item| item["public_model"] == model)
+                .expect("newapi request telemetry");
+            let upstream = if model == "deepseek-v4-flash" {
+                "deepseek-v4-flash-free"
+            } else {
+                "big-pickle"
+            };
+            assert_eq!(record["upstream_model"], upstream);
+            assert_eq!(record["outcome"], "success");
+            assert_eq!(record["prompt_tokens"], 11);
+            assert_eq!(record["completion_tokens"], 7);
+            assert_eq!(record["total_tokens"], 18);
+        }
         stop_server(child, port);
     }
 
