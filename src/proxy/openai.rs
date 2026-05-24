@@ -48,7 +48,8 @@ async fn handle_oa_non_stream(
         &config.extra_headers,
     )
     .await?;
-    let (content, reasoning, _usage) = crate::zen::client::collect_stream_text(resp).await?;
+    let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
+    let (content, reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
@@ -58,37 +59,74 @@ async fn handle_oa_non_stream(
     if content.trim().is_empty() && has_tools {
         if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
             let tc = synthesis::tool::complete_tool_call(&tc, cr);
-            return Ok(oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)));
+            return Ok(with_observed_exit_ip(
+                oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)),
+                observed_exit_ip,
+            ));
         }
     }
     if content.trim().is_empty() && !reasoning.trim().is_empty() {
         if has_tools {
             if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
                 let tc = synthesis::tool::complete_tool_call(&tc, cr);
-                return Ok(oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)));
+                return Ok(with_observed_exit_ip(
+                    oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)),
+                    observed_exit_ip,
+                ));
             }
         } else {
             let fb = synthesis::text::synthesize_text_fallback(&prompt);
-            return Ok(
-                oa_text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response(),
-            );
+            let pt = estimate(&prompt);
+            let ct = estimate(&fb);
+            return Ok(with_observed_exit_ip(
+                oa_text_resp(ts, &cr.model, &fb, pt, ct, pt + ct).into_response(),
+                observed_exit_ip,
+            ));
         }
     }
-    Ok(oa_text_resp(
-        ts,
-        &cr.model,
-        &content,
-        estimate(&prompt),
-        estimate(&content),
+    let prompt_tokens = usage
+        .as_ref()
+        .and_then(|usage| usage.prompt_tokens)
+        .unwrap_or_else(|| estimate(&prompt));
+    let completion_tokens = usage
+        .as_ref()
+        .and_then(|usage| usage.completion_tokens)
+        .unwrap_or_else(|| estimate(&content));
+    let total_tokens = usage
+        .as_ref()
+        .and_then(|usage| usage.total_tokens)
+        .unwrap_or(prompt_tokens + completion_tokens);
+    Ok(with_observed_exit_ip(
+        oa_text_resp(
+            ts,
+            &cr.model,
+            &content,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        ),
+        observed_exit_ip,
     ))
 }
 
-fn oa_text_resp(ts: u64, model: &str, text: &str, pt: u64, ct: u64) -> Response {
-    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":pt+ct}})).into_response()
+fn oa_text_resp(ts: u64, model: &str, text: &str, pt: u64, ct: u64, total: u64) -> Response {
+    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total}})).into_response()
 }
 
 fn oa_tool_resp(ts: u64, model: &str, tc: &ToolCall, pt: u64) -> Response {
     Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[tc]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":pt,"completion_tokens":1,"total_tokens":pt+1}})).into_response()
+}
+
+fn with_observed_exit_ip(
+    mut response: Response,
+    observed_exit_ip: Option<reqwest::header::HeaderValue>,
+) -> Response {
+    if let Some(value) = observed_exit_ip {
+        response
+            .headers_mut()
+            .insert("x-zen-observed-exit-ip", value);
+    }
+    response
 }
 
 async fn handle_oa_stream(
@@ -126,7 +164,14 @@ async fn handle_oa_stream(
         let mut tcs: Vec<(i64,String,String,Option<String>)> = Vec::new();
         let mut _synthesized = false;
         while let Some(ev) = event_stream.next().await {
-            let Ok(ev) = ev else { return; };
+            let ev = match ev {
+                Ok(ev) => ev,
+                Err(err) => {
+                    yield Ok(Event::default().data(serde_json::json!({"error":{"type":"stream_error","message":err.message}}).to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+            };
             if let Some(ref chs) = ev.choices { for ch in chs { if let Some(ref d) = ch.delta {
                 if let Some(ref c) = d.content { if !c.is_empty() { text.push_str(c);
                     yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":c},"finish_reason":null}]}).to_string()));
@@ -157,7 +202,7 @@ async fn handle_oa_stream(
             "id": id, "object": "chat.completion.chunk", "created": created,
             "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
         }).to_string()));
-        yield Ok(Event::default().data("[DONE]".to_string()));
+        yield Ok(Event::default().data("[DONE]"));
     };
     Ok(Sse::new(stream).into_response())
 }

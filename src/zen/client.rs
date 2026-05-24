@@ -151,17 +151,21 @@ pub async fn collect_stream_text(
                     if data == "[DONE]" {
                         continue;
                     }
-                    if let Ok(event) = serde_json::from_str::<ZenSseEvent>(data) {
-                        usage = event.usage.or(usage);
-                        if let Some(choices) = event.choices {
-                            for choice in choices {
-                                if let Some(delta) = choice.delta {
-                                    if let Some(c) = delta.content {
-                                        content.push_str(&c);
-                                    }
-                                    if let Some(r) = delta.reasoning_content {
-                                        reasoning.push_str(&r);
-                                    }
+                    let event = serde_json::from_str::<ZenSseEvent>(data).map_err(|e| {
+                        crate::error::AppError::new(
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            format!("stream parse error: {e}"),
+                        )
+                    })?;
+                    usage = event.usage.or(usage);
+                    if let Some(choices) = event.choices {
+                        for choice in choices {
+                            if let Some(delta) = choice.delta {
+                                if let Some(c) = delta.content {
+                                    content.push_str(&c);
+                                }
+                                if let Some(r) = delta.reasoning_content {
+                                    reasoning.push_str(&r);
                                 }
                             }
                         }
@@ -193,8 +197,15 @@ pub fn stream_sse_events(
                         for line in s.lines() {
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if data == "[DONE]" { continue; }
-                                if let Ok(event) = serde_json::from_str::<ZenSseEvent>(data) {
-                                    yield Ok(event);
+                                match serde_json::from_str::<ZenSseEvent>(data) {
+                                    Ok(event) => yield Ok(event),
+                                    Err(e) => {
+                                        yield Err(crate::error::AppError::new(
+                                            axum::http::StatusCode::BAD_GATEWAY,
+                                            format!("stream parse error: {e}"),
+                                        ));
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -214,8 +225,15 @@ pub fn stream_sse_events(
                         for line in s.lines() {
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if data == "[DONE]" { continue; }
-                                if let Ok(event) = serde_json::from_str::<ZenSseEvent>(data) {
-                                    yield Ok(event);
+                                match serde_json::from_str::<ZenSseEvent>(data) {
+                                    Ok(event) => yield Ok(event),
+                                    Err(e) => {
+                                        yield Err(crate::error::AppError::new(
+                                            axum::http::StatusCode::BAD_GATEWAY,
+                                            format!("stream parse error: {e}"),
+                                        ));
+                                        return;
+                                    }
                                 }
                             }
                         }

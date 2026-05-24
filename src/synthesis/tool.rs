@@ -1,4 +1,3 @@
-
 use crate::protocol::types::{ChatRequest, OpenAITool, OpenAIToolFunction, ToolCall, ToolFunction};
 use rand::Rng;
 use regex::Regex;

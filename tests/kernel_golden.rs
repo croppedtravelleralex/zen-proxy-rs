@@ -61,6 +61,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("broken-json") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {not-json}\n\n",
+        )
+            .into_response();
+    }
 
     let chunk = if prompt.contains("tool-delta") {
         json!({
@@ -172,6 +180,9 @@ async fn openai_non_stream_uses_caller_client_and_returns_golden_response() {
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "golden answer");
     assert_eq!(body["model"], "deepseek-v4-flash-free");
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+    assert_eq!(body["usage"]["total_tokens"], 5);
     let observed = state.requests.lock().unwrap();
     assert_eq!(observed[0].proof_header.as_deref(), Some("caller-client"));
     assert_eq!(observed[0].extra_header.as_deref(), Some("extra-proof"));
@@ -208,6 +219,8 @@ async fn anthropic_non_stream_returns_golden_message_response() {
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
     assert_eq!(body["content"][0]["text"], "golden answer");
     assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(body["usage"]["input_tokens"], 3);
+    assert_eq!(body["usage"]["output_tokens"], 2);
 }
 
 #[tokio::test]
@@ -293,4 +306,35 @@ async fn upstream_429_is_returned_as_rate_limit_error() {
             .map(|(_, value)| value.as_str()),
         Some("60")
     );
+}
+
+#[tokio::test]
+async fn non_stream_parse_error_is_structured_error() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let err = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "broken-json", false, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert!(err.message.contains("stream parse error"));
+}
+
+#[tokio::test]
+async fn stream_parse_error_is_emitted_before_done() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "broken-json", true, None),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("stream_error"));
+    assert!(body.contains("[DONE]"));
 }

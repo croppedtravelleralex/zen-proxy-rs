@@ -1,4 +1,3 @@
-
 use regex::Regex;
 
 /// Try to extract expected text from prompt patterns.

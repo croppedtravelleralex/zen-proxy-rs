@@ -53,7 +53,8 @@ async fn handle_non_stream(
         &config.extra_headers,
     )
     .await?;
-    let (content, reasoning, _usage) = crate::zen::client::collect_stream_text(resp).await?;
+    let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
+    let (content, reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
@@ -64,7 +65,10 @@ async fn handle_non_stream(
         if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
             let tc = synthesis::tool::complete_tool_call(&tc, cr);
             let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-            return Ok(tool_resp(ts, &cr.model, &tc, &input, estimate(&prompt)));
+            return Ok(with_observed_exit_ip(
+                tool_resp(ts, &cr.model, &tc, &input, estimate(&prompt)),
+                observed_exit_ip,
+            ));
         }
     }
     if content.trim().is_empty() && !reasoning.trim().is_empty() {
@@ -72,21 +76,30 @@ async fn handle_non_stream(
             if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
                 let tc = synthesis::tool::complete_tool_call(&tc, cr);
                 let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                return Ok(tool_resp(ts, &cr.model, &tc, &input, estimate(&prompt)));
+                return Ok(with_observed_exit_ip(
+                    tool_resp(ts, &cr.model, &tc, &input, estimate(&prompt)),
+                    observed_exit_ip,
+                ));
             }
         } else {
             let fb = synthesis::text::synthesize_text_fallback(&prompt);
-            return Ok(
+            return Ok(with_observed_exit_ip(
                 text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response(),
-            );
+                observed_exit_ip,
+            ));
         }
     }
-    Ok(text_resp(
-        ts,
-        &cr.model,
-        &content,
-        estimate(&prompt),
-        estimate(&content),
+    let input_tokens = usage
+        .as_ref()
+        .and_then(|usage| usage.prompt_tokens)
+        .unwrap_or_else(|| estimate(&prompt));
+    let output_tokens = usage
+        .as_ref()
+        .and_then(|usage| usage.completion_tokens)
+        .unwrap_or_else(|| estimate(&content));
+    Ok(with_observed_exit_ip(
+        text_resp(ts, &cr.model, &content, input_tokens, output_tokens),
+        observed_exit_ip,
     ))
 }
 
@@ -96,6 +109,18 @@ fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens
 
 fn tool_resp(ts: u128, model: &str, tc: &ToolCall, input: &Value, input_tokens: u64) -> Response {
     Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"tool_use","id":tc.id,"name":tc.function.name,"input":input}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}})).into_response()
+}
+
+fn with_observed_exit_ip(
+    mut response: Response,
+    observed_exit_ip: Option<reqwest::header::HeaderValue>,
+) -> Response {
+    if let Some(value) = observed_exit_ip {
+        response
+            .headers_mut()
+            .insert("x-zen-observed-exit-ip", value);
+    }
+    response
 }
 
 async fn handle_stream(
@@ -134,7 +159,14 @@ async fn handle_stream(
         let mut tcs: Vec<(i64,String,String,Option<String>)> = Vec::new();
         let mut synthesized = false;
         while let Some(ev) = event_stream.next().await {
-            let Ok(ev) = ev else { return; };
+            let ev = match ev {
+                Ok(ev) => ev,
+                Err(err) => {
+                    yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"stream_error","message":err.message}}).to_string()));
+                    yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
+                    return;
+                }
+            };
             if let Some(ref chs) = ev.choices { for ch in chs { if let Some(ref d) = ch.delta {
                 if let Some(ref c) = d.content { if !c.is_empty() {
                     if text.is_empty() { yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string())); }
