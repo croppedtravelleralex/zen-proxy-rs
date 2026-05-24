@@ -48,7 +48,7 @@ pub async fn handle_v4_proxy(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
-    let registry = StaticModelRegistry::default();
+    let registry = StaticModelRegistry;
     let resolved = match registry.resolve(&public_model) {
         Ok(resolved) => resolved,
         Err(ModelError::UnknownModel(model)) => {
@@ -251,14 +251,6 @@ async fn call_with_retry(
                         latency,
                         attempt,
                     );
-                    let body_bytes_len = response
-                        .headers()
-                        .get("content-type")
-                        .and_then(|value| value.to_str().ok())
-                        .map(|ct| ct.contains("text/event-stream"))
-                        .unwrap_or(false)
-                        .then_some(0)
-                        .unwrap_or(0);
                     return Ok(V4CallResult {
                         response,
                         request_id,
@@ -271,7 +263,7 @@ async fn call_with_retry(
                         was_rate_limited,
                         upstream_ms: latency,
                         ttft_ms: None,
-                        body_bytes_len,
+                        body_bytes_len: 0,
                     });
                 }
                 last_status = status;
@@ -409,6 +401,7 @@ async fn dispatch_or_wait(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report_status_failure(
     state: &Arc<AppState>,
     conf: &Config,
@@ -466,6 +459,7 @@ fn report_status_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_ledger(
     state: &Arc<AppState>,
     conf: &Config,

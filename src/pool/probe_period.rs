@@ -29,7 +29,11 @@ impl ProbePeriod {
 
             let result = tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
-                client.post(&probe_url).header("x-api-key", api_key).json(&body).send(),
+                client
+                    .post(&probe_url)
+                    .header("x-api-key", api_key)
+                    .json(&body)
+                    .send(),
             )
             .await;
 

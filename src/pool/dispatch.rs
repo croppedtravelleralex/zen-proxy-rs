@@ -35,7 +35,7 @@ impl PoolNode {
 
     fn score(&self) -> f64 {
         let base_pct = self.base_score.load(Ordering::Relaxed) as f64 / SCORE_SCALE as f64;
-        let health = (base_pct / 100.0).min(1.0).max(0.0) * 0.50;
+        let health = (base_pct / 100.0).clamp(0.0, 1.0) * 0.50;
 
         let recent = self.recent_results.read().unwrap();
         let total = recent.len();
@@ -124,7 +124,11 @@ impl Pool for DispatchPool {
         None
     }
 
-    fn try_acquire_sticky(&self, _meta: &RequestMeta, node_id: &NodeId) -> Result<NodeRef, DispatchError> {
+    fn try_acquire_sticky(
+        &self,
+        _meta: &RequestMeta,
+        node_id: &NodeId,
+    ) -> Result<NodeRef, DispatchError> {
         let nodes = self.nodes.read().unwrap();
         nodes
             .iter()

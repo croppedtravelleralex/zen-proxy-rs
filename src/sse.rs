@@ -39,15 +39,14 @@ impl SseBuffer {
                             lines.push(line_with_nl);
                         }
                     }
-                } else if current_line.is_empty() && found_lf
-                    && !self.done {
-                        lines.push(vec![b'\n']);
-                    }
-                if !self.done
-                    && (current_line == b"data: [DONE]" || current_line == b"data:[DONE]") {
-                        self.done = true;
-                        lines.push(b"data: [DONE]\n".to_vec());
-                    }
+                } else if current_line.is_empty() && found_lf && !self.done {
+                    lines.push(vec![b'\n']);
+                }
+                if !self.done && (current_line == b"data: [DONE]" || current_line == b"data:[DONE]")
+                {
+                    self.done = true;
+                    lines.push(b"data: [DONE]\n".to_vec());
+                }
                 current_line.clear();
                 found_lf = true;
             } else {

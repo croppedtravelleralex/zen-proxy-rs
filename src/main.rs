@@ -19,18 +19,18 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use axum::{
-    Router,
     extract::State,
     response::Json,
     routing::{any, get},
+    Router,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
-use tracing_subscriber::{EnvFilter, Registry, prelude::*, reload};
+use tracing_subscriber::{prelude::*, reload, EnvFilter, Registry};
 
-use collector::DataCollector;
 use collector::default::DefaultCollector;
 use collector::export::JsonBackend;
+use collector::DataCollector;
 use pool::active::ActivePool;
 use pool::dead::DeadPoolImpl;
 use pool::dispatch::DispatchPool;
@@ -93,7 +93,7 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> String {
 async fn models_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
     let cfg = st.config.read().unwrap();
     let data = if cfg.v4_model_registry_active() {
-        let registry = v4::model::StaticModelRegistry::default();
+        let registry = v4::model::StaticModelRegistry;
         registry
             .public_models()
             .into_iter()

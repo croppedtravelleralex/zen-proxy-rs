@@ -43,7 +43,7 @@ impl Default for ActivePool {
 
 impl Pool for ActivePool {
     fn acquire(&self) -> Option<NodeRef> {
-        let entries = self.entries.write().unwrap();
+        let entries = self.entries.read().unwrap();
         for entry in entries.values() {
             let current = entry.active_requests.load(Ordering::Relaxed);
             let max = entry.max_concurrent.load(Ordering::Relaxed) as i64;
@@ -56,7 +56,7 @@ impl Pool for ActivePool {
     }
 
     fn release(&self, node_id: &NodeId, result: &ResultKind) {
-        let entries = self.entries.write().unwrap();
+        let entries = self.entries.read().unwrap();
         if let Some(entry) = entries.get(node_id) {
             entry.active_requests.fetch_sub(1, Ordering::SeqCst);
 

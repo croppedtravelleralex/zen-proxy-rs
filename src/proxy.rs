@@ -217,6 +217,7 @@ pub async fn proxy_handler(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy_with_retry(
     state: &Arc<AppState>,
     path: &str,
@@ -320,7 +321,7 @@ async fn proxy_with_retry(
                         node_url_redacted: LedgerEvent::redact_node_url(&node_url),
                         model: model.to_string(),
                         stream: streaming,
-                        status: status,
+                        status,
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
@@ -337,7 +338,7 @@ async fn proxy_with_retry(
                         exit_ip: None,
                         pool_from: None,
                         pool_to: None,
-                        attempt: attempt,
+                        attempt,
                     });
                     if streaming && status == 200 {
                         let resp = stream_to_axum(up_resp).await;
@@ -413,7 +414,7 @@ async fn proxy_with_retry(
                         node_url_redacted: LedgerEvent::redact_node_url(&node_url),
                         model: model.to_string(),
                         stream: streaming,
-                        status: status,
+                        status,
                         retry_after: up_resp
                             .headers()
                             .get("retry-after")
@@ -434,7 +435,7 @@ async fn proxy_with_retry(
                         exit_ip: None,
                         pool_from: Some("dispatch".into()),
                         pool_to: Some("ratelimited".into()),
-                        attempt: attempt,
+                        attempt,
                     });
                 } else {
                     state.pool_manager.report(
@@ -452,7 +453,7 @@ async fn proxy_with_retry(
                         node_url_redacted: LedgerEvent::redact_node_url(&node_url),
                         model: model.to_string(),
                         stream: streaming,
-                        status: status,
+                        status,
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
@@ -469,7 +470,7 @@ async fn proxy_with_retry(
                         exit_ip: None,
                         pool_from: Some("dispatch".into()),
                         pool_to: None,
-                        attempt: attempt,
+                        attempt,
                     });
                 }
 
@@ -514,7 +515,7 @@ async fn proxy_with_retry(
                     total_tokens: None,
                     pool_from: Some("dispatch".into()),
                     pool_to: None,
-                    attempt: attempt,
+                    attempt,
                 });
                 warn!(attempt, error = %e, "upstream request error");
                 if attempt < max {

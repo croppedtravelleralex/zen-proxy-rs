@@ -3,6 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::Mutex;
 
+#[allow(clippy::upper_case_acronyms)]
 pub struct WAL {
     writer: Mutex<BufWriter<File>>,
     path: String,
@@ -79,9 +80,7 @@ impl WAL {
                 *w = BufWriter::new(new_file);
                 Ok(())
             }
-            Ok(_) => Err(std::io::Error::other(
-                "gzip failed",
-            )),
+            Ok(_) => Err(std::io::Error::other("gzip failed")),
             Err(e) => Err(e),
         }
     }

@@ -42,7 +42,10 @@ impl DefaultCollector {
             rpm_window: Mutex::new(VecDeque::with_capacity(4096)),
             ring_buffer: RingBuffer::new(10000),
             aggregator: RollingAggregator::new(300_000, 12),
-            wal: std::env::var("TELEMETRY_WAL_PATH").ok().as_deref().map(WAL::new),
+            wal: std::env::var("TELEMETRY_WAL_PATH")
+                .ok()
+                .as_deref()
+                .map(WAL::new),
             backend: RwLock::new(None),
             pool_dims: RwLock::new(PoolDimensionStats {
                 dispatch_size: 0,
@@ -139,7 +142,11 @@ impl DataCollector for DefaultCollector {
                 ts: event.ts,
                 node_id: event.node_id.clone(),
                 from_pool: event.pool.clone(),
-                to_pool: if event.success { "active".into() } else { "dispatch".into() },
+                to_pool: if event.success {
+                    "active".into()
+                } else {
+                    "dispatch".into()
+                },
                 reason: format!("schedule: score={}", event.score_before),
             });
         }
@@ -151,8 +158,16 @@ impl DataCollector for DefaultCollector {
                 ts: event.ts,
                 node_id: event.node_id.clone(),
                 from_pool: event.pool.clone(),
-                to_pool: if event.ok { "dispatch".into() } else { "dead".into() },
-                reason: format!("probe_{}: {}", if event.ok { "ok" } else { "fail" }, event.pool),
+                to_pool: if event.ok {
+                    "dispatch".into()
+                } else {
+                    "dead".into()
+                },
+                reason: format!(
+                    "probe_{}: {}",
+                    if event.ok { "ok" } else { "fail" },
+                    event.pool
+                ),
             });
         }
     }
@@ -216,22 +231,26 @@ impl DataCollector for DefaultCollector {
     }
 
     fn query_requests(&self, filter: &RequestFilter) -> RequestQueryResult {
-        let (items, cursor) = self.ring_buffer.query(
-            filter.since,
-            filter.limit,
-            filter.cursor,
-        );
+        let (items, cursor) = self
+            .ring_buffer
+            .query(filter.since, filter.limit, filter.cursor);
         // Apply post-filter for model/status if set
         let items = if filter.model.is_some() || filter.status.is_some() {
-            items.into_iter().filter(|r| {
-                let match_model = filter.model.as_ref().is_none_or(|m| r.model == *m);
-                let match_status = filter.status.is_none_or(|s| r.status == s);
-                match_model && match_status
-            }).collect()
+            items
+                .into_iter()
+                .filter(|r| {
+                    let match_model = filter.model.as_ref().is_none_or(|m| r.model == *m);
+                    let match_status = filter.status.is_none_or(|s| r.status == s);
+                    match_model && match_status
+                })
+                .collect()
         } else {
             items
         };
-        RequestQueryResult { items, next_cursor: cursor }
+        RequestQueryResult {
+            items,
+            next_cursor: cursor,
+        }
     }
 
     fn aggregator_snapshot(&self) -> serde_json::Value {
@@ -246,6 +265,13 @@ impl DataCollector for DefaultCollector {
     }
 
     fn recent_events(&self, limit: usize) -> Vec<PoolEvent> {
-        self.pool_events.read().unwrap().iter().rev().take(limit).cloned().collect()
+        self.pool_events
+            .read()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect()
     }
 }

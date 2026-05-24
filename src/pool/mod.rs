@@ -79,7 +79,11 @@ pub struct RequestMeta {
 
 pub trait Pool: Send + Sync {
     fn acquire(&self) -> Option<NodeRef>;
-    fn try_acquire_sticky(&self, _meta: &RequestMeta, _node_id: &NodeId) -> Result<NodeRef, DispatchError> {
+    fn try_acquire_sticky(
+        &self,
+        _meta: &RequestMeta,
+        _node_id: &NodeId,
+    ) -> Result<NodeRef, DispatchError> {
         Err(DispatchError::NoResource)
     }
     fn release(&self, node_id: &NodeId, result: &ResultKind);
@@ -91,7 +95,11 @@ pub trait Pool: Send + Sync {
 
 pub trait PoolManager: Send + Sync {
     fn dispatch(&self, req: &RequestMeta) -> Result<DispatchResult, DispatchError>;
-    fn dispatch_sticky(&self, meta: &RequestMeta, node_id: &str) -> Result<DispatchResult, DispatchError>;
+    fn dispatch_sticky(
+        &self,
+        meta: &RequestMeta,
+        node_id: &str,
+    ) -> Result<DispatchResult, DispatchError>;
     fn report(&self, node_id: NodeId, result: ResultKind, latency_us: u64);
     fn pool_stats(&self) -> PoolStats;
     fn fuse_all(&self);

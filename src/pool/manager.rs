@@ -37,6 +37,7 @@ where
     R: RateLimitedPool,
     K: DeadPool,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dispatch: Arc<D>,
         active: Arc<A>,

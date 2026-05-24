@@ -130,6 +130,10 @@ impl RateLimitedPool for RateLimitedPoolImpl {
     }
 
     fn get_node_ref(&self, node_id: &NodeId) -> Option<NodeRef> {
-        self.entries.read().unwrap().get(node_id).map(|e| e.node.clone())
+        self.entries
+            .read()
+            .unwrap()
+            .get(node_id)
+            .map(|e| e.node.clone())
     }
 }

@@ -22,13 +22,17 @@ fn err(msg: &str) -> Response {
 macro_rules! auth_h {
     ($name:ident, $body:expr) => {
         async fn $name(State(st): State<Arc<AppState>>, h: HeaderMap) -> Response {
-            if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+            if AdminService::check_auth(&h, &st).is_err() {
+                return err("unauthorized");
+            }
             $body(&st)
         }
     };
     ($name:ident, $body:expr, $extra:ty) => {
         async fn $name(State(st): State<Arc<AppState>>, h: HeaderMap, e: $extra) -> Response {
-            if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+            if AdminService::check_auth(&h, &st).is_err() {
+                return err("unauthorized");
+            }
             $body(&st, e)
         }
     };
@@ -62,58 +66,128 @@ auth_h!(events_recent_h, AdminService::events_recent);
 auth_h!(events_probes_h, AdminService::events_probes);
 auth_h!(nodes_list_h, AdminService::ledger_summary);
 
-async fn pool_by_name_h(State(st): State<Arc<AppState>>, h: HeaderMap, Path(n): Path<String>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+async fn pool_by_name_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(n): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     AdminService::pool_by_name(&st, &n)
 }
-async fn request_detail_h(State(st): State<Arc<AppState>>, h: HeaderMap, Path(rid): Path<String>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+async fn request_detail_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(rid): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     AdminService::request_detail(&st, &rid)
 }
-async fn requests_h(State(st): State<Arc<AppState>>, h: HeaderMap, Query(p): Query<HashMap<String, String>>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
-    AdminService::requests_list(&st, &RequestFilter {
-        model: p.get("model").cloned(),
-        status: p.get("status").and_then(|v| v.parse().ok()),
-        limit: p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100),
-        ..Default::default()
-    })
+async fn requests_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::requests_list(
+        &st,
+        &RequestFilter {
+            model: p.get("model").cloned(),
+            status: p.get("status").and_then(|v| v.parse().ok()),
+            limit: p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100),
+            ..Default::default()
+        },
+    )
 }
-async fn fuse_post_h(State(st): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<Value>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
-    AdminService::fuse_set(&st, b.get("open").and_then(|v| v.as_bool()).unwrap_or(false))
+async fn fuse_post_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Json(b): Json<Value>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::fuse_set(
+        &st,
+        b.get("open").and_then(|v| v.as_bool()).unwrap_or(false),
+    )
 }
-async fn node_add_h(State(st): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<Value>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+async fn node_add_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Json(b): Json<Value>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     let url = match b.get("url").and_then(|v| v.as_str()) {
         Some(u) => u,
-        None => return AdminService::error_response(axum::http::StatusCode::BAD_REQUEST, "missing url"),
+        None => {
+            return AdminService::error_response(axum::http::StatusCode::BAD_REQUEST, "missing url")
+        }
     };
     AdminService::node_add(&st, url)
 }
-async fn node_delete_h(State(st): State<Arc<AppState>>, h: HeaderMap, Path(nid): Path<String>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+async fn node_delete_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     AdminService::node_delete(&st, &nid)
 }
-async fn node_probe_h(State(st): State<Arc<AppState>>, h: HeaderMap, Path(nid): Path<String>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+async fn node_probe_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     AdminService::node_probe(&st, &nid)
 }
-async fn node_recover_h(State(st): State<Arc<AppState>>, h: HeaderMap, Path(nid): Path<String>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+async fn node_recover_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     AdminService::node_recover(&st, &nid)
 }
 async fn probe_now_h(State(st): State<Arc<AppState>>, h: HeaderMap) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     AdminService::probe_now(&st)
 }
-async fn requests_export_h(State(st): State<Arc<AppState>>, h: HeaderMap, Query(p): Query<HashMap<String, String>>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+async fn requests_export_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     let limit = p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10000);
     AdminService::requests_export(&st, limit)
 }
-async fn sys_log_level_h(State(st): State<Arc<AppState>>, h: HeaderMap, Path(level): Path<String>) -> Response {
-    if AdminService::check_auth(&h, &st).is_err() { return err("unauthorized"); }
+async fn sys_log_level_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(level): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
     AdminService::system_log_level(&level)
 }
 
@@ -154,8 +228,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
 
     // Static /admin/nodes and parameterized /admin/nodes/{node_id} in separate
     // routers to avoid matchit route conflict in axum 0.8.
-    let nodes_static = Router::new()
-        .route("/admin/nodes", get(nodes_list_h).post(node_add_h));
+    let nodes_static = Router::new().route("/admin/nodes", get(nodes_list_h).post(node_add_h));
     let nodes_param = Router::new()
         .route("/admin/nodes/{node_id}", delete(node_delete_h))
         .route("/admin/nodes/{node_id}/probe", post(node_probe_h))

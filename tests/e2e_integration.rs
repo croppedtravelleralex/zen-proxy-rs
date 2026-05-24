@@ -312,6 +312,69 @@ mod e2e {
     }
 
     #[test]
+    fn test_v4_transport_failure_returns_bad_gateway() {
+        let (child, port) = start_server_with_env(
+            19792,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", "http://127.0.0.1:9/zen"),
+                ("POOL_MAX_RETRIES", "0"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 openai transport-failure request");
+        assert_eq!(resp.status(), 502);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_runtime_rollback_uses_same_binary_for_legacy_and_v4() {
+        let (upstream_base, _) = start_mock_zen();
+        let (legacy_child, legacy_port) = start_server(19793);
+        let legacy_resp =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", legacy_port))
+                .expect("legacy models endpoint");
+        assert_eq!(legacy_resp.status(), 200);
+        let legacy_body: serde_json::Value = legacy_resp.json().unwrap();
+        let legacy_ids: Vec<&str> = legacy_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(legacy_ids, vec!["deepseek-v4-flash", "deepseek-v4-pro"]);
+        stop_server(legacy_child, legacy_port);
+
+        let (v4_child, v4_port) = start_server_with_env(
+            19794,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+            ],
+        );
+        let v4_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", v4_port))
+            .expect("v4 models endpoint");
+        assert_eq!(v4_resp.status(), 200);
+        let v4_body: serde_json::Value = v4_resp.json().unwrap();
+        let v4_ids: Vec<&str> = v4_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(v4_ids, vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]);
+        stop_server(v4_child, v4_port);
+    }
+
+    #[test]
     fn test_admin_nodes_requires_auth() {
         let (child, port) = start_server(19787);
         let client = reqwest::blocking::Client::new();
