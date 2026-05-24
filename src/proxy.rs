@@ -12,6 +12,7 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::collector::RequestTelemetry;
+use crate::config::ProviderMode;
 use crate::ledger::LedgerEvent;
 use crate::opencode_headers::{apply_opencode_headers, build_opencode_headers};
 use crate::pool::{DispatchError, ErrorKind, RequestMeta};
@@ -63,10 +64,23 @@ pub async fn proxy_handler(
         let provided = extract_bearer_token(&headers);
         if provided.as_deref() != Some(key.as_str()) {
             warn!("proxy authentication failed");
-            return (StatusCode::FORBIDDEN, Json(serde_json::json!({
-                "error": { "message": "invalid proxy api key" }
-            }))).into_response();
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": { "message": "invalid proxy api key" }
+                })),
+            )
+                .into_response();
         }
+    }
+
+    if conf.zen_provider_mode == ProviderMode::FreeModelKernel
+        && matches!(path.as_str(), "chat/completions" | "messages")
+    {
+        return crate::v4::provider::handle_v4_proxy(
+            &state, &path, &method, &headers, body, &client_id, start,
+        )
+        .await;
     }
 
     let (streaming, modified_body) = if body.is_empty() {
@@ -151,8 +165,16 @@ pub async fn proxy_handler(
             );
 
             let (status_code, error_code, message): (StatusCode, i64, String) = match status {
-                999 => (StatusCode::SERVICE_UNAVAILABLE, -999, "no proxy resources available".into()),
-                998 => (StatusCode::SERVICE_UNAVAILABLE, -998, "circuit open: upstream rate limit detected".into()),
+                999 => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    -999,
+                    "no proxy resources available".into(),
+                ),
+                998 => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    -998,
+                    "circuit open: upstream rate limit detected".into(),
+                ),
                 _ => (
                     StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                     status as i64,
@@ -171,13 +193,12 @@ pub async fn proxy_handler(
                 Json(serde_json::json!({
                     "error": { "code": error_code, "message": message }
                 })),
-            ).into_response();
+            )
+                .into_response();
 
             if let Some(secs) = retry_after {
-                resp.headers_mut().insert(
-                    "Retry-After",
-                    HeaderValue::from_str(&secs).unwrap(),
-                );
+                resp.headers_mut()
+                    .insert("Retry-After", HeaderValue::from_str(&secs).unwrap());
             }
 
             resp
@@ -257,9 +278,7 @@ async fn proxy_with_retry(
         }
 
         // Inject opencode headers
-        if let Some(opencode_headers) =
-            build_opencode_headers(headers, &conf, client_id, model)
-        {
+        if let Some(opencode_headers) = build_opencode_headers(headers, &conf, client_id, model) {
             upstream_req = apply_opencode_headers(upstream_req, &opencode_headers);
         }
 
@@ -294,9 +313,7 @@ async fn proxy_with_retry(
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(
-                            &conf.upstream_api_key,
-                        ),
+                        upstream_api_key_hash: LedgerEvent::short_hash(&conf.upstream_api_key),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,
@@ -393,9 +410,7 @@ async fn proxy_with_retry(
                             .and_then(|v| v.parse::<i64>().ok()),
                         error_type: Some("upstream_429".into()),
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(
-                            &conf.upstream_api_key,
-                        ),
+                        upstream_api_key_hash: LedgerEvent::short_hash(&conf.upstream_api_key),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,
@@ -430,9 +445,7 @@ async fn proxy_with_retry(
                         retry_after: None,
                         error_type: None,
                         latency_ms: latency,
-                        upstream_api_key_hash: LedgerEvent::short_hash(
-                            &conf.upstream_api_key,
-                        ),
+                        upstream_api_key_hash: LedgerEvent::short_hash(&conf.upstream_api_key),
                         user_agent_hash: None,
                         client_hash: None,
                         project_hash: None,

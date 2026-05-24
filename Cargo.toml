@@ -24,3 +24,4 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 hex = "0.4"
+free-model-client-rs = { path = "../free-model-client-rs" }
