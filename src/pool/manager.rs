@@ -7,6 +7,8 @@ use std::time::Duration;
 use crate::collector::{DataCollector, ProbeEvent};
 use crate::pool::probe_period::ProbePeriod;
 use crate::pool::*;
+use crate::v4::contracts::{DeadNodeState, DeadProbePolicy};
+use crate::v4::dead_probe::AdaptiveDeadProbePolicy;
 
 pub struct PoolManagerImpl<D, A, R, K>
 where
@@ -220,6 +222,9 @@ where
                 self.active.release(&node_id, &result);
                 self.dispatch.release(&node_id, &result);
                 self.dispatch.remove(&node_id);
+                if let Some(node) = self.nodes.read().unwrap().get(&node_id).cloned() {
+                    self.dead.add(node);
+                }
                 self.dead.bury(node_id);
             }
         }
@@ -312,6 +317,51 @@ where
         let ids: Vec<NodeId> = self.nodes.read().unwrap().keys().cloned().collect();
         for id in ids {
             let _ = self.probe_node(&id);
+        }
+    }
+
+    fn probe_dead_adaptive(&self) {
+        let policy = AdaptiveDeadProbePolicy::default();
+        let ids = self.dead.select_all_for_probe();
+        let dead_count = ids.len();
+        let batch_size = policy.next_batch_size(dead_count, 0.0);
+        if batch_size == 0 {
+            return;
+        }
+
+        let due_ids = ids
+            .into_iter()
+            .filter(|id| {
+                let dead_count = self.dead.dead_count(id);
+                let state = DeadNodeState {
+                    node_id: id.clone(),
+                    dead_count,
+                    last_probe_ts_ms: None,
+                    recent_recovery_rate: 0.0,
+                };
+                let delay = policy.next_delay_secs(&state);
+                let dead_age = self.dead.dead_age_secs(id).unwrap_or(0);
+                let probe_age = self.dead.last_probe_age_secs(id);
+                dead_age >= delay && probe_age.is_none_or(|age| age >= delay)
+            })
+            .take(batch_size)
+            .collect::<Vec<_>>();
+
+        for id in due_ids {
+            let Some(result) = self.probe_node(&id) else {
+                continue;
+            };
+            let consecutive_successes = self.dead.record_probe_result(&id, result.success);
+            if AdaptiveDeadProbePolicy::recovery_proven(consecutive_successes, false) {
+                self.recover_node(&id);
+            }
+            self.collector.record_probe(&ProbeEvent {
+                ts: chrono::Utc::now().timestamp(),
+                node_id: id,
+                pool: "dead_probe_adaptive".to_string(),
+                ok: result.success,
+                latency_ms: result.latency_ms,
+            });
         }
     }
 }

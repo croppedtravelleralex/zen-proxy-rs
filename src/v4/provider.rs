@@ -5,6 +5,7 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use free_model_client_rs::error::AppError;
 use free_model_client_rs::kernel::{FreeModelKernel, KernelConfig};
 use free_model_client_rs::protocol::types::{AnthropicRequest, ChatRequest};
 use serde_json::Value;
@@ -120,6 +121,43 @@ pub async fn handle_v4_proxy(
         }
         Err(err) => {
             state.upstream_health.record(err.status.as_u16());
+            if let Some(rid) = err.request_id.as_ref() {
+                let latency = start.elapsed().as_millis() as u64;
+                state.collector.record_request(&RequestTelemetry {
+                    rid: rid.clone(),
+                    ts: chrono::Utc::now().timestamp_millis(),
+                    model: public_model.clone(),
+                    public_model: public_model.clone(),
+                    upstream_model: err.upstream_model.clone(),
+                    protocol: if path == "messages" {
+                        "anthropic_messages".to_string()
+                    } else {
+                        "openai_chat_completions".to_string()
+                    },
+                    client_id: client_id.to_string(),
+                    path: path.to_string(),
+                    method: method.to_string(),
+                    is_streaming: streaming,
+                    node_url: err.node_url_redacted.clone().unwrap_or_default(),
+                    selected_node_id: err.selected_node_id.clone().unwrap_or_default(),
+                    selected_node_url_redacted: err.node_url_redacted.clone().unwrap_or_default(),
+                    observed_exit_ip: String::new(),
+                    outcome: err.outcome.clone(),
+                    pool: "dispatch".to_string(),
+                    exit_ip: String::new(),
+                    status: err.status.as_u16(),
+                    rate_limited: err.was_rate_limited,
+                    retry_count: err.retry_count,
+                    latency_total_ms: latency,
+                    upstream_ms: err.upstream_ms,
+                    ttft_ms: 0,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    bytes_sent: body.len() as u64,
+                    bytes_received: 0,
+                });
+            }
             let mut response = error_response(err.status, err.message);
             if let Some(retry_after) = err.retry_after_secs {
                 response.headers_mut().insert(
@@ -151,6 +189,61 @@ struct V4CallError {
     status: StatusCode,
     message: String,
     retry_after_secs: Option<u64>,
+    request_id: Option<String>,
+    selected_node_id: Option<String>,
+    node_url_redacted: Option<String>,
+    upstream_model: String,
+    outcome: String,
+    retry_count: u32,
+    was_rate_limited: bool,
+    upstream_ms: u64,
+}
+
+impl V4CallError {
+    fn before_dispatch(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            retry_after_secs: None,
+            request_id: None,
+            selected_node_id: None,
+            node_url_redacted: None,
+            upstream_model: String::new(),
+            outcome: "error".to_string(),
+            retry_count: 0,
+            was_rate_limited: false,
+            upstream_ms: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn after_dispatch(
+        status: StatusCode,
+        message: impl Into<String>,
+        retry_after_secs: Option<u64>,
+        request_id: String,
+        node_id: String,
+        node_url: &str,
+        upstream_model: &str,
+        outcome: &str,
+        retry_count: u32,
+        was_rate_limited: bool,
+        upstream_ms: u64,
+    ) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            retry_after_secs,
+            request_id: Some(request_id),
+            selected_node_id: Some(node_id),
+            node_url_redacted: Some(LedgerEvent::redact_node_url(node_url)),
+            upstream_model: upstream_model.to_string(),
+            outcome: outcome.to_string(),
+            retry_count,
+            was_rate_limited,
+            upstream_ms,
+        }
+    }
 }
 
 async fn call_with_retry(
@@ -162,7 +255,7 @@ async fn call_with_retry(
     public_model: &str,
     upstream_model: &str,
 ) -> Result<V4CallResult, V4CallError> {
-    let max = conf.pool_max_retries.max(1);
+    let max = conf.pool_max_retries;
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_node_id = String::new();
     let mut was_rate_limited = false;
@@ -199,30 +292,31 @@ async fn call_with_retry(
         let response = match path {
             "chat/completions" => {
                 let request = serde_json::from_value::<ChatRequest>(upstream_body.clone())
-                    .map_err(|err| V4CallError {
-                        status: StatusCode::BAD_REQUEST,
-                        message: format!("invalid OpenAI chat request: {err}"),
-                        retry_after_secs: None,
+                    .map_err(|err| {
+                        V4CallError::before_dispatch(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid OpenAI chat request: {err}"),
+                        )
                     })?;
                 kernel.openai_chat(&dispatch_result.client, request).await
             }
             "messages" => {
                 let request = serde_json::from_value::<AnthropicRequest>(upstream_body.clone())
-                    .map_err(|err| V4CallError {
-                        status: StatusCode::BAD_REQUEST,
-                        message: format!("invalid Anthropic messages request: {err}"),
-                        retry_after_secs: None,
+                    .map_err(|err| {
+                        V4CallError::before_dispatch(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid Anthropic messages request: {err}"),
+                        )
                     })?;
                 kernel
                     .anthropic_messages(&dispatch_result.client, request)
                     .await
             }
             _ => {
-                return Err(V4CallError {
-                    status: StatusCode::NOT_FOUND,
-                    message: format!("unsupported V4 path: {path}"),
-                    retry_after_secs: None,
-                })
+                return Err(V4CallError::before_dispatch(
+                    StatusCode::NOT_FOUND,
+                    format!("unsupported V4 path: {path}"),
+                ))
             }
         };
         let latency = call_start.elapsed().as_millis() as u64;
@@ -231,6 +325,11 @@ async fn call_with_retry(
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
+                    let observed_exit_ip = response
+                        .headers()
+                        .get("x-zen-observed-exit-ip")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToOwned::to_owned);
                     state.pool_manager.report(
                         node_id.clone(),
                         ResultKind::Success(status.as_u16()),
@@ -250,13 +349,14 @@ async fn call_with_retry(
                         None,
                         latency,
                         attempt,
+                        request_meta.stream,
                     );
                     return Ok(V4CallResult {
                         response,
                         request_id,
                         selected_node_id: node_id,
                         node_url_redacted: LedgerEvent::redact_node_url(&node_url),
-                        observed_exit_ip: None,
+                        observed_exit_ip,
                         upstream_model: upstream_model.to_string(),
                         outcome: "success".to_string(),
                         retry_count: attempt,
@@ -278,16 +378,30 @@ async fn call_with_retry(
                     status.as_u16(),
                     latency,
                     attempt,
+                    request_meta.stream,
                 );
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     was_rate_limited = true;
                 }
                 if attempt >= max {
-                    return Err(V4CallError {
+                    let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
+                        "rate_limited"
+                    } else {
+                        "upstream_error"
+                    };
+                    return Err(V4CallError::after_dispatch(
                         status,
-                        message: format!("upstream error {}", status.as_u16()),
-                        retry_after_secs: retry_after(&response),
-                    });
+                        format!("upstream error {}", status.as_u16()),
+                        retry_after(&response),
+                        request_id,
+                        node_id,
+                        &node_url,
+                        upstream_model,
+                        outcome,
+                        attempt,
+                        was_rate_limited,
+                        latency,
+                    ));
                 }
             }
             Err(err) => {
@@ -321,37 +435,61 @@ async fn call_with_retry(
                         Some("upstream_429"),
                         latency,
                         attempt,
+                        request_meta.stream,
                     );
                 } else {
+                    let (error_kind, outcome, error_type) = classify_app_error(&err);
                     state.pool_manager.report(
                         node_id.clone(),
-                        ResultKind::Error {
-                            kind: ErrorKind::Upstream5xx,
-                        },
+                        ResultKind::Error { kind: error_kind },
                         latency,
                     );
                     record_ledger(
                         state,
                         conf,
                         &request_id,
-                        "upstream_error",
+                        outcome,
                         &node_id,
                         &node_url,
                         public_model,
                         upstream_model,
                         status.as_u16(),
                         None,
-                        Some("upstream_error"),
+                        Some(error_type),
                         latency,
                         attempt,
+                        request_meta.stream,
                     );
                 }
                 if attempt >= max {
-                    return Err(V4CallError {
+                    let (error_kind, outcome, _) = classify_app_error(&err);
+                    let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
+                        "rate_limited"
+                    } else if matches!(
+                        error_kind,
+                        ErrorKind::Timeout
+                            | ErrorKind::ConnectionRefused
+                            | ErrorKind::DnsFailure
+                            | ErrorKind::SocksHandshake
+                            | ErrorKind::Other
+                    ) {
+                        "transport_error"
+                    } else {
+                        outcome
+                    };
+                    return Err(V4CallError::after_dispatch(
                         status,
-                        message: err.message,
-                        retry_after_secs: retry_after,
-                    });
+                        err.message,
+                        retry_after,
+                        request_id,
+                        node_id,
+                        &node_url,
+                        upstream_model,
+                        outcome,
+                        attempt,
+                        was_rate_limited || status == StatusCode::TOO_MANY_REQUESTS,
+                        latency,
+                    ));
                 }
             }
         }
@@ -359,11 +497,10 @@ async fn call_with_retry(
         tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
     }
 
-    Err(V4CallError {
-        status: last_status,
-        message: format!("upstream error {}", last_status.as_u16()),
-        retry_after_secs: None,
-    })
+    Err(V4CallError::before_dispatch(
+        last_status,
+        format!("upstream error {}", last_status.as_u16()),
+    ))
 }
 
 async fn dispatch_or_wait(
@@ -374,28 +511,24 @@ async fn dispatch_or_wait(
 ) -> Result<crate::pool::DispatchResult, V4CallError> {
     match state.pool_manager.dispatch(request_meta) {
         Ok(result) => Ok(result),
-        Err(DispatchError::CircuitOpen) => Err(V4CallError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "circuit open: upstream rate limit detected".to_string(),
-            retry_after_secs: None,
-        }),
+        Err(DispatchError::CircuitOpen) => Err(V4CallError::before_dispatch(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "circuit open: upstream rate limit detected",
+        )),
         Err(DispatchError::NoResource) => {
             if attempt < max {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                state
-                    .pool_manager
-                    .dispatch(request_meta)
-                    .map_err(|_| V4CallError {
-                        status: StatusCode::SERVICE_UNAVAILABLE,
-                        message: "no proxy resources available".to_string(),
-                        retry_after_secs: None,
-                    })
-            } else {
-                Err(V4CallError {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    message: "no proxy resources available".to_string(),
-                    retry_after_secs: None,
+                state.pool_manager.dispatch(request_meta).map_err(|_| {
+                    V4CallError::before_dispatch(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "no proxy resources available",
+                    )
                 })
+            } else {
+                Err(V4CallError::before_dispatch(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no proxy resources available",
+                ))
             }
         }
     }
@@ -413,6 +546,7 @@ fn report_status_failure(
     status: u16,
     latency: u64,
     attempt: u32,
+    stream: bool,
 ) {
     if status == 429 {
         state
@@ -432,6 +566,7 @@ fn report_status_failure(
             Some("upstream_429"),
             latency,
             attempt,
+            stream,
         );
     } else {
         state.pool_manager.report(
@@ -455,8 +590,37 @@ fn report_status_failure(
             Some("upstream_error"),
             latency,
             attempt,
+            stream,
         );
     }
+}
+
+fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str) {
+    let message = err.message.to_ascii_lowercase();
+    if err.status == StatusCode::GATEWAY_TIMEOUT || message.contains("timeout") {
+        return (ErrorKind::Timeout, "transport_error", "timeout");
+    }
+    if message.contains("connection refused") || message.contains("os error 111") {
+        return (
+            ErrorKind::ConnectionRefused,
+            "transport_error",
+            "connection_refused",
+        );
+    }
+    if message.contains("dns") {
+        return (ErrorKind::DnsFailure, "transport_error", "dns_failure");
+    }
+    if message.contains("socks") || message.contains("proxy") {
+        return (
+            ErrorKind::SocksHandshake,
+            "transport_error",
+            "socks_handshake",
+        );
+    }
+    if message.contains("upstream connection error") {
+        return (ErrorKind::Other, "transport_error", "network");
+    }
+    (ErrorKind::Upstream5xx, "upstream_error", "upstream_error")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -474,6 +638,7 @@ fn record_ledger(
     error_type: Option<&str>,
     latency: u64,
     attempt: u32,
+    stream: bool,
 ) {
     state.ledger.record(&LedgerEvent {
         ts: chrono::Utc::now().timestamp_millis(),
@@ -482,7 +647,7 @@ fn record_ledger(
         node_id: node_id.to_string(),
         node_url_redacted: LedgerEvent::redact_node_url(node_url),
         model: format!("{public_model}->{upstream_model}"),
-        stream: false,
+        stream,
         status,
         retry_after,
         error_type: error_type.map(ToOwned::to_owned),
@@ -528,10 +693,11 @@ async fn buffered_response(response: Response) -> Result<(Response, u64), V4Call
     let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), 1024 * 1024)
         .await
-        .map_err(|err| V4CallError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("failed to read provider response body: {err}"),
-            retry_after_secs: None,
+        .map_err(|err| {
+            V4CallError::before_dispatch(
+                StatusCode::BAD_GATEWAY,
+                format!("failed to read provider response body: {err}"),
+            )
         })?;
     let len = bytes.len() as u64;
     let mut rebuilt = Response::new(Body::from(bytes));

@@ -32,6 +32,7 @@ release gates pass
 | Transport Failure | fault injection | timeout/refused/SOCKS failure moves node to Dead |
 | Sticky Retry | fault injection | retry tries same node before spending another node |
 | Dead Probe | scheduler tests | 60-120 minute jitter and adaptive batch rules hold |
+| No-Retry Semantics | fault injection | `POOL_MAX_RETRIES=0` sends exactly one upstream request |
 | Observability | admin/WAL/metrics check | same request id appears across request detail, WAL, metrics-derived data |
 | Rollback | runtime drill | switch between legacy and FreeModel mode without rebuild |
 | Release | commands | fmt, clippy, tests, release build pass |
@@ -246,4 +247,3 @@ Rollback requirements:
 
 The V4.0 implementation targets a 99-point engineering standard. The remaining
 uncertainty is long-running production evidence after acceptance passes.
-

@@ -202,6 +202,17 @@ async fn main() {
         });
     }
 
+    // Background: low-frequency adaptive Dead-pool recovery.
+    {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60 * 60)).await;
+                state.pool_manager.probe_dead_adaptive();
+            }
+        });
+    }
+
     // SIGHUP hot-reload
     {
         let state = app_state.clone();

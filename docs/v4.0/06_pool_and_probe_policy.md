@@ -62,6 +62,15 @@ or
 1 complete chat probe success with non-429 status
 ```
 
+Implementation notes:
+
+- automatic Dead probing is driven by `PoolManager::probe_dead_adaptive`.
+- the background scheduler runs at low frequency; it does not call `probe_all`.
+- probe batches are selected from due Dead entries only, using the V4 adaptive
+  batch policy.
+- probe requests go through the embedded `free-model-client-rs` kernel with the
+  selected node's `reqwest::Client`.
+
 ## Probe Requirements
 
 Probe requests must use the same transport class and provider request builder as
@@ -83,8 +92,8 @@ The provider adapter resolves the public model before sending upstream.
 ## Anti-Patterns
 
 - scanning all dead nodes every minute.
+- using `probe_all` as the automatic Dead recovery loop.
 - using probe traffic that does not include the same auth/header path as real
   requests.
 - moving 429 nodes to Dead.
 - selecting a fresh node on every retry by default.
-

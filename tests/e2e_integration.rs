@@ -90,7 +90,10 @@ fn start_mock_zen() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
                 let body = format!("data: {}\n\ndata: [DONE]\n\n", chunk);
                 (
                     StatusCode::OK,
-                    [("content-type", "text/event-stream")],
+                    [
+                        ("content-type", "text/event-stream"),
+                        ("x-zen-observed-exit-ip", "direct"),
+                    ],
                     body,
                 )
                     .into_response()
@@ -274,6 +277,7 @@ mod e2e {
         assert_eq!(openai_record["upstream_model"], "deepseek-v4-flash-free");
         assert_eq!(openai_record["selected_node_id"], "direct");
         assert_eq!(openai_record["selected_node_url_redacted"], "direct");
+        assert_eq!(openai_record["observed_exit_ip"], "direct");
         assert_eq!(openai_record["outcome"], "success");
         stop_server(child, port);
     }
@@ -308,6 +312,22 @@ mod e2e {
         );
         let seen = observed.lock().unwrap();
         assert_eq!(seen[0]["selected_node_id"], "direct");
+        assert_eq!(seen.len(), 1, "POOL_MAX_RETRIES=0 must not retry");
+        drop(seen);
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let items = requests_body["data"].as_array().unwrap();
+        let rate_limited_record = items
+            .iter()
+            .find(|item| item["status"] == 429)
+            .expect("429 request telemetry");
+        assert_eq!(rate_limited_record["outcome"], "rate_limited");
+        assert_eq!(rate_limited_record["retry_count"], 0);
         stop_server(child, port);
     }
 
@@ -332,6 +352,20 @@ mod e2e {
             .send()
             .expect("v4 openai transport-failure request");
         assert_eq!(resp.status(), 502);
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let items = requests_body["data"].as_array().unwrap();
+        let failure_record = items
+            .iter()
+            .find(|item| item["status"] == 502)
+            .expect("transport failure request telemetry");
+        assert_eq!(failure_record["outcome"], "transport_error");
+        assert_eq!(failure_record["retry_count"], 0);
         stop_server(child, port);
     }
 

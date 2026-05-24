@@ -1,5 +1,9 @@
 use std::time::Duration;
 
+use free_model_client_rs::kernel::{FreeModelKernel, KernelConfig};
+use free_model_client_rs::protocol::types::{ChatRequest, Message};
+use serde_json::Value;
+
 use crate::pool::*;
 
 pub struct ProbePeriod;
@@ -12,28 +16,37 @@ impl ProbePeriod {
         timeout_secs: u64,
         api_key: &str,
     ) -> bool {
-        let probe_url = format!(
+        let zen_chat_url = format!(
             "{}/v1/chat/completions",
             upstream_base.trim_end_matches('/')
         );
-        let body = serde_json::json!({
-            "model": "big-pickle",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": false,
+        let kernel = FreeModelKernel::new(KernelConfig {
+            zen_chat_url,
+            zen_api_key: api_key.to_string(),
+            extra_headers: vec![("x-zen-proxy-probe".to_string(), "dead".to_string())],
         });
-
         for i in 0..3 {
             if i > 0 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
+            let request = ChatRequest {
+                model: "deepseek-v4-flash-free".to_string(),
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: Value::String("Reply exactly: OK".to_string()),
+                    tool_calls: None,
+                }],
+                stream: Some(false),
+                max_tokens: Some(32),
+                temperature: None,
+                top_p: None,
+                tools: None,
+                tool_choice: None,
+            };
 
             let result = tokio::time::timeout(
                 Duration::from_secs(timeout_secs),
-                client
-                    .post(&probe_url)
-                    .header("x-api-key", api_key)
-                    .json(&body)
-                    .send(),
+                kernel.openai_chat(client, request),
             )
             .await;
 

@@ -109,6 +109,7 @@ pub trait PoolManager: Send + Sync {
     fn probe_node(&self, node_id: &str) -> Option<ProbeResult>;
     fn recover_node(&self, node_id: &str);
     fn probe_all(&self);
+    fn probe_dead_adaptive(&self);
 }
 
 pub trait RateLimitedPool: Pool {
@@ -123,6 +124,9 @@ pub trait RateLimitedPool: Pool {
 pub trait DeadPool: Pool {
     fn bury(&self, node_id: NodeId);
     fn select_all_for_probe(&self) -> Vec<NodeId>;
+    fn dead_age_secs(&self, node_id: &NodeId) -> Option<u64>;
+    fn last_probe_age_secs(&self, node_id: &NodeId) -> Option<u64>;
+    fn record_probe_result(&self, node_id: &NodeId, success: bool) -> u8;
     fn recover(&self, node_id: &NodeId);
     fn dead_count(&self, node_id: &NodeId) -> u32;
     fn get_node_ref(&self, node_id: &NodeId) -> Option<NodeRef>;
