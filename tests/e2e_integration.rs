@@ -257,6 +257,24 @@ mod e2e {
         assert_eq!(seen[1]["body"]["model"], "big-pickle");
         assert_eq!(seen[0]["selected_node_id"], "direct");
         assert_eq!(seen[0]["selected_node_url"], "direct");
+
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let items = requests_body["data"].as_array().unwrap();
+        let openai_record = items
+            .iter()
+            .find(|item| item["public_model"] == "deepseek-v4-flash")
+            .unwrap();
+        assert!(openai_record["rid"].as_str().is_some());
+        assert_eq!(openai_record["upstream_model"], "deepseek-v4-flash-free");
+        assert_eq!(openai_record["selected_node_id"], "direct");
+        assert_eq!(openai_record["selected_node_url_redacted"], "direct");
+        assert_eq!(openai_record["outcome"], "success");
         stop_server(child, port);
     }
 

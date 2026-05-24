@@ -3,7 +3,6 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-
 use crate::collector::RequestFilter;
 
 use crate::state::AppState;
@@ -23,7 +22,10 @@ impl AdminService {
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(|s| s.to_string())
             .or_else(|| {
-                headers.get("x-api-key").and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+                headers
+                    .get("x-api-key")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
             });
         match provided {
             Some(ref p) if p == key => Ok(()),
@@ -56,7 +58,9 @@ impl AdminService {
             "upstream": { "backoff": state.upstream_health.is_backoff() }
         }))
     }
-    pub fn health_live() -> Response { Self::ok_response(json!({ "status":"alive" })) }
+    pub fn health_live() -> Response {
+        Self::ok_response(json!({ "status":"alive" }))
+    }
     pub fn health_ready(state: &AppState) -> Response {
         let pools = state.pool_manager.pool_stats();
         let cfg = state.config.read().unwrap();
@@ -99,13 +103,17 @@ impl AdminService {
     pub fn stats_upstream(state: &AppState) -> Response {
         Self::ok_response(json!({ "backoff": state.upstream_health.is_backoff() }))
     }
-    pub fn pools(state: &AppState) -> Response { Self::stats_pools(state) }
+    pub fn pools(state: &AppState) -> Response {
+        Self::stats_pools(state)
+    }
     pub fn pool_by_name(state: &AppState, name: &str) -> Response {
         let p = state.pool_manager.pool_stats();
         match name {
             "dispatch" => Self::ok_response(json!({"name":"dispatch","size":p.dispatch_size})),
             "active" => Self::ok_response(json!({"name":"active","size":p.active_size})),
-            "ratelimited" => Self::ok_response(json!({"name":"ratelimited","size":p.ratelimited_size})),
+            "ratelimited" => {
+                Self::ok_response(json!({"name":"ratelimited","size":p.ratelimited_size}))
+            }
             "dead" => Self::ok_response(json!({"name":"dead","size":p.dead_size})),
             _ => Self::error_response(StatusCode::NOT_FOUND, "unknown pool"),
         }
@@ -114,11 +122,16 @@ impl AdminService {
     // --- Fuse ---
     pub fn fuse_status(state: &AppState) -> Response {
         let p = state.pool_manager.pool_stats();
-        Self::ok_response(json!({"fuse":p.fuse,"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size}}))
+        Self::ok_response(
+            json!({"fuse":p.fuse,"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size}}),
+        )
     }
     pub fn fuse_set(state: &AppState, open: bool) -> Response {
-        if open { state.pool_manager.fuse_all(); }
-        else { state.pool_manager.unfuse_all(); }
+        if open {
+            state.pool_manager.fuse_all();
+        } else {
+            state.pool_manager.unfuse_all();
+        }
         Self::fuse_status(state)
     }
 
@@ -127,11 +140,16 @@ impl AdminService {
         let result = state.collector.query_requests(filter);
         let items: Vec<Value> = result.items.iter().map(|r| json!(r)).collect();
         let mut resp = json!({ "success": true, "data": items });
-        if let Some(c) = result.next_cursor { resp["meta"] = json!({ "next_cursor": c }); }
+        if let Some(c) = result.next_cursor {
+            resp["meta"] = json!({ "next_cursor": c });
+        }
         Json(resp).into_response()
     }
     pub fn request_detail(state: &AppState, rid: &str) -> Response {
-        let filter = RequestFilter { rid: Some(rid.into()), ..Default::default() };
+        let filter = RequestFilter {
+            rid: Some(rid.into()),
+            ..Default::default()
+        };
         let result = state.collector.query_requests(&filter);
         match result.items.into_iter().next() {
             Some(r) => Self::ok_response(json!(r)),
@@ -139,16 +157,33 @@ impl AdminService {
         }
     }
     pub fn requests_recent(state: &AppState) -> Response {
-        Self::ok_response(json!(state.collector.query_requests(&RequestFilter { limit: 100, ..Default::default() }).items))
+        Self::ok_response(json!(
+            state
+                .collector
+                .query_requests(&RequestFilter {
+                    limit: 100,
+                    ..Default::default()
+                })
+                .items
+        ))
     }
     pub fn requests_summary(state: &AppState) -> Response {
         let s = state.collector.snapshot();
-        Self::ok_response(json!({"total":s.requests.total,"success":s.requests.success,"count_429":s.requests.count_429,"count_4xx":s.requests.count_4xx,"count_5xx":s.requests.count_5xx,"rpm":s.requests.rpm,"avg_latency_ms":s.requests.avg_latency_ms}))
+        Self::ok_response(
+            json!({"total":s.requests.total,"success":s.requests.success,"count_429":s.requests.count_429,"count_4xx":s.requests.count_4xx,"count_5xx":s.requests.count_5xx,"rpm":s.requests.rpm,"avg_latency_ms":s.requests.avg_latency_ms}),
+        )
     }
-    pub fn requests_models(state: &AppState) -> Response { Self::stats_models(state) }
-    pub fn requests_nodes(state: &AppState) -> Response { Self::stats_nodes(state) }
+    pub fn requests_models(state: &AppState) -> Response {
+        Self::stats_models(state)
+    }
+    pub fn requests_nodes(state: &AppState) -> Response {
+        Self::stats_nodes(state)
+    }
     pub fn requests_export(state: &AppState, limit: usize) -> Response {
-        let result = state.collector.query_requests(&RequestFilter { limit, ..Default::default() });
+        let result = state.collector.query_requests(&RequestFilter {
+            limit,
+            ..Default::default()
+        });
         let mut body = String::new();
         for item in &result.items {
             if let Ok(line) = serde_json::to_string(item) {
@@ -172,12 +207,17 @@ impl AdminService {
     }
     pub fn events_probes(state: &AppState) -> Response {
         let all = state.collector.recent_events(500);
-        let probes: Vec<_> = all.into_iter().filter(|e| e.reason.starts_with("probe_")).collect();
+        let probes: Vec<_> = all
+            .into_iter()
+            .filter(|e| e.reason.starts_with("probe_"))
+            .collect();
         Self::ok_response(probes)
     }
 
     // --- Ledger ---
-    pub fn ledger_summary(state: &AppState) -> Response { Self::ok_response(state.ledger.summary()) }
+    pub fn ledger_summary(state: &AppState) -> Response {
+        Self::ok_response(state.ledger.summary())
+    }
     pub fn ledger_models(state: &AppState) -> Response {
         let m = state.ledger.by_model_summary();
         Self::ok_response(m.into_iter().map(|(k,v)| (k,json!({"requests":v.requests,"success":v.success,"429":v.count_429,"5xx":v.count_5xx}))).collect::<Value>())
@@ -200,6 +240,8 @@ impl AdminService {
             "probe_timeout_secs": cfg.probe_timeout_secs,
             "allow_direct_fallback": cfg.allow_direct_fallback,
             "pool_starvation_retry_after_secs": cfg.pool_starvation_retry_after_secs,
+            "zen_provider_mode": cfg.zen_provider_mode.to_string(),
+            "v4_model_registry_enabled": cfg.v4_model_registry_enabled,
             "admin_api_key_configured": cfg.admin_api_key.is_some(),
             "proxy_api_key_configured": cfg.proxy_api_key.is_some(),
         }))
@@ -222,7 +264,8 @@ impl AdminService {
             warnings.push("POOL_MAX_RETRIES is 0 — no retries on failure".into());
         }
         if cfg.allow_direct_fallback {
-            warnings.push("ALLOW_DIRECT_FALLBACK is enabled — requests may bypass proxy pool".into());
+            warnings
+                .push("ALLOW_DIRECT_FALLBACK is enabled — requests may bypass proxy pool".into());
         }
         Self::ok_response(json!({
             "valid": warnings.is_empty(),
@@ -232,12 +275,16 @@ impl AdminService {
 
     // --- System ---
     pub fn system_uptime(state: &AppState) -> Response {
-        Self::ok_response(json!({"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"version":env!("CARGO_PKG_VERSION")}))
+        Self::ok_response(
+            json!({"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"version":env!("CARGO_PKG_VERSION")}),
+        )
     }
     pub fn system_info(state: &AppState) -> Response {
         let p = state.pool_manager.pool_stats();
         let s = state.collector.snapshot();
-        Self::ok_response(json!({"version":env!("CARGO_PKG_VERSION"),"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size,"fuse":p.fuse},"requests":{"total":s.requests.total,"success":s.requests.success,"rpm":s.requests.rpm},"upstream":{"backoff":state.upstream_health.is_backoff()}}))
+        Self::ok_response(
+            json!({"version":env!("CARGO_PKG_VERSION"),"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size,"fuse":p.fuse},"requests":{"total":s.requests.total,"success":s.requests.success,"rpm":s.requests.rpm},"upstream":{"backoff":state.upstream_health.is_backoff()}}),
+        )
     }
     pub fn system_log_level(level: &str) -> Response {
         match crate::set_log_level(level) {
@@ -257,7 +304,9 @@ impl AdminService {
     }
     pub fn node_probe(state: &AppState, node_id: &str) -> Response {
         match state.pool_manager.probe_node(node_id) {
-            Some(result) => Self::ok_response(json!({"success":result.success,"latency_ms":result.latency_ms})),
+            Some(result) => {
+                Self::ok_response(json!({"success":result.success,"latency_ms":result.latency_ms}))
+            }
             None => Self::error_response(StatusCode::NOT_FOUND, "node not found"),
         }
     }

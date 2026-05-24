@@ -125,11 +125,22 @@ pub async fn proxy_handler(
                 rid: uuid::Uuid::new_v4().to_string(),
                 ts: chrono::Utc::now().timestamp_millis(),
                 model: pr.model.clone(),
+                public_model: pr.model.clone(),
+                upstream_model: pr.model.clone(),
+                protocol: if path == "messages" {
+                    "anthropic_messages".to_string()
+                } else {
+                    "openai_chat_completions".to_string()
+                },
                 client_id: client_id.clone(),
                 path: path.clone(),
                 method: method.to_string(),
                 is_streaming: streaming,
                 node_url: pr.node_url.clone(),
+                selected_node_id: String::new(),
+                selected_node_url_redacted: LedgerEvent::redact_node_url(&pr.node_url),
+                observed_exit_ip: String::new(),
+                outcome: if status < 400 { "success" } else { "error" }.to_string(),
                 pool: pr.pool.clone(),
                 exit_ip: String::new(),
                 status,

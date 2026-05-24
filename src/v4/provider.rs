@@ -84,12 +84,23 @@ pub async fn handle_v4_proxy(
             state.collector.record_request(&RequestTelemetry {
                 rid: result.request_id.clone(),
                 ts: chrono::Utc::now().timestamp_millis(),
-                model: public_model,
+                model: public_model.clone(),
+                public_model: public_model.clone(),
+                upstream_model: result.upstream_model,
+                protocol: if path == "messages" {
+                    "anthropic_messages".to_string()
+                } else {
+                    "openai_chat_completions".to_string()
+                },
                 client_id: client_id.to_string(),
                 path: path.to_string(),
                 method: method.to_string(),
                 is_streaming: streaming,
                 node_url: result.node_url_redacted.clone(),
+                selected_node_id: result.selected_node_id,
+                selected_node_url_redacted: result.node_url_redacted.clone(),
+                observed_exit_ip: result.observed_exit_ip.clone().unwrap_or_default(),
+                outcome: result.outcome,
                 pool: "dispatch".to_string(),
                 exit_ip: result.observed_exit_ip.unwrap_or_default(),
                 status,
@@ -124,8 +135,11 @@ pub async fn handle_v4_proxy(
 struct V4CallResult {
     response: Response,
     request_id: String,
+    selected_node_id: String,
     node_url_redacted: String,
     observed_exit_ip: Option<String>,
+    upstream_model: String,
+    outcome: String,
     retry_count: u32,
     was_rate_limited: bool,
     upstream_ms: u64,
@@ -248,8 +262,11 @@ async fn call_with_retry(
                     return Ok(V4CallResult {
                         response,
                         request_id,
+                        selected_node_id: node_id,
                         node_url_redacted: LedgerEvent::redact_node_url(&node_url),
                         observed_exit_ip: None,
+                        upstream_model: upstream_model.to_string(),
+                        outcome: "success".to_string(),
                         retry_count: attempt,
                         was_rate_limited,
                         upstream_ms: latency,
