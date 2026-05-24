@@ -345,7 +345,7 @@ mod e2e {
     fn test_v4_proxy_api_key_accepts_x_api_key_header() {
         let (upstream_base, observed) = start_mock_zen();
         let (child, port) = start_server_with_env(
-            19798,
+            19800,
             &[
                 ("ZEN_PROVIDER_MODE", "free_model_kernel"),
                 ("UPSTREAM_BASE", upstream_base.as_str()),
@@ -367,6 +367,53 @@ mod e2e {
             .expect("v4 openai request with x-api-key");
         assert_eq!(resp.status(), 200);
         assert_eq!(observed.lock().unwrap().len(), 1);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_stream_telemetry_records_bytes_and_usage() {
+        let (upstream_base, _) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19801,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash-lite",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }))
+            .send()
+            .expect("v4 openai stream request");
+        let status = resp.status();
+        let body = resp.text().unwrap();
+        assert_eq!(status, 200, "stream response body: {body}");
+        assert!(body.contains("data: [DONE]"));
+
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let stream_record = requests_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["is_streaming"] == true)
+            .expect("stream telemetry record");
+        assert_eq!(stream_record["prompt_tokens"], 2);
+        assert_eq!(stream_record["completion_tokens"], 3);
+        assert_eq!(stream_record["total_tokens"], 5);
+        assert!(stream_record["bytes_received"].as_u64().unwrap_or(0) > 0);
         stop_server(child, port);
     }
 
@@ -555,6 +602,7 @@ mod e2e {
             "/admin/models",
             "/admin/models/deepseek-v4-flash",
             "/admin/budget",
+            "/admin/budget/nodes",
             "/admin/stats",
             "/admin/stats/models",
             "/admin/stats/nodes",
@@ -621,6 +669,15 @@ mod e2e {
             .expect("missing admin model endpoint");
         assert_eq!(missing_model.status(), 404);
 
+        let budget_nodes = client
+            .get(format!("http://127.0.0.1:{}/admin/budget/nodes", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("budget nodes endpoint");
+        assert_eq!(budget_nodes.status(), 200);
+        let body: serde_json::Value = budget_nodes.json().unwrap();
+        assert!(body["data"]["nodes"].as_array().unwrap().is_empty());
+
         stop_server(child, port);
     }
 
@@ -664,6 +721,19 @@ mod e2e {
             .expect("nodes endpoint");
         let nodes_body: serde_json::Value = nodes_resp.json().unwrap();
         assert_eq!(nodes_body["data"]["pools"]["dispatch"], 1);
+
+        let budget_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/nodes/{}/budget",
+                port, node_id
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("node budget endpoint");
+        assert_eq!(budget_resp.status(), 200);
+        let budget_body: serde_json::Value = budget_resp.json().unwrap();
+        assert_eq!(budget_body["data"]["node_id"], node_id);
+        assert!(budget_body["data"]["local_budget"].is_object());
 
         let probe_missing_resp = client
             .post(format!(

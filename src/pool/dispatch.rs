@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::pool::global_budget::GlobalBudgetRegistry;
 use crate::pool::*;
 use reqwest::Client;
+use serde_json::{json, Value};
 
 const SCORE_SCALE: u64 = 100;
 const DEFAULT_MAX_CALLS_PER_WINDOW: u64 = 100;
@@ -266,6 +267,43 @@ impl PoolNode {
             budget_hit_reason: budget.budget_hit_reason.clone(),
         }
     }
+
+    fn detail(&self, global_budget: Option<&GlobalBudgetRegistry>) -> Value {
+        let snapshot = self.snapshot();
+        let global = global_budget
+            .map(|registry| registry.snapshot(&self.node.id))
+            .unwrap_or_default();
+        json!({
+            "node_id": snapshot.node_id,
+            "node_url_redacted": crate::ledger::LedgerEvent::redact_node_url(&self.node.url),
+            "state": snapshot.node_state,
+            "score": self.score(),
+            "base_score": self.base_score.load(Ordering::Relaxed) as f64 / SCORE_SCALE as f64,
+            "consecutive_successes": self.consecutive_successes.load(Ordering::Relaxed),
+            "recent_success_rate": self.recent_success_rate(),
+            "avg_latency_ms": self.avg_latency_ms.load(Ordering::Relaxed),
+            "idle_secs": chrono::Utc::now().timestamp().saturating_sub(self.idle_since.load(Ordering::Relaxed)),
+            "local_budget": {
+                "calls_in_window": snapshot.calls_in_window,
+                "tokens_in_window": snapshot.tokens_in_window,
+                "kb_in_window": snapshot.kb_in_window,
+                "concurrent_now": snapshot.concurrent_now,
+                "max_concurrent": snapshot.max_concurrent,
+                "cooldown_until": snapshot.cooldown_until,
+                "budget_hit_reason": snapshot.budget_hit_reason,
+            },
+            "global_budget": global,
+        })
+    }
+
+    fn recent_success_rate(&self) -> f64 {
+        let recent = self.recent_results.read().unwrap();
+        if recent.is_empty() {
+            return 0.0;
+        }
+        let successes = recent.iter().filter(|&&value| value).count();
+        successes as f64 / recent.len() as f64
+    }
 }
 
 pub struct DispatchPool {
@@ -478,6 +516,24 @@ impl Pool for DispatchPool {
 
     fn budget_counts(&self) -> (usize, usize, usize) {
         self.budget_counts()
+    }
+
+    fn budget_details(&self) -> Vec<Value> {
+        self.nodes
+            .read()
+            .unwrap()
+            .iter()
+            .map(|node| node.detail(self.global_budget.as_ref()))
+            .collect()
+    }
+
+    fn node_budget_detail(&self, node_id: &NodeId) -> Option<Value> {
+        self.nodes
+            .read()
+            .unwrap()
+            .iter()
+            .find(|node| node.node.id == *node_id)
+            .map(|node| node.detail(self.global_budget.as_ref()))
     }
 
     fn name(&self) -> &'static str {

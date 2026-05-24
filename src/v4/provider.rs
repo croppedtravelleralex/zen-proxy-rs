@@ -8,9 +8,12 @@ use axum::Json;
 use free_model_client_rs::error::AppError;
 use free_model_client_rs::kernel::{FreeModelKernel, KernelConfig};
 use free_model_client_rs::protocol::types::{AnthropicRequest, ChatRequest};
+use futures::StreamExt;
 use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
-use crate::collector::RequestTelemetry;
+use crate::collector::{DataCollector, RequestTelemetry};
 use crate::config::Config;
 use crate::ledger::LedgerEvent;
 use crate::pool::{DispatchError, ErrorKind, RequestMeta, ResultKind};
@@ -81,6 +84,14 @@ pub async fn handle_v4_proxy(
         stream: streaming,
         body_size: body.len() as u64,
     };
+    let stream_usage_fallback = if streaming {
+        UsageCounts {
+            prompt_tokens: estimate_prompt_tokens(path, &upstream_body),
+            ..UsageCounts::default()
+        }
+    } else {
+        UsageCounts::default()
+    };
 
     match call_with_retry(
         state,
@@ -96,7 +107,7 @@ pub async fn handle_v4_proxy(
         Ok(result) => {
             let latency = start.elapsed().as_millis() as u64;
             let status = result.response.status().as_u16();
-            state.collector.record_request(&RequestTelemetry {
+            let telemetry = RequestTelemetry {
                 rid: result.request_id.clone(),
                 ts: chrono::Utc::now().timestamp_millis(),
                 model: public_model.clone(),
@@ -129,9 +140,20 @@ pub async fn handle_v4_proxy(
                 total_tokens: result.usage.total_tokens,
                 bytes_sent: body.len() as u64,
                 bytes_received: result.body_bytes_len,
-            });
+            };
             state.upstream_health.record(status);
-            let mut response = result.response;
+            let mut response = if streaming {
+                metered_stream_response(
+                    result.response,
+                    path.to_string(),
+                    telemetry,
+                    stream_usage_fallback,
+                    state.collector.clone(),
+                )
+            } else {
+                state.collector.record_request(&telemetry);
+                result.response
+            };
             response.headers_mut().insert(
                 "x-zen-stream-seen",
                 HeaderValue::from_static(if streaming { "true" } else { "false" }),
@@ -766,6 +788,176 @@ async fn buffered_response_with_usage(
     Ok((rebuilt, len, usage))
 }
 
+fn metered_stream_response(
+    response: Response,
+    path: String,
+    telemetry: RequestTelemetry,
+    fallback_usage: UsageCounts,
+    collector: Arc<dyn DataCollector>,
+) -> Response {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut upstream = response.into_body().into_data_stream();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(16);
+
+    tokio::spawn(async move {
+        let mut metrics = StreamMetrics::new(fallback_usage);
+        while let Some(item) = upstream.next().await {
+            match item {
+                Ok(bytes) => {
+                    metrics.ingest(&path, &bytes);
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+        let mut telemetry = telemetry;
+        telemetry.bytes_received = metrics.bytes_received;
+        let usage = metrics.final_usage();
+        telemetry.prompt_tokens = usage.prompt_tokens;
+        telemetry.completion_tokens = usage.completion_tokens;
+        telemetry.total_tokens = usage.total_tokens;
+        collector.record_request(&telemetry);
+    });
+
+    let mut rebuilt = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    *rebuilt.status_mut() = status;
+    *rebuilt.headers_mut() = headers;
+    rebuilt
+}
+
+#[derive(Default)]
+struct StreamMetrics {
+    bytes_received: u64,
+    usage: UsageCounts,
+    fallback_usage: UsageCounts,
+    completion_text: String,
+    buffer: String,
+}
+
+impl StreamMetrics {
+    fn new(fallback_usage: UsageCounts) -> Self {
+        Self {
+            fallback_usage,
+            ..Self::default()
+        }
+    }
+
+    fn ingest(&mut self, path: &str, bytes: &Bytes) {
+        self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
+        let text = String::from_utf8_lossy(bytes);
+        self.buffer.push_str(&text);
+        while let Some(idx) = self.buffer.find("\n\n") {
+            let frame = self.buffer[..idx].to_string();
+            self.buffer.drain(..idx + 2);
+            self.ingest_sse_frame(path, &frame);
+        }
+    }
+
+    fn ingest_sse_frame(&mut self, path: &str, frame: &str) {
+        for line in frame.lines() {
+            let Some(data) = line.trim_start().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            self.ingest_usage_value(path, &value);
+        }
+    }
+
+    fn ingest_usage_value(&mut self, path: &str, value: &Value) {
+        if path == "messages" {
+            if let Some(usage) = value
+                .get("message")
+                .and_then(|message| message.get("usage"))
+                .or_else(|| value.get("usage"))
+            {
+                self.usage.prompt_tokens = usage_u32(usage, "input_tokens");
+                let output_tokens = usage_u32(usage, "output_tokens");
+                if output_tokens > 0 {
+                    self.usage.completion_tokens = output_tokens;
+                }
+                self.usage.total_tokens = self
+                    .usage
+                    .prompt_tokens
+                    .saturating_add(self.usage.completion_tokens);
+            }
+            return;
+        }
+
+        if let Some(text) = value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("content"))
+            .and_then(|content| content.as_str())
+        {
+            self.completion_text.push_str(text);
+        }
+
+        let Some(usage) = value.get("usage") else {
+            return;
+        };
+        let prompt_tokens = usage_u32(usage, "prompt_tokens");
+        let completion_tokens = usage_u32(usage, "completion_tokens");
+        let total_tokens = usage_u32(usage, "total_tokens");
+        if prompt_tokens > 0 {
+            self.usage.prompt_tokens = prompt_tokens;
+        }
+        if completion_tokens > 0 {
+            self.usage.completion_tokens = completion_tokens;
+        }
+        if total_tokens > 0 {
+            self.usage.total_tokens = total_tokens;
+        } else {
+            self.usage.total_tokens = self
+                .usage
+                .prompt_tokens
+                .saturating_add(self.usage.completion_tokens);
+        }
+    }
+
+    fn final_usage(&self) -> UsageCounts {
+        let prompt_tokens = self
+            .usage
+            .prompt_tokens
+            .max(self.fallback_usage.prompt_tokens);
+        let completion_tokens = self.usage.completion_tokens.max(
+            self.fallback_usage
+                .completion_tokens
+                .max(estimate_text_tokens(&self.completion_text)),
+        );
+        let total_tokens = self
+            .usage
+            .total_tokens
+            .max(prompt_tokens.saturating_add(completion_tokens));
+        UsageCounts {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        }
+    }
+}
+
+fn usage_u32(usage: &Value, name: &str) -> u32 {
+    usage
+        .get(name)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
+}
+
 fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
         return UsageCounts::default();
@@ -773,16 +965,9 @@ fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
     let Some(usage) = value.get("usage") else {
         return UsageCounts::default();
     };
-    let as_u32 = |name: &str| -> u32 {
-        usage
-            .get(name)
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0)
-            .min(u32::MAX as u64) as u32
-    };
     if path == "messages" {
-        let prompt_tokens = as_u32("input_tokens");
-        let completion_tokens = as_u32("output_tokens");
+        let prompt_tokens = usage_u32(usage, "input_tokens");
+        let completion_tokens = usage_u32(usage, "output_tokens");
         UsageCounts {
             prompt_tokens,
             completion_tokens,
@@ -790,9 +975,56 @@ fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
         }
     } else {
         UsageCounts {
-            prompt_tokens: as_u32("prompt_tokens"),
-            completion_tokens: as_u32("completion_tokens"),
-            total_tokens: as_u32("total_tokens"),
+            prompt_tokens: usage_u32(usage, "prompt_tokens"),
+            completion_tokens: usage_u32(usage, "completion_tokens"),
+            total_tokens: usage_u32(usage, "total_tokens"),
         }
     }
+}
+
+fn estimate_prompt_tokens(path: &str, body: &Value) -> u32 {
+    if path == "messages" {
+        return body
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| estimate_message_content_tokens(message.get("content")))
+                    .sum()
+            })
+            .unwrap_or(0);
+    }
+
+    body.get("messages")
+        .and_then(|messages| messages.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .map(|message| estimate_message_content_tokens(message.get("content")))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn estimate_message_content_tokens(content: Option<&Value>) -> u32 {
+    match content {
+        Some(Value::String(text)) => estimate_text_tokens(text),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|text| text.as_str())
+                    .or_else(|| part.get("content").and_then(|text| text.as_str()))
+            })
+            .map(estimate_text_tokens)
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn estimate_text_tokens(text: &str) -> u32 {
+    let word_like = text.split_whitespace().count() as u32;
+    let char_like = text.chars().count().div_ceil(4) as u32;
+    word_like.max(char_like)
 }

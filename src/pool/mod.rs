@@ -99,6 +99,12 @@ pub trait Pool: Send + Sync {
     fn budget_counts(&self) -> (usize, usize, usize) {
         (0, 0, 0)
     }
+    fn budget_details(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    fn node_budget_detail(&self, _node_id: &NodeId) -> Option<serde_json::Value> {
+        None
+    }
     fn try_acquire_sticky(
         &self,
         _meta: &RequestMeta,
@@ -122,6 +128,8 @@ pub trait PoolManager: Send + Sync {
     ) -> Result<DispatchResult, DispatchError>;
     fn report(&self, node_id: NodeId, result: ResultKind, latency_us: u64);
     fn pool_stats(&self) -> PoolStats;
+    fn budget_details(&self) -> Vec<serde_json::Value>;
+    fn node_budget_detail(&self, node_id: &str) -> Option<serde_json::Value>;
     fn fuse_all(&self);
     fn unfuse_all(&self);
     fn add_node(&self, url: &str);

@@ -50,6 +50,7 @@ auth_h!(routes_h, AdminService::routes);
 auth_h!(runtime_h, AdminService::runtime);
 auth_h!(models_h, AdminService::models);
 auth_h!(budget_h, AdminService::budget);
+auth_h!(budget_nodes_h, AdminService::budget_nodes);
 auth_h!(pools_h, AdminService::pools);
 auth_h!(fuse_get_h, AdminService::fuse_status);
 auth_h!(requests_recent_h, AdminService::requests_recent);
@@ -167,6 +168,16 @@ async fn node_probe_h(
     }
     AdminService::node_probe(&st, &nid)
 }
+async fn node_budget_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(nid): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::node_budget(&st, &nid)
+}
 async fn node_recover_h(
     State(st): State<Arc<AppState>>,
     h: HeaderMap,
@@ -215,6 +226,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/models", get(models_h))
         .route("/admin/models/{model_id}", get(model_detail_h))
         .route("/admin/budget", get(budget_h))
+        .route("/admin/budget/nodes", get(budget_nodes_h))
         .route("/admin/stats", get(stats_h))
         .route("/admin/stats/models", get(stats_models_h))
         .route("/admin/stats/nodes", get(stats_nodes_h))
@@ -250,6 +262,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
     let nodes_static = Router::new().route("/admin/nodes", get(nodes_list_h).post(node_add_h));
     let nodes_param = Router::new()
         .route("/admin/nodes/{node_id}", delete(node_delete_h))
+        .route("/admin/nodes/{node_id}/budget", get(node_budget_h))
         .route("/admin/nodes/{node_id}/probe", post(node_probe_h))
         .route("/admin/nodes/{node_id}/recover", post(node_recover_h));
 

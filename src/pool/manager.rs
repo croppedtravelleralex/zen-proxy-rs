@@ -259,6 +259,14 @@ where
         }
     }
 
+    fn budget_details(&self) -> Vec<serde_json::Value> {
+        self.dispatch.budget_details()
+    }
+
+    fn node_budget_detail(&self, node_id: &str) -> Option<serde_json::Value> {
+        self.dispatch.node_budget_detail(&node_id.to_string())
+    }
+
     fn fuse_all(&self) {
         self.fuse.store(true, Ordering::Release);
         let ids: Vec<NodeId> = self.nodes.read().unwrap().keys().cloned().collect();

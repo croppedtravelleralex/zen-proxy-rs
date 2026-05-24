@@ -147,6 +147,7 @@ impl AdminService {
                 {"method":"GET","path":"/admin/models"},
                 {"method":"GET","path":"/admin/models/{model_id}"},
                 {"method":"GET","path":"/admin/budget"},
+                {"method":"GET","path":"/admin/budget/nodes"},
                 {"method":"GET","path":"/admin/stats"},
                 {"method":"GET","path":"/admin/stats/models"},
                 {"method":"GET","path":"/admin/stats/nodes"},
@@ -177,6 +178,7 @@ impl AdminService {
                 {"method":"POST","path":"/admin/system/log-level/{level}"},
                 {"method":"GET,POST","path":"/admin/nodes"},
                 {"method":"DELETE","path":"/admin/nodes/{node_id}"},
+                {"method":"GET","path":"/admin/nodes/{node_id}/budget"},
                 {"method":"POST","path":"/admin/nodes/{node_id}/probe"},
                 {"method":"POST","path":"/admin/nodes/{node_id}/recover"},
                 {"method":"POST","path":"/admin/probe/now"}
@@ -289,6 +291,17 @@ impl AdminService {
                 "active": p.active_size,
             }
         }))
+    }
+    pub fn budget_nodes(state: &AppState) -> Response {
+        Self::ok_response(json!({
+            "nodes": state.pool_manager.budget_details()
+        }))
+    }
+    pub fn node_budget(state: &AppState, node_id: &str) -> Response {
+        match state.pool_manager.node_budget_detail(node_id) {
+            Some(detail) => Self::ok_response(detail),
+            None => Self::error_response(StatusCode::NOT_FOUND, "node not found"),
+        }
     }
     pub fn pools(state: &AppState) -> Response {
         Self::stats_pools(state)
