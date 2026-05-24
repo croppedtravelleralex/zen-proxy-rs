@@ -1,3 +1,5 @@
 /target
 nodes.json
 .env
+.claude/
+false/
