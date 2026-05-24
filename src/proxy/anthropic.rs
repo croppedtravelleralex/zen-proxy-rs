@@ -22,7 +22,8 @@ pub async fn handle_anthropic_messages(
         .map(|t| translate::anthropic_tools_to_openai(t))
         .unwrap_or_default();
     let max_tok = body.max_tokens.max(32);
-    let zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
+    let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
+    translate::disable_thinking_for_assistant_history(&mut zb, &msgs);
     let cr = ChatRequest {
         model: model.clone(),
         messages: msgs,
@@ -56,6 +57,7 @@ async fn handle_non_stream(
     .await?;
     let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
     let (content, _reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
+    let content = crate::redact::redact_text(&content);
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -64,7 +66,14 @@ async fn handle_non_stream(
     if content.trim().is_empty() {
         let fb = synthesis::text::synthesize_text_fallback(&prompt);
         return Ok(with_observed_exit_ip(
-            text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response(),
+            text_resp(
+                ts,
+                &cr.model,
+                &crate::redact::redact_text(&fb),
+                estimate(&prompt),
+                estimate(&fb),
+            )
+            .into_response(),
             observed_exit_ip,
         ));
     }
@@ -143,9 +152,7 @@ async fn handle_stream(
             };
             if let Some(ref chs) = ev.choices { for ch in chs { if let Some(ref d) = ch.delta {
                 if let Some(ref c) = d.content { if !c.is_empty() {
-                    if text.is_empty() { yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string())); }
                     text.push_str(c);
-                    yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":c}}).to_string()));
                 }}
                 if let Some(ref td) = d.tool_calls { for tc in td {
                     let idx = tc.index.unwrap_or(0);
@@ -156,7 +163,12 @@ async fn handle_stream(
                 }}
             }}}
         }
-        if !text.is_empty() { yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string())); }
+        if !text.is_empty() {
+            text = crate::redact::redact_text(&text);
+            yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
+            yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}).to_string()));
+            yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string()));
+        }
         if !tcs.is_empty() {
             for (ti,(idx,name,args,cid)) in tcs.iter().enumerate() {
                 let tidx=ti as u64;
@@ -173,6 +185,7 @@ async fn handle_stream(
         } else if text.is_empty() {
             let fb=synthesis::text::synthesize_text_fallback(&translate::build_prompt_text(&body.messages));
             yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
+            let fb = crate::redact::redact_text(&fb);
             yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":fb}}).to_string()));
             yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string()));
             text = fb;

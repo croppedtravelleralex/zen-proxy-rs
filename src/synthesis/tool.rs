@@ -274,6 +274,7 @@ mod tests {
                 role: "user".to_string(),
                 content: Value::String(prompt.to_string()),
                 tool_calls: None,
+                tool_call_id: None,
             }],
             stream: Some(false),
             max_tokens: None,

@@ -147,6 +147,7 @@ fn chat_request(
             role: "user".to_string(),
             content: Value::String(prompt.to_string()),
             tool_calls: None,
+            tool_call_id: None,
         }],
         stream: Some(stream),
         max_tokens: Some(64),
@@ -334,6 +335,82 @@ async fn anthropic_empty_stream_with_tools_uses_text_fallback_not_synthetic_tool
     let body = response_text(response).await;
     assert!(body.contains("NO_TOOL_CALL"));
     assert!(!body.contains("tool_use"));
+}
+
+#[tokio::test]
+async fn anthropic_tool_use_history_is_preserved_as_openai_tool_calls() {
+    let req = AnthropicRequest {
+        messages: vec![
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: json!([
+                    {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.txt"}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"tool_result","tool_use_id":"toolu_1","content":"hello"}
+                ]),
+            },
+        ],
+        ..anthropic_request("deepseek-v4-flash-free", "ignored", true)
+    };
+
+    let messages = free_model_client_rs::protocol::translate::anthropic_to_openai_messages(&req);
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[0].content, Value::Null);
+    assert_eq!(
+        messages[0].tool_calls.as_ref().unwrap()[0].id.as_deref(),
+        Some("toolu_1")
+    );
+    assert_eq!(
+        messages[0].tool_calls.as_ref().unwrap()[0].function.name,
+        "Read"
+    );
+    assert_eq!(messages[1].role, "tool");
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("toolu_1"));
+    assert_eq!(messages[1].content, json!("hello"));
+}
+
+#[test]
+fn thinking_is_disabled_when_assistant_history_has_no_reasoning() {
+    let mut body = json!({
+        "model":"deepseek-v4-flash-free",
+        "messages":[{"role":"assistant","content":null,"tool_calls":[]}]
+    });
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::Null,
+        tool_calls: Some(vec![]),
+        tool_call_id: None,
+    }];
+
+    free_model_client_rs::protocol::translate::disable_thinking_for_assistant_history(
+        &mut body, &messages,
+    );
+
+    assert_eq!(body["thinking"], json!({"type":"disabled"}));
+}
+
+#[test]
+fn anthropic_tool_result_content_is_redacted_before_upstream() {
+    let req = AnthropicRequest {
+        messages: vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: json!([
+                {"type":"tool_result","tool_use_id":"toolu_secret","content":"API_KEY=abc123\nNEWAPI_KEY=sk-fake-do-not-leak\nproxy.example:8080:user:pass"}
+            ]),
+        }],
+        ..anthropic_request("deepseek-v4-flash-free", "ignored", true)
+    };
+
+    let messages = free_model_client_rs::protocol::translate::anthropic_to_openai_messages(&req);
+    let content = messages[0].content.as_str().unwrap();
+    assert!(!content.contains("abc123"));
+    assert!(!content.contains("sk-fake-do-not-leak"));
+    assert!(!content.contains("user:pass"));
+    assert!(content.contains("[REDACTED]"));
 }
 
 #[tokio::test]
