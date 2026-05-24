@@ -173,6 +173,13 @@ async fn call_with_retry(
         let kernel = FreeModelKernel::new(KernelConfig {
             zen_chat_url: conf.chat_url(),
             zen_api_key: conf.upstream_api_key.clone(),
+            extra_headers: vec![
+                ("x-zen-proxy-selected-node-id".to_string(), node_id.clone()),
+                (
+                    "x-zen-proxy-selected-node-url".to_string(),
+                    LedgerEvent::redact_node_url(&node_url),
+                ),
+            ],
         });
         let call_start = Instant::now();
         let response = match path {

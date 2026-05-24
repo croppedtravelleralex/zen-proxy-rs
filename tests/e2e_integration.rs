@@ -54,9 +54,20 @@ fn start_mock_zen() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         rt.block_on(async move {
             async fn handler(
                 State(observed): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                headers: axum::http::HeaderMap,
                 Json(body): Json<serde_json::Value>,
             ) -> impl IntoResponse {
-                observed.lock().unwrap().push(body.clone());
+                observed.lock().unwrap().push(serde_json::json!({
+                    "body": body,
+                    "selected_node_id": headers
+                        .get("x-zen-proxy-selected-node-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default(),
+                    "selected_node_url": headers
+                        .get("x-zen-proxy-selected-node-url")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                }));
                 if body
                     .get("messages")
                     .and_then(|messages| messages.as_array())
@@ -242,8 +253,43 @@ mod e2e {
         assert_eq!(anthropic_body["content"][0]["text"], "zen v4 ok");
 
         let seen = observed.lock().unwrap();
-        assert_eq!(seen[0]["model"], "deepseek-v4-flash-free");
-        assert_eq!(seen[1]["model"], "big-pickle");
+        assert_eq!(seen[0]["body"]["model"], "deepseek-v4-flash-free");
+        assert_eq!(seen[1]["body"]["model"], "big-pickle");
+        assert_eq!(seen[0]["selected_node_id"], "direct");
+        assert_eq!(seen[0]["selected_node_url"], "direct");
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_upstream_429_returns_retry_after() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19791,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "rate-limit"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 openai rate-limit request");
+        assert_eq!(resp.status(), 429);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("60")
+        );
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen[0]["selected_node_id"], "direct");
         stop_server(child, port);
     }
 
