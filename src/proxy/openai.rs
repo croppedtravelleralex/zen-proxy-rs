@@ -50,40 +50,20 @@ async fn handle_oa_non_stream(
     )
     .await?;
     let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
-    let (content, reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
-    let has_tools = translate::has_tools(cr);
+    let (content, _reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if content.trim().is_empty() && has_tools {
-        if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
-            let tc = synthesis::tool::complete_tool_call(&tc, cr);
-            return Ok(with_observed_exit_ip(
-                oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)),
-                observed_exit_ip,
-            ));
-        }
-    }
-    if content.trim().is_empty() && !reasoning.trim().is_empty() {
-        if has_tools {
-            if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
-                let tc = synthesis::tool::complete_tool_call(&tc, cr);
-                return Ok(with_observed_exit_ip(
-                    oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)),
-                    observed_exit_ip,
-                ));
-            }
-        } else {
-            let fb = synthesis::text::synthesize_text_fallback(&prompt);
-            let pt = estimate(&prompt);
-            let ct = estimate(&fb);
-            return Ok(with_observed_exit_ip(
-                oa_text_resp(ts, &cr.model, &fb, pt, ct, pt + ct).into_response(),
-                observed_exit_ip,
-            ));
-        }
+    if content.trim().is_empty() {
+        let fb = synthesis::text::synthesize_text_fallback(&prompt);
+        let pt = estimate(&prompt);
+        let ct = estimate(&fb);
+        return Ok(with_observed_exit_ip(
+            oa_text_resp(ts, &cr.model, &fb, pt, ct, pt + ct).into_response(),
+            observed_exit_ip,
+        ));
     }
     let prompt_tokens = usage
         .as_ref()
@@ -112,10 +92,6 @@ async fn handle_oa_non_stream(
 
 fn oa_text_resp(ts: u64, model: &str, text: &str, pt: u64, ct: u64, total: u64) -> Response {
     Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total}})).into_response()
-}
-
-fn oa_tool_resp(ts: u64, model: &str, tc: &ToolCall, pt: u64) -> Response {
-    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[tc]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":pt,"completion_tokens":1,"total_tokens":pt+1}})).into_response()
 }
 
 fn with_observed_exit_ip(
@@ -149,7 +125,6 @@ async fn handle_oa_stream(
     .await?;
     let byte_stream = resp.bytes_stream();
     let mut event_stream = Box::pin(crate::zen::client::stream_sse_events(byte_stream));
-    let has_tools = translate::has_tools(cr);
     let model = cr.model.clone();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -163,7 +138,6 @@ async fn handle_oa_stream(
         yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
         let mut text = String::new();
         let mut tcs: Vec<(i64,String,String,Option<String>)> = Vec::new();
-        let mut _synthesized = false;
         while let Some(ev) = event_stream.next().await {
             let ev = match ev {
                 Ok(ev) => ev,
@@ -189,16 +163,11 @@ async fn handle_oa_stream(
                 }}
             }}}
         }
-        if text.is_empty() && tcs.is_empty() && has_tools {
-            if let Some(tc)=synthesis::tool::synthesize_tool_call(&body) {
-                let ct=synthesis::tool::complete_tool_call(&tc,&body);
-                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":ct.id,"type":"function","function":{"name":ct.function.name,"arguments":ct.function.arguments}}]},"finish_reason":"tool_calls"}]}).to_string()));
-            }
-        } else if text.is_empty() && tcs.is_empty() {
+        if text.is_empty() && tcs.is_empty() {
             let fb=synthesis::text::synthesize_text_fallback(&translate::build_prompt_text(&body.messages));
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":fb},"finish_reason":"stop"}]}).to_string()));
         }
-        let finish_reason = if !tcs.is_empty() || _synthesized { "tool_calls" } else { "stop" };
+        let finish_reason = if !tcs.is_empty() { "tool_calls" } else { "stop" };
         yield Ok(Event::default().data(serde_json::json!({
             "id": id, "object": "chat.completion.chunk", "created": created,
             "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]

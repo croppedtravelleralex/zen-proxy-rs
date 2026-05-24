@@ -69,6 +69,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("empty-upstream") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: [DONE]\n\n",
+        )
+            .into_response();
+    }
 
     let chunk = if prompt.contains("tool-delta") {
         json!({
@@ -240,8 +248,10 @@ async fn anthropic_stream_returns_golden_event_sequence() {
         .unwrap();
     let body = response_text(response).await;
     assert!(body.contains("event: message_start"));
+    assert!(body.contains("\"input_tokens\":2"));
     assert!(body.contains("event: content_block_delta"));
     assert!(body.contains("golden answer"));
+    assert!(body.contains("\"output_tokens\":4"));
     assert!(body.contains("event: message_stop"));
 }
 
@@ -268,6 +278,62 @@ async fn tool_delta_is_preserved_in_streaming_openai_response() {
     assert!(body.contains("read_file"));
     assert!(body.contains("README.md"));
     assert!(body.contains("tool_calls"));
+}
+
+#[tokio::test]
+async fn openai_empty_stream_with_tools_uses_text_fallback_not_synthetic_tool_call() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let tools = vec![OpenAITool {
+        tool_type: "function".to_string(),
+        function: OpenAIToolFunction {
+            name: "read_file".to_string(),
+            description: None,
+            parameters: None,
+        },
+    }];
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request(
+                "deepseek-v4-flash-free",
+                "empty-upstream",
+                true,
+                Some(tools),
+            ),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("NO_TOOL_CALL"));
+    assert!(!body.contains("tool_calls"));
+}
+
+#[tokio::test]
+async fn anthropic_empty_stream_with_tools_uses_text_fallback_not_synthetic_tool_use() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            AnthropicRequest {
+                tools: Some(vec![free_model_client_rs::protocol::types::ToolDef {
+                    name: "Read".to_string(),
+                    description: "Read a file".to_string(),
+                    input_schema: free_model_client_rs::protocol::types::ToolInputSchema {
+                        schema_type: "object".to_string(),
+                        properties: Some(json!({"file_path":{"type":"string"}})),
+                        required: Some(vec!["file_path".to_string()]),
+                    },
+                }]),
+                ..anthropic_request("deepseek-v4-flash-free", "empty-upstream", true)
+            },
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("NO_TOOL_CALL"));
+    assert!(!body.contains("tool_use"));
 }
 
 #[tokio::test]
