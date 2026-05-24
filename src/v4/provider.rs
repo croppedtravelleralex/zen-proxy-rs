@@ -367,7 +367,7 @@ async fn call_with_retry(
                         retry_count: attempt,
                         was_rate_limited,
                         upstream_ms: latency,
-                        ttft_ms: None,
+                        ttft_ms: Some(latency),
                         body_bytes_len: 0,
                     });
                 }

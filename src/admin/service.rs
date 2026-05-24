@@ -64,10 +64,31 @@ impl AdminService {
     pub fn health_ready(state: &AppState) -> Response {
         let pools = state.pool_manager.pool_stats();
         let cfg = state.config.read().unwrap();
-        if pools.dispatch_size > 0 || cfg.allow_direct_fallback {
-            Self::ok_response(json!({ "status":"ready" }))
+        let payload = json!({
+            "proxy_ready": pools.dispatch_size > 0,
+            "direct_fallback_active": cfg.allow_direct_fallback,
+            "dispatch_size": pools.dispatch_size,
+            "ratelimited_size": pools.ratelimited_size,
+            "dead_size": pools.dead_size,
+            "nodes_file": cfg.nodes_file,
+        });
+        if pools.dispatch_size > 0 {
+            Self::ok_response(json!({ "status":"ready", "details": payload }))
+        } else if cfg.allow_direct_fallback {
+            Self::ok_response(json!({ "status":"direct_fallback_only", "details": payload }))
         } else {
-            Self::error_response(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstream nodes")
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "success": false,
+                    "error": "no healthy upstream nodes",
+                    "data": {
+                        "status": "not_ready",
+                        "details": payload
+                    }
+                })),
+            )
+                .into_response()
         }
     }
 
@@ -105,6 +126,22 @@ impl AdminService {
     }
     pub fn pools(state: &AppState) -> Response {
         Self::stats_pools(state)
+    }
+    pub fn nodes(state: &AppState) -> Response {
+        let p = state.pool_manager.pool_stats();
+        let cfg = state.config.read().unwrap();
+        Self::ok_response(json!({
+            "nodes_file": cfg.nodes_file,
+            "allow_direct_fallback": cfg.allow_direct_fallback,
+            "pools": {
+                "dispatch": p.dispatch_size,
+                "active": p.active_size,
+                "ratelimited": p.ratelimited_size,
+                "dead": p.dead_size,
+                "total": p.total(),
+                "fuse": p.fuse,
+            }
+        }))
     }
     pub fn pool_by_name(state: &AppState, name: &str) -> Response {
         let p = state.pool_manager.pool_stats();
@@ -255,7 +292,7 @@ impl AdminService {
         let cfg = state.config.read().unwrap();
         let mut warnings: Vec<String> = Vec::new();
         if cfg.admin_api_key.is_none() {
-            warnings.push("ADMIN_API_KEY is not set — admin endpoints have no auth".into());
+            warnings.push("ADMIN_API_KEY is not set — admin endpoints reject all requests".into());
         }
         if cfg.proxy_api_key.is_none() {
             warnings.push("PROXY_API_KEY is not set — proxy is open to all tokens".into());

@@ -224,6 +224,7 @@ mod e2e {
                 ("ZEN_PROVIDER_MODE", "free_model_kernel"),
                 ("UPSTREAM_BASE", upstream_base.as_str()),
                 ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
             ],
         );
         let client = reqwest::blocking::Client::new();
@@ -291,6 +292,7 @@ mod e2e {
                 ("ZEN_PROVIDER_MODE", "free_model_kernel"),
                 ("UPSTREAM_BASE", upstream_base.as_str()),
                 ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
             ],
         );
         let client = reqwest::blocking::Client::new();
@@ -339,6 +341,7 @@ mod e2e {
                 ("ZEN_PROVIDER_MODE", "free_model_kernel"),
                 ("UPSTREAM_BASE", "http://127.0.0.1:9/zen"),
                 ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
             ],
         );
         let client = reqwest::blocking::Client::new();
@@ -432,7 +435,50 @@ mod e2e {
         assert_eq!(resp.status(), 200, "valid API key should be accepted");
         let body: serde_json::Value = resp.json().unwrap();
         assert!(body["success"].as_bool().unwrap_or(false));
-        assert!(body["data"]["total_requests"].is_number());
+        assert!(body["data"]["pools"]["total"].is_number());
+        assert_eq!(body["data"]["allow_direct_fallback"], false);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_ready_reports_not_ready_without_nodes() {
+        let (child, port) = start_server(19796);
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/admin/health/ready", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin ready endpoint");
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["data"]["status"], "not_ready");
+        assert_eq!(body["data"]["details"]["direct_fallback_active"], false);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_without_nodes_and_without_direct_fallback_returns_503() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19795,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 no-resource request");
+        assert_eq!(resp.status(), 503);
+        assert_eq!(observed.lock().unwrap().len(), 0);
         stop_server(child, port);
     }
 }

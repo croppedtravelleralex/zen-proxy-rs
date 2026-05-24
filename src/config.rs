@@ -113,7 +113,7 @@ impl Config {
                 _ => None,
             },
             model_mapping: Self::default_model_mapping(),
-            allow_direct_fallback: load_env_var("ALLOW_DIRECT_FALLBACK", true),
+            allow_direct_fallback: load_env_var("ALLOW_DIRECT_FALLBACK", false),
             benchmark_mode: load_env_var("BENCHMARK_MODE", false),
             log_level: load_env_var("LOG_LEVEL", "info".to_string()),
             sticky_ttl_secs: load_env_var("STICKY_TTL_SECS", 180.0f64),
@@ -202,7 +202,7 @@ impl Config {
 
     pub fn load_nodes(&self) -> Vec<String> {
         match std::fs::read_to_string(&self.nodes_file) {
-            Ok(contents) => match serde_json::from_str::<Vec<String>>(&contents) {
+            Ok(contents) => match parse_nodes_file(&contents) {
                 Ok(nodes) => {
                     tracing::info!(count = nodes.len(), file = %self.nodes_file, "loaded proxy nodes");
                     nodes
@@ -213,7 +213,7 @@ impl Config {
                 }
             },
             Err(_) => {
-                tracing::warn!(file = %self.nodes_file, "nodes file not found, using empty pool (direct-only)");
+                tracing::warn!(file = %self.nodes_file, "nodes file not found, using empty pool");
                 Vec::new()
             }
         }
@@ -242,6 +242,36 @@ pub fn load_env_var<T: FromStr>(key: &str, default: T) -> T {
             }
         },
         Ok(_) | Err(_) => default,
+    }
+}
+
+fn parse_nodes_file(contents: &str) -> Result<Vec<String>, String> {
+    if let Ok(nodes) = serde_json::from_str::<Vec<String>>(contents) {
+        return Ok(nodes);
+    }
+
+    let nodes = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(parse_proxy_line)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(nodes)
+}
+
+fn parse_proxy_line(line: &str) -> Result<String, String> {
+    if line.contains("://") {
+        return Ok(line.to_string());
+    }
+
+    let parts = line.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [host, port, user, pass] if !host.is_empty() && !port.is_empty() => {
+            Ok(format!("http://{user}:{pass}@{host}:{port}"))
+        }
+        [host, port] if !host.is_empty() && !port.is_empty() => Ok(format!("http://{host}:{port}")),
+        _ => Err(format!("unsupported proxy line format: {line}")),
     }
 }
 
@@ -282,7 +312,7 @@ mod tests {
         assert_eq!(cfg.port, 4000);
         assert!(cfg.admin_api_key.is_none());
         assert!(cfg.model_override.is_none());
-        assert_eq!(cfg.allow_direct_fallback, true);
+        assert_eq!(cfg.allow_direct_fallback, false);
         assert_eq!(cfg.benchmark_mode, false);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.probe_timeout_secs, 30);
@@ -354,6 +384,18 @@ mod tests {
             "big-pickle"
         );
         assert_eq!(cfg.model_mapping.len(), 2);
+    }
+
+    #[test]
+    fn parse_nodes_file_accepts_json_array() {
+        let nodes = parse_nodes_file(r#"["socks5://127.0.0.1:1080"]"#).unwrap();
+        assert_eq!(nodes, vec!["socks5://127.0.0.1:1080"]);
+    }
+
+    #[test]
+    fn parse_nodes_file_accepts_webshare_host_port_user_pass() {
+        let nodes = parse_nodes_file("1.2.3.4:8080:user:pass\n").unwrap();
+        assert_eq!(nodes, vec!["http://user:pass@1.2.3.4:8080"]);
     }
 
     #[test]

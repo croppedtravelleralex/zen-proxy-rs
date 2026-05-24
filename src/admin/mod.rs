@@ -64,7 +64,7 @@ auth_h!(sys_uptime_h, AdminService::system_uptime);
 auth_h!(sys_info_h, AdminService::system_info);
 auth_h!(events_recent_h, AdminService::events_recent);
 auth_h!(events_probes_h, AdminService::events_probes);
-auth_h!(nodes_list_h, AdminService::ledger_summary);
+auth_h!(nodes_list_h, AdminService::nodes);
 
 async fn pool_by_name_h(
     State(st): State<Arc<AppState>>,

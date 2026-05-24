@@ -10,6 +10,9 @@ use crate::pool::*;
 use crate::v4::contracts::{DeadNodeState, DeadProbePolicy};
 use crate::v4::dead_probe::AdaptiveDeadProbePolicy;
 
+const DIRECT_NODE_ID: &str = "direct";
+const DIRECT_NODE_URL: &str = "direct";
+
 pub struct PoolManagerImpl<D, A, R, K>
 where
     D: Pool,
@@ -113,21 +116,23 @@ where
                                 .unwrap(),
                         );
                     }
-                    let direct_id = "direct".to_string();
                     Ok(NodeRef {
-                        id: direct_id,
-                        url: "direct".to_string(),
+                        id: DIRECT_NODE_ID.to_string(),
+                        url: DIRECT_NODE_URL.to_string(),
                     })
                 } else {
                     Err(DispatchError::NoResource)
                 }
             })?;
-        self.active.add(node.clone());
 
-        {
-            let mut all = self.nodes.write().unwrap();
-            if !all.contains_key(&node.id) {
-                all.insert(node.id.clone(), node.clone());
+        if node.id != DIRECT_NODE_ID {
+            self.active.add(node.clone());
+
+            {
+                let mut all = self.nodes.write().unwrap();
+                if !all.contains_key(&node.id) {
+                    all.insert(node.id.clone(), node.clone());
+                }
             }
         }
 
@@ -154,6 +159,10 @@ where
         if self.fuse.load(Ordering::Acquire) {
             return Err(DispatchError::NoResource);
         }
+        if node_id == DIRECT_NODE_ID {
+            return self.dispatch(meta);
+        }
+
         // 先尝试粘滞获取指定节点
         let nid: NodeId = node_id.to_string();
         if let Ok(node) = self.dispatch.try_acquire_sticky(meta, &nid) {
@@ -173,6 +182,10 @@ where
     }
 
     fn report(&self, node_id: NodeId, result: ResultKind, _latency_us: u64) {
+        if node_id == DIRECT_NODE_ID {
+            return;
+        }
+
         match result {
             ResultKind::Success(_) => {
                 self.active.release(&node_id, &result);
