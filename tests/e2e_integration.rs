@@ -2,6 +2,12 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+fn sha256_first8(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(input.as_bytes());
+    hex::encode(&hash[..4])
+}
+
 fn start_server(port: u16) -> (Child, u16) {
     start_server_with_env(port, &[])
 }
@@ -205,6 +211,24 @@ mod e2e {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().unwrap();
         assert_eq!(body["object"], "list");
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_models_alias_endpoint_v4_mode() {
+        let (child, port) =
+            start_server_with_env(19797, &[("ZEN_PROVIDER_MODE", "free_model_kernel")]);
+        let resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/models", port))
+            .expect("models alias endpoint");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().unwrap();
         let ids: Vec<&str> = body["data"]
             .as_array()
             .unwrap()
@@ -453,6 +477,185 @@ mod e2e {
         let body: serde_json::Value = resp.json().unwrap();
         assert_eq!(body["data"]["status"], "not_ready");
         assert_eq!(body["data"]["details"]["direct_fallback_active"], false);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_read_api_coverage() {
+        let (child, port) = start_server(19798);
+        let client = reqwest::blocking::Client::new();
+        let paths = [
+            "/admin/health",
+            "/admin/health/live",
+            "/admin/stats",
+            "/admin/stats/models",
+            "/admin/stats/nodes",
+            "/admin/stats/pools",
+            "/admin/stats/upstream",
+            "/admin/pools",
+            "/admin/pools/dispatch",
+            "/admin/pools/active",
+            "/admin/pools/ratelimited",
+            "/admin/pools/dead",
+            "/admin/fuse",
+            "/admin/requests",
+            "/admin/requests/recent",
+            "/admin/requests/summary",
+            "/admin/requests/models",
+            "/admin/requests/nodes",
+            "/admin/events",
+            "/admin/events/recent",
+            "/admin/events/probes",
+            "/admin/ledger",
+            "/admin/ledger/models",
+            "/admin/ledger/keys",
+            "/admin/ledger/streams",
+            "/admin/config",
+            "/admin/config/validation",
+            "/admin/system/uptime",
+            "/admin/system/info",
+            "/admin/requests/export?limit=5",
+        ];
+
+        for path in paths {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .header("x-api-key", "test-key")
+                .send()
+                .unwrap_or_else(|err| panic!("GET {path} failed: {err}"));
+            assert_eq!(resp.status(), 200, "GET {path}");
+        }
+
+        let missing = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/requests/missing-rid",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("request detail missing endpoint");
+        assert_eq!(missing.status(), 404);
+
+        let unknown_pool = client
+            .get(format!("http://127.0.0.1:{}/admin/pools/unknown", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("unknown pool endpoint");
+        assert_eq!(unknown_pool.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_write_api_coverage() {
+        let (child, port) = start_server(19799);
+        let client = reqwest::blocking::Client::new();
+
+        let fuse_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/fuse", port))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"open": true}))
+            .send()
+            .expect("fuse set endpoint");
+        assert_eq!(fuse_resp.status(), 200);
+        let fuse_body: serde_json::Value = fuse_resp.json().unwrap();
+        assert_eq!(fuse_body["data"]["fuse"], true);
+
+        let unfuse_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/fuse", port))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"open": false}))
+            .send()
+            .expect("fuse unset endpoint");
+        assert_eq!(unfuse_resp.status(), 200);
+
+        let node_url = "http://127.0.0.1:9";
+        let node_id = sha256_first8(node_url);
+        let add_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"url": node_url}))
+            .send()
+            .expect("node add endpoint");
+        assert_eq!(add_resp.status(), 200);
+
+        let nodes_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("nodes endpoint");
+        let nodes_body: serde_json::Value = nodes_resp.json().unwrap();
+        assert_eq!(nodes_body["data"]["pools"]["dispatch"], 1);
+
+        let probe_missing_resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/nodes/missing-node/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("node missing probe endpoint");
+        assert_eq!(probe_missing_resp.status(), 404);
+
+        let recover_resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/nodes/{}/recover",
+                port, node_id
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("node recover endpoint");
+        assert_eq!(recover_resp.status(), 200);
+
+        let delete_resp = client
+            .delete(format!("http://127.0.0.1:{}/admin/nodes/{}", port, node_id))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("node delete endpoint");
+        assert_eq!(delete_resp.status(), 200);
+
+        let log_resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/system/log-level/info",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("log level endpoint");
+        assert_eq!(log_resp.status(), 200);
+
+        let reload_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/config/reload", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("config reload endpoint");
+        assert_eq!(reload_resp.status(), 200);
+
+        let probe_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/probe/now", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("probe now endpoint");
+        assert_eq!(probe_resp.status(), 200);
+
+        let missing_url_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({}))
+            .send()
+            .expect("node add missing url endpoint");
+        assert_eq!(missing_url_resp.status(), 400);
+
+        let invalid_log_resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/system/log-level/nope",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("invalid log level endpoint");
+        assert_eq!(invalid_log_resp.status(), 400);
+
         stop_server(child, port);
     }
 
