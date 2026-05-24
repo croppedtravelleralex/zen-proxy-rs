@@ -8,6 +8,14 @@ pub fn normalize_model(model: &str) -> String {
         .to_lowercase()
 }
 
+pub fn map_upstream_model(model: &str, mappings: &[(String, String)]) -> String {
+    mappings
+        .iter()
+        .find(|(public, _)| public == model)
+        .map(|(_, upstream)| upstream.clone())
+        .unwrap_or_else(|| model.to_string())
+}
+
 pub fn anthropic_to_openai_messages(req: &AnthropicRequest) -> Vec<Message> {
     let mut msgs = Vec::new();
     if let Some(ref sys) = req.system {

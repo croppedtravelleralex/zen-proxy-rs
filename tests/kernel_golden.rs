@@ -119,6 +119,10 @@ async fn spawn_mock_zen() -> (KernelConfig, reqwest::Client, MockState) {
         zen_chat_url: format!("http://{addr}/zen"),
         zen_api_key: "public".to_string(),
         extra_headers: vec![("x-kernel-extra".to_string(), "extra-proof".to_string())],
+        model_mappings: vec![(
+            "deepseek-v4-flash".to_string(),
+            "deepseek-v4-flash-free".to_string(),
+        )],
     };
     (config, client, state)
 }
@@ -172,14 +176,14 @@ async fn openai_non_stream_uses_caller_client_and_returns_golden_response() {
     let response = kernel
         .openai_chat(
             &client,
-            chat_request("deepseek-v4-flash-free", "plain", false, None),
+            chat_request("deepseek-v4-flash", "plain", false, None),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "golden answer");
-    assert_eq!(body["model"], "deepseek-v4-flash-free");
+    assert_eq!(body["model"], "deepseek-v4-flash");
     assert_eq!(body["usage"]["prompt_tokens"], 3);
     assert_eq!(body["usage"]["completion_tokens"], 2);
     assert_eq!(body["usage"]["total_tokens"], 5);

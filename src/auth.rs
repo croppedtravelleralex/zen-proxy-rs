@@ -26,6 +26,7 @@ mod tests {
             api_key: api_key.into(),
             timeout: Duration::from_secs(120),
             free_models: vec![],
+            model_mappings: vec![],
         }
     }
 

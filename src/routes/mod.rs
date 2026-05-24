@@ -15,6 +15,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Self {
         let http_client = reqwest::Client::builder()
+            .no_proxy()
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .timeout(config.timeout)

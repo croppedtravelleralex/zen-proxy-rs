@@ -10,6 +10,7 @@ pub struct KernelConfig {
     pub zen_chat_url: String,
     pub zen_api_key: String,
     pub extra_headers: Vec<(String, String)>,
+    pub model_mappings: Vec<(String, String)>,
 }
 
 impl From<&Config> for KernelConfig {
@@ -18,6 +19,11 @@ impl From<&Config> for KernelConfig {
             zen_chat_url: config.zen_chat_url.clone(),
             zen_api_key: config.zen_api_key.clone(),
             extra_headers: Vec::new(),
+            model_mappings: config
+                .model_mappings
+                .iter()
+                .map(|mapping| (mapping.public_name.clone(), mapping.upstream_name.clone()))
+                .collect(),
         }
     }
 }

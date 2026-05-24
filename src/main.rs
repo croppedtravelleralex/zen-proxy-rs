@@ -42,7 +42,7 @@ async fn main() {
         ));
 
     tracing::info!(
-        "free-model-client-rs http://{} kernel=direct-zen zen={}",
+        "free-model-client-rs http://{} kernel=newapi url={}",
         bind_addr,
         config.zen_chat_url
     );

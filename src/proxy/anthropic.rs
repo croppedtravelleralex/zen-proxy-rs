@@ -14,6 +14,7 @@ pub async fn handle_anthropic_messages(
     body: AnthropicRequest,
 ) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
+    let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
     let msgs = translate::anthropic_to_openai_messages(&body);
     let tools: Vec<OpenAITool> = body
         .tools
@@ -21,7 +22,7 @@ pub async fn handle_anthropic_messages(
         .map(|t| translate::anthropic_tools_to_openai(t))
         .unwrap_or_default();
     let max_tok = body.max_tokens.max(32);
-    let zb = serde_json::json!({"model":model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
+    let zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
     let cr = ChatRequest {
         model: model.clone(),
         messages: msgs,

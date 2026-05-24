@@ -14,9 +14,10 @@ pub async fn handle_openai_chat(
     body: ChatRequest,
 ) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
+    let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
     let tools = body.tools.clone().unwrap_or_default();
     let max_tok = body.max_tokens.unwrap_or(1024).max(32);
-    let zb = serde_json::json!({"model":model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
+    let zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
     let cr = ChatRequest {
         model: model.clone(),
         messages: body.messages.clone(),
