@@ -1,7 +1,41 @@
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderMode {
+    Legacy,
+    FreeModelKernel,
+}
+
+impl ProviderMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::FreeModelKernel => "free_model_kernel",
+        }
+    }
+}
+
+impl fmt::Display for ProviderMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "free_model_kernel" | "free-model-kernel" => Ok(Self::FreeModelKernel),
+            _ => Err(()),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -43,6 +77,8 @@ pub struct Config {
     pub global_backoff_cooldown_secs: u64,
     pub nodes_file: String,
     pub ledger_events_path: String,
+    pub zen_provider_mode: ProviderMode,
+    pub v4_model_registry_enabled: bool,
 }
 
 impl Config {
@@ -99,10 +135,15 @@ impl Config {
                 "zen-proxy-rs".to_string(),
             ),
             opencode_session_ttl_secs: load_env_var("OPENCODE_SESSION_TTL_SECS", 1800u64),
-            pool_starvation_retry_after_secs: load_env_var("POOL_STARVATION_RETRY_AFTER_SECS", 5u64),
+            pool_starvation_retry_after_secs: load_env_var(
+                "POOL_STARVATION_RETRY_AFTER_SECS",
+                5u64,
+            ),
             global_backoff_cooldown_secs: load_env_var("GLOBAL_BACKOFF_COOLDOWN_SECS", 30u64),
             ledger_events_path: env::var("LEDGER_EVENTS_PATH")
                 .unwrap_or_else(|_| "/tmp/zen-proxy-ledger-events.jsonl".into()),
+            zen_provider_mode: load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy),
+            v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
         }
     }
 
@@ -112,18 +153,13 @@ impl Config {
 
     fn default_model_mapping() -> HashMap<String, String> {
         let mut m = HashMap::new();
-        m.insert("deepseek-v4-flash".to_string(), "big-pickle".to_string());
         m.insert(
-            "deepseek-v4-flash-lite".to_string(),
-            "big-pickle-nothinking".to_string(),
-        );
-        m.insert(
-            "deepseek-v4-pro".to_string(),
+            "deepseek-v4-flash".to_string(),
             "deepseek-v4-flash-free".to_string(),
         );
         m.insert(
-            "deepseek-v4-pro-lite".to_string(),
-            "deepseek-v4-flash-nothinking".to_string(),
+            "deepseek-v4-flash-lite".to_string(),
+            "big-pickle".to_string(),
         );
         m
     }
@@ -185,6 +221,10 @@ impl Config {
     pub fn proxy_auth_required(&self) -> bool {
         self.proxy_api_key.is_some()
     }
+
+    pub fn v4_model_registry_active(&self) -> bool {
+        self.v4_model_registry_enabled || self.zen_provider_mode == ProviderMode::FreeModelKernel
+    }
 }
 
 pub fn load_env_var<T: FromStr>(key: &str, default: T) -> T {
@@ -233,6 +273,8 @@ mod tests {
             "OPENCODE_CLIENT_NAME",
             "OPENCODE_PROJECT_SEED",
             "OPENCODE_SESSION_TTL_SECS",
+            "ZEN_PROVIDER_MODE",
+            "V4_MODEL_REGISTRY_ENABLED",
         ]);
 
         let cfg = Config::from_env();
@@ -250,6 +292,9 @@ mod tests {
         assert_eq!(cfg.opencode_client_name, "cli");
         assert_eq!(cfg.opencode_project_seed, "zen-proxy-rs");
         assert_eq!(cfg.opencode_session_ttl_secs, 1800);
+        assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
+        assert_eq!(cfg.v4_model_registry_enabled, false);
+        assert_eq!(cfg.v4_model_registry_active(), false);
     }
 
     #[test]
@@ -260,6 +305,8 @@ mod tests {
         unsafe { env::set_var("PROBE_BATCH_SIZE", "10") };
         unsafe { env::set_var("OPENCODE_HEADERS_ENABLED", "true") };
         unsafe { env::set_var("OPENCODE_CLIENT_NAME", "desktop-cli") };
+        unsafe { env::set_var("ZEN_PROVIDER_MODE", "free_model_kernel") };
+        unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
@@ -267,6 +314,9 @@ mod tests {
         assert_eq!(cfg.probe_batch_size, 10);
         assert_eq!(cfg.opencode_headers_enabled, true);
         assert_eq!(cfg.opencode_client_name, "desktop-cli");
+        assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
+        assert_eq!(cfg.v4_model_registry_enabled, true);
+        assert_eq!(cfg.v4_model_registry_active(), true);
 
         remove_env_vars(&[
             "PORT",
@@ -274,11 +324,14 @@ mod tests {
             "PROBE_BATCH_SIZE",
             "OPENCODE_HEADERS_ENABLED",
             "OPENCODE_CLIENT_NAME",
+            "ZEN_PROVIDER_MODE",
+            "V4_MODEL_REGISTRY_ENABLED",
         ]);
     }
 
     #[test]
     fn from_env_graceful_on_bad_values() {
+        let _guard = env_lock();
         unsafe { env::set_var("PORT", "not-a-number") };
 
         let cfg = Config::from_env();
@@ -289,28 +342,22 @@ mod tests {
 
     #[test]
     fn model_mapping_is_pre_populated() {
+        let _guard = env_lock();
         let cfg = Config::from_env();
         assert_eq!(
             cfg.model_mapping.get("deepseek-v4-flash").unwrap(),
-            "big-pickle"
-        );
-        assert_eq!(
-            cfg.model_mapping.get("deepseek-v4-flash-lite").unwrap(),
-            "big-pickle-nothinking"
-        );
-        assert_eq!(
-            cfg.model_mapping.get("deepseek-v4-pro").unwrap(),
             "deepseek-v4-flash-free"
         );
         assert_eq!(
-            cfg.model_mapping.get("deepseek-v4-pro-lite").unwrap(),
-            "deepseek-v4-flash-nothinking"
+            cfg.model_mapping.get("deepseek-v4-flash-lite").unwrap(),
+            "big-pickle"
         );
-        assert_eq!(cfg.model_mapping.len(), 4);
+        assert_eq!(cfg.model_mapping.len(), 2);
     }
 
     #[test]
     fn reload_re_reads_env() {
+        let _guard = env_lock();
         let mut cfg = Config::from_env();
 
         unsafe { env::set_var("PORT", "9999") };
@@ -322,6 +369,7 @@ mod tests {
 
     #[test]
     fn load_env_var_returns_default_on_empty_var() {
+        let _guard = env_lock();
         unsafe { env::set_var("PORT", "") };
         let port: u16 = load_env_var("PORT", 4000u16);
         assert_eq!(port, 4000);
@@ -330,6 +378,7 @@ mod tests {
 
     #[test]
     fn convenience_accessors() {
+        let _guard = env_lock();
         let cfg = Config::from_env();
         assert_eq!(cfg.bind_addr(), "127.0.0.1:4000");
         assert!(cfg.chat_url().ends_with("/v1/chat/completions"));
@@ -344,6 +393,7 @@ mod tests {
 
     #[test]
     fn model_override_none_when_unset() {
+        let _guard = env_lock();
         env::remove_var("MODEL_OVERRIDE");
         let cfg = Config::from_env();
         assert!(cfg.model_override.is_none());
@@ -351,6 +401,7 @@ mod tests {
 
     #[test]
     fn model_override_some_when_set() {
+        let _guard = env_lock();
         unsafe { env::set_var("MODEL_OVERRIDE", "custom-model") };
         let cfg = Config::from_env();
         assert_eq!(cfg.model_override.as_deref(), Some("custom-model"));
@@ -359,6 +410,7 @@ mod tests {
 
     #[test]
     fn model_override_none_when_empty() {
+        let _guard = env_lock();
         unsafe { env::set_var("MODEL_OVERRIDE", "") };
         let cfg = Config::from_env();
         assert!(cfg.model_override.is_none());
@@ -367,6 +419,7 @@ mod tests {
 
     #[test]
     fn admin_api_key_none_when_unset() {
+        let _guard = env_lock();
         env::remove_var("ADMIN_API_KEY");
         let cfg = Config::from_env();
         assert!(cfg.admin_api_key.is_none());
@@ -374,6 +427,7 @@ mod tests {
 
     #[test]
     fn admin_api_key_some_when_set() {
+        let _guard = env_lock();
         unsafe { env::set_var("ADMIN_API_KEY", "secret-key-123") };
         let cfg = Config::from_env();
         assert_eq!(cfg.admin_api_key.as_deref(), Some("secret-key-123"));
@@ -382,6 +436,7 @@ mod tests {
 
     #[test]
     fn nodes_file_default() {
+        let _guard = env_lock();
         env::remove_var("NODES_FILE");
         let cfg = Config::from_env();
         assert_eq!(cfg.nodes_file, "/etc/zen-proxy/nodes.json");

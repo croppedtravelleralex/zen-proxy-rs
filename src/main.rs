@@ -13,23 +13,24 @@ mod server;
 mod sse;
 mod state;
 mod utils;
+mod v4;
 
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use axum::{
+    Router,
     extract::State,
     response::Json,
     routing::{any, get},
-    Router,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
-use tracing_subscriber::{prelude::*, reload, EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, prelude::*, reload};
 
+use collector::DataCollector;
 use collector::default::DefaultCollector;
 use collector::export::JsonBackend;
-use collector::DataCollector;
 use pool::active::ActivePool;
 use pool::dead::DeadPoolImpl;
 use pool::dispatch::DispatchPool;
@@ -38,6 +39,7 @@ use pool::ratelimited::RateLimitedPoolImpl;
 use pool::{DeadPool, NodeRef, Pool, RateLimitedPool};
 use provider::webshare::WebShareProvider;
 use state::AppState;
+use v4::model::ModelRegistry;
 
 static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
@@ -52,7 +54,9 @@ pub(crate) fn set_log_level(level: &str) -> Result<(), &'static str> {
         "trace" => EnvFilter::new("trace"),
         _ => return Err("invalid log level, use: off/error/warn/info/debug/trace"),
     };
-    handle.modify(|f| *f = new_filter).map_err(|_| "reload failed")
+    handle
+        .modify(|f| *f = new_filter)
+        .map_err(|_| "reload failed")
 }
 
 async fn health_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
@@ -86,13 +90,24 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> String {
     backend.encode(&snapshot)
 }
 
-async fn models_handler() -> Json<Value> {
+async fn models_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let cfg = st.config.read().unwrap();
+    let data = if cfg.v4_model_registry_active() {
+        let registry = v4::model::StaticModelRegistry::default();
+        registry
+            .public_models()
+            .into_iter()
+            .map(|model| json!({"id": model.id, "object": "model"}))
+            .collect::<Vec<_>>()
+    } else {
+        vec![
+            json!({"id": "deepseek-v4-flash", "object": "model"}),
+            json!({"id": "deepseek-v4-pro", "object": "model"}),
+        ]
+    };
     Json(json!({
         "object": "list",
-        "data": [
-            {"id": "deepseek-v4-flash", "object": "model"},
-            {"id": "deepseek-v4-pro", "object": "model"}
-        ]
+        "data": data
     }))
 }
 
@@ -117,8 +132,7 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
-    let log_filter = EnvFilter::from_default_env()
-        .add_directive(tracing::Level::INFO.into());
+    let log_filter = EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
     let (log_filter, log_handle) = reload::Layer::new(log_filter);
     LOG_RELOAD.set(log_handle).ok();
     tracing_subscriber::registry()
