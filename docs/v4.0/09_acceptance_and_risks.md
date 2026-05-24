@@ -1,23 +1,96 @@
 # V4.0 Acceptance and Risks
 
-## Acceptance Gates
+## Completion Definition
 
-### Structure Gate
+V4.0 is complete only when these claims are all backed by fresh evidence:
 
-- `proxy.rs` does not own provider protocol details.
-- pool code does not build Zen request bodies.
-- transport code does not know model mapping.
-- FreeModel kernel does not choose proxy nodes.
+```text
+contracts are explicit
+selected egress is provable
+protocol behavior is golden-tested
+failure behavior is injected and verified
+rollout is configurable and reversible
+release gates pass
+```
 
-### API Gate
+## Acceptance Matrix
 
-- `/v1/models` returns only:
-  - `deepseek-v4-flash`
-  - `deepseek-v4-flash-lite`
-- `/v1/chat/completions` supports stream and non-stream.
-- `/v1/messages` supports stream and non-stream.
+| Gate | Required Evidence | Pass Criteria |
+|---|---|---|
+| Structure | file/module inspection | protocol logic is outside `proxy.rs`; pool does not build Zen bodies |
+| Config | unit tests | `ZEN_PROVIDER_MODE` defaults to legacy; V4 mode can be enabled |
+| Model API | API test | `/v1/models` returns only `deepseek-v4-flash` and `deepseek-v4-flash-lite` |
+| Model Mapping | unit/API tests | flash maps to `deepseek-v4-flash-free`; flash-lite maps to `big-pickle` |
+| OpenAI Non-Stream | mock Zen integration | valid OpenAI response, correct model, usage if available |
+| OpenAI Stream | golden SSE test | valid SSE frames, `[DONE]`, TTFT recorded |
+| Anthropic Non-Stream | mock Zen integration | valid Anthropic message response |
+| Anthropic Stream | golden SSE test | valid Anthropic event sequence |
+| Tool Call | golden fixture | tool deltas are preserved or fallback is deterministic |
+| Reasoning-Only | golden fixture | no hidden reasoning leak; structured fallback/error behavior |
+| Egress Proof | test-mode proof | selected node id matches observed egress evidence |
+| 429 Handling | fault injection | node moves to RateLimited; retry-after recorded |
+| Transport Failure | fault injection | timeout/refused/SOCKS failure moves node to Dead |
+| Sticky Retry | fault injection | retry tries same node before spending another node |
+| Dead Probe | scheduler tests | 60-120 minute jitter and adaptive batch rules hold |
+| Observability | admin/WAL/metrics check | same request id appears across request detail, WAL, metrics-derived data |
+| Rollback | runtime drill | switch between legacy and FreeModel mode without rebuild |
+| Release | commands | fmt, clippy, tests, release build pass |
 
-### Egress Gate
+## Structural Acceptance
+
+Required:
+
+- `proxy.rs` handles HTTP boundary and orchestration only.
+- provider protocol logic lives in `ProviderAdapter`/`FreeModelKernel`.
+- pool code owns node lifecycle only.
+- transport code owns egress clients only.
+- model mapping lives in `ModelRegistry`.
+- request facts live in `RequestRecord`.
+
+Rejected:
+
+- FreeModel kernel creates an unrelated global client for production requests.
+- Dead pool sends hand-built provider-specific probe bodies.
+- Provider adapter mutates pool state directly.
+- Transport adapter branches on model names.
+- Observability code changes request control flow.
+
+## API Acceptance
+
+### `GET /v1/models`
+
+Expected ids:
+
+```text
+deepseek-v4-flash
+deepseek-v4-flash-lite
+```
+
+No upstream-only model ids should appear.
+
+### `POST /v1/chat/completions`
+
+Required cases:
+
+- `stream=false`
+- `stream=true`
+- unknown model
+- request with tools
+- reasoning-only upstream output
+- upstream 429
+
+### `POST /v1/messages`
+
+Required cases:
+
+- `stream=false`
+- `stream=true`
+- system field
+- tool definitions
+- tool result message
+- upstream 429
+
+## Egress Acceptance
 
 Must prove:
 
@@ -25,33 +98,94 @@ Must prove:
 selected node -> selected transport client -> actual upstream request
 ```
 
+Minimum request record fields:
+
+```text
+request_id
+selected_node_id
+selected_node_url_redacted
+observed_exit_ip, when available
+upstream_status
+```
+
+If Zen cannot expose the observed IP, use a controlled auxiliary endpoint in
+test mode. Production may omit `observed_exit_ip`, but tests must still prove
+transport selection.
+
 Without this proof, V4.0 is not complete.
 
-### Failure Gate
+## Failure Acceptance
 
 Fault injection must cover:
 
-- 429
-- 500
-- timeout
-- connection refused
-- SOCKS failure
-- partial SSE
-- broken JSON
-- slow first token
+| Fault | Expected Result | Required Record |
+|---|---|---|
+| 429 | node enters RateLimited | status, retry_after, node id |
+| FreeUsageLimitError | node enters RateLimited | error type, node id |
+| timeout | node enters Dead | transport error kind, node id |
+| connection refused | node enters Dead | transport error kind, node id |
+| SOCKS failure | node enters Dead | transport error kind, node id |
+| 500 | retry/backoff, then policy result | retry count, final outcome |
+| partial SSE | structured stream error | request id and stream error |
+| broken JSON | structured upstream parse error | request id and parse error |
+| slow first token | response succeeds or timeout policy applies | TTFT |
 
-Expected outcomes:
+## Dead Probe Acceptance
 
-| Fault | Expected result |
-|---|---|
-| 429 | node enters RateLimited |
-| timeout | node enters Dead |
-| connection refused | node enters Dead |
-| 500 | retry/backoff, then policy result |
-| partial SSE | structured upstream/stream error |
-| slow first token | TTFT recorded |
+Required defaults:
 
-### Release Gate
+```text
+probe interval: 60-120 minutes with jitter
+initial batch: max(1, dead_count * 1%)
+if recovery rate >= 30%: double next batch
+if recovery rate < 10%: reset to minimum
+single batch cap: min(20, dead_count * 10%)
+recovery: 2 successful probes or 1 complete non-429 chat success
+```
+
+Tests must prove:
+
+- dead nodes are not scanned continuously.
+- RateLimited nodes are not mixed into Dead probing.
+- probes use the same provider and transport path as real requests.
+- recovered nodes return through the expected pool transition.
+
+## Observability Acceptance
+
+Admin and storage must agree on request facts.
+
+Required admin checks:
+
+```text
+GET /admin/health
+GET /admin/pools
+GET /admin/requests
+GET /admin/requests/{request_id}
+GET /admin/events
+GET /admin/config
+```
+
+Required fields in request detail:
+
+```text
+public_model
+upstream_model
+protocol
+stream
+selected_node_id
+selected_node_url_redacted
+observed_exit_ip, when available
+status
+outcome
+retry_count
+latency_total_ms
+upstream_ms
+ttft_ms, for stream
+```
+
+No secrets may be emitted in admin, metrics, or WAL output.
+
+## Release Acceptance
 
 Required commands:
 
@@ -62,18 +196,31 @@ cargo test
 cargo build --release
 ```
 
-Performance must be measured from release artifacts, not dev mode.
+Performance and process checks must use release artifacts.
 
-## Rollback
+Suggested baseline:
 
-V4.0 must keep a runtime switch until acceptance is complete:
+```text
+process count: 1
+idle RSS target: <= 50 MB unless justified
+proxy overhead P95 target: <= 30 ms excluding upstream/model latency
+```
+
+## Rollback Acceptance
+
+V4.0 must keep a runtime switch until full acceptance:
 
 ```text
 ZEN_PROVIDER_MODE=legacy
 ZEN_PROVIDER_MODE=free_model_kernel
 ```
 
-Rollback must not require rebuilding.
+Rollback requirements:
+
+- no rebuild.
+- no data migration required.
+- admin config shows active mode.
+- request records include active provider mode.
 
 ## Known Shortcomings
 
@@ -84,16 +231,19 @@ Rollback must not require rebuilding.
   areas.
 - Observed exit IP may require a test endpoint when Zen does not expose it.
 
+## Risk Register
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| FreeModel kernel keeps global client ownership | proxy rotation silently fails | kernel API must require caller-provided client |
+| Anthropic stream edge cases drift | Claude Code compatibility breaks | golden event sequence tests |
+| 429 and Dead are mixed | useful nodes get buried or bad nodes keep retrying | explicit `UpstreamOutcome` mapping tests |
+| old legacy code remains active accidentally | V4 behavior is inconsistent | provider mode gate and request record mode field |
+| observability has two truth sources | admin/debugging becomes unreliable | canonical `RequestRecord` |
+| rollback is not tested | production recovery is slow | rollback drill in release gate |
+
 ## Score Target
 
-The V4.0 design targets a 99-point engineering standard:
-
-- interface contracts are explicit.
-- selected egress is provable.
-- protocol behavior is golden-tested.
-- failure behavior is injected and verified.
-- rollout is configurable and reversible.
-- release gates are mandatory.
-
-The remaining uncertainty is long-running production evidence.
+The V4.0 implementation targets a 99-point engineering standard. The remaining
+uncertainty is long-running production evidence after acceptance passes.
 
