@@ -280,9 +280,22 @@ mod e2e {
         let anthropic_body: serde_json::Value = anthropic_resp.json().unwrap();
         assert_eq!(anthropic_body["content"][0]["text"], "zen v4 ok");
 
+        let anthropic_health_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash-lite",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 anthropic health-style request");
+        assert_eq!(anthropic_health_resp.status(), 200);
+
         let seen = observed.lock().unwrap();
         assert_eq!(seen[0]["body"]["model"], "deepseek-v4-flash-free");
         assert_eq!(seen[1]["body"]["model"], "big-pickle");
+        assert_eq!(seen[2]["body"]["model"], "big-pickle");
+        assert_eq!(seen[2]["body"]["max_tokens"], 1024);
         assert_eq!(seen[0]["selected_node_id"], "direct");
         assert_eq!(seen[0]["selected_node_url"], "direct");
 

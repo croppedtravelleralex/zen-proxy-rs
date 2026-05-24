@@ -62,6 +62,13 @@ pub async fn handle_v4_proxy(
 
     let mut upstream_body = parsed;
     upstream_body["model"] = Value::String(resolved.upstream_model.clone());
+    if path == "messages"
+        && upstream_body
+            .get("max_tokens")
+            .is_none_or(|value| value.is_null())
+    {
+        upstream_body["max_tokens"] = Value::from(1024);
+    }
     let request_meta = RequestMeta {
         model: public_model.clone(),
         stream: streaming,
