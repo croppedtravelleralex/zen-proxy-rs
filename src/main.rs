@@ -97,12 +97,12 @@ async fn models_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
         registry
             .public_models()
             .into_iter()
-            .map(|model| json!({"id": model.id, "object": "model"}))
+            .map(|model| json!({"id": model.id, "object": "model", "owned_by": "deepseek"}))
             .collect::<Vec<_>>()
     } else {
         vec![
-            json!({"id": "deepseek-v4-flash", "object": "model"}),
-            json!({"id": "deepseek-v4-pro", "object": "model"}),
+            json!({"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"}),
+            json!({"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"}),
         ]
     };
     Json(json!({

@@ -36,6 +36,7 @@ impl ProbePeriod {
                     role: "user".to_string(),
                     content: Value::String("Reply exactly: OK".to_string()),
                     tool_calls: None,
+                    tool_call_id: None,
                 }],
                 stream: Some(false),
                 max_tokens: Some(32),
