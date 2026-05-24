@@ -24,6 +24,7 @@ impl ProbePeriod {
             zen_chat_url,
             zen_api_key: api_key.to_string(),
             extra_headers: vec![("x-zen-proxy-probe".to_string(), "dead".to_string())],
+            model_mappings: Vec::new(),
         });
         for i in 0..3 {
             if i > 0 {

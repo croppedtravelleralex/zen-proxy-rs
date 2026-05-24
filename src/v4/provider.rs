@@ -287,6 +287,11 @@ async fn call_with_retry(
                     LedgerEvent::redact_node_url(&node_url),
                 ),
             ],
+            model_mappings: conf
+                .model_mapping
+                .iter()
+                .map(|(public, upstream)| (public.clone(), upstream.clone()))
+                .collect(),
         });
         let call_start = Instant::now();
         let response = match path {

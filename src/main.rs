@@ -241,6 +241,7 @@ async fn main() {
         .route("/", get(index_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/models", get(models_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/{*path}", any(proxy::proxy_handler))
         .layer(CorsLayer::permissive())
