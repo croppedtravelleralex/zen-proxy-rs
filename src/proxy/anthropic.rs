@@ -1,29 +1,60 @@
+use crate::error::AppError;
+use crate::kernel::KernelConfig;
+use crate::protocol::translate::estimate_tokens as estimate;
+use crate::protocol::{translate, types::*};
+use crate::synthesis;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use reqwest::Client;
 use serde_json::Value;
-use crate::error::AppError;
-use crate::protocol::{translate, types::*};
-use crate::routes::AppState;
-use crate::synthesis;
-use crate::protocol::translate::estimate_tokens as estimate;
 
-pub async fn handle_anthropic_messages(state: &AppState, body: AnthropicRequest) -> Result<Response, AppError> {
+pub async fn handle_anthropic_messages(
+    client: &Client,
+    config: &KernelConfig,
+    body: AnthropicRequest,
+) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
     let msgs = translate::anthropic_to_openai_messages(&body);
-    let tools: Vec<OpenAITool> = body.tools.as_ref().map(|t| translate::anthropic_tools_to_openai(t)).unwrap_or_default();
+    let tools: Vec<OpenAITool> = body
+        .tools
+        .as_ref()
+        .map(|t| translate::anthropic_tools_to_openai(t))
+        .unwrap_or_default();
     let max_tok = body.max_tokens.max(32);
     let zb = serde_json::json!({"model":model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
-    let cr = ChatRequest{model:model.clone(),messages:msgs,stream:Some(true),max_tokens:Some(max_tok),temperature:body.temperature,top_p:None,tools:if tools.is_empty(){None}else{Some(tools)},tool_choice:None};
-    if body.stream.unwrap_or(false) { handle_stream(state, &cr, &zb).await }
-    else { handle_non_stream(state, &cr, &zb).await }
+    let cr = ChatRequest {
+        model: model.clone(),
+        messages: msgs,
+        stream: Some(true),
+        max_tokens: Some(max_tok),
+        temperature: body.temperature,
+        top_p: None,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+        tool_choice: None,
+    };
+    if body.stream.unwrap_or(false) {
+        handle_stream(client, config, &cr, &zb).await
+    } else {
+        handle_non_stream(client, config, &cr, &zb).await
+    }
 }
 
-async fn handle_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
-    let resp = crate::zen::client::fetch_zen_stream(&state.http_client, &state.config.zen_chat_url, &state.config.zen_api_key, zb).await?;
-    let (content, reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
+async fn handle_non_stream(
+    client: &Client,
+    config: &KernelConfig,
+    cr: &ChatRequest,
+    zb: &Value,
+) -> Result<Response, AppError> {
+    let resp =
+        crate::zen::client::fetch_zen_stream(client, &config.zen_chat_url, &config.zen_api_key, zb)
+            .await?;
+    let (content, reasoning, _usage) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
     if content.trim().is_empty() && has_tools {
         if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
             let tc = synthesis::tool::complete_tool_call(&tc, cr);
@@ -39,10 +70,19 @@ async fn handle_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Re
                 return Ok(tool_resp(ts, &cr.model, &tc, &input, estimate(&prompt)));
             }
         } else {
-            let fb = synthesis::text::synthesize_text_fallback(&prompt); return Ok(text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response());
+            let fb = synthesis::text::synthesize_text_fallback(&prompt);
+            return Ok(
+                text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response(),
+            );
         }
     }
-    Ok(text_resp(ts, &cr.model, &content, estimate(&prompt), estimate(&content)))
+    Ok(text_resp(
+        ts,
+        &cr.model,
+        &content,
+        estimate(&prompt),
+        estimate(&content),
+    ))
 }
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
@@ -53,16 +93,29 @@ fn tool_resp(ts: u128, model: &str, tc: &ToolCall, input: &Value, input_tokens: 
     Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"tool_use","id":tc.id,"name":tc.function.name,"input":input}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}})).into_response()
 }
 
-async fn handle_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
+async fn handle_stream(
+    client: &Client,
+    config: &KernelConfig,
+    cr: &ChatRequest,
+    zb: &Value,
+) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
+    use futures::StreamExt;
     use std::convert::Infallible;
-        use futures::StreamExt;
-    let resp = crate::zen::client::fetch_zen_stream(&state.http_client, &state.config.zen_chat_url, &state.config.zen_api_key, zb).await?;
+    let resp =
+        crate::zen::client::fetch_zen_stream(client, &config.zen_chat_url, &config.zen_api_key, zb)
+            .await?;
     let byte_stream = resp.bytes_stream();
     let mut event_stream = Box::pin(crate::zen::client::stream_sse_events(byte_stream));
     let has_tools = translate::has_tools(cr);
     let model = cr.model.clone();
-    let msg_id = format!("msg_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+    let msg_id = format!(
+        "msg_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
     let body = cr.clone();
     let m = model.clone();
     let stream = async_stream::stream! {

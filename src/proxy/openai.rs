@@ -1,28 +1,55 @@
+use crate::error::AppError;
+use crate::kernel::KernelConfig;
+use crate::protocol::translate::estimate_tokens as estimate;
+use crate::protocol::{translate, types::*};
+use crate::synthesis;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use reqwest::Client;
 use serde_json::Value;
-use crate::error::AppError;
-use crate::protocol::{translate, types::*};
-use crate::routes::AppState;
-use crate::synthesis;
-use crate::protocol::translate::estimate_tokens as estimate;
 
-pub async fn handle_openai_chat(state: &AppState, body: ChatRequest) -> Result<Response, AppError> {
+pub async fn handle_openai_chat(
+    client: &Client,
+    config: &KernelConfig,
+    body: ChatRequest,
+) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
     let tools = body.tools.clone().unwrap_or_default();
     let max_tok = body.max_tokens.unwrap_or(1024).max(32);
     let zb = serde_json::json!({"model":model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
-    let cr = ChatRequest{model:model.clone(),messages:body.messages.clone(),stream:Some(true),max_tokens:Some(max_tok),temperature:body.temperature,top_p:body.top_p,tools:if tools.is_empty(){None}else{Some(tools)},tool_choice:body.tool_choice.clone()};
-    if body.stream.unwrap_or(false) { handle_oa_stream(state, &cr, &zb).await }
-    else { handle_oa_non_stream(state, &cr, &zb).await }
+    let cr = ChatRequest {
+        model: model.clone(),
+        messages: body.messages.clone(),
+        stream: Some(true),
+        max_tokens: Some(max_tok),
+        temperature: body.temperature,
+        top_p: body.top_p,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+        tool_choice: body.tool_choice.clone(),
+    };
+    if body.stream.unwrap_or(false) {
+        handle_oa_stream(client, config, &cr, &zb).await
+    } else {
+        handle_oa_non_stream(client, config, &cr, &zb).await
+    }
 }
 
-async fn handle_oa_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
-    let resp = crate::zen::client::fetch_zen_stream(&state.http_client, &state.config.zen_chat_url, &state.config.zen_api_key, zb).await?;
-    let (content, reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
+async fn handle_oa_non_stream(
+    client: &Client,
+    config: &KernelConfig,
+    cr: &ChatRequest,
+    zb: &Value,
+) -> Result<Response, AppError> {
+    let resp =
+        crate::zen::client::fetch_zen_stream(client, &config.zen_chat_url, &config.zen_api_key, zb)
+            .await?;
+    let (content, reasoning, _usage) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     if content.trim().is_empty() && has_tools {
         if let Some(tc) = synthesis::tool::synthesize_tool_call(cr) {
             let tc = synthesis::tool::complete_tool_call(&tc, cr);
@@ -36,10 +63,19 @@ async fn handle_oa_non_stream(state: &AppState, cr: &ChatRequest, zb: &Value) ->
                 return Ok(oa_tool_resp(ts, &cr.model, &tc, estimate(&prompt)));
             }
         } else {
-            let fb = synthesis::text::synthesize_text_fallback(&prompt); return Ok(oa_text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response());
+            let fb = synthesis::text::synthesize_text_fallback(&prompt);
+            return Ok(
+                oa_text_resp(ts, &cr.model, &fb, estimate(&prompt), estimate(&fb)).into_response(),
+            );
         }
     }
-    Ok(oa_text_resp(ts, &cr.model, &content, estimate(&prompt), estimate(&content)))
+    Ok(oa_text_resp(
+        ts,
+        &cr.model,
+        &content,
+        estimate(&prompt),
+        estimate(&content),
+    ))
 }
 
 fn oa_text_resp(ts: u64, model: &str, text: &str, pt: u64, ct: u64) -> Response {
@@ -50,16 +86,26 @@ fn oa_tool_resp(ts: u64, model: &str, tc: &ToolCall, pt: u64) -> Response {
     Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[tc]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":pt,"completion_tokens":1,"total_tokens":pt+1}})).into_response()
 }
 
-async fn handle_oa_stream(state: &AppState, cr: &ChatRequest, zb: &Value) -> Result<Response, AppError> {
+async fn handle_oa_stream(
+    client: &Client,
+    config: &KernelConfig,
+    cr: &ChatRequest,
+    zb: &Value,
+) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
+    use futures::StreamExt;
     use std::convert::Infallible;
-        use futures::StreamExt;
-    let resp = crate::zen::client::fetch_zen_stream(&state.http_client, &state.config.zen_chat_url, &state.config.zen_api_key, zb).await?;
+    let resp =
+        crate::zen::client::fetch_zen_stream(client, &config.zen_chat_url, &config.zen_api_key, zb)
+            .await?;
     let byte_stream = resp.bytes_stream();
     let mut event_stream = Box::pin(crate::zen::client::stream_sse_events(byte_stream));
     let has_tools = translate::has_tools(cr);
     let model = cr.model.clone();
-    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let cid = format!("chatcmpl_{created}");
     let body = cr.clone();
     let m = model.clone();

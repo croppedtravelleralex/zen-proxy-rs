@@ -1,21 +1,11 @@
-
-mod auth;
-mod config;
-mod error;
-mod protocol;
-mod proxy;
-mod routes;
-mod synthesis;
-mod zen;
-
 use axum::http::StatusCode;
-use config::Config;
-use routes::{create_router, AppState};
+use free_model_client_rs::config::Config;
+use free_model_client_rs::routes::{create_router, AppState};
 use std::time::Duration;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
-use tower_http::set_header::SetResponseHeaderLayer;
 
 #[tokio::main]
 async fn main() {
@@ -40,10 +30,12 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("x-content-type-options"),
-            axum::http::HeaderValue::from_static("nosniff")
+            axum::http::HeaderValue::from_static("nosniff"),
         ))
         .layer(cors)
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            10 * 1024 * 1024,
+        ))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             Duration::from_secs(130),
