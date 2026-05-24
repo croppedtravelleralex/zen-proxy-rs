@@ -33,7 +33,7 @@ use collector::export::JsonBackend;
 use collector::DataCollector;
 use pool::active::ActivePool;
 use pool::dead::DeadPoolImpl;
-use pool::dispatch::DispatchPool;
+use pool::dispatch::{DispatchPool, NodeBudgetLimits};
 use pool::manager::PoolManagerImpl;
 use pool::ratelimited::RateLimitedPoolImpl;
 use pool::{DeadPool, NodeRef, Pool, RateLimitedPool};
@@ -146,7 +146,12 @@ async fn main() {
     tracing::info!(count = node_urls.len(), "loaded proxy nodes");
 
     let _provider = Arc::new(WebShareProvider::new(node_urls.clone()));
-    let dispatch = DispatchPool::new();
+    let dispatch = DispatchPool::new_with_limits(NodeBudgetLimits {
+        max_calls_per_window: config.node_max_calls_per_window,
+        max_tokens_per_window: config.node_max_tokens_per_window,
+        max_kb_per_window: config.node_max_kb_per_window,
+        cooldown_secs: config.node_budget_cooldown_secs,
+    });
     let active = Arc::new(ActivePool::new());
     let ratelimited = Arc::new(RateLimitedPoolImpl::new());
     let dead = Arc::new(DeadPoolImpl::new());

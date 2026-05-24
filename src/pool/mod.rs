@@ -62,6 +62,9 @@ pub struct PoolStats {
     pub pool_transitions: u64,
     pub active_concurrency: usize,
     pub fuse: bool,
+    pub cooldown_size: usize,
+    pub budget_limited_size: usize,
+    pub leased_count: usize,
 }
 
 impl PoolStats {
@@ -77,8 +80,24 @@ pub struct RequestMeta {
     pub body_size: u64,
 }
 
+impl RequestMeta {
+    pub fn estimated_input_tokens(&self) -> u64 {
+        (self.body_size / 4).max(1)
+    }
+
+    pub fn request_kb(&self) -> u64 {
+        self.body_size.div_ceil(1024).max(1)
+    }
+}
+
 pub trait Pool: Send + Sync {
     fn acquire(&self) -> Option<NodeRef>;
+    fn acquire_for(&self, _meta: &RequestMeta) -> Option<NodeRef> {
+        self.acquire()
+    }
+    fn budget_counts(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
     fn try_acquire_sticky(
         &self,
         _meta: &RequestMeta,

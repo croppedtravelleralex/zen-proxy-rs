@@ -49,6 +49,13 @@ pub async fn handle_v4_proxy(
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_string();
+    tracing::info!(
+        path,
+        model = %public_model,
+        stream_seen_by_zenproxy = streaming,
+        body_size = body.len(),
+        "v4 ingress request"
+    );
     let registry = StaticModelRegistry;
     let resolved = match registry.resolve(&public_model) {
         Ok(resolved) => resolved,
@@ -124,7 +131,12 @@ pub async fn handle_v4_proxy(
                 bytes_received: result.body_bytes_len,
             });
             state.upstream_health.record(status);
-            result.response
+            let mut response = result.response;
+            response.headers_mut().insert(
+                "x-zen-stream-seen",
+                HeaderValue::from_static(if streaming { "true" } else { "false" }),
+            );
+            response
         }
         Err(err) => {
             state.upstream_health.record(err.status.as_u16());

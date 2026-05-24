@@ -95,13 +95,13 @@ where
     R: RateLimitedPool + 'static,
     K: DeadPool + 'static,
 {
-    fn dispatch(&self, _req: &RequestMeta) -> Result<DispatchResult, DispatchError> {
+    fn dispatch(&self, req: &RequestMeta) -> Result<DispatchResult, DispatchError> {
         if self.fuse.load(Ordering::Acquire) {
             return Err(DispatchError::NoResource);
         }
         let node = self
             .dispatch
-            .acquire()
+            .acquire_for(req)
             .ok_or(DispatchError::NoResource)
             .or_else(|_| {
                 if self.allow_direct_fallback {
@@ -244,6 +244,7 @@ where
     }
 
     fn pool_stats(&self) -> PoolStats {
+        let (cooldown_size, budget_limited_size, leased_count) = self.dispatch.budget_counts();
         PoolStats {
             dispatch_size: self.dispatch.available(),
             active_size: self.active.available(),
@@ -252,6 +253,9 @@ where
             pool_transitions: 0,
             active_concurrency: self.active.available(),
             fuse: self.fuse.load(Ordering::Acquire),
+            cooldown_size,
+            budget_limited_size,
+            leased_count,
         }
     }
 

@@ -79,6 +79,10 @@ pub struct Config {
     pub ledger_events_path: String,
     pub zen_provider_mode: ProviderMode,
     pub v4_model_registry_enabled: bool,
+    pub node_max_calls_per_window: u64,
+    pub node_max_tokens_per_window: u64,
+    pub node_max_kb_per_window: u64,
+    pub node_budget_cooldown_secs: i64,
 }
 
 impl Config {
@@ -144,6 +148,10 @@ impl Config {
                 .unwrap_or_else(|_| "/tmp/zen-proxy-ledger-events.jsonl".into()),
             zen_provider_mode: load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy),
             v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
+            node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
+            node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 250_000u64),
+            node_max_kb_per_window: load_env_var("NODE_MAX_KB_PER_WINDOW", 64 * 1024u64),
+            node_budget_cooldown_secs: load_env_var("NODE_BUDGET_COOLDOWN_SECS", 60i64),
         }
     }
 
@@ -306,6 +314,10 @@ mod tests {
             "OPENCODE_SESSION_TTL_SECS",
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
+            "NODE_MAX_CALLS_PER_WINDOW",
+            "NODE_MAX_TOKENS_PER_WINDOW",
+            "NODE_MAX_KB_PER_WINDOW",
+            "NODE_BUDGET_COOLDOWN_SECS",
         ]);
 
         let cfg = Config::from_env();
@@ -326,6 +338,10 @@ mod tests {
         assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
         assert_eq!(cfg.v4_model_registry_enabled, false);
         assert_eq!(cfg.v4_model_registry_active(), false);
+        assert_eq!(cfg.node_max_calls_per_window, 100);
+        assert_eq!(cfg.node_max_tokens_per_window, 250_000);
+        assert_eq!(cfg.node_max_kb_per_window, 64 * 1024);
+        assert_eq!(cfg.node_budget_cooldown_secs, 60);
     }
 
     #[test]
@@ -338,6 +354,10 @@ mod tests {
         unsafe { env::set_var("OPENCODE_CLIENT_NAME", "desktop-cli") };
         unsafe { env::set_var("ZEN_PROVIDER_MODE", "free_model_kernel") };
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
+        unsafe { env::set_var("NODE_MAX_CALLS_PER_WINDOW", "7") };
+        unsafe { env::set_var("NODE_MAX_TOKENS_PER_WINDOW", "777") };
+        unsafe { env::set_var("NODE_MAX_KB_PER_WINDOW", "77") };
+        unsafe { env::set_var("NODE_BUDGET_COOLDOWN_SECS", "17") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
@@ -348,6 +368,10 @@ mod tests {
         assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
         assert_eq!(cfg.v4_model_registry_enabled, true);
         assert_eq!(cfg.v4_model_registry_active(), true);
+        assert_eq!(cfg.node_max_calls_per_window, 7);
+        assert_eq!(cfg.node_max_tokens_per_window, 777);
+        assert_eq!(cfg.node_max_kb_per_window, 77);
+        assert_eq!(cfg.node_budget_cooldown_secs, 17);
 
         remove_env_vars(&[
             "PORT",
@@ -357,6 +381,10 @@ mod tests {
             "OPENCODE_CLIENT_NAME",
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
+            "NODE_MAX_CALLS_PER_WINDOW",
+            "NODE_MAX_TOKENS_PER_WINDOW",
+            "NODE_MAX_KB_PER_WINDOW",
+            "NODE_BUDGET_COOLDOWN_SECS",
         ]);
     }
 

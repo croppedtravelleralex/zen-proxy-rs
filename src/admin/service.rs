@@ -117,8 +117,9 @@ impl AdminService {
         Self::ok_response(json!({
             "dispatch": p.dispatch_size, "active": p.active_size,
             "ratelimited": p.ratelimited_size, "dead": p.dead_size,
+            "cooldown": p.cooldown_size, "budget_limited": p.budget_limited_size,
             "total": p.total(), "transitions": p.pool_transitions,
-            "concurrency": p.active_concurrency, "fuse": p.fuse,
+            "concurrency": p.active_concurrency, "leased": p.leased_count, "fuse": p.fuse,
         }))
     }
     pub fn stats_upstream(state: &AppState) -> Response {
@@ -138,6 +139,9 @@ impl AdminService {
                 "active": p.active_size,
                 "ratelimited": p.ratelimited_size,
                 "dead": p.dead_size,
+                "cooldown": p.cooldown_size,
+                "budget_limited": p.budget_limited_size,
+                "leased": p.leased_count,
                 "total": p.total(),
                 "fuse": p.fuse,
             }
@@ -146,7 +150,9 @@ impl AdminService {
     pub fn pool_by_name(state: &AppState, name: &str) -> Response {
         let p = state.pool_manager.pool_stats();
         match name {
-            "dispatch" => Self::ok_response(json!({"name":"dispatch","size":p.dispatch_size})),
+            "dispatch" => Self::ok_response(
+                json!({"name":"dispatch","size":p.dispatch_size,"cooldown":p.cooldown_size,"budget_limited":p.budget_limited_size,"leased":p.leased_count}),
+            ),
             "active" => Self::ok_response(json!({"name":"active","size":p.active_size})),
             "ratelimited" => {
                 Self::ok_response(json!({"name":"ratelimited","size":p.ratelimited_size}))
@@ -160,7 +166,7 @@ impl AdminService {
     pub fn fuse_status(state: &AppState) -> Response {
         let p = state.pool_manager.pool_stats();
         Self::ok_response(
-            json!({"fuse":p.fuse,"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size}}),
+            json!({"fuse":p.fuse,"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size,"cooldown":p.cooldown_size,"budget_limited":p.budget_limited_size,"leased":p.leased_count}}),
         )
     }
     pub fn fuse_set(state: &AppState, open: bool) -> Response {
@@ -281,6 +287,12 @@ impl AdminService {
             "v4_model_registry_enabled": cfg.v4_model_registry_enabled,
             "admin_api_key_configured": cfg.admin_api_key.is_some(),
             "proxy_api_key_configured": cfg.proxy_api_key.is_some(),
+            "node_budget": {
+                "max_calls_per_window": cfg.node_max_calls_per_window,
+                "max_tokens_per_window": cfg.node_max_tokens_per_window,
+                "max_kb_per_window": cfg.node_max_kb_per_window,
+                "cooldown_secs": cfg.node_budget_cooldown_secs,
+            },
         }))
     }
     pub fn config_reload(state: &AppState) -> Response {
@@ -320,7 +332,7 @@ impl AdminService {
         let p = state.pool_manager.pool_stats();
         let s = state.collector.snapshot();
         Self::ok_response(
-            json!({"version":env!("CARGO_PKG_VERSION"),"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size,"fuse":p.fuse},"requests":{"total":s.requests.total,"success":s.requests.success,"rpm":s.requests.rpm},"upstream":{"backoff":state.upstream_health.is_backoff()}}),
+            json!({"version":env!("CARGO_PKG_VERSION"),"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size,"cooldown":p.cooldown_size,"budget_limited":p.budget_limited_size,"leased":p.leased_count,"fuse":p.fuse},"requests":{"total":s.requests.total,"success":s.requests.success,"rpm":s.requests.rpm},"upstream":{"backoff":state.upstream_health.is_backoff()}}),
         )
     }
     pub fn system_log_level(level: &str) -> Response {
