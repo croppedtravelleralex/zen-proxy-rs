@@ -124,9 +124,9 @@ pub async fn handle_v4_proxy(
                 latency_total_ms: latency,
                 upstream_ms: result.upstream_ms,
                 ttft_ms: result.ttft_ms.unwrap_or_default(),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
+                prompt_tokens: result.usage.prompt_tokens,
+                completion_tokens: result.usage.completion_tokens,
+                total_tokens: result.usage.total_tokens,
                 bytes_sent: body.len() as u64,
                 bytes_received: result.body_bytes_len,
             });
@@ -202,6 +202,14 @@ struct V4CallResult {
     upstream_ms: u64,
     ttft_ms: Option<u64>,
     body_bytes_len: u64,
+    usage: UsageCounts,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageCounts {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
 }
 
 struct V4CallError {
@@ -375,6 +383,11 @@ async fn call_with_retry(
                         attempt,
                         request_meta.stream,
                     );
+                    let (response, body_bytes_len, usage) = if request_meta.stream {
+                        (response, 0, UsageCounts::default())
+                    } else {
+                        buffered_response_with_usage(response, path).await?
+                    };
                     return Ok(V4CallResult {
                         response,
                         request_id,
@@ -387,7 +400,8 @@ async fn call_with_retry(
                         was_rate_limited,
                         upstream_ms: latency,
                         ttft_ms: Some(latency),
-                        body_bytes_len: 0,
+                        body_bytes_len,
+                        usage,
                     });
                 }
                 last_status = status;
@@ -728,4 +742,57 @@ async fn buffered_response(response: Response) -> Result<(Response, u64), V4Call
     *rebuilt.status_mut() = status;
     *rebuilt.headers_mut() = headers;
     Ok((rebuilt, len))
+}
+
+async fn buffered_response_with_usage(
+    response: Response,
+    path: &str,
+) -> Result<(Response, u64, UsageCounts), V4CallError> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|err| {
+            V4CallError::before_dispatch(
+                StatusCode::BAD_GATEWAY,
+                format!("failed to read provider response body: {err}"),
+            )
+        })?;
+    let len = bytes.len() as u64;
+    let usage = extract_usage_counts(path, &bytes);
+    let mut rebuilt = Response::new(Body::from(bytes));
+    *rebuilt.status_mut() = status;
+    *rebuilt.headers_mut() = headers;
+    Ok((rebuilt, len, usage))
+}
+
+fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return UsageCounts::default();
+    };
+    let Some(usage) = value.get("usage") else {
+        return UsageCounts::default();
+    };
+    let as_u32 = |name: &str| -> u32 {
+        usage
+            .get(name)
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32
+    };
+    if path == "messages" {
+        let prompt_tokens = as_u32("input_tokens");
+        let completion_tokens = as_u32("output_tokens");
+        UsageCounts {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        }
+    } else {
+        UsageCounts {
+            prompt_tokens: as_u32("prompt_tokens"),
+            completion_tokens: as_u32("completion_tokens"),
+            total_tokens: as_u32("total_tokens"),
+        }
+    }
 }

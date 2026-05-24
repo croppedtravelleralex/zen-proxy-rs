@@ -334,6 +334,10 @@ mod e2e {
         assert_eq!(openai_record["selected_node_url_redacted"], "direct");
         assert_eq!(openai_record["observed_exit_ip"], "direct");
         assert_eq!(openai_record["outcome"], "success");
+        assert_eq!(openai_record["prompt_tokens"], 2);
+        assert_eq!(openai_record["completion_tokens"], 3);
+        assert_eq!(openai_record["total_tokens"], 5);
+        assert!(openai_record["bytes_received"].as_u64().unwrap_or(0) > 0);
         stop_server(child, port);
     }
 
