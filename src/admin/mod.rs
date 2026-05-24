@@ -46,6 +46,10 @@ auth_h!(stats_models_h, AdminService::stats_models);
 auth_h!(stats_nodes_h, AdminService::stats_nodes);
 auth_h!(stats_pools_h, AdminService::stats_pools);
 auth_h!(stats_upstream_h, AdminService::stats_upstream);
+auth_h!(routes_h, AdminService::routes);
+auth_h!(runtime_h, AdminService::runtime);
+auth_h!(models_h, AdminService::models);
+auth_h!(budget_h, AdminService::budget);
 auth_h!(pools_h, AdminService::pools);
 auth_h!(fuse_get_h, AdminService::fuse_status);
 auth_h!(requests_recent_h, AdminService::requests_recent);
@@ -85,6 +89,16 @@ async fn request_detail_h(
         return err("unauthorized");
     }
     AdminService::request_detail(&st, &rid)
+}
+async fn model_detail_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::model_detail(&st, &model_id)
 }
 async fn requests_h(
     State(st): State<Arc<AppState>>,
@@ -196,6 +210,11 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/health", get(health_h))
         .route("/admin/health/live", get(health_live_h))
         .route("/admin/health/ready", get(health_ready_h))
+        .route("/admin/routes", get(routes_h))
+        .route("/admin/runtime", get(runtime_h))
+        .route("/admin/models", get(models_h))
+        .route("/admin/models/{model_id}", get(model_detail_h))
+        .route("/admin/budget", get(budget_h))
         .route("/admin/stats", get(stats_h))
         .route("/admin/stats/models", get(stats_models_h))
         .route("/admin/stats/nodes", get(stats_nodes_h))

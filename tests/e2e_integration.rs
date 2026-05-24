@@ -218,6 +218,23 @@ mod e2e {
             .filter_map(|model| model["id"].as_str())
             .collect();
         assert_eq!(ids, vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]);
+
+        let detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/deepseek-v4-flash",
+            port
+        ))
+        .expect("model detail endpoint");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(detail_body["id"], "deepseek-v4-flash");
+        assert_eq!(detail_body["upstream_id"], "deepseek-v4-flash-free");
+
+        let missing = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/deepseek-v4-pro",
+            port
+        ))
+        .expect("missing model detail endpoint");
+        assert_eq!(missing.status(), 404);
         stop_server(child, port);
     }
 
@@ -529,6 +546,11 @@ mod e2e {
         let paths = [
             "/admin/health",
             "/admin/health/live",
+            "/admin/routes",
+            "/admin/runtime",
+            "/admin/models",
+            "/admin/models/deepseek-v4-flash",
+            "/admin/budget",
             "/admin/stats",
             "/admin/stats/models",
             "/admin/stats/nodes",
@@ -584,6 +606,16 @@ mod e2e {
             .send()
             .expect("unknown pool endpoint");
         assert_eq!(unknown_pool.status(), 404);
+
+        let missing_model = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/not-a-model",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("missing admin model endpoint");
+        assert_eq!(missing_model.status(), 404);
 
         stop_server(child, port);
     }

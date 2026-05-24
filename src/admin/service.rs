@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::collector::RequestFilter;
 
 use crate::state::AppState;
+use crate::v4::model::{ModelRegistry, StaticModelRegistry};
 
 pub struct AdminService;
 
@@ -124,6 +125,170 @@ impl AdminService {
     }
     pub fn stats_upstream(state: &AppState) -> Response {
         Self::ok_response(json!({ "backoff": state.upstream_health.is_backoff() }))
+    }
+    pub fn routes(_state: &AppState) -> Response {
+        Self::ok_response(json!({
+            "public": [
+                {"method":"GET","path":"/"},
+                {"method":"GET","path":"/health"},
+                {"method":"GET","path":"/metrics"},
+                {"method":"GET","path":"/models"},
+                {"method":"GET","path":"/v1/models"},
+                {"method":"GET","path":"/v1/models/{model_id}"},
+                {"method":"POST","path":"/v1/chat/completions"},
+                {"method":"POST","path":"/v1/messages"}
+            ],
+            "admin": [
+                {"method":"GET","path":"/admin/health"},
+                {"method":"GET","path":"/admin/health/live"},
+                {"method":"GET","path":"/admin/health/ready"},
+                {"method":"GET","path":"/admin/routes"},
+                {"method":"GET","path":"/admin/runtime"},
+                {"method":"GET","path":"/admin/models"},
+                {"method":"GET","path":"/admin/models/{model_id}"},
+                {"method":"GET","path":"/admin/budget"},
+                {"method":"GET","path":"/admin/stats"},
+                {"method":"GET","path":"/admin/stats/models"},
+                {"method":"GET","path":"/admin/stats/nodes"},
+                {"method":"GET","path":"/admin/stats/pools"},
+                {"method":"GET","path":"/admin/stats/upstream"},
+                {"method":"GET","path":"/admin/pools"},
+                {"method":"GET","path":"/admin/pools/{name}"},
+                {"method":"GET,POST","path":"/admin/fuse"},
+                {"method":"GET","path":"/admin/requests"},
+                {"method":"GET","path":"/admin/requests/recent"},
+                {"method":"GET","path":"/admin/requests/summary"},
+                {"method":"GET","path":"/admin/requests/models"},
+                {"method":"GET","path":"/admin/requests/nodes"},
+                {"method":"GET","path":"/admin/requests/{rid}"},
+                {"method":"GET","path":"/admin/requests/export"},
+                {"method":"GET","path":"/admin/events"},
+                {"method":"GET","path":"/admin/events/recent"},
+                {"method":"GET","path":"/admin/events/probes"},
+                {"method":"GET","path":"/admin/ledger"},
+                {"method":"GET","path":"/admin/ledger/models"},
+                {"method":"GET","path":"/admin/ledger/keys"},
+                {"method":"GET","path":"/admin/ledger/streams"},
+                {"method":"GET","path":"/admin/config"},
+                {"method":"POST","path":"/admin/config/reload"},
+                {"method":"GET","path":"/admin/config/validation"},
+                {"method":"GET","path":"/admin/system/uptime"},
+                {"method":"GET","path":"/admin/system/info"},
+                {"method":"POST","path":"/admin/system/log-level/{level}"},
+                {"method":"GET,POST","path":"/admin/nodes"},
+                {"method":"DELETE","path":"/admin/nodes/{node_id}"},
+                {"method":"POST","path":"/admin/nodes/{node_id}/probe"},
+                {"method":"POST","path":"/admin/nodes/{node_id}/recover"},
+                {"method":"POST","path":"/admin/probe/now"}
+            ]
+        }))
+    }
+    pub fn runtime(state: &AppState) -> Response {
+        let cfg = state.config.read().unwrap();
+        let p = state.pool_manager.pool_stats();
+        Self::ok_response(json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "uptime_secs": state.startup_time.elapsed().as_secs(),
+            "bind_address": cfg.bind_address,
+            "port": cfg.port,
+            "provider_mode": cfg.zen_provider_mode.to_string(),
+            "v4_model_registry_active": cfg.v4_model_registry_active(),
+            "upstream_base": cfg.upstream_base,
+            "allow_direct_fallback": cfg.allow_direct_fallback,
+            "global_budget": cfg.global_budget_redis_url.as_ref().map(|_| json!({
+                "configured": true,
+                "instance_id": cfg.instance_id,
+                "window_secs": cfg.node_budget_window_secs,
+                "lease_ttl_secs": cfg.node_lease_ttl_secs,
+            })).unwrap_or_else(|| json!({"configured": false})),
+            "pools": {
+                "dispatch": p.dispatch_size,
+                "active": p.active_size,
+                "ratelimited": p.ratelimited_size,
+                "dead": p.dead_size,
+                "cooldown": p.cooldown_size,
+                "budget_limited": p.budget_limited_size,
+                "leased": p.leased_count,
+                "fuse": p.fuse,
+            }
+        }))
+    }
+    pub fn models(state: &AppState) -> Response {
+        let cfg = state.config.read().unwrap();
+        if cfg.v4_model_registry_active() {
+            let registry = StaticModelRegistry;
+            let models: Vec<Value> = registry
+                .public_models()
+                .into_iter()
+                .map(|model| {
+                    json!({
+                        "id": model.id,
+                        "upstream_id": model.upstream_id,
+                        "owned_by": "deepseek",
+                        "endpoints": ["openai_chat_completions", "anthropic_messages"]
+                    })
+                })
+                .collect();
+            Self::ok_response(json!({"mode": "v4", "models": models}))
+        } else {
+            Self::ok_response(json!({
+                "mode": "legacy",
+                "models": [
+                    {"id":"deepseek-v4-flash","upstream_id":"deepseek-v4-flash"},
+                    {"id":"deepseek-v4-pro","upstream_id":"deepseek-v4-pro"}
+                ]
+            }))
+        }
+    }
+    pub fn model_detail(state: &AppState, model_id: &str) -> Response {
+        let cfg = state.config.read().unwrap();
+        if cfg.v4_model_registry_active() {
+            let registry = StaticModelRegistry;
+            match registry.resolve(model_id) {
+                Ok(resolved) => Self::ok_response(json!({
+                    "id": resolved.public_model,
+                    "upstream_id": resolved.upstream_model,
+                    "mode": "v4",
+                    "endpoints": ["openai_chat_completions", "anthropic_messages"]
+                })),
+                Err(_) => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
+            }
+        } else {
+            match model_id {
+                "deepseek-v4-flash" | "deepseek-v4-pro" => Self::ok_response(json!({
+                    "id": model_id,
+                    "upstream_id": model_id,
+                    "mode": "legacy"
+                })),
+                _ => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
+            }
+        }
+    }
+    pub fn budget(state: &AppState) -> Response {
+        let cfg = state.config.read().unwrap();
+        let p = state.pool_manager.pool_stats();
+        Self::ok_response(json!({
+            "global": {
+                "redis_configured": cfg.global_budget_redis_url.is_some(),
+                "instance_id": cfg.instance_id,
+                "window_secs": cfg.node_budget_window_secs,
+                "lease_ttl_secs": cfg.node_lease_ttl_secs,
+            },
+            "limits": {
+                "max_calls_per_window": cfg.node_max_calls_per_window,
+                "max_tokens_per_window": cfg.node_max_tokens_per_window,
+                "max_kb_per_window": cfg.node_max_kb_per_window,
+                "cooldown_secs": cfg.node_budget_cooldown_secs,
+            },
+            "current": {
+                "dispatch": p.dispatch_size,
+                "cooldown": p.cooldown_size,
+                "budget_limited": p.budget_limited_size,
+                "leased": p.leased_count,
+                "active": p.active_size,
+            }
+        }))
     }
     pub fn pools(state: &AppState) -> Response {
         Self::stats_pools(state)

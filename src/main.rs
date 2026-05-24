@@ -19,7 +19,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
+    http::StatusCode,
     response::Json,
     routing::{any, get},
     Router,
@@ -110,6 +111,49 @@ async fn models_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
         "object": "list",
         "data": data
     }))
+}
+
+async fn model_detail_handler(
+    State(st): State<Arc<AppState>>,
+    Path(model_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cfg = st.config.read().unwrap();
+    let data = if cfg.v4_model_registry_active() {
+        let registry = v4::model::StaticModelRegistry;
+        match registry.resolve(&model_id) {
+            Ok(model) => json!({
+                "id": model.public_model,
+                "object": "model",
+                "owned_by": "deepseek",
+                "upstream_id": model.upstream_model
+            }),
+            Err(_) => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        json!({"error":{"message":"model not found","type":"invalid_request_error","code":"model_not_found"}}),
+                    ),
+                ));
+            }
+        }
+    } else {
+        match model_id.as_str() {
+            "deepseek-v4-flash" | "deepseek-v4-pro" => json!({
+                "id": model_id,
+                "object": "model",
+                "owned_by": "deepseek"
+            }),
+            _ => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(
+                        json!({"error":{"message":"model not found","type":"invalid_request_error","code":"model_not_found"}}),
+                    ),
+                ));
+            }
+        }
+    };
+    Ok(Json(data))
 }
 
 async fn shutdown_signal() {
@@ -270,6 +314,7 @@ async fn main() {
         .route("/metrics", get(metrics_handler))
         .route("/models", get(models_handler))
         .route("/v1/models", get(models_handler))
+        .route("/v1/models/{model_id}", get(model_detail_handler))
         .route("/v1/{*path}", any(proxy::proxy_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
