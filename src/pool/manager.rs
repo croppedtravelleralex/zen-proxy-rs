@@ -143,7 +143,11 @@ where
         Ok(DispatchResult { node, client, url })
     }
 
-    fn dispatch_sticky(&self, meta: &RequestMeta, node_id: &str) -> Result<DispatchResult, DispatchError> {
+    fn dispatch_sticky(
+        &self,
+        meta: &RequestMeta,
+        node_id: &str,
+    ) -> Result<DispatchResult, DispatchError> {
         if self.fuse.load(Ordering::Acquire) {
             return Err(DispatchError::NoResource);
         }
@@ -188,7 +192,9 @@ where
                     let nid = node_id.clone();
 
                     tokio::spawn(async move {
-                        let ok = ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await;
+                        let ok =
+                            ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key)
+                                .await;
 
                         if ok {
                             ratelimited.recover(&nid);
@@ -213,39 +219,7 @@ where
                 self.active.release(&node_id, &result);
                 self.dispatch.release(&node_id, &result);
                 self.dispatch.remove(&node_id);
-
-                if let Some(nr) = self.nodes.read().unwrap().get(&node_id).cloned() {
-                    let dispatch = self.dispatch.clone();
-                    let dead = self.dead.clone();
-                    let collector = self.collector.clone();
-                    let client = self.get_or_create_client(&node_id, &nr.url);
-                    let upstream = self.upstream_base.clone();
-                    let timeout = self.probe_timeout_secs;
-                    let api_key = self.upstream_api_key.clone();
-                    let nid = node_id.clone();
-
-                    tokio::spawn(async move {
-                        let ok = ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await;
-
-                        if ok {
-                            dispatch.add(NodeRef {
-                                id: nid.clone(),
-                                url: nr.url.clone(),
-                            });
-                            dispatch.release(&nid, &ResultKind::Success(200));
-                        } else {
-                            dead.bury(nid.clone());
-                        }
-
-                        collector.record_probe(&ProbeEvent {
-                            ts: chrono::Utc::now().timestamp(),
-                            node_id: nid,
-                            pool: "error_probe".to_string(),
-                            ok,
-                            latency_ms: 0,
-                        });
-                    });
-                }
+                self.dead.bury(node_id);
             }
         }
     }
@@ -312,7 +286,10 @@ where
                 ProbePeriod::probe_node(&client, nr, &upstream, timeout, &api_key).await
             })
         });
-        Some(ProbeResult { success: ok, latency_ms: start.elapsed().as_millis() as u64 })
+        Some(ProbeResult {
+            success: ok,
+            latency_ms: start.elapsed().as_millis() as u64,
+        })
     }
 
     fn recover_node(&self, node_id: &str) {
