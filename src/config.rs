@@ -4,13 +4,10 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
-use serde::Deserialize;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderMode {
     Legacy,
     FreeModelKernel,
-    NewApi,
 }
 
 impl ProviderMode {
@@ -18,7 +15,6 @@ impl ProviderMode {
         match self {
             Self::Legacy => "legacy",
             Self::FreeModelKernel => "free_model_kernel",
-            Self::NewApi => "newapi",
         }
     }
 }
@@ -36,18 +32,9 @@ impl FromStr for ProviderMode {
         match value {
             "legacy" => Ok(Self::Legacy),
             "free_model_kernel" | "free-model-kernel" => Ok(Self::FreeModelKernel),
-            "newapi" | "new_api" | "new-api" => Ok(Self::NewApi),
             _ => Err(()),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct NewApiChannelConn {
-    #[serde(rename = "_type")]
-    pub conn_type: Option<String>,
-    pub key: String,
-    pub url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +79,6 @@ pub struct Config {
     pub ledger_events_path: String,
     pub zen_provider_mode: ProviderMode,
     pub v4_model_registry_enabled: bool,
-    pub newapi_channel: Option<NewApiChannelConn>,
 }
 
 impl Config {
@@ -158,7 +144,6 @@ impl Config {
                 .unwrap_or_else(|_| "/tmp/zen-proxy-ledger-events.jsonl".into()),
             zen_provider_mode: load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy),
             v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
-            newapi_channel: Self::load_newapi_channel(),
         }
     }
 
@@ -239,38 +224,7 @@ impl Config {
 
     pub fn v4_model_registry_active(&self) -> bool {
         self.v4_model_registry_enabled
-            || matches!(
-                self.zen_provider_mode,
-                ProviderMode::FreeModelKernel | ProviderMode::NewApi
-            )
-    }
-
-    fn load_newapi_channel() -> Option<NewApiChannelConn> {
-        if let Ok(raw) = env::var("NEWAPI_CHANNEL_CONN") {
-            if !raw.trim().is_empty() {
-                match serde_json::from_str::<NewApiChannelConn>(&raw) {
-                    Ok(conn) => return Some(conn),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to parse NEWAPI_CHANNEL_CONN");
-                    }
-                }
-            }
-        }
-
-        let key = env::var("NEWAPI_KEY")
-            .ok()
-            .filter(|value| !value.is_empty());
-        let url = env::var("NEWAPI_URL")
-            .ok()
-            .filter(|value| !value.is_empty());
-        match (key, url) {
-            (Some(key), Some(url)) => Some(NewApiChannelConn {
-                conn_type: Some("newapi_channel_conn".to_string()),
-                key,
-                url,
-            }),
-            _ => None,
-        }
+            || matches!(self.zen_provider_mode, ProviderMode::FreeModelKernel)
     }
 }
 
@@ -322,9 +276,6 @@ mod tests {
             "OPENCODE_SESSION_TTL_SECS",
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
-            "NEWAPI_CHANNEL_CONN",
-            "NEWAPI_KEY",
-            "NEWAPI_URL",
         ]);
 
         let cfg = Config::from_env();
@@ -345,7 +296,6 @@ mod tests {
         assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
         assert_eq!(cfg.v4_model_registry_enabled, false);
         assert_eq!(cfg.v4_model_registry_active(), false);
-        assert!(cfg.newapi_channel.is_none());
     }
 
     #[test]
@@ -356,14 +306,8 @@ mod tests {
         unsafe { env::set_var("PROBE_BATCH_SIZE", "10") };
         unsafe { env::set_var("OPENCODE_HEADERS_ENABLED", "true") };
         unsafe { env::set_var("OPENCODE_CLIENT_NAME", "desktop-cli") };
-        unsafe { env::set_var("ZEN_PROVIDER_MODE", "newapi") };
+        unsafe { env::set_var("ZEN_PROVIDER_MODE", "free_model_kernel") };
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
-        unsafe {
-            env::set_var(
-                "NEWAPI_CHANNEL_CONN",
-                r#"{"_type":"newapi_channel_conn","key":"sk-dev","url":"http://127.0.0.1:3000"}"#,
-            )
-        };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
@@ -371,14 +315,9 @@ mod tests {
         assert_eq!(cfg.probe_batch_size, 10);
         assert_eq!(cfg.opencode_headers_enabled, true);
         assert_eq!(cfg.opencode_client_name, "desktop-cli");
-        assert_eq!(cfg.zen_provider_mode, ProviderMode::NewApi);
+        assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
         assert_eq!(cfg.v4_model_registry_enabled, true);
         assert_eq!(cfg.v4_model_registry_active(), true);
-        assert_eq!(cfg.newapi_channel.as_ref().unwrap().key, "sk-dev");
-        assert_eq!(
-            cfg.newapi_channel.as_ref().unwrap().url,
-            "http://127.0.0.1:3000"
-        );
 
         remove_env_vars(&[
             "PORT",
@@ -388,7 +327,6 @@ mod tests {
             "OPENCODE_CLIENT_NAME",
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
-            "NEWAPI_CHANNEL_CONN",
         ]);
     }
 

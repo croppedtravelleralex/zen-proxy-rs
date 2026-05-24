@@ -242,7 +242,6 @@ impl AdminService {
             "pool_starvation_retry_after_secs": cfg.pool_starvation_retry_after_secs,
             "zen_provider_mode": cfg.zen_provider_mode.to_string(),
             "v4_model_registry_enabled": cfg.v4_model_registry_enabled,
-            "newapi_channel_configured": cfg.newapi_channel.is_some(),
             "admin_api_key_configured": cfg.admin_api_key.is_some(),
             "proxy_api_key_configured": cfg.proxy_api_key.is_some(),
         }))
