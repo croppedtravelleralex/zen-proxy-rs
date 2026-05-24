@@ -1,6 +1,7 @@
 pub mod active;
 pub mod dead;
 pub mod dispatch;
+pub mod global_budget;
 pub mod manager;
 pub mod probe_period;
 pub mod ratelimited;

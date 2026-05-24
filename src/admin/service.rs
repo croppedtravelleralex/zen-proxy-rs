@@ -287,11 +287,15 @@ impl AdminService {
             "v4_model_registry_enabled": cfg.v4_model_registry_enabled,
             "admin_api_key_configured": cfg.admin_api_key.is_some(),
             "proxy_api_key_configured": cfg.proxy_api_key.is_some(),
+            "instance_id": cfg.instance_id,
+            "global_budget_redis_configured": cfg.global_budget_redis_url.is_some(),
             "node_budget": {
                 "max_calls_per_window": cfg.node_max_calls_per_window,
                 "max_tokens_per_window": cfg.node_max_tokens_per_window,
                 "max_kb_per_window": cfg.node_max_kb_per_window,
                 "cooldown_secs": cfg.node_budget_cooldown_secs,
+                "window_secs": cfg.node_budget_window_secs,
+                "lease_ttl_secs": cfg.node_lease_ttl_secs,
             },
         }))
     }

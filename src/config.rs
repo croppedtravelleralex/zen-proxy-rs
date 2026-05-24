@@ -83,6 +83,10 @@ pub struct Config {
     pub node_max_tokens_per_window: u64,
     pub node_max_kb_per_window: u64,
     pub node_budget_cooldown_secs: i64,
+    pub node_budget_window_secs: u64,
+    pub node_lease_ttl_secs: u64,
+    pub global_budget_redis_url: Option<String>,
+    pub instance_id: String,
 }
 
 impl Config {
@@ -152,6 +156,14 @@ impl Config {
             node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 250_000u64),
             node_max_kb_per_window: load_env_var("NODE_MAX_KB_PER_WINDOW", 64 * 1024u64),
             node_budget_cooldown_secs: load_env_var("NODE_BUDGET_COOLDOWN_SECS", 60i64),
+            node_budget_window_secs: load_env_var("NODE_BUDGET_WINDOW_SECS", 3600u64),
+            node_lease_ttl_secs: load_env_var("NODE_LEASE_TTL_SECS", 180u64),
+            global_budget_redis_url: match env::var("GLOBAL_BUDGET_REDIS_URL") {
+                Ok(v) if !v.is_empty() => Some(v),
+                _ => None,
+            },
+            instance_id: env::var("INSTANCE_ID")
+                .unwrap_or_else(|_| format!("zen-{}-{}", std::process::id(), uuid::Uuid::new_v4())),
         }
     }
 
@@ -318,6 +330,10 @@ mod tests {
             "NODE_MAX_TOKENS_PER_WINDOW",
             "NODE_MAX_KB_PER_WINDOW",
             "NODE_BUDGET_COOLDOWN_SECS",
+            "NODE_BUDGET_WINDOW_SECS",
+            "NODE_LEASE_TTL_SECS",
+            "GLOBAL_BUDGET_REDIS_URL",
+            "INSTANCE_ID",
         ]);
 
         let cfg = Config::from_env();
@@ -342,6 +358,10 @@ mod tests {
         assert_eq!(cfg.node_max_tokens_per_window, 250_000);
         assert_eq!(cfg.node_max_kb_per_window, 64 * 1024);
         assert_eq!(cfg.node_budget_cooldown_secs, 60);
+        assert_eq!(cfg.node_budget_window_secs, 3600);
+        assert_eq!(cfg.node_lease_ttl_secs, 180);
+        assert!(cfg.global_budget_redis_url.is_none());
+        assert!(cfg.instance_id.starts_with("zen-"));
     }
 
     #[test]
@@ -358,6 +378,10 @@ mod tests {
         unsafe { env::set_var("NODE_MAX_TOKENS_PER_WINDOW", "777") };
         unsafe { env::set_var("NODE_MAX_KB_PER_WINDOW", "77") };
         unsafe { env::set_var("NODE_BUDGET_COOLDOWN_SECS", "17") };
+        unsafe { env::set_var("NODE_BUDGET_WINDOW_SECS", "1700") };
+        unsafe { env::set_var("NODE_LEASE_TTL_SECS", "270") };
+        unsafe { env::set_var("GLOBAL_BUDGET_REDIS_URL", "redis://127.0.0.1:6379/") };
+        unsafe { env::set_var("INSTANCE_ID", "test-instance") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
@@ -372,6 +396,13 @@ mod tests {
         assert_eq!(cfg.node_max_tokens_per_window, 777);
         assert_eq!(cfg.node_max_kb_per_window, 77);
         assert_eq!(cfg.node_budget_cooldown_secs, 17);
+        assert_eq!(cfg.node_budget_window_secs, 1700);
+        assert_eq!(cfg.node_lease_ttl_secs, 270);
+        assert_eq!(
+            cfg.global_budget_redis_url.as_deref(),
+            Some("redis://127.0.0.1:6379/")
+        );
+        assert_eq!(cfg.instance_id, "test-instance");
 
         remove_env_vars(&[
             "PORT",
@@ -385,6 +416,10 @@ mod tests {
             "NODE_MAX_TOKENS_PER_WINDOW",
             "NODE_MAX_KB_PER_WINDOW",
             "NODE_BUDGET_COOLDOWN_SECS",
+            "NODE_BUDGET_WINDOW_SECS",
+            "NODE_LEASE_TTL_SECS",
+            "GLOBAL_BUDGET_REDIS_URL",
+            "INSTANCE_ID",
         ]);
     }
 

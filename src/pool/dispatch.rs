@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
+use crate::pool::global_budget::GlobalBudgetRegistry;
 use crate::pool::*;
 use reqwest::Client;
 
@@ -112,6 +113,14 @@ impl NodeBudget {
             .saturating_add(meta.estimated_input_tokens());
         self.kb_in_window = self.kb_in_window.saturating_add(meta.request_kb());
         self.budget_hit_reason = None;
+    }
+
+    fn rollback_admit(&mut self, meta: &RequestMeta) {
+        self.calls_in_window = self.calls_in_window.saturating_sub(1);
+        self.tokens_in_window = self
+            .tokens_in_window
+            .saturating_sub(meta.estimated_input_tokens());
+        self.kb_in_window = self.kb_in_window.saturating_sub(meta.request_kb());
     }
 
     fn cooldown(&mut self, now: i64, reason: impl Into<String>) {
@@ -232,6 +241,11 @@ impl PoolNode {
             });
     }
 
+    fn rollback_local_admit(&self, meta: &RequestMeta) {
+        self.release_lease();
+        self.budget.write().unwrap().rollback_admit(meta);
+    }
+
     fn snapshot(&self) -> NodeBudgetSnapshot {
         let budget = self.budget.read().unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -258,6 +272,7 @@ pub struct DispatchPool {
     nodes: RwLock<Vec<PoolNode>>,
     idle_since: AtomicI64,
     budget_limits: NodeBudgetLimits,
+    global_budget: Option<GlobalBudgetRegistry>,
 }
 
 impl DispatchPool {
@@ -270,7 +285,13 @@ impl DispatchPool {
             nodes: RwLock::new(Vec::new()),
             idle_since: AtomicI64::new(chrono::Utc::now().timestamp()),
             budget_limits,
+            global_budget: None,
         }
+    }
+
+    pub fn with_global_budget(mut self, global_budget: GlobalBudgetRegistry) -> Self {
+        self.global_budget = Some(global_budget);
+        self
     }
 
     pub fn budget_snapshots(&self) -> Vec<NodeBudgetSnapshot> {
@@ -297,6 +318,27 @@ impl DispatchPool {
             .map(|snapshot| snapshot.concurrent_now as usize)
             .sum();
         (cooldown_size, budget_limited_size, leased_count)
+    }
+
+    fn global_admit(&self, node: &PoolNode, meta: &RequestMeta) -> bool {
+        let Some(registry) = &self.global_budget else {
+            return true;
+        };
+        match registry.try_acquire(&node.node.id, meta) {
+            Ok(_) => true,
+            Err(reason) => {
+                let mut budget = node.budget.write().unwrap();
+                if matches!(
+                    reason.as_str(),
+                    "max_calls" | "max_tokens" | "max_kb" | "cooldown"
+                ) {
+                    budget.cooldown(chrono::Utc::now().timestamp(), format!("global_{reason}"));
+                } else {
+                    budget.budget_hit_reason = Some(format!("global_{reason}"));
+                }
+                false
+            }
+        }
     }
 }
 
@@ -352,9 +394,12 @@ impl Pool for DispatchPool {
             cumulative += n.score();
             if cumulative >= threshold {
                 if n.try_admit(meta, now) {
-                    return Some(n.node.clone());
+                    if self.global_admit(n, meta) {
+                        return Some(n.node.clone());
+                    }
+                    n.rollback_local_admit(meta);
                 }
-                return None;
+                continue;
             }
         }
 
@@ -373,16 +418,21 @@ impl Pool for DispatchPool {
             .find(|n| n.node.id == *node_id)
             .ok_or(DispatchError::NoResource)?;
         if node.try_admit(_meta, now) {
-            Ok(node.node.clone())
-        } else {
-            Err(DispatchError::NoResource)
+            if self.global_admit(node, _meta) {
+                return Ok(node.node.clone());
+            }
+            node.rollback_local_admit(_meta);
         }
+        Err(DispatchError::NoResource)
     }
 
     fn release(&self, node_id: &NodeId, result: &ResultKind) {
         let mut nodes = self.nodes.write().unwrap();
         if let Some(pn) = nodes.iter_mut().find(|n| n.node.id == *node_id) {
             pn.release_lease();
+            if let Some(registry) = &self.global_budget {
+                registry.release_one(node_id);
+            }
             match result {
                 ResultKind::Success(_) => {
                     pn.record_result(true, 0);

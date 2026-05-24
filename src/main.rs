@@ -34,6 +34,7 @@ use collector::DataCollector;
 use pool::active::ActivePool;
 use pool::dead::DeadPoolImpl;
 use pool::dispatch::{DispatchPool, NodeBudgetLimits};
+use pool::global_budget::{GlobalBudgetConfig, GlobalBudgetRegistry};
 use pool::manager::PoolManagerImpl;
 use pool::ratelimited::RateLimitedPoolImpl;
 use pool::{DeadPool, NodeRef, Pool, RateLimitedPool};
@@ -146,12 +147,33 @@ async fn main() {
     tracing::info!(count = node_urls.len(), "loaded proxy nodes");
 
     let _provider = Arc::new(WebShareProvider::new(node_urls.clone()));
-    let dispatch = DispatchPool::new_with_limits(NodeBudgetLimits {
+    let mut dispatch = DispatchPool::new_with_limits(NodeBudgetLimits {
         max_calls_per_window: config.node_max_calls_per_window,
         max_tokens_per_window: config.node_max_tokens_per_window,
         max_kb_per_window: config.node_max_kb_per_window,
         cooldown_secs: config.node_budget_cooldown_secs,
     });
+    if let Some(redis_url) = config.global_budget_redis_url.clone() {
+        match GlobalBudgetRegistry::new(GlobalBudgetConfig {
+            redis_url,
+            instance_id: config.instance_id.clone(),
+            window_secs: config.node_budget_window_secs,
+            lease_ttl_secs: config.node_lease_ttl_secs,
+            max_calls_per_window: config.node_max_calls_per_window,
+            max_tokens_per_window: config.node_max_tokens_per_window,
+            max_kb_per_window: config.node_max_kb_per_window,
+            max_concurrent: 5,
+            cooldown_secs: config.node_budget_cooldown_secs,
+        }) {
+            Ok(registry) => {
+                tracing::info!(instance_id = %config.instance_id, "global Redis budget registry enabled");
+                dispatch = dispatch.with_global_budget(registry);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "global Redis budget registry unavailable; using local budgets");
+            }
+        }
+    }
     let active = Arc::new(ActivePool::new());
     let ratelimited = Arc::new(RateLimitedPoolImpl::new());
     let dead = Arc::new(DeadPoolImpl::new());
