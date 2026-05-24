@@ -82,8 +82,21 @@ pub async fn fetch_zen_stream(
     api_key: &str,
     body: &serde_json::Value,
 ) -> Result<reqwest::Response, crate::error::AppError> {
+    fetch_zen_stream_with_headers(client, zen_url, api_key, body, &[]).await
+}
+
+pub async fn fetch_zen_stream_with_headers(
+    client: &Client,
+    zen_url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    extra_headers: &[(String, String)],
+) -> Result<reqwest::Response, crate::error::AppError> {
     let mut req = client.post(zen_url).json(body);
     for (k, v) in zen_headers(api_key) {
+        req = req.header(k, v);
+    }
+    for (k, v) in extra_headers {
         req = req.header(k, v);
     }
     let resp = req.send().await.map_err(|e| {

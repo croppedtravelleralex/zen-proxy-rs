@@ -21,6 +21,7 @@ struct MockState {
 #[derive(Debug)]
 struct ObservedRequest {
     proof_header: Option<String>,
+    extra_header: Option<String>,
     model: Option<String>,
 }
 
@@ -32,6 +33,10 @@ async fn mock_zen_handler(
     state.requests.lock().unwrap().push(ObservedRequest {
         proof_header: headers
             .get("x-client-proof")
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned),
+        extra_header: headers
+            .get("x-kernel-extra")
             .and_then(|v| v.to_str().ok())
             .map(ToOwned::to_owned),
         model: body
@@ -105,6 +110,7 @@ async fn spawn_mock_zen() -> (KernelConfig, reqwest::Client, MockState) {
     let config = KernelConfig {
         zen_chat_url: format!("http://{addr}/zen"),
         zen_api_key: "public".to_string(),
+        extra_headers: vec![("x-kernel-extra".to_string(), "extra-proof".to_string())],
     };
     (config, client, state)
 }
@@ -168,6 +174,7 @@ async fn openai_non_stream_uses_caller_client_and_returns_golden_response() {
     assert_eq!(body["model"], "deepseek-v4-flash-free");
     let observed = state.requests.lock().unwrap();
     assert_eq!(observed[0].proof_header.as_deref(), Some("caller-client"));
+    assert_eq!(observed[0].extra_header.as_deref(), Some("extra-proof"));
     assert_eq!(observed[0].model.as_deref(), Some("deepseek-v4-flash-free"));
 }
 

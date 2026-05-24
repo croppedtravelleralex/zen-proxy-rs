@@ -45,9 +45,14 @@ async fn handle_non_stream(
     cr: &ChatRequest,
     zb: &Value,
 ) -> Result<Response, AppError> {
-    let resp =
-        crate::zen::client::fetch_zen_stream(client, &config.zen_chat_url, &config.zen_api_key, zb)
-            .await?;
+    let resp = crate::zen::client::fetch_zen_stream_with_headers(
+        client,
+        &config.zen_chat_url,
+        &config.zen_api_key,
+        zb,
+        &config.extra_headers,
+    )
+    .await?;
     let (content, reasoning, _usage) = crate::zen::client::collect_stream_text(resp).await?;
     let has_tools = translate::has_tools(cr);
     let prompt = translate::build_prompt_text(&cr.messages);
@@ -102,9 +107,14 @@ async fn handle_stream(
     use axum::response::sse::{Event, Sse};
     use futures::StreamExt;
     use std::convert::Infallible;
-    let resp =
-        crate::zen::client::fetch_zen_stream(client, &config.zen_chat_url, &config.zen_api_key, zb)
-            .await?;
+    let resp = crate::zen::client::fetch_zen_stream_with_headers(
+        client,
+        &config.zen_chat_url,
+        &config.zen_api_key,
+        zb,
+        &config.extra_headers,
+    )
+    .await?;
     let byte_stream = resp.bytes_stream();
     let mut event_stream = Box::pin(crate::zen::client::stream_sse_events(byte_stream));
     let has_tools = translate::has_tools(cr);
