@@ -253,6 +253,8 @@ impl AdminService {
                 "large_context_body_mb": cfg.v43_large_context_body_mb,
                 "huge_context_body_mb": cfg.v43_huge_context_body_mb,
                 "wait_timeout_ms": cfg.v43_lane_wait_timeout_ms,
+                "async_collector_enabled": cfg.v43_async_collector_enabled,
+                "collector_queue_capacity": cfg.v43_collector_queue_capacity,
                 "runtime": state.lanes.snapshot(),
             },
             "global_budget": cfg.global_budget_redis_url.as_ref().map(|_| json!({

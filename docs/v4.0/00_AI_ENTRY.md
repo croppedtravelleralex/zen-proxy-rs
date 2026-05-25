@@ -114,6 +114,9 @@ Confirmed on 2026-05-25:
 - `AUDIT_LOG_DIR=/tmp/zen-proxy-audit` unless overridden
 - V4.3 lane isolation is implemented in code but must be enabled through
   `V43_LANES_ENABLED=true` and process restart.
+- V4.3 async collector is implemented but disabled by default through
+  `V43_ASYNC_COLLECTOR_ENABLED=false`; enable only after release-mode soak.
+- V4.3 request history no longer uses the old unsafe ring buffer.
 - NewAPI channel 19 is the active user path into ZenProxy.
 - NewAPI logs show 940 calls on 2026-05-25 CST at the time of analysis.
 - Nginx uses `least_conn` over `127.0.0.1:4001`, `127.0.0.1:4002`,

@@ -186,6 +186,8 @@ pub struct Config {
     pub v43_large_context_body_mb: usize,
     pub v43_huge_context_body_mb: usize,
     pub v43_lane_wait_timeout_ms: u64,
+    pub v43_async_collector_enabled: bool,
+    pub v43_collector_queue_capacity: usize,
 }
 
 impl Config {
@@ -301,6 +303,8 @@ impl Config {
             v43_large_context_body_mb: load_env_var("V43_LARGE_CONTEXT_BODY_MB", 8usize),
             v43_huge_context_body_mb: load_env_var("V43_HUGE_CONTEXT_BODY_MB", 32usize),
             v43_lane_wait_timeout_ms: load_env_var("V43_LANE_WAIT_TIMEOUT_MS", 1_000u64),
+            v43_async_collector_enabled: load_env_var("V43_ASYNC_COLLECTOR_ENABLED", false),
+            v43_collector_queue_capacity: load_env_var("V43_COLLECTOR_QUEUE_CAPACITY", 8192usize),
         }
     }
 
@@ -498,6 +502,8 @@ mod tests {
             "V43_LARGE_CONTEXT_BODY_MB",
             "V43_HUGE_CONTEXT_BODY_MB",
             "V43_LANE_WAIT_TIMEOUT_MS",
+            "V43_ASYNC_COLLECTOR_ENABLED",
+            "V43_COLLECTOR_QUEUE_CAPACITY",
         ]);
 
         let cfg = Config::from_env();
@@ -553,6 +559,8 @@ mod tests {
         assert_eq!(cfg.v43_large_context_body_mb, 8);
         assert_eq!(cfg.v43_huge_context_body_mb, 32);
         assert_eq!(cfg.v43_lane_wait_timeout_ms, 1_000);
+        assert!(!cfg.v43_async_collector_enabled);
+        assert_eq!(cfg.v43_collector_queue_capacity, 8192);
     }
 
     #[test]
@@ -600,6 +608,8 @@ mod tests {
         unsafe { env::set_var("V43_LARGE_CONTEXT_BODY_MB", "9") };
         unsafe { env::set_var("V43_HUGE_CONTEXT_BODY_MB", "33") };
         unsafe { env::set_var("V43_LANE_WAIT_TIMEOUT_MS", "1500") };
+        unsafe { env::set_var("V43_ASYNC_COLLECTOR_ENABLED", "true") };
+        unsafe { env::set_var("V43_COLLECTOR_QUEUE_CAPACITY", "1234") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
@@ -648,6 +658,8 @@ mod tests {
         assert_eq!(cfg.v43_large_context_body_mb, 9);
         assert_eq!(cfg.v43_huge_context_body_mb, 33);
         assert_eq!(cfg.v43_lane_wait_timeout_ms, 1500);
+        assert!(cfg.v43_async_collector_enabled);
+        assert_eq!(cfg.v43_collector_queue_capacity, 1234);
 
         remove_env_vars(&[
             "PORT",
@@ -692,6 +704,8 @@ mod tests {
             "V43_LARGE_CONTEXT_BODY_MB",
             "V43_HUGE_CONTEXT_BODY_MB",
             "V43_LANE_WAIT_TIMEOUT_MS",
+            "V43_ASYNC_COLLECTOR_ENABLED",
+            "V43_COLLECTOR_QUEUE_CAPACITY",
         ]);
     }
 

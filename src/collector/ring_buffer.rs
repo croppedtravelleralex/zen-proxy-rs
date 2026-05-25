@@ -1,33 +1,35 @@
 use crate::collector::RequestTelemetry;
-use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub struct RingBuffer {
-    buffer: Box<[UnsafeCell<Option<RequestTelemetry>>]>,
+    buffer: Mutex<VecDeque<RingEntry>>,
     capacity: usize,
     head: AtomicU64,
 }
 
-unsafe impl Sync for RingBuffer {}
+struct RingEntry {
+    seq: u64,
+    item: RequestTelemetry,
+}
 
 impl RingBuffer {
     pub fn new(capacity: usize) -> Self {
-        let mut buf = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            buf.push(UnsafeCell::new(None));
-        }
         RingBuffer {
-            buffer: buf.into_boxed_slice(),
-            capacity,
+            buffer: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity: capacity.max(1),
             head: AtomicU64::new(0),
         }
     }
 
     pub fn push(&self, item: RequestTelemetry) {
-        let pos = self.head.fetch_add(1, Ordering::Relaxed) as usize % self.capacity;
-        unsafe {
-            *self.buffer[pos].get() = Some(item);
+        let seq = self.head.fetch_add(1, Ordering::AcqRel);
+        let mut buffer = self.buffer.lock().unwrap();
+        if buffer.len() >= self.capacity {
+            buffer.pop_front();
         }
+        buffer.push_back(RingEntry { seq, item });
     }
 
     pub fn query(
@@ -37,26 +39,22 @@ impl RingBuffer {
         cursor: Option<u64>,
     ) -> (Vec<RequestTelemetry>, Option<u64>) {
         let head = self.head.load(Ordering::Relaxed);
-        let start = cursor.unwrap_or(head.saturating_sub(1));
-        let mut results = Vec::with_capacity(limit.min(self.capacity));
+        let start_seq = cursor.unwrap_or_else(|| head.saturating_sub(1));
+        let limit = limit.max(1);
+        let buffer = self.buffer.lock().unwrap();
+        let mut results = Vec::with_capacity(limit.min(buffer.len()));
         let mut next_cursor = None;
 
-        let scan_count = self.capacity.min(head as usize);
-        for i in 0..scan_count {
-            let idx = (start as usize).wrapping_sub(i) % self.capacity;
-            let entry = unsafe { &*self.buffer[idx].get() };
-            if let Some(ref tele) = entry {
-                if let Some(since_ts) = since {
-                    if tele.ts < since_ts {
-                        continue;
-                    }
+        for entry in buffer.iter().rev().filter(|entry| entry.seq <= start_seq) {
+            if let Some(since_ts) = since {
+                if entry.item.ts < since_ts {
+                    continue;
                 }
-                results.push(tele.clone());
-                if results.len() >= limit {
-                    let new_pos = (start as usize).wrapping_sub(i).wrapping_sub(1);
-                    next_cursor = Some(new_pos as u64);
-                    break;
-                }
+            }
+            results.push(entry.item.clone());
+            if results.len() >= limit {
+                next_cursor = entry.seq.checked_sub(1);
+                break;
             }
         }
 

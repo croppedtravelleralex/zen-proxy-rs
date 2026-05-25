@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{prelude::*, reload, EnvFilter, Registry};
 
+use collector::async_collector::AsyncCollector;
 use collector::default::DefaultCollector;
 use collector::export::JsonBackend;
 use collector::DataCollector;
@@ -229,11 +230,19 @@ async fn main() {
     }
     tracing::info!(count = node_urls.len(), "nodes added to dispatch pool");
 
-    let collector = Arc::new(DefaultCollector::new());
+    let default_collector = Arc::new(DefaultCollector::new());
     {
         let json_backend = JsonBackend::new("/tmp/zen-proxy-snapshot.json");
-        collector.set_backend(Box::new(json_backend));
+        default_collector.set_backend(Box::new(json_backend));
     }
+    let collector: Arc<dyn DataCollector> = if config.v43_async_collector_enabled {
+        AsyncCollector::spawn(
+            default_collector.clone(),
+            config.v43_collector_queue_capacity,
+        )
+    } else {
+        default_collector
+    };
 
     let pool_manager = Arc::new(PoolManagerImpl::new(
         Arc::new(dispatch),

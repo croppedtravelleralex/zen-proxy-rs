@@ -1,4 +1,5 @@
 pub mod aggregator;
+pub mod async_collector;
 pub mod audit;
 pub mod default;
 pub mod export;
