@@ -240,7 +240,7 @@ impl Config {
             zen_provider_mode: load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy),
             v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
             node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
-            node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 250_000u64),
+            node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 10_000_000u64),
             node_max_kb_per_window: load_env_var("NODE_MAX_KB_PER_WINDOW", 64 * 1024u64),
             node_budget_cooldown_secs: load_env_var("NODE_BUDGET_COOLDOWN_SECS", 60i64),
             node_budget_window_secs: load_env_var("NODE_BUDGET_WINDOW_SECS", 3600u64),
@@ -479,7 +479,7 @@ mod tests {
         assert!(!cfg.v4_model_registry_enabled);
         assert!(!cfg.v4_model_registry_active());
         assert_eq!(cfg.node_max_calls_per_window, 100);
-        assert_eq!(cfg.node_max_tokens_per_window, 250_000);
+        assert_eq!(cfg.node_max_tokens_per_window, 10_000_000);
         assert_eq!(cfg.node_max_kb_per_window, 64 * 1024);
         assert_eq!(cfg.node_budget_cooldown_secs, 60);
         assert_eq!(cfg.node_budget_window_secs, 3600);

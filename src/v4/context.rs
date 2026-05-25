@@ -200,10 +200,17 @@ pub fn govern_request(
             ),
         });
     }
+    if current.estimated_prompt_tokens > target_tokens {
+        return Err(ContextReject {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: format!(
+                "request is too large after safe compaction: original_tokens={} effective_tokens={} token_target={}",
+                before.estimated_prompt_tokens, current.estimated_prompt_tokens, target_tokens
+            ),
+        });
+    }
 
-    let action = if current.body_bytes <= target_bytes
-        || current.estimated_prompt_tokens <= conf.context_token_target
-    {
+    let action = if current.body_bytes <= target_bytes {
         ContextAction::Compact
     } else {
         ContextAction::CompactPartial
@@ -332,7 +339,7 @@ fn compact_old_large_text(
     cache: &mut ArtifactCacheStats,
     trace: &mut Vec<String>,
 ) {
-    let preserve_from = preserve_from(body, conf.context_preserve_recent_messages);
+    let latest_user_idx = latest_user_message_index(body);
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -342,7 +349,7 @@ fn compact_old_large_text(
         .saturating_mul(2)
         .max(64 * 1024);
     for (idx, message) in messages.iter_mut().enumerate() {
-        if idx >= preserve_from || is_system_like_message(message) {
+        if latest_user_idx.is_some_and(|latest| idx >= latest) || is_system_like_message(message) {
             continue;
         }
         let Some(content) = message.get_mut("content") else {
@@ -883,6 +890,48 @@ mod tests {
             "messages": [
                 {"role": "tool", "content": big, "tool_call_id": "old-tool"},
                 {"role": "assistant", "content": "recent assistant"},
+                {"role": "user", "content": "latest user"}
+            ]
+        });
+        let original = serialized_len(&body);
+        let plan = govern_request(&cfg, "chat/completions", body, original).unwrap();
+        assert!(plan.after.body_bytes < plan.before.body_bytes);
+        let messages = plan.body["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["content"], "latest user");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("ZenProxy context compactor"));
+    }
+
+    #[test]
+    fn enforce_mode_rejects_uncompressible_latest_message_over_token_target() {
+        let mut cfg = test_config(CompactorMode::Enforce);
+        cfg.context_token_target = 100;
+        cfg.context_token_compact = 100;
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "user", "content": "x".repeat(2 * 1024)}
+            ]
+        });
+        let original = serialized_len(&body);
+        let reject = govern_request(&cfg, "chat/completions", body, original).unwrap_err();
+        assert_eq!(reject.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(reject.message.contains("effective_tokens"));
+    }
+
+    #[test]
+    fn enforce_mode_trims_old_large_text_inside_recent_window() {
+        let mut cfg = test_config(CompactorMode::Enforce);
+        cfg.context_preserve_recent_messages = 8;
+        cfg.context_token_target = 1_000;
+        cfg.context_token_compact = 100;
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "user", "content": "x".repeat(2 * MIB)},
+                {"role": "assistant", "content": "old assistant"},
                 {"role": "user", "content": "latest user"}
             ]
         });

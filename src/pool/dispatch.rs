@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 const SCORE_SCALE: u64 = 100;
 const DEFAULT_MAX_CALLS_PER_WINDOW: u64 = 100;
-const DEFAULT_MAX_TOKENS_PER_WINDOW: u64 = 250_000;
+const DEFAULT_MAX_TOKENS_PER_WINDOW: u64 = 10_000_000;
 const DEFAULT_MAX_KB_PER_WINDOW: u64 = 64 * 1024;
 const DEFAULT_COOLDOWN_SECS: i64 = 60;
 
@@ -380,8 +380,7 @@ impl DispatchPool {
     }
 
     fn request_exceeds_single_node_budget(&self, meta: &RequestMeta) -> bool {
-        meta.estimated_input_tokens() > self.budget_limits.max_tokens_per_window
-            || meta.request_kb() > self.budget_limits.max_kb_per_window
+        meta.request_kb() > self.budget_limits.max_kb_per_window
             || self.budget_limits.max_calls_per_window == 0
     }
 }
@@ -643,9 +642,20 @@ mod tests {
     }
 
     #[test]
-    fn single_request_over_budget_does_not_cooldown_nodes() {
+    fn single_request_over_token_budget_does_not_preflight_reject() {
         let pool = DispatchPool::new_with_limits(NodeBudgetLimits {
             max_tokens_per_window: 100,
+            max_kb_per_window: 64 * 1024,
+            ..NodeBudgetLimits::default()
+        });
+
+        assert_eq!(pool.preflight(&meta(1_200)), Ok(()));
+    }
+
+    #[test]
+    fn single_request_over_budget_does_not_cooldown_nodes() {
+        let pool = DispatchPool::new_with_limits(NodeBudgetLimits {
+            max_kb_per_window: 1,
             ..NodeBudgetLimits::default()
         });
         pool.add(NodeRef::new(
