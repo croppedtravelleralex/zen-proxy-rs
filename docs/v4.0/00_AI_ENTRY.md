@@ -2,10 +2,11 @@
 
 ## One-Line Status
 
-ZenProxyRS V4.0 is a single-process Rust proxy control plane that keeps
+ZenProxyRS V4.0/V4.1-A is a single-process Rust proxy control plane that keeps
 `zen-proxy-rs` responsible for proxy rotation, pool state, retry, admin, and
 observability, while moving Zen protocol adaptation into a reusable
-`free-model-client-rs` kernel.
+`free-model-client-rs` kernel. V4.1-A has landed real node latency scoring,
+retry-chain/failure telemetry, and a bounded V4 retry budget.
 
 ## Current Goal
 
@@ -49,6 +50,7 @@ root-level legacy audit reports as active guidance.
 4. [Request Flow](./04_request_flow.md)
 5. [Implementation Plan](./08_implementation_plan.md)
 6. [Acceptance and Risks](./09_acceptance_and_risks.md)
+7. [2026-05-25 Operations Report](./10_2026-05-25_operations_report.md)
 
 ## Hard Decisions
 
@@ -64,6 +66,42 @@ root-level legacy audit reports as active guidance.
 - The selected proxy node must be the transport used for the actual Zen request.
 - Dead-pool probing is low-frequency and progressive, not continuous scanning.
 - V4.0 must support rollback to the legacy path until acceptance is complete.
+- NewAPI is not part of this repository and must not be modified when fixing
+  ZenProxy behavior. The intended external chain is:
+  `client -> NewAPI -> ZenProxyRS :4000 -> free-model-client kernel -> Zen`.
+
+## Current Runtime Entry Points
+
+Use these for local maintenance:
+
+```text
+ZenProxy public API: http://127.0.0.1:4000/v1
+ZenProxy admin API:  http://127.0.0.1:4000/admin
+ZenProxy admin key:  test-key
+Proxy API key:       sk-dev
+NewAPI base URL:     http://127.0.0.1:8081
+NewAPI dev key:      sk-dev
+```
+
+Current systemd service:
+
+```text
+zen-proxy-rs.service
+WorkingDirectory=/home/lenovo/zen-proxy-rs
+ExecStart=/home/lenovo/zen-proxy-rs/target/release/zen-proxy-rs
+```
+
+## Current V4.1-A Evidence
+
+Confirmed on 2026-05-25:
+
+- `ZEN_PROVIDER_MODE=free_model_kernel`
+- `V4_MODEL_REGISTRY_ENABLED=true`
+- `REQUEST_BODY_LIMIT_MB=64`
+- `ZEN_COMPACTOR_MODE=enforce`
+- `V4_RETRY_BUDGET_MS=45000`
+- NewAPI channel 19 is the active user path into ZenProxy.
+- NewAPI logs show 940 calls on 2026-05-25 CST at the time of analysis.
 
 ## Verification Commands
 
@@ -78,3 +116,14 @@ cargo build --release
 
 For V4.0 completion, code checks are not enough. The acceptance suite must also
 prove that the observed Zen egress path matches the selected node.
+
+## Runtime Data Sources
+
+For operations analysis, use sources in this order:
+
+1. NewAPI PostgreSQL `logs` table for user-visible call counts and durations.
+2. ZenProxy `/admin/requests/*` for current-process request detail and timings.
+3. Redis `zprs:budget:*` keys for global node budget distribution.
+4. `/tmp/zen-proxy-ledger-events.jsonl` for V4 ledger events from the current
+   WAL file.
+5. systemd service environment and logs for effective runtime configuration.

@@ -23,3 +23,11 @@ Start here:
 | [07_observability_and_admin.md](./v4.0/07_observability_and_admin.md) | Ledger, metrics, admin APIs, exit-IP proof |
 | [08_implementation_plan.md](./v4.0/08_implementation_plan.md) | Ordered implementation tasks |
 | [09_acceptance_and_risks.md](./v4.0/09_acceptance_and_risks.md) | Acceptance gates, known risks, rollback |
+| [10_2026-05-25_operations_report.md](./v4.0/10_2026-05-25_operations_report.md) | V4.1-A maintenance notes and 2026-05-25 NewAPI call analysis |
+
+## AI Maintenance Rule
+
+Future AI work must start from [V4.0 AI Entry](./v4.0/00_AI_ENTRY.md), then check
+the latest operations report before changing code. Runtime facts from ZenProxy
+admin APIs, NewAPI logs, Redis budgets, WAL files, tests, and release builds are
+higher priority than older chat history.
