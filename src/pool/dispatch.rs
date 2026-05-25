@@ -378,6 +378,12 @@ impl DispatchPool {
             }
         }
     }
+
+    fn request_exceeds_single_node_budget(&self, meta: &RequestMeta) -> bool {
+        meta.estimated_input_tokens() > self.budget_limits.max_tokens_per_window
+            || meta.request_kb() > self.budget_limits.max_kb_per_window
+            || self.budget_limits.max_calls_per_window == 0
+    }
 }
 
 impl Default for DispatchPool {
@@ -396,6 +402,10 @@ impl Pool for DispatchPool {
     }
 
     fn acquire_for(&self, meta: &RequestMeta) -> Option<NodeRef> {
+        if self.request_exceeds_single_node_budget(meta) {
+            return None;
+        }
+
         let nodes = self.nodes.read().unwrap();
         if nodes.is_empty() {
             return None;
@@ -449,6 +459,10 @@ impl Pool for DispatchPool {
         _meta: &RequestMeta,
         node_id: &NodeId,
     ) -> Result<NodeRef, DispatchError> {
+        if self.request_exceeds_single_node_budget(_meta) {
+            return Err(DispatchError::RequestTooLarge);
+        }
+
         let nodes = self.nodes.read().unwrap();
         let now = chrono::Utc::now().timestamp();
         let node = nodes
@@ -462,6 +476,14 @@ impl Pool for DispatchPool {
             node.rollback_local_admit(_meta);
         }
         Err(DispatchError::NoResource)
+    }
+
+    fn preflight(&self, meta: &RequestMeta) -> Result<(), DispatchError> {
+        if self.request_exceeds_single_node_budget(meta) {
+            Err(DispatchError::RequestTooLarge)
+        } else {
+            Ok(())
+        }
     }
 
     fn release(&self, node_id: &NodeId, result: &ResultKind) {
@@ -609,9 +631,39 @@ mod tests {
             "socks5h://user:pass@127.0.0.1:1082".to_string(),
         ));
 
-        assert!(pool.acquire_for(&meta(1_200)).is_none());
+        for _ in 0..2 {
+            let node = pool.acquire_for(&meta(200)).unwrap();
+            pool.release(&node.id, &ResultKind::Success(200));
+        }
+
+        assert!(pool.acquire_for(&meta(200)).is_none());
         let snapshot = pool.budget_snapshots().pop().unwrap();
         assert_eq!(snapshot.node_state, "cooldown");
         assert_eq!(snapshot.budget_hit_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn single_request_over_budget_does_not_cooldown_nodes() {
+        let pool = DispatchPool::new_with_limits(NodeBudgetLimits {
+            max_tokens_per_window: 100,
+            ..NodeBudgetLimits::default()
+        });
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:1083".to_string(),
+        ));
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:1084".to_string(),
+        ));
+
+        assert_eq!(
+            pool.preflight(&meta(1_200)),
+            Err(DispatchError::RequestTooLarge)
+        );
+        assert!(pool.acquire_for(&meta(1_200)).is_none());
+
+        for snapshot in pool.budget_snapshots() {
+            assert_eq!(snapshot.node_state, "dispatch");
+            assert_eq!(snapshot.budget_hit_reason, None);
+        }
     }
 }

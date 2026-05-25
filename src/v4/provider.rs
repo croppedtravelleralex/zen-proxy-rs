@@ -598,6 +598,10 @@ async fn dispatch_or_wait(
             StatusCode::SERVICE_UNAVAILABLE,
             "circuit open: upstream rate limit detected",
         )),
+        Err(DispatchError::RequestTooLarge) => Err(V4CallError::before_dispatch(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request exceeds proxy node budget",
+        )),
         Err(DispatchError::NoResource) => {
             if attempt < max {
                 tokio::time::sleep(Duration::from_millis(100)).await;

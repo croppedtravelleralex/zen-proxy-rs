@@ -99,6 +99,7 @@ where
         if self.fuse.load(Ordering::Acquire) {
             return Err(DispatchError::NoResource);
         }
+        self.dispatch.preflight(req)?;
         let node = self
             .dispatch
             .acquire_for(req)
@@ -159,6 +160,7 @@ where
         if self.fuse.load(Ordering::Acquire) {
             return Err(DispatchError::NoResource);
         }
+        self.dispatch.preflight(meta)?;
         if node_id == DIRECT_NODE_ID {
             return self.dispatch(meta);
         }

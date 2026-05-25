@@ -264,6 +264,7 @@ async fn proxy_with_retry(
             match state.pool_manager.dispatch(req_meta) {
                 Ok(r) => r,
                 Err(DispatchError::CircuitOpen) => return Err(998),
+                Err(DispatchError::RequestTooLarge) => return Err(413),
                 Err(DispatchError::NoResource) => {
                     if attempt < max {
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -280,6 +281,7 @@ async fn proxy_with_retry(
                 Err(_) => match state.pool_manager.dispatch(req_meta) {
                     Ok(r) => r,
                     Err(DispatchError::CircuitOpen) => return Err(998),
+                    Err(DispatchError::RequestTooLarge) => return Err(413),
                     Err(DispatchError::NoResource) => {
                         if attempt < max {
                             tokio::time::sleep(Duration::from_millis(100)).await;

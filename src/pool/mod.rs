@@ -52,6 +52,7 @@ pub struct DispatchResult {
 pub enum DispatchError {
     NoResource,
     CircuitOpen,
+    RequestTooLarge,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,9 @@ impl RequestMeta {
 
 pub trait Pool: Send + Sync {
     fn acquire(&self) -> Option<NodeRef>;
+    fn preflight(&self, _meta: &RequestMeta) -> Result<(), DispatchError> {
+        Ok(())
+    }
     fn acquire_for(&self, _meta: &RequestMeta) -> Option<NodeRef> {
         self.acquire()
     }
