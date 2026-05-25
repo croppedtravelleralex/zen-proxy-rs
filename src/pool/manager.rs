@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
 
 use crate::collector::{DataCollector, ProbeEvent};
 use crate::pool::probe_period::ProbePeriod;
+use crate::pool::transport::TransportRegistry;
 use crate::pool::*;
 use crate::v4::contracts::{DeadNodeState, DeadProbePolicy};
 use crate::v4::dead_probe::AdaptiveDeadProbePolicy;
@@ -27,12 +27,11 @@ where
     collector: Arc<dyn DataCollector>,
     fuse: AtomicBool,
     nodes: RwLock<HashMap<NodeId, NodeRef>>,
-    clients: RwLock<HashMap<NodeId, reqwest::Client>>,
+    transport: TransportRegistry,
     upstream_base: String,
     upstream_api_key: String,
     probe_timeout_secs: u64,
     allow_direct_fallback: bool,
-    direct_client: std::sync::Mutex<Option<reqwest::Client>>,
 }
 
 impl<D, A, R, K> PoolManagerImpl<D, A, R, K>
@@ -62,29 +61,12 @@ where
             collector,
             fuse: AtomicBool::new(false),
             nodes: RwLock::new(HashMap::new()),
-            clients: RwLock::new(HashMap::new()),
+            transport: TransportRegistry::new(),
             upstream_base,
             upstream_api_key,
             probe_timeout_secs,
             allow_direct_fallback,
-            direct_client: std::sync::Mutex::new(None),
         }
-    }
-
-    fn make_client(socks5_url: &str) -> reqwest::Client {
-        reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(socks5_url).unwrap())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap()
-    }
-
-    fn get_or_create_client(&self, node_id: &NodeId, url: &str) -> reqwest::Client {
-        let mut map = self.clients.write().unwrap();
-        map.entry(node_id.clone())
-            .or_insert_with(|| Self::make_client(url))
-            .clone()
     }
 }
 
@@ -106,17 +88,6 @@ where
             .ok_or(DispatchError::NoResource)
             .or_else(|_| {
                 if self.allow_direct_fallback {
-                    let mut dc = self.direct_client.lock().unwrap();
-                    if dc.is_none() {
-                        *dc = Some(
-                            reqwest::Client::builder()
-                                .no_proxy()
-                                .connect_timeout(Duration::from_secs(30))
-                                .timeout(Duration::from_secs(120))
-                                .build()
-                                .unwrap(),
-                        );
-                    }
                     Ok(NodeRef {
                         id: DIRECT_NODE_ID.to_string(),
                         url: DIRECT_NODE_URL.to_string(),
@@ -139,14 +110,9 @@ where
 
         let url = node.url.clone();
         let client = if node.id == "direct" {
-            self.direct_client
-                .lock()
-                .unwrap()
-                .as_ref()
-                .cloned()
-                .unwrap()
+            self.transport.direct_client()
         } else {
-            self.get_or_create_client(&node.id, &url)
+            self.transport.client_for_node(&node)
         };
 
         Ok(DispatchResult { node, client, url })
@@ -176,7 +142,7 @@ where
                 }
             }
             let url = node.url.clone();
-            let client = self.get_or_create_client(&node.id, &url);
+            let client = self.transport.client_for_node(&node);
             return Ok(DispatchResult { node, client, url });
         }
         // 回退到普通 dispatch
@@ -205,7 +171,7 @@ where
                     let ratelimited = self.ratelimited.clone();
                     let dispatch = self.dispatch.clone();
                     let collector = self.collector.clone();
-                    let client = self.get_or_create_client(&node_id, &nr.url);
+                    let client = self.transport.client_for_node(&nr);
                     let upstream = self.upstream_base.clone();
                     let timeout = self.probe_timeout_secs;
                     let api_key = self.upstream_api_key.clone();
@@ -312,7 +278,7 @@ where
         let nid = node_id.to_string();
         let nodes = self.nodes.read().unwrap();
         let nr = nodes.get(&nid)?;
-        let client = self.get_or_create_client(&nid, &nr.url);
+        let client = self.transport.client_for_node(nr);
         let upstream = self.upstream_base.clone();
         let timeout = self.probe_timeout_secs;
         let api_key = self.upstream_api_key.clone();

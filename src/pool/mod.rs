@@ -5,6 +5,7 @@ pub mod global_budget;
 pub mod manager;
 pub mod probe_period;
 pub mod ratelimited;
+pub mod transport;
 
 use std::fmt::Debug;
 use std::hash::Hash;
