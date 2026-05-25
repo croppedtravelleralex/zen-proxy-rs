@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use redis::Commands;
+use redis::{Commands, Connection};
 use uuid::Uuid;
 
 use crate::pool::{NodeId, RequestMeta};
@@ -29,6 +29,7 @@ pub struct GlobalLease {
 pub struct GlobalBudgetRegistry {
     client: redis::Client,
     config: GlobalBudgetConfig,
+    connection: Arc<Mutex<Option<Connection>>>,
     local_leases: Arc<Mutex<HashMap<NodeId, Vec<String>>>>,
 }
 
@@ -38,8 +39,25 @@ impl GlobalBudgetRegistry {
         Ok(Self {
             client,
             config,
+            connection: Arc::new(Mutex::new(None)),
             local_leases: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn with_connection<T>(
+        &self,
+        action: impl FnOnce(&mut Connection) -> redis::RedisResult<T>,
+    ) -> redis::RedisResult<T> {
+        let mut cached = self.connection.lock().unwrap();
+        if cached.is_none() {
+            *cached = Some(self.client.get_connection()?);
+        }
+
+        let result = action(cached.as_mut().unwrap());
+        if result.is_err() {
+            *cached = None;
+        }
+        result
     }
 
     pub fn try_acquire(&self, node_id: &str, meta: &RequestMeta) -> Result<GlobalLease, String> {
@@ -124,31 +142,30 @@ return {'ok', active + 1}
 "#,
         );
 
-        let mut conn = self
-            .client
-            .get_connection()
-            .map_err(|err| err.to_string())?;
-        let response: Vec<String> = script
-            .key(&budget_key)
-            .key(&cooldown_key)
-            .key(&leases_key)
-            .key(&lease_key)
-            .arg(now_secs)
-            .arg(now_ms)
-            .arg(lease_expires_at_ms)
-            .arg(&lease_id)
-            .arg(&self.config.instance_id)
-            .arg(1u64)
-            .arg(meta.estimated_input_tokens())
-            .arg(meta.request_kb())
-            .arg(self.config.max_calls_per_window)
-            .arg(self.config.max_tokens_per_window)
-            .arg(self.config.max_kb_per_window)
-            .arg(self.config.max_concurrent)
-            .arg(self.config.cooldown_secs)
-            .arg(window_secs)
-            .arg(lease_ttl_ms)
-            .invoke(&mut conn)
+        let response: Vec<String> = self
+            .with_connection(|conn| {
+                script
+                    .key(&budget_key)
+                    .key(&cooldown_key)
+                    .key(&leases_key)
+                    .key(&lease_key)
+                    .arg(now_secs)
+                    .arg(now_ms)
+                    .arg(lease_expires_at_ms)
+                    .arg(&lease_id)
+                    .arg(&self.config.instance_id)
+                    .arg(1u64)
+                    .arg(meta.estimated_input_tokens())
+                    .arg(meta.request_kb())
+                    .arg(self.config.max_calls_per_window)
+                    .arg(self.config.max_tokens_per_window)
+                    .arg(self.config.max_kb_per_window)
+                    .arg(self.config.max_concurrent)
+                    .arg(self.config.cooldown_secs)
+                    .arg(window_secs)
+                    .arg(lease_ttl_ms)
+                    .invoke(conn)
+            })
             .map_err(|err| err.to_string())?;
 
         if response.first().map(String::as_str) == Some("ok") {
@@ -195,42 +212,41 @@ end
 return exists
 "#,
         );
-        let mut conn = self
-            .client
-            .get_connection()
-            .map_err(|err| err.to_string())?;
-        let _: i64 = script
-            .key(leases_key)
-            .key(lease_key)
-            .arg(lease_id)
-            .invoke(&mut conn)
+        let _: i64 = self
+            .with_connection(|conn| {
+                script
+                    .key(leases_key)
+                    .key(lease_key)
+                    .arg(lease_id)
+                    .invoke(conn)
+            })
             .map_err(|err| err.to_string())?;
         Ok(())
     }
 
     pub fn snapshot(&self, node_id: &str) -> HashMap<String, String> {
-        let mut conn = match self.client.get_connection() {
-            Ok(conn) => conn,
-            Err(_) => return HashMap::new(),
-        };
         let now = chrono::Utc::now();
         let window_secs = self.config.window_secs.max(1);
         let bucket = now.timestamp() / window_secs as i64;
-        let mut snapshot: HashMap<String, String> = conn
-            .hgetall(self.budget_key(node_id, bucket))
-            .unwrap_or_default();
         let leases_key = self.leases_key(node_id);
-        let _ = redis::cmd("ZREMRANGEBYSCORE")
-            .arg(&leases_key)
-            .arg("-inf")
-            .arg(now.timestamp_millis())
-            .query::<i64>(&mut conn);
-        if let Ok(active) = redis::cmd("ZCARD").arg(&leases_key).query::<i64>(&mut conn) {
-            snapshot.insert("active".to_string(), active.to_string());
-        }
-        if let Ok(cooldown_until) = conn.get::<_, String>(self.cooldown_key(node_id)) {
-            snapshot.insert("cooldown_until".to_string(), cooldown_until);
-        }
+        let Ok(mut snapshot) = self.with_connection(|conn| {
+            let mut snapshot: HashMap<String, String> =
+                conn.hgetall(self.budget_key(node_id, bucket))?;
+            let _ = redis::cmd("ZREMRANGEBYSCORE")
+                .arg(&leases_key)
+                .arg("-inf")
+                .arg(now.timestamp_millis())
+                .query::<i64>(conn);
+            if let Ok(active) = redis::cmd("ZCARD").arg(&leases_key).query::<i64>(conn) {
+                snapshot.insert("active".to_string(), active.to_string());
+            }
+            if let Ok(cooldown_until) = conn.get::<_, String>(self.cooldown_key(node_id)) {
+                snapshot.insert("cooldown_until".to_string(), cooldown_until);
+            }
+            Ok(snapshot)
+        }) else {
+            return HashMap::new();
+        };
         snapshot.insert("bucket".to_string(), bucket.to_string());
         snapshot
     }

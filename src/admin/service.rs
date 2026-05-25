@@ -255,6 +255,13 @@ impl AdminService {
                 "wait_timeout_ms": cfg.v43_lane_wait_timeout_ms,
                 "async_collector_enabled": cfg.v43_async_collector_enabled,
                 "collector_queue_capacity": cfg.v43_collector_queue_capacity,
+                "dispatch_shards": cfg.v43_dispatch_shards,
+                "node_min_concurrency": cfg.v43_node_min_concurrency,
+                "node_max_concurrency": cfg.v43_node_max_concurrency,
+                "aimd_success_step": cfg.v43_aimd_success_step,
+                "aimd_failure_percent": cfg.v43_aimd_failure_percent,
+                "aimd_slow_latency_ms": cfg.v43_aimd_slow_latency_ms,
+                "global_budget_mode": cfg.v43_global_budget_mode.to_string(),
                 "runtime": state.lanes.snapshot(),
             },
             "global_budget": cfg.global_budget_redis_url.as_ref().map(|_| json!({
@@ -262,7 +269,9 @@ impl AdminService {
                 "instance_id": cfg.instance_id,
                 "window_secs": cfg.node_budget_window_secs,
                 "lease_ttl_secs": cfg.node_lease_ttl_secs,
+                "mode": cfg.v43_global_budget_mode.to_string(),
             })).unwrap_or_else(|| json!({"configured": false})),
+            "data_plane": state.pool_manager.runtime_details(),
             "pools": {
                 "dispatch": p.dispatch_size,
                 "active": p.active_size,

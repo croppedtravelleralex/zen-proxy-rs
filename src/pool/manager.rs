@@ -1,9 +1,8 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use crate::collector::{DataCollector, ProbeEvent};
+use crate::pool::node_registry::NodeRegistry;
 use crate::pool::probe_period::ProbePeriod;
 use crate::pool::transport::TransportRegistry;
 use crate::pool::*;
@@ -26,7 +25,7 @@ where
     dead: Arc<K>,
     collector: Arc<dyn DataCollector>,
     fuse: AtomicBool,
-    nodes: RwLock<HashMap<NodeId, NodeRef>>,
+    nodes: NodeRegistry,
     transport: TransportRegistry,
     upstream_base: String,
     upstream_api_key: String,
@@ -60,13 +59,17 @@ where
             dead,
             collector,
             fuse: AtomicBool::new(false),
-            nodes: RwLock::new(HashMap::new()),
+            nodes: NodeRegistry::new(),
             transport: TransportRegistry::new(),
             upstream_base,
             upstream_api_key,
             probe_timeout_secs,
             allow_direct_fallback,
         }
+    }
+
+    pub fn register_known_node(&self, node: NodeRef) {
+        self.nodes.insert(node);
     }
 }
 
@@ -100,12 +103,7 @@ where
         if node.id != DIRECT_NODE_ID {
             self.active.add(node.clone());
 
-            {
-                let mut all = self.nodes.write().unwrap();
-                if !all.contains_key(&node.id) {
-                    all.insert(node.id.clone(), node.clone());
-                }
-            }
+            self.nodes.insert(node.clone());
         }
 
         let url = node.url.clone();
@@ -135,12 +133,7 @@ where
         let nid: NodeId = node_id.to_string();
         if let Ok(node) = self.dispatch.try_acquire_sticky(meta, &nid) {
             self.active.add(node.clone());
-            {
-                let mut all = self.nodes.write().unwrap();
-                if !all.contains_key(&node.id) {
-                    all.insert(node.id.clone(), node.clone());
-                }
-            }
+            self.nodes.insert(node.clone());
             let url = node.url.clone();
             let client = self.transport.client_for_node(&node);
             return Ok(DispatchResult { node, client, url });
@@ -167,7 +160,7 @@ where
                     .release_with_latency(&node_id, &result, latency_ms);
                 self.dispatch.remove(&node_id);
 
-                if let Some(nr) = self.nodes.read().unwrap().get(&node_id).cloned() {
+                if let Some(nr) = self.nodes.get(&node_id) {
                     let ratelimited = self.ratelimited.clone();
                     let dispatch = self.dispatch.clone();
                     let collector = self.collector.clone();
@@ -206,7 +199,7 @@ where
                 self.dispatch
                     .release_with_latency(&node_id, &result, latency_ms);
                 self.dispatch.remove(&node_id);
-                if let Some(node) = self.nodes.read().unwrap().get(&node_id).cloned() {
+                if let Some(node) = self.nodes.get(&node_id) {
                     self.dead.add(node);
                 }
                 self.dead.bury(node_id);
@@ -240,7 +233,7 @@ where
 
     fn fuse_all(&self) {
         self.fuse.store(true, Ordering::Release);
-        let ids: Vec<NodeId> = self.nodes.read().unwrap().keys().cloned().collect();
+        let ids = self.nodes.ids();
         for id in &ids {
             self.dispatch.remove(id);
             self.dead.bury(id.clone());
@@ -250,9 +243,8 @@ where
     fn unfuse_all(&self) {
         self.fuse.store(false, Ordering::Release);
         let dead_ids = self.dead.select_all_for_probe();
-        let nodes = self.nodes.read().unwrap();
         for id in &dead_ids {
-            if let Some(nr) = nodes.get(id) {
+            if let Some(nr) = self.nodes.get(id) {
                 self.dispatch.add(nr.clone());
                 self.dead.recover(id);
             }
@@ -262,7 +254,7 @@ where
     fn add_node(&self, url: &str) {
         let nr = NodeRef::new(url.to_string());
         self.dispatch.add(nr.clone());
-        self.nodes.write().unwrap().insert(nr.id.clone(), nr);
+        self.nodes.insert(nr);
     }
 
     fn remove_node(&self, node_id: &str) {
@@ -271,21 +263,20 @@ where
         self.active.remove(&nid);
         self.ratelimited.remove(&nid);
         self.dead.remove(&nid);
-        self.nodes.write().unwrap().remove(&nid);
+        self.nodes.remove(&nid);
     }
 
     fn probe_node(&self, node_id: &str) -> Option<ProbeResult> {
         let nid = node_id.to_string();
-        let nodes = self.nodes.read().unwrap();
-        let nr = nodes.get(&nid)?;
-        let client = self.transport.client_for_node(nr);
+        let nr = self.nodes.get(&nid)?;
+        let client = self.transport.client_for_node(&nr);
         let upstream = self.upstream_base.clone();
         let timeout = self.probe_timeout_secs;
         let api_key = self.upstream_api_key.clone();
         let start = std::time::Instant::now();
         let ok = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                ProbePeriod::probe_node(&client, nr, &upstream, timeout, &api_key).await
+                ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await
             })
         });
         Some(ProbeResult {
@@ -296,8 +287,7 @@ where
 
     fn recover_node(&self, node_id: &str) {
         let nid = node_id.to_string();
-        let nodes = self.nodes.read().unwrap();
-        if let Some(nr) = nodes.get(&nid) {
+        if let Some(nr) = self.nodes.get(&nid) {
             self.dead.recover(&nid);
             self.ratelimited.recover(&nid);
             if self.fuse.load(Ordering::Acquire) {
@@ -310,7 +300,7 @@ where
     }
 
     fn probe_all(&self) {
-        let ids: Vec<NodeId> = self.nodes.read().unwrap().keys().cloned().collect();
+        let ids = self.nodes.ids();
         for id in ids {
             let _ = self.probe_node(&id);
         }
@@ -344,20 +334,53 @@ where
             .collect::<Vec<_>>();
 
         for id in due_ids {
-            let Some(result) = self.probe_node(&id) else {
+            let Some(nr) = self.nodes.get(&id) else {
                 continue;
             };
-            let consecutive_successes = self.dead.record_probe_result(&id, result.success);
-            if AdaptiveDeadProbePolicy::recovery_proven(consecutive_successes, false) {
-                self.recover_node(&id);
-            }
-            self.collector.record_probe(&ProbeEvent {
-                ts: chrono::Utc::now().timestamp(),
-                node_id: id,
-                pool: "dead_probe_adaptive".to_string(),
-                ok: result.success,
-                latency_ms: result.latency_ms,
+            let dead = self.dead.clone();
+            let dispatch = self.dispatch.clone();
+            let ratelimited = self.ratelimited.clone();
+            let collector = self.collector.clone();
+            let client = self.transport.client_for_node(&nr);
+            let upstream = self.upstream_base.clone();
+            let timeout = self.probe_timeout_secs;
+            let api_key = self.upstream_api_key.clone();
+            let fuse_is_open = self.fuse.load(Ordering::Acquire);
+
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let ok = ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await;
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let consecutive_successes = dead.record_probe_result(&id, ok);
+                if AdaptiveDeadProbePolicy::recovery_proven(consecutive_successes, false) {
+                    dead.recover(&id);
+                    ratelimited.recover(&id);
+                    if !fuse_is_open {
+                        dispatch.add(nr.clone());
+                        dispatch.release(&id, &ResultKind::Success(200));
+                    }
+                }
+                collector.record_probe(&ProbeEvent {
+                    ts: chrono::Utc::now().timestamp(),
+                    node_id: id,
+                    pool: "dead_probe_adaptive".to_string(),
+                    ok,
+                    latency_ms,
+                });
             });
         }
+    }
+
+    fn runtime_details(&self) -> serde_json::Value {
+        let transport = self.transport.snapshot();
+        serde_json::json!({
+            "node_registry": {
+                "nodes": self.nodes.len(),
+            },
+            "transport": {
+                "node_client_count": transport.node_client_count,
+                "direct_client_initialized": transport.direct_client_initialized,
+            }
+        })
     }
 }

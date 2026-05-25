@@ -109,6 +109,39 @@ impl FromStr for ArtifactCacheMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalBudgetMode {
+    Off,
+    SyncRedis,
+}
+
+impl GlobalBudgetMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::SyncRedis => "sync_redis",
+        }
+    }
+}
+
+impl fmt::Display for GlobalBudgetMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for GlobalBudgetMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" | "local" | "none" => Ok(Self::Off),
+            "sync_redis" | "redis" | "on" => Ok(Self::SyncRedis),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
@@ -188,6 +221,13 @@ pub struct Config {
     pub v43_lane_wait_timeout_ms: u64,
     pub v43_async_collector_enabled: bool,
     pub v43_collector_queue_capacity: usize,
+    pub v43_dispatch_shards: usize,
+    pub v43_node_min_concurrency: u32,
+    pub v43_node_max_concurrency: u32,
+    pub v43_aimd_success_step: u32,
+    pub v43_aimd_failure_percent: u32,
+    pub v43_aimd_slow_latency_ms: u64,
+    pub v43_global_budget_mode: GlobalBudgetMode,
 }
 
 impl Config {
@@ -305,6 +345,16 @@ impl Config {
             v43_lane_wait_timeout_ms: load_env_var("V43_LANE_WAIT_TIMEOUT_MS", 1_000u64),
             v43_async_collector_enabled: load_env_var("V43_ASYNC_COLLECTOR_ENABLED", false),
             v43_collector_queue_capacity: load_env_var("V43_COLLECTOR_QUEUE_CAPACITY", 8192usize),
+            v43_dispatch_shards: load_env_var("V43_DISPATCH_SHARDS", 16usize),
+            v43_node_min_concurrency: load_env_var("V43_NODE_MIN_CONCURRENCY", 1u32),
+            v43_node_max_concurrency: load_env_var("V43_NODE_MAX_CONCURRENCY", 16u32),
+            v43_aimd_success_step: load_env_var("V43_AIMD_SUCCESS_STEP", 1u32),
+            v43_aimd_failure_percent: load_env_var("V43_AIMD_FAILURE_PERCENT", 50u32),
+            v43_aimd_slow_latency_ms: load_env_var("V43_AIMD_SLOW_LATENCY_MS", 30_000u64),
+            v43_global_budget_mode: load_env_var(
+                "V43_GLOBAL_BUDGET_MODE",
+                GlobalBudgetMode::SyncRedis,
+            ),
         }
     }
 
@@ -561,6 +611,13 @@ mod tests {
         assert_eq!(cfg.v43_lane_wait_timeout_ms, 1_000);
         assert!(!cfg.v43_async_collector_enabled);
         assert_eq!(cfg.v43_collector_queue_capacity, 8192);
+        assert_eq!(cfg.v43_dispatch_shards, 16);
+        assert_eq!(cfg.v43_node_min_concurrency, 1);
+        assert_eq!(cfg.v43_node_max_concurrency, 16);
+        assert_eq!(cfg.v43_aimd_success_step, 1);
+        assert_eq!(cfg.v43_aimd_failure_percent, 50);
+        assert_eq!(cfg.v43_aimd_slow_latency_ms, 30_000);
+        assert_eq!(cfg.v43_global_budget_mode, GlobalBudgetMode::SyncRedis);
     }
 
     #[test]
@@ -610,6 +667,13 @@ mod tests {
         unsafe { env::set_var("V43_LANE_WAIT_TIMEOUT_MS", "1500") };
         unsafe { env::set_var("V43_ASYNC_COLLECTOR_ENABLED", "true") };
         unsafe { env::set_var("V43_COLLECTOR_QUEUE_CAPACITY", "1234") };
+        unsafe { env::set_var("V43_DISPATCH_SHARDS", "7") };
+        unsafe { env::set_var("V43_NODE_MIN_CONCURRENCY", "2") };
+        unsafe { env::set_var("V43_NODE_MAX_CONCURRENCY", "21") };
+        unsafe { env::set_var("V43_AIMD_SUCCESS_STEP", "3") };
+        unsafe { env::set_var("V43_AIMD_FAILURE_PERCENT", "40") };
+        unsafe { env::set_var("V43_AIMD_SLOW_LATENCY_MS", "12345") };
+        unsafe { env::set_var("V43_GLOBAL_BUDGET_MODE", "off") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
@@ -660,6 +724,13 @@ mod tests {
         assert_eq!(cfg.v43_lane_wait_timeout_ms, 1500);
         assert!(cfg.v43_async_collector_enabled);
         assert_eq!(cfg.v43_collector_queue_capacity, 1234);
+        assert_eq!(cfg.v43_dispatch_shards, 7);
+        assert_eq!(cfg.v43_node_min_concurrency, 2);
+        assert_eq!(cfg.v43_node_max_concurrency, 21);
+        assert_eq!(cfg.v43_aimd_success_step, 3);
+        assert_eq!(cfg.v43_aimd_failure_percent, 40);
+        assert_eq!(cfg.v43_aimd_slow_latency_ms, 12_345);
+        assert_eq!(cfg.v43_global_budget_mode, GlobalBudgetMode::Off);
 
         remove_env_vars(&[
             "PORT",
@@ -706,6 +777,13 @@ mod tests {
             "V43_LANE_WAIT_TIMEOUT_MS",
             "V43_ASYNC_COLLECTOR_ENABLED",
             "V43_COLLECTOR_QUEUE_CAPACITY",
+            "V43_DISPATCH_SHARDS",
+            "V43_NODE_MIN_CONCURRENCY",
+            "V43_NODE_MAX_CONCURRENCY",
+            "V43_AIMD_SUCCESS_STEP",
+            "V43_AIMD_FAILURE_PERCENT",
+            "V43_AIMD_SLOW_LATENCY_MS",
+            "V43_GLOBAL_BUDGET_MODE",
         ]);
     }
 

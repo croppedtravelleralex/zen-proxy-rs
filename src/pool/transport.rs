@@ -4,6 +4,12 @@ use std::time::Duration;
 
 use crate::pool::{NodeId, NodeRef};
 
+#[derive(Debug, Clone)]
+pub struct TransportRegistrySnapshot {
+    pub node_client_count: usize,
+    pub direct_client_initialized: bool,
+}
+
 pub struct TransportRegistry {
     clients: RwLock<HashMap<NodeId, reqwest::Client>>,
     direct_client: Mutex<Option<reqwest::Client>>,
@@ -37,6 +43,13 @@ impl TransportRegistry {
             );
         }
         client.as_ref().cloned().unwrap()
+    }
+
+    pub fn snapshot(&self) -> TransportRegistrySnapshot {
+        TransportRegistrySnapshot {
+            node_client_count: self.clients.read().unwrap().len(),
+            direct_client_initialized: self.direct_client.lock().unwrap().is_some(),
+        }
     }
 
     fn make_socks_client(socks5_url: &str) -> reqwest::Client {

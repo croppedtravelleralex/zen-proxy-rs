@@ -75,12 +75,22 @@ GET  /admin/requests
 GET  /admin/requests/{request_id}
 GET  /admin/events
 GET  /admin/config
+GET  /admin/runtime
 POST /admin/config/reload
 POST /admin/fuse
 ```
 
 Admin endpoints require authentication. Missing admin credentials should fail
 closed for admin routes.
+
+`/admin/runtime` is the fast live-data endpoint for V4.3. It includes:
+
+- lane limits and in-flight counts;
+- context governance limits;
+- global budget mode and lease window;
+- pool sizes and current leased count;
+- data-plane internals: node-registry size, transport client-cache count, and
+  direct-client initialization state.
 
 ## Durable Audit API
 

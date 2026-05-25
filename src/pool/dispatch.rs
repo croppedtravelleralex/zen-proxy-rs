@@ -11,6 +11,28 @@ const DEFAULT_MAX_CALLS_PER_WINDOW: u64 = 100;
 const DEFAULT_MAX_TOKENS_PER_WINDOW: u64 = 10_000_000;
 const DEFAULT_MAX_KB_PER_WINDOW: u64 = 64 * 1024;
 const DEFAULT_COOLDOWN_SECS: i64 = 60;
+const DEFAULT_DISPATCH_SHARDS: usize = 16;
+
+#[derive(Debug, Clone)]
+pub struct AimdConfig {
+    pub min_concurrent: u32,
+    pub max_concurrent: u32,
+    pub success_step: u32,
+    pub failure_percent: u32,
+    pub slow_latency_ms: u64,
+}
+
+impl Default for AimdConfig {
+    fn default() -> Self {
+        Self {
+            min_concurrent: 1,
+            max_concurrent: 16,
+            success_step: 1,
+            failure_percent: 50,
+            slow_latency_ms: 30_000,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct NodeBudgetLimits {
@@ -148,7 +170,7 @@ struct PoolNode {
 }
 
 impl PoolNode {
-    fn new(node: NodeRef, limits: NodeBudgetLimits) -> Self {
+    fn new(node: NodeRef, limits: NodeBudgetLimits, aimd: &AimdConfig) -> Self {
         Self {
             node,
             base_score: AtomicU64::new(80 * SCORE_SCALE),
@@ -156,7 +178,10 @@ impl PoolNode {
             recent_results: RwLock::new(VecDeque::with_capacity(20)),
             avg_latency_ms: AtomicU64::new(0),
             idle_since: AtomicI64::new(chrono::Utc::now().timestamp()),
-            max_concurrent: AtomicU32::new(5),
+            max_concurrent: AtomicU32::new(5u32.clamp(
+                aimd.min_concurrent.max(1),
+                aimd.max_concurrent.max(aimd.min_concurrent.max(1)),
+            )),
             active_leases: AtomicU32::new(0),
             budget: RwLock::new(NodeBudget::from(limits)),
         }
@@ -189,7 +214,7 @@ impl PoolNode {
         health + success_rate + idle_factor + latency_factor + momentum
     }
 
-    fn record_result(&self, success: bool, latency_ms: u64) {
+    fn record_result(&self, success: bool, latency_ms: u64, aimd: &AimdConfig) {
         {
             let mut recent = self.recent_results.write().unwrap();
             recent.push_back(success);
@@ -202,10 +227,34 @@ impl PoolNode {
 
         if success {
             let prev = self.consecutive_successes.fetch_add(1, Ordering::Relaxed);
-            let _ = prev;
+            if prev.saturating_add(1) % 3 == 0 {
+                let _ =
+                    self.max_concurrent
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                            Some(
+                                value
+                                    .saturating_add(aimd.success_step.max(1))
+                                    .min(aimd.max_concurrent.max(aimd.min_concurrent)),
+                            )
+                        });
+            }
+            if latency_ms >= aimd.slow_latency_ms && aimd.slow_latency_ms > 0 {
+                self.reduce_concurrency(aimd);
+            }
         } else {
             self.consecutive_successes.store(0, Ordering::Relaxed);
+            self.reduce_concurrency(aimd);
         }
+    }
+
+    fn reduce_concurrency(&self, aimd: &AimdConfig) {
+        let failure_percent = aimd.failure_percent.clamp(1, 99);
+        let _ = self
+            .max_concurrent
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                let reduced = value.saturating_mul(failure_percent) / 100;
+                Some(reduced.max(aimd.min_concurrent.max(1)))
+            });
     }
 
     fn try_admit(&self, meta: &RequestMeta, now: i64) -> bool {
@@ -302,11 +351,24 @@ impl PoolNode {
     }
 }
 
-pub struct DispatchPool {
+struct DispatchShard {
     nodes: RwLock<Vec<PoolNode>>,
+}
+
+impl DispatchShard {
+    fn new() -> Self {
+        Self {
+            nodes: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+pub struct DispatchPool {
+    shards: Vec<DispatchShard>,
     idle_since: AtomicI64,
     budget_limits: NodeBudgetLimits,
     global_budget: Option<GlobalBudgetRegistry>,
+    aimd: AimdConfig,
 }
 
 impl DispatchPool {
@@ -315,11 +377,25 @@ impl DispatchPool {
     }
 
     pub fn new_with_limits(budget_limits: NodeBudgetLimits) -> Self {
+        Self::new_with_options(
+            budget_limits,
+            AimdConfig::default(),
+            DEFAULT_DISPATCH_SHARDS,
+        )
+    }
+
+    pub fn new_with_options(
+        budget_limits: NodeBudgetLimits,
+        aimd: AimdConfig,
+        shard_count: usize,
+    ) -> Self {
+        let shard_count = shard_count.clamp(1, 128);
         Self {
-            nodes: RwLock::new(Vec::new()),
+            shards: (0..shard_count).map(|_| DispatchShard::new()).collect(),
             idle_since: AtomicI64::new(chrono::Utc::now().timestamp()),
             budget_limits,
             global_budget: None,
+            aimd,
         }
     }
 
@@ -329,12 +405,11 @@ impl DispatchPool {
     }
 
     pub fn budget_snapshots(&self) -> Vec<NodeBudgetSnapshot> {
-        self.nodes
-            .read()
-            .unwrap()
-            .iter()
-            .map(PoolNode::snapshot)
-            .collect()
+        let mut snapshots = Vec::new();
+        for shard in &self.shards {
+            snapshots.extend(shard.nodes.read().unwrap().iter().map(PoolNode::snapshot));
+        }
+        snapshots
     }
 
     pub fn budget_counts(&self) -> (usize, usize, usize) {
@@ -423,34 +498,26 @@ impl DispatchPool {
         }
         None
     }
-}
 
-impl Default for DispatchPool {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Pool for DispatchPool {
-    fn acquire(&self) -> Option<NodeRef> {
-        self.acquire_for(&RequestMeta {
-            model: String::new(),
-            stream: false,
-            body_size: 1,
-        })
-    }
-
-    fn acquire_for(&self, meta: &RequestMeta) -> Option<NodeRef> {
-        if self.request_exceeds_single_node_budget(meta) {
-            return None;
+    fn shard_index_for_id(&self, node_id: &str) -> usize {
+        let mut hash = 0usize;
+        for byte in node_id.as_bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(*byte as usize);
         }
+        hash % self.shards.len().max(1)
+    }
 
-        let nodes = self.nodes.read().unwrap();
+    fn acquire_from_shard(
+        &self,
+        shard_idx: usize,
+        meta: &RequestMeta,
+        now: i64,
+    ) -> Option<NodeRef> {
+        let nodes = self.shards[shard_idx].nodes.read().unwrap();
         if nodes.is_empty() {
             return None;
         }
 
-        let now = chrono::Utc::now().timestamp();
         if let Some(node) = self.try_sampled_acquire(&nodes, meta, now) {
             return Some(node);
         }
@@ -497,6 +564,43 @@ impl Pool for DispatchPool {
         None
     }
 
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+}
+
+impl Default for DispatchPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pool for DispatchPool {
+    fn acquire(&self) -> Option<NodeRef> {
+        self.acquire_for(&RequestMeta {
+            model: String::new(),
+            stream: false,
+            body_size: 1,
+        })
+    }
+
+    fn acquire_for(&self, meta: &RequestMeta) -> Option<NodeRef> {
+        if self.request_exceeds_single_node_budget(meta) {
+            return None;
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let start = fastrand::usize(..self.shards.len());
+        for offset in 0..self.shards.len() {
+            let idx = (start + offset) % self.shards.len();
+            if let Some(node) = self.acquire_from_shard(idx, meta, now) {
+                return Some(node);
+            }
+        }
+
+        None
+    }
+
     fn try_acquire_sticky(
         &self,
         _meta: &RequestMeta,
@@ -506,7 +610,8 @@ impl Pool for DispatchPool {
             return Err(DispatchError::RequestTooLarge);
         }
 
-        let nodes = self.nodes.read().unwrap();
+        let shard_idx = self.shard_index_for_id(node_id);
+        let nodes = self.shards[shard_idx].nodes.read().unwrap();
         let now = chrono::Utc::now().timestamp();
         let node = nodes
             .iter()
@@ -530,7 +635,8 @@ impl Pool for DispatchPool {
     }
 
     fn release_with_latency(&self, node_id: &NodeId, result: &ResultKind, latency_ms: u64) {
-        let mut nodes = self.nodes.write().unwrap();
+        let shard_idx = self.shard_index_for_id(node_id);
+        let mut nodes = self.shards[shard_idx].nodes.write().unwrap();
         if let Some(pn) = nodes.iter_mut().find(|n| n.node.id == *node_id) {
             pn.release_lease();
             if let Some(registry) = &self.global_budget {
@@ -538,15 +644,15 @@ impl Pool for DispatchPool {
             }
             match result {
                 ResultKind::Success(_) => {
-                    pn.record_result(true, latency_ms);
+                    pn.record_result(true, latency_ms, &self.aimd);
                     pn.idle_since
                         .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
                 }
                 ResultKind::RateLimited => {
-                    pn.record_result(false, latency_ms);
+                    pn.record_result(false, latency_ms, &self.aimd);
                 }
                 ResultKind::Error { .. } => {
-                    pn.record_result(false, latency_ms);
+                    pn.record_result(false, latency_ms, &self.aimd);
                 }
             }
         }
@@ -557,24 +663,32 @@ impl Pool for DispatchPool {
     }
 
     fn remove(&self, node_id: &NodeId) {
-        let mut nodes = self.nodes.write().unwrap();
+        let shard_idx = self.shard_index_for_id(node_id);
+        let mut nodes = self.shards[shard_idx].nodes.write().unwrap();
         nodes.retain(|n| n.node.id != *node_id);
     }
 
     fn add(&self, node: NodeRef) {
-        let mut nodes = self.nodes.write().unwrap();
+        let shard_idx = self.shard_index_for_id(&node.id);
+        let mut nodes = self.shards[shard_idx].nodes.write().unwrap();
         if !nodes.iter().any(|n| n.node.id == node.id) {
-            nodes.push(PoolNode::new(node, self.budget_limits.clone()));
+            nodes.push(PoolNode::new(node, self.budget_limits.clone(), &self.aimd));
         }
     }
 
     fn available(&self) -> usize {
-        self.nodes
-            .read()
-            .unwrap()
+        self.shards
             .iter()
-            .filter(|node| node.snapshot().node_state == "dispatch")
-            .count()
+            .map(|shard| {
+                shard
+                    .nodes
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .filter(|node| node.snapshot().node_state == "dispatch")
+                    .count()
+            })
+            .sum()
     }
 
     fn budget_counts(&self) -> (usize, usize, usize) {
@@ -582,16 +696,24 @@ impl Pool for DispatchPool {
     }
 
     fn budget_details(&self) -> Vec<Value> {
-        self.nodes
-            .read()
-            .unwrap()
-            .iter()
-            .map(|node| node.detail(self.global_budget.as_ref()))
-            .collect()
+        let mut details = Vec::new();
+        for shard in &self.shards {
+            details.extend(
+                shard
+                    .nodes
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|node| node.detail(self.global_budget.as_ref())),
+            );
+        }
+        details
     }
 
     fn node_budget_detail(&self, node_id: &NodeId) -> Option<Value> {
-        self.nodes
+        let shard_idx = self.shard_index_for_id(node_id);
+        self.shards[shard_idx]
+            .nodes
             .read()
             .unwrap()
             .iter()
@@ -674,6 +796,54 @@ mod tests {
 
         let detail = pool.node_budget_detail(&node.id).unwrap();
         assert_eq!(detail["avg_latency_ms"].as_u64(), Some(12_345));
+    }
+
+    #[test]
+    fn dispatch_pool_spreads_nodes_across_configured_shards() {
+        let pool =
+            DispatchPool::new_with_options(NodeBudgetLimits::default(), AimdConfig::default(), 4);
+        for port in 2000..2020 {
+            pool.add(NodeRef::new(format!(
+                "socks5h://user:pass@127.0.0.1:{port}"
+            )));
+        }
+
+        assert_eq!(pool.shard_count(), 4);
+        assert_eq!(pool.budget_snapshots().len(), 20);
+        assert_eq!(pool.available(), 20);
+    }
+
+    #[test]
+    fn aimd_expands_after_successes_and_reduces_after_errors() {
+        let pool = DispatchPool::new_with_options(
+            NodeBudgetLimits::default(),
+            AimdConfig {
+                min_concurrent: 1,
+                max_concurrent: 8,
+                success_step: 1,
+                failure_percent: 50,
+                slow_latency_ms: 10_000,
+            },
+            2,
+        );
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:2080".to_string(),
+        ));
+
+        let node = pool.acquire_for(&meta(100)).unwrap();
+        for _ in 0..3 {
+            pool.release_with_latency(&node.id, &ResultKind::Success(200), 100);
+        }
+        let expanded = pool.node_budget_detail(&node.id).unwrap()["local_budget"]["max_concurrent"]
+            .as_u64()
+            .unwrap();
+        assert!(expanded > 5);
+
+        pool.release_with_latency(&node.id, &ResultKind::RateLimited, 100);
+        let reduced = pool.node_budget_detail(&node.id).unwrap()["local_budget"]["max_concurrent"]
+            .as_u64()
+            .unwrap();
+        assert!(reduced < expanded);
     }
 
     #[test]

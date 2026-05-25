@@ -37,7 +37,7 @@ use collector::DataCollector;
 use lanes::LaneLimiter;
 use pool::active::ActivePool;
 use pool::dead::DeadPoolImpl;
-use pool::dispatch::{DispatchPool, NodeBudgetLimits};
+use pool::dispatch::{AimdConfig, DispatchPool, NodeBudgetLimits};
 use pool::global_budget::{GlobalBudgetConfig, GlobalBudgetRegistry};
 use pool::manager::PoolManagerImpl;
 use pool::ratelimited::RateLimitedPoolImpl;
@@ -194,30 +194,42 @@ async fn main() {
     tracing::info!(count = node_urls.len(), "loaded proxy nodes");
 
     let _provider = Arc::new(WebShareProvider::new(node_urls.clone()));
-    let mut dispatch = DispatchPool::new_with_limits(NodeBudgetLimits {
-        max_calls_per_window: config.node_max_calls_per_window,
-        max_tokens_per_window: config.node_max_tokens_per_window,
-        max_kb_per_window: config.node_max_kb_per_window,
-        cooldown_secs: config.node_budget_cooldown_secs,
-    });
-    if let Some(redis_url) = config.global_budget_redis_url.clone() {
-        match GlobalBudgetRegistry::new(GlobalBudgetConfig {
-            redis_url,
-            instance_id: config.instance_id.clone(),
-            window_secs: config.node_budget_window_secs,
-            lease_ttl_secs: config.node_lease_ttl_secs,
+    let mut dispatch = DispatchPool::new_with_options(
+        NodeBudgetLimits {
             max_calls_per_window: config.node_max_calls_per_window,
             max_tokens_per_window: config.node_max_tokens_per_window,
             max_kb_per_window: config.node_max_kb_per_window,
-            max_concurrent: 5,
             cooldown_secs: config.node_budget_cooldown_secs,
-        }) {
-            Ok(registry) => {
-                tracing::info!(instance_id = %config.instance_id, "global Redis budget registry enabled");
-                dispatch = dispatch.with_global_budget(registry);
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "global Redis budget registry unavailable; using local budgets");
+        },
+        AimdConfig {
+            min_concurrent: config.v43_node_min_concurrency,
+            max_concurrent: config.v43_node_max_concurrency,
+            success_step: config.v43_aimd_success_step,
+            failure_percent: config.v43_aimd_failure_percent,
+            slow_latency_ms: config.v43_aimd_slow_latency_ms,
+        },
+        config.v43_dispatch_shards,
+    );
+    if config.v43_global_budget_mode == config::GlobalBudgetMode::SyncRedis {
+        if let Some(redis_url) = config.global_budget_redis_url.clone() {
+            match GlobalBudgetRegistry::new(GlobalBudgetConfig {
+                redis_url,
+                instance_id: config.instance_id.clone(),
+                window_secs: config.node_budget_window_secs,
+                lease_ttl_secs: config.node_lease_ttl_secs,
+                max_calls_per_window: config.node_max_calls_per_window,
+                max_tokens_per_window: config.node_max_tokens_per_window,
+                max_kb_per_window: config.node_max_kb_per_window,
+                max_concurrent: 5,
+                cooldown_secs: config.node_budget_cooldown_secs,
+            }) {
+                Ok(registry) => {
+                    tracing::info!(instance_id = %config.instance_id, "global Redis budget registry enabled");
+                    dispatch = dispatch.with_global_budget(registry);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "global Redis budget registry unavailable; using local budgets");
+                }
             }
         }
     }
@@ -255,6 +267,9 @@ async fn main() {
         config.probe_timeout_secs,
         config.allow_direct_fallback,
     ));
+    for url in &node_urls {
+        pool_manager.register_known_node(NodeRef::new(url.clone()));
+    }
 
     let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
     let lanes = Arc::new(LaneLimiter::from_config(&config));

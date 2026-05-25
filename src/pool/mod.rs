@@ -3,6 +3,7 @@ pub mod dead;
 pub mod dispatch;
 pub mod global_budget;
 pub mod manager;
+pub mod node_registry;
 pub mod probe_period;
 pub mod ratelimited;
 pub mod transport;
@@ -147,6 +148,9 @@ pub trait PoolManager: Send + Sync {
     fn recover_node(&self, node_id: &str);
     fn probe_all(&self);
     fn probe_dead_adaptive(&self);
+    fn runtime_details(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
 }
 
 pub trait RateLimitedPool: Pool {

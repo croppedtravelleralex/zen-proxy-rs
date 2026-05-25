@@ -6,9 +6,9 @@ ZenProxyRS V4.0/V4.1-A is a Rust proxy control plane that keeps `zen-proxy-rs`
 responsible for proxy rotation, pool state, retry, admin, and observability,
 while moving Zen protocol adaptation into a reusable `free-model-client-rs`
 kernel. The active local runtime is now a multi-instance deployment behind one
-Nginx entrypoint on port 4000. V4.3 work has started to replace coarse
-multi-process scaling with a scalable data plane built around lane isolation,
-shared state, and measurable long-stream capacity.
+Nginx entrypoint on port 4000. V4.3 has moved the scaling path from coarse
+"more full processes" toward a measurable data plane: lanes, sharded dispatch,
+node registry, adaptive node concurrency, and reduced Redis budget overhead.
 
 ## Current Goal
 
@@ -117,7 +117,31 @@ Confirmed on 2026-05-25:
 - V4.3 async collector is implemented but disabled by default through
   `V43_ASYNC_COLLECTOR_ENABLED=false`; enable only after release-mode soak.
 - V4.3 request history no longer uses the old unsafe ring buffer.
+- V4.3 dispatch uses configurable ready-node shards through
+  `V43_DISPATCH_SHARDS`.
+- V4.3 node concurrency uses AIMD controls:
+  `V43_NODE_MIN_CONCURRENCY`, `V43_NODE_MAX_CONCURRENCY`,
+  `V43_AIMD_SUCCESS_STEP`, `V43_AIMD_FAILURE_PERCENT`,
+  `V43_AIMD_SLOW_LATENCY_MS`.
+- V4.3 global budget mode is explicit through `V43_GLOBAL_BUDGET_MODE`; keep
+  `sync_redis` for multi-instance runtime and use `off` only for single-process
+  profiles.
+- `/admin/runtime` exposes `data_plane.node_registry` and
+  `data_plane.transport` for the current process.
 - NewAPI channel 19 is the active user path into ZenProxy.
+
+Latest V4.3 verification on 2026-05-25:
+
+- `cargo fmt --check`, `cargo check`, `cargo test`, and
+  `cargo build --release` passed.
+- systemd runtime uses `/home/lenovo/zen-proxy-rs/target/release/zen-proxy-rs`.
+- `zen-proxy-rs@1`, `zen-proxy-rs@2`, `zen-proxy-rs@3`, and `nginx` restarted
+  active.
+- `http://127.0.0.1:4000/v1/models` returns only the two public models.
+- direct ZenProxy chat and NewAPI -> ZenProxy chat both returned HTTP 200.
+- `/admin/runtime` shows `data_plane.node_registry.nodes=100`,
+  `v43_lanes.enabled=true`, `v43_lanes.dispatch_shards=16`, and
+  `v43_lanes.global_budget_mode=sync_redis`.
 - NewAPI logs show 940 calls on 2026-05-25 CST at the time of analysis.
 - Nginx uses `least_conn` over `127.0.0.1:4001`, `127.0.0.1:4002`,
   and `127.0.0.1:4004`. Port 4003 was skipped because it hit a local
