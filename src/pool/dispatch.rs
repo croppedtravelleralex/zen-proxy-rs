@@ -485,7 +485,7 @@ impl Pool for DispatchPool {
         }
     }
 
-    fn release(&self, node_id: &NodeId, result: &ResultKind) {
+    fn release_with_latency(&self, node_id: &NodeId, result: &ResultKind, latency_ms: u64) {
         let mut nodes = self.nodes.write().unwrap();
         if let Some(pn) = nodes.iter_mut().find(|n| n.node.id == *node_id) {
             pn.release_lease();
@@ -494,18 +494,22 @@ impl Pool for DispatchPool {
             }
             match result {
                 ResultKind::Success(_) => {
-                    pn.record_result(true, 0);
+                    pn.record_result(true, latency_ms);
                     pn.idle_since
                         .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
                 }
                 ResultKind::RateLimited => {
-                    pn.record_result(false, 0);
+                    pn.record_result(false, latency_ms);
                 }
                 ResultKind::Error { .. } => {
-                    pn.record_result(false, 0);
+                    pn.record_result(false, latency_ms);
                 }
             }
         }
+    }
+
+    fn release(&self, node_id: &NodeId, result: &ResultKind) {
+        self.release_with_latency(node_id, result, 0);
     }
 
     fn remove(&self, node_id: &NodeId) {
@@ -618,6 +622,20 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.node_state, "cooldown");
         assert_eq!(snapshot.budget_hit_reason.as_deref(), Some("max_calls"));
+    }
+
+    #[test]
+    fn release_with_latency_updates_node_latency_score_input() {
+        let pool = DispatchPool::new();
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:1085".to_string(),
+        ));
+
+        let node = pool.acquire_for(&meta(100)).unwrap();
+        pool.release_with_latency(&node.id, &ResultKind::Success(200), 12_345);
+
+        let detail = pool.node_budget_detail(&node.id).unwrap();
+        assert_eq!(detail["avg_latency_ms"].as_u64(), Some(12_345));
     }
 
     #[test]

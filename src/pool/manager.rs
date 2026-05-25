@@ -183,7 +183,7 @@ where
         self.dispatch(meta)
     }
 
-    fn report(&self, node_id: NodeId, result: ResultKind, _latency_us: u64) {
+    fn report(&self, node_id: NodeId, result: ResultKind, latency_ms: u64) {
         if node_id == DIRECT_NODE_ID {
             return;
         }
@@ -191,12 +191,14 @@ where
         match result {
             ResultKind::Success(_) => {
                 self.active.release(&node_id, &result);
-                self.dispatch.release(&node_id, &result);
+                self.dispatch
+                    .release_with_latency(&node_id, &result, latency_ms);
             }
             ResultKind::RateLimited => {
                 self.ratelimited.quarantine(node_id.clone());
                 self.active.release(&node_id, &result);
-                self.dispatch.release(&node_id, &result);
+                self.dispatch
+                    .release_with_latency(&node_id, &result, latency_ms);
                 self.dispatch.remove(&node_id);
 
                 if let Some(nr) = self.nodes.read().unwrap().get(&node_id).cloned() {
@@ -235,7 +237,8 @@ where
             }
             ResultKind::Error { .. } => {
                 self.active.release(&node_id, &result);
-                self.dispatch.release(&node_id, &result);
+                self.dispatch
+                    .release_with_latency(&node_id, &result, latency_ms);
                 self.dispatch.remove(&node_id);
                 if let Some(node) = self.nodes.read().unwrap().get(&node_id).cloned() {
                     self.dead.add(node);

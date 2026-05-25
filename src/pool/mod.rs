@@ -116,6 +116,10 @@ pub trait Pool: Send + Sync {
     ) -> Result<NodeRef, DispatchError> {
         Err(DispatchError::NoResource)
     }
+    fn release_with_latency(&self, node_id: &NodeId, result: &ResultKind, latency_ms: u64) {
+        let _ = latency_ms;
+        self.release(node_id, result);
+    }
     fn release(&self, node_id: &NodeId, result: &ResultKind);
     fn remove(&self, node_id: &NodeId);
     fn add(&self, node: NodeRef);

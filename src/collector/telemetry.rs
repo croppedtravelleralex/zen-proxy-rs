@@ -34,6 +34,9 @@ pub fn new_telemetry() -> RequestTelemetry {
         total_tokens: 0,
         bytes_sent: 0,
         bytes_received: 0,
+        failure_kind: String::new(),
+        failure_message: String::new(),
+        retry_chain: Vec::new(),
         context: None,
     }
 }

@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::collector::{DataCollector, RequestTelemetry, RequestTimings};
+use crate::collector::{DataCollector, RequestAttemptTelemetry, RequestTelemetry, RequestTimings};
 use crate::config::Config;
 use crate::ledger::LedgerEvent;
 use crate::pool::{DispatchError, ErrorKind, RequestMeta, ResultKind};
@@ -166,6 +166,9 @@ pub async fn handle_v4_proxy(
                 total_tokens: result.usage.total_tokens,
                 bytes_sent: effective_body_len,
                 bytes_received: result.body_bytes_len,
+                failure_kind: String::new(),
+                failure_message: String::new(),
+                retry_chain: result.retry_chain,
                 context: Some(context_telemetry.clone()),
             };
             state.upstream_health.record(status);
@@ -231,6 +234,9 @@ pub async fn handle_v4_proxy(
                     total_tokens: 0,
                     bytes_sent: effective_body_len,
                     bytes_received: 0,
+                    failure_kind: err.failure_kind.clone(),
+                    failure_message: err.message.clone(),
+                    retry_chain: err.retry_chain.clone(),
                     context: Some(context_telemetry.clone()),
                 });
             }
@@ -260,6 +266,7 @@ struct V4CallResult {
     upstream_ms: u64,
     ttft_ms: Option<u64>,
     timings: RequestTimings,
+    retry_chain: Vec<RequestAttemptTelemetry>,
     body_bytes_len: u64,
     usage: UsageCounts,
 }
@@ -283,6 +290,8 @@ struct V4CallError {
     retry_count: u32,
     was_rate_limited: bool,
     upstream_ms: u64,
+    failure_kind: String,
+    retry_chain: Vec<RequestAttemptTelemetry>,
 }
 
 impl V4CallError {
@@ -299,6 +308,8 @@ impl V4CallError {
             retry_count: 0,
             was_rate_limited: false,
             upstream_ms: 0,
+            failure_kind: String::new(),
+            retry_chain: Vec::new(),
         }
     }
 
@@ -315,6 +326,8 @@ impl V4CallError {
         retry_count: u32,
         was_rate_limited: bool,
         upstream_ms: u64,
+        failure_kind: impl Into<String>,
+        retry_chain: Vec<RequestAttemptTelemetry>,
     ) -> Self {
         Self {
             status,
@@ -328,6 +341,8 @@ impl V4CallError {
             retry_count,
             was_rate_limited,
             upstream_ms,
+            failure_kind: failure_kind.into(),
+            retry_chain,
         }
     }
 }
@@ -346,6 +361,8 @@ async fn call_with_retry(
     let mut last_node_id = String::new();
     let mut was_rate_limited = false;
     let mut dispatch_wait_ms = 0u64;
+    let mut retry_chain = Vec::new();
+    let retry_budget_ms = conf.v4_retry_budget_ms;
 
     for attempt in 0..=max {
         let dispatch_start = Instant::now();
@@ -446,6 +463,15 @@ async fn call_with_retry(
                         attempt,
                         request_meta.stream,
                     );
+                    retry_chain.push(RequestAttemptTelemetry {
+                        attempt,
+                        node_id: node_id.clone(),
+                        node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                        status: status.as_u16(),
+                        latency_ms: latency,
+                        outcome: "success".to_string(),
+                        error_type: String::new(),
+                    });
                     let (response, body_bytes_len, usage) = if request_meta.stream {
                         (response, 0, UsageCounts::default())
                     } else {
@@ -470,6 +496,7 @@ async fn call_with_retry(
                             stream_complete_ms: 0,
                             total_ms: latency,
                         },
+                        retry_chain,
                         body_bytes_len,
                         usage,
                     });
@@ -491,6 +518,24 @@ async fn call_with_retry(
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     was_rate_limited = true;
                 }
+                let failure_kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                    "upstream_429"
+                } else {
+                    "upstream_error"
+                };
+                retry_chain.push(RequestAttemptTelemetry {
+                    attempt,
+                    node_id: node_id.clone(),
+                    node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                    status: status.as_u16(),
+                    latency_ms: latency,
+                    outcome: if status == StatusCode::TOO_MANY_REQUESTS {
+                        "rate_limited".to_string()
+                    } else {
+                        "upstream_error".to_string()
+                    },
+                    error_type: failure_kind.to_string(),
+                });
                 if attempt >= max {
                     let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
                         "rate_limited"
@@ -509,6 +554,8 @@ async fn call_with_retry(
                         attempt,
                         was_rate_limited,
                         latency,
+                        failure_kind,
+                        retry_chain,
                     ));
                 }
             }
@@ -545,6 +592,15 @@ async fn call_with_retry(
                         attempt,
                         request_meta.stream,
                     );
+                    retry_chain.push(RequestAttemptTelemetry {
+                        attempt,
+                        node_id: node_id.clone(),
+                        node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                        status: status.as_u16(),
+                        latency_ms: latency,
+                        outcome: "rate_limited".to_string(),
+                        error_type: "upstream_429".to_string(),
+                    });
                 } else {
                     let (error_kind, outcome, error_type) = classify_app_error(&err);
                     state.pool_manager.report(
@@ -568,6 +624,15 @@ async fn call_with_retry(
                         attempt,
                         request_meta.stream,
                     );
+                    retry_chain.push(RequestAttemptTelemetry {
+                        attempt,
+                        node_id: node_id.clone(),
+                        node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                        status: status.as_u16(),
+                        latency_ms: latency,
+                        outcome: outcome.to_string(),
+                        error_type: error_type.to_string(),
+                    });
                 }
                 if attempt >= max {
                     let (error_kind, outcome, _) = classify_app_error(&err);
@@ -597,9 +662,34 @@ async fn call_with_retry(
                         attempt,
                         was_rate_limited || status == StatusCode::TOO_MANY_REQUESTS,
                         latency,
+                        outcome,
+                        retry_chain,
                     ));
                 }
             }
+        }
+
+        let elapsed_ms: u64 = retry_chain.iter().map(|attempt| attempt.latency_ms).sum();
+        if retry_budget_ms > 0 && elapsed_ms >= retry_budget_ms {
+            return Err(V4CallError::after_dispatch(
+                last_status,
+                format!(
+                    "upstream retry budget exhausted after {}ms with status {}",
+                    elapsed_ms,
+                    last_status.as_u16()
+                ),
+                None,
+                uuid::Uuid::new_v4().to_string(),
+                last_node_id.clone(),
+                "",
+                upstream_model,
+                "retry_budget_exhausted",
+                attempt,
+                was_rate_limited,
+                elapsed_ms,
+                "retry_budget_exhausted",
+                retry_chain,
+            ));
         }
 
         tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;

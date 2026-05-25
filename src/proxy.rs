@@ -184,6 +184,13 @@ pub async fn proxy_handler(
                 total_tokens: 0,
                 bytes_sent: body_len,
                 bytes_received: pr.body_bytes.len() as u64,
+                failure_kind: if status < 400 {
+                    String::new()
+                } else {
+                    "upstream_error".to_string()
+                },
+                failure_message: String::new(),
+                retry_chain: Vec::new(),
                 context: None,
             };
 

@@ -467,6 +467,8 @@ impl AdminService {
                     "status": r.status,
                     "stream": r.is_streaming,
                     "node": r.selected_node_id,
+                    "failure_kind": r.failure_kind,
+                    "retry_chain": r.retry_chain,
                     "timings": r.timings,
                     "legacy": {
                         "latency_total_ms": r.latency_total_ms,
@@ -546,6 +548,7 @@ impl AdminService {
         Self::ok_response(json!({
             "upstream_base": cfg.upstream_base,
             "pool_max_retries": cfg.pool_max_retries,
+            "v4_retry_budget_ms": cfg.v4_retry_budget_ms,
             "probe_timeout_secs": cfg.probe_timeout_secs,
             "allow_direct_fallback": cfg.allow_direct_fallback,
             "pool_starvation_retry_after_secs": cfg.pool_starvation_retry_after_secs,

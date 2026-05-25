@@ -121,6 +121,7 @@ pub struct Config {
     pub proxy_cooldown_seconds: u64,
     pub proxy_recovery_interval: u64,
     pub pool_max_retries: u32,
+    pub v4_retry_budget_ms: u64,
     pub pool_max_size: u32,
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
@@ -192,6 +193,7 @@ impl Config {
             proxy_cooldown_seconds: load_env_var("PROXY_COOLDOWN_SECONDS", 60u64),
             proxy_recovery_interval: load_env_var("PROXY_RECOVERY_INTERVAL", 30u64),
             pool_max_retries: load_env_var("POOL_MAX_RETRIES", 3u32),
+            v4_retry_budget_ms: load_env_var("V4_RETRY_BUDGET_MS", 45_000u64),
             pool_max_size: load_env_var("POOL_MAX_SIZE", 128u32),
             connect_timeout_secs: load_env_var("CONNECT_TIMEOUT_SECS", 5u64),
             request_timeout_secs: load_env_var("REQUEST_TIMEOUT_SECS", 120u64),
@@ -435,6 +437,7 @@ mod tests {
             "OPENCODE_SESSION_TTL_SECS",
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
+            "V4_RETRY_BUDGET_MS",
             "NODE_MAX_CALLS_PER_WINDOW",
             "NODE_MAX_TOKENS_PER_WINDOW",
             "NODE_MAX_KB_PER_WINDOW",
@@ -477,6 +480,7 @@ mod tests {
         assert_eq!(cfg.opencode_session_ttl_secs, 1800);
         assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
         assert!(!cfg.v4_model_registry_enabled);
+        assert_eq!(cfg.v4_retry_budget_ms, 45_000);
         assert!(!cfg.v4_model_registry_active());
         assert_eq!(cfg.node_max_calls_per_window, 100);
         assert_eq!(cfg.node_max_tokens_per_window, 10_000_000);
@@ -513,6 +517,7 @@ mod tests {
         unsafe { env::set_var("OPENCODE_CLIENT_NAME", "desktop-cli") };
         unsafe { env::set_var("ZEN_PROVIDER_MODE", "free_model_kernel") };
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
+        unsafe { env::set_var("V4_RETRY_BUDGET_MS", "12345") };
         unsafe { env::set_var("NODE_MAX_CALLS_PER_WINDOW", "7") };
         unsafe { env::set_var("NODE_MAX_TOKENS_PER_WINDOW", "777") };
         unsafe { env::set_var("NODE_MAX_KB_PER_WINDOW", "77") };
@@ -545,6 +550,7 @@ mod tests {
         assert_eq!(cfg.opencode_client_name, "desktop-cli");
         assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
         assert!(cfg.v4_model_registry_enabled);
+        assert_eq!(cfg.v4_retry_budget_ms, 12_345);
         assert!(cfg.v4_model_registry_active());
         assert_eq!(cfg.node_max_calls_per_window, 7);
         assert_eq!(cfg.node_max_tokens_per_window, 777);

@@ -39,7 +39,24 @@ pub struct RequestTelemetry {
     pub total_tokens: u32,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    #[serde(default)]
+    pub failure_kind: String,
+    #[serde(default)]
+    pub failure_message: String,
+    #[serde(default)]
+    pub retry_chain: Vec<RequestAttemptTelemetry>,
     pub context: Option<ContextTelemetry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestAttemptTelemetry {
+    pub attempt: u32,
+    pub node_id: String,
+    pub node_url_redacted: String,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub outcome: String,
+    pub error_type: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -199,7 +216,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn request_telemetry_defaults_missing_timings_for_old_records() {
+    fn request_telemetry_defaults_missing_optional_v41_fields_for_old_records() {
         let value = json!({
             "rid": "r1",
             "ts": 1,
@@ -235,6 +252,8 @@ mod tests {
         let telemetry: RequestTelemetry = serde_json::from_value(value).unwrap();
 
         assert_eq!(telemetry.timings.first_chunk_ms, 0);
+        assert!(telemetry.failure_kind.is_empty());
+        assert!(telemetry.retry_chain.is_empty());
         assert_eq!(telemetry.latency_total_ms, 10);
     }
 }
