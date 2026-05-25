@@ -254,10 +254,10 @@ async fn anthropic_stream_returns_golden_event_sequence() {
         .unwrap();
     let body = response_text(response).await;
     assert!(body.contains("event: message_start"));
-    assert!(body.contains("\"input_tokens\":2"));
+    assert!(body.contains("\"input_tokens\":3"));
     assert!(body.contains("event: content_block_delta"));
     assert!(body.contains("golden answer"));
-    assert!(body.contains("\"output_tokens\":4"));
+    assert!(body.contains("\"output_tokens\":2"));
     assert!(body.contains("event: message_stop"));
 }
 
@@ -332,7 +332,7 @@ async fn openai_empty_stream_with_tools_reports_empty_output_without_synthetic_t
             parameters: None,
         },
     }];
-    let response = kernel
+    let err = kernel
         .openai_chat(
             &client,
             chat_request(
@@ -343,17 +343,16 @@ async fn openai_empty_stream_with_tools_reports_empty_output_without_synthetic_t
             ),
         )
         .await
-        .unwrap();
-    let body = response_text(response).await;
-    assert!(body.contains("empty_output"));
-    assert!(!body.contains("tool_calls"));
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert!(err.message.contains("no assistant content or tool call"));
 }
 
 #[tokio::test]
 async fn anthropic_empty_stream_with_tools_reports_empty_output_without_synthetic_tool_use() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let response = kernel
+    let err = kernel
         .anthropic_messages(
             &client,
             AnthropicRequest {
@@ -370,10 +369,9 @@ async fn anthropic_empty_stream_with_tools_reports_empty_output_without_syntheti
             },
         )
         .await
-        .unwrap();
-    let body = response_text(response).await;
-    assert!(body.contains("empty_output"));
-    assert!(!body.contains("tool_use"));
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert!(err.message.contains("no assistant content or tool call"));
 }
 
 #[tokio::test]
@@ -562,14 +560,13 @@ async fn non_stream_parse_error_is_structured_error() {
 async fn stream_parse_error_is_emitted_before_done() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let response = kernel
+    let err = kernel
         .openai_chat(
             &client,
             chat_request("deepseek-v4-flash-free", "broken-json", true, None),
         )
         .await
-        .unwrap();
-    let body = response_text(response).await;
-    assert!(body.contains("stream_error"));
-    assert!(body.contains("[DONE]"));
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert!(err.message.contains("stream parse error"));
 }

@@ -183,7 +183,6 @@ async fn handle_oa_stream(
     zb: &Value,
 ) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
-    use futures::StreamExt;
     use std::convert::Infallible;
     let resp = crate::zen::client::fetch_zen_stream_with_headers(
         client,
@@ -193,8 +192,11 @@ async fn handle_oa_stream(
         &config.extra_headers,
     )
     .await?;
-    let byte_stream = resp.bytes_stream();
-    let mut event_stream = Box::pin(crate::zen::client::stream_sse_events(byte_stream));
+    let collected = crate::zen::client::collect_stream_parts(resp).await?;
+    let text = crate::redact::redact_text(&collected.content);
+    if text.trim().is_empty() && collected.tool_calls.is_empty() {
+        return Err(AppError::empty_upstream());
+    }
     let model = cr.model.clone();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -203,43 +205,18 @@ async fn handle_oa_stream(
     let cid = format!("chatcmpl_{created}");
     let m = model.clone();
     let id = cid.clone();
+    let tool_calls = collected.tool_calls;
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
-        let mut text = String::new();
-        let mut tcs: Vec<(i64,String,String,Option<String>)> = Vec::new();
-        while let Some(ev) = event_stream.next().await {
-            let ev = match ev {
-                Ok(ev) => ev,
-                Err(err) => {
-                    yield Ok(Event::default().data(serde_json::json!({"error":{"type":"stream_error","message":err.message}}).to_string()));
-                    yield Ok(Event::default().data("[DONE]"));
-                    return;
-                }
-            };
-            if let Some(ref chs) = ev.choices { for ch in chs { if let Some(ref d) = ch.delta {
-                if let Some(ref c) = d.content { if !c.is_empty() {
-                    text.push_str(c);
-                }}
-                if let Some(ref td) = d.tool_calls { for tc in td {
-                    let idx = tc.index.unwrap_or(0);
-                    let n = tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
-                    let a = tc.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                    if let Some(e) = tcs.iter_mut().find(|(i,_,_,_)| *i==idx) { e.2.push_str(&a); }
-                    else if !n.is_empty()||!a.is_empty() { let clean_id = tc.id.clone().unwrap_or_default();
-                let clean_id = if let Some(pos) = clean_id.find("{") { clean_id[..pos].to_string() } else { clean_id };
-                tcs.push((idx,n.clone(),a.clone(),Some(clean_id))); }
-                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":idx,"id":tc.id,"type":"function","function":{"name":n,"arguments":a}}]},"finish_reason":null}]}).to_string()));
-                }}
-            }}}
-        }
-        if !text.is_empty() {
-            text = crate::redact::redact_text(&text);
+        if !text.trim().is_empty() {
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}).to_string()));
         }
-        if text.is_empty() && tcs.is_empty() {
-            yield Ok(Event::default().data(serde_json::json!({"error":{"type":"empty_output","message":"upstream returned no assistant content or tool call"}}).to_string()));
+        for tool in tool_calls.iter() {
+            let clean_id = tool.id.clone().unwrap_or_else(|| format!("call_{}", tool.index));
+            let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
+            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":tool.index,"id":clean_id,"type":"function","function":{"name":tool.name,"arguments":tool.arguments}}]},"finish_reason":null}]}).to_string()));
         }
-        let finish_reason = if !tcs.is_empty() { "tool_calls" } else { "stop" };
+        let finish_reason = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
         yield Ok(Event::default().data(serde_json::json!({
             "id": id, "object": "chat.completion.chunk", "created": created,
             "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
