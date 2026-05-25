@@ -26,6 +26,7 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{prelude::*, reload, EnvFilter, Registry};
 
@@ -311,6 +312,7 @@ async fn main() {
         .request_body_limit_mb
         .max(1)
         .saturating_mul(1024 * 1024);
+    let v1_max_concurrent_requests = config.v1_max_concurrent_requests.max(1);
     let app = Router::new()
         .merge(admin::admin_router())
         .route("/", get(index_handler))
@@ -319,7 +321,10 @@ async fn main() {
         .route("/models", get(models_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{model_id}", get(model_detail_handler))
-        .route("/v1/{*path}", any(proxy::proxy_handler))
+        .route(
+            "/v1/{*path}",
+            any(proxy::proxy_handler).layer(ConcurrencyLimitLayer::new(v1_max_concurrent_requests)),
+        )
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(CorsLayer::permissive())
         .with_state(app_state);

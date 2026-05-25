@@ -163,6 +163,7 @@ pub struct Config {
     pub global_budget_redis_url: Option<String>,
     pub instance_id: String,
     pub request_body_limit_mb: usize,
+    pub v1_max_concurrent_requests: usize,
     pub context_warn_body_mb: usize,
     pub context_compact_body_mb: usize,
     pub context_target_body_mb: usize,
@@ -259,6 +260,7 @@ impl Config {
             instance_id: env::var("INSTANCE_ID")
                 .unwrap_or_else(|_| format!("zen-{}-{}", std::process::id(), uuid::Uuid::new_v4())),
             request_body_limit_mb: load_env_var("REQUEST_BODY_LIMIT_MB", 64usize),
+            v1_max_concurrent_requests: load_env_var("V1_MAX_CONCURRENT_REQUESTS", 32usize),
             context_warn_body_mb: load_env_var("CONTEXT_WARN_BODY_MB", 24usize),
             context_compact_body_mb: load_env_var("CONTEXT_COMPACT_BODY_MB", 30usize),
             context_target_body_mb: load_env_var("CONTEXT_TARGET_BODY_MB", 26usize),
@@ -454,6 +456,7 @@ mod tests {
             "GLOBAL_BUDGET_REDIS_URL",
             "INSTANCE_ID",
             "REQUEST_BODY_LIMIT_MB",
+            "V1_MAX_CONCURRENT_REQUESTS",
             "CONTEXT_WARN_BODY_MB",
             "CONTEXT_COMPACT_BODY_MB",
             "CONTEXT_TARGET_BODY_MB",
@@ -500,6 +503,7 @@ mod tests {
         assert!(cfg.global_budget_redis_url.is_none());
         assert!(cfg.instance_id.starts_with("zen-"));
         assert_eq!(cfg.request_body_limit_mb, 64);
+        assert_eq!(cfg.v1_max_concurrent_requests, 32);
         assert_eq!(cfg.context_warn_body_mb, 24);
         assert_eq!(cfg.context_compact_body_mb, 30);
         assert_eq!(cfg.context_target_body_mb, 26);
@@ -538,6 +542,7 @@ mod tests {
         unsafe { env::set_var("GLOBAL_BUDGET_REDIS_URL", "redis://127.0.0.1:6379/") };
         unsafe { env::set_var("INSTANCE_ID", "test-instance") };
         unsafe { env::set_var("REQUEST_BODY_LIMIT_MB", "128") };
+        unsafe { env::set_var("V1_MAX_CONCURRENT_REQUESTS", "12") };
         unsafe { env::set_var("CONTEXT_WARN_BODY_MB", "20") };
         unsafe { env::set_var("CONTEXT_COMPACT_BODY_MB", "29") };
         unsafe { env::set_var("CONTEXT_TARGET_BODY_MB", "25") };
@@ -577,6 +582,7 @@ mod tests {
         );
         assert_eq!(cfg.instance_id, "test-instance");
         assert_eq!(cfg.request_body_limit_mb, 128);
+        assert_eq!(cfg.v1_max_concurrent_requests, 12);
         assert_eq!(cfg.context_warn_body_mb, 20);
         assert_eq!(cfg.context_compact_body_mb, 29);
         assert_eq!(cfg.context_target_body_mb, 25);
@@ -612,6 +618,7 @@ mod tests {
             "GLOBAL_BUDGET_REDIS_URL",
             "INSTANCE_ID",
             "REQUEST_BODY_LIMIT_MB",
+            "V1_MAX_CONCURRENT_REQUESTS",
             "CONTEXT_WARN_BODY_MB",
             "CONTEXT_COMPACT_BODY_MB",
             "CONTEXT_TARGET_BODY_MB",

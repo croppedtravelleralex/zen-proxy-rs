@@ -14,7 +14,8 @@ The active runtime chain is:
 Claude Code / Cherry Studio / client
 -> NewAPI http://127.0.0.1:8081
 -> channel 19 Zenproxyrs4.0
--> ZenProxyRS http://127.0.0.1:4000
+-> Nginx http://127.0.0.1:4000
+-> ZenProxyRS instance 4001 / 4002 / 4004
 -> free_model_kernel
 -> selected proxy node
 -> Zen upstream
@@ -36,6 +37,13 @@ Confirmed code/runtime changes:
 - Active config includes `ZEN_PROVIDER_MODE=free_model_kernel`,
   `V4_MODEL_REGISTRY_ENABLED=true`, Redis global budget, 64 MB ingress limit,
   and enforced context governance.
+- Active serving shape is multi-instance:
+  `nginx.service` listens on port 4000 and load-balances to
+  `zen-proxy-rs@1.service` on 4001, `zen-proxy-rs@2.service` on 4002, and
+  `zen-proxy-rs@3.service` on 4004.
+- `zen-proxy-rs.service` is disabled as the legacy single-instance service.
+- Per-instance `V1_MAX_CONCURRENT_REQUESTS=12`, so current planned local
+  inference concurrency is 36 before Nginx/backpressure.
 
 Verification already performed:
 
@@ -46,6 +54,11 @@ cargo test
 cargo build --release
 NewAPI streaming request through http://127.0.0.1:8081 succeeded
 ZenProxy admin telemetry showed retry_chain and real node avg_latency_ms
+Nginx 4000 returned /v1/models through the load balancer
+NewAPI non-stream and stream requests through 4000 returned HTTP 200
+Stopping zen-proxy-rs@2 left 4000 /v1/models and NewAPI chat working
+Six concurrent direct 4000 chat requests returned HTTP 200 and were recorded
+across all three instances
 ```
 
 Commit:

@@ -2,12 +2,11 @@
 
 ## One-Line Status
 
-ZenProxyRS V4.0/V4.1-A is a single-process Rust proxy control plane that keeps
-`zen-proxy-rs` responsible for proxy rotation, pool state, retry, admin, and
-observability, while moving Zen protocol adaptation into a reusable
-`free-model-client-rs` kernel. V4.1-A has landed real node latency scoring,
-retry-chain/failure telemetry, a bounded V4 retry budget, and the first
-durable 99+ audit ledger path.
+ZenProxyRS V4.0/V4.1-A is a Rust proxy control plane that keeps `zen-proxy-rs`
+responsible for proxy rotation, pool state, retry, admin, and observability,
+while moving Zen protocol adaptation into a reusable `free-model-client-rs`
+kernel. The active local runtime is now a multi-instance deployment behind one
+Nginx entrypoint on port 4000.
 
 ## Current Goal
 
@@ -19,7 +18,9 @@ Target chain:
 
 ```text
 Client / external gateway / Claude Code
--> ZenProxyRS V4.0 Public API
+-> NewAPI or direct OpenAI-compatible client
+-> Nginx LB on http://127.0.0.1:4000
+-> ZenProxyRS instance on 4001 / 4002 / 4004
 -> Auth / RequestContext / ModelRegistry
 -> PoolManager selects a proxy node
 -> Transport creates or reuses a per-node reqwest::Client
@@ -84,12 +85,16 @@ NewAPI base URL:     http://127.0.0.1:8081
 NewAPI dev key:      sk-dev
 ```
 
-Current systemd service:
+Current runtime services:
 
 ```text
+nginx.service: listens on 0.0.0.0:4000 and load-balances to ZenProxy backends
+zen-proxy-rs@1.service: 127.0.0.1:4001, INSTANCE_ID=zen-1
+zen-proxy-rs@2.service: 127.0.0.1:4002, INSTANCE_ID=zen-2
+zen-proxy-rs@3.service: 127.0.0.1:4004, INSTANCE_ID=zen-3
+
+Disabled legacy service:
 zen-proxy-rs.service
-WorkingDirectory=/home/lenovo/zen-proxy-rs
-ExecStart=/home/lenovo/zen-proxy-rs/target/release/zen-proxy-rs
 ```
 
 ## Current V4.1-A Evidence
@@ -100,11 +105,15 @@ Confirmed on 2026-05-25:
 - `V4_MODEL_REGISTRY_ENABLED=true`
 - `REQUEST_BODY_LIMIT_MB=64`
 - `ZEN_COMPACTOR_MODE=enforce`
-- `V4_RETRY_BUDGET_MS=45000`
+- `V4_RETRY_BUDGET_MS=120000`
+- `V1_MAX_CONCURRENT_REQUESTS=12` per ZenProxy instance
 - `AUDIT_LOG_ENABLED=true`
 - `AUDIT_LOG_DIR=/tmp/zen-proxy-audit` unless overridden
 - NewAPI channel 19 is the active user path into ZenProxy.
 - NewAPI logs show 940 calls on 2026-05-25 CST at the time of analysis.
+- Nginx uses `least_conn` over `127.0.0.1:4001`, `127.0.0.1:4002`,
+  and `127.0.0.1:4004`. Port 4003 was skipped because it hit a local
+  `AddrInUse` condition during rollout.
 
 ## Verification Commands
 

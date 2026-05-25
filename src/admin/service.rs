@@ -233,6 +233,7 @@ impl AdminService {
             "allow_direct_fallback": cfg.allow_direct_fallback,
             "context_governance": {
                 "request_body_limit_mb": cfg.request_body_limit_mb,
+                "v1_max_concurrent_requests": cfg.v1_max_concurrent_requests,
                 "compactor_mode": cfg.zen_compactor_mode.to_string(),
                 "artifact_cache_mode": cfg.zen_artifact_cache_mode.to_string(),
                 "warn_body_mb": cfg.context_warn_body_mb,
@@ -638,6 +639,7 @@ impl AdminService {
             "global_budget_redis_configured": cfg.global_budget_redis_url.is_some(),
             "context_governance": {
                 "request_body_limit_mb": cfg.request_body_limit_mb,
+                "v1_max_concurrent_requests": cfg.v1_max_concurrent_requests,
                 "compactor_mode": cfg.zen_compactor_mode.to_string(),
                 "artifact_cache_mode": cfg.zen_artifact_cache_mode.to_string(),
                 "artifact_cache_dir": cfg.artifact_cache_dir,

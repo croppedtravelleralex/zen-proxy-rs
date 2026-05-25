@@ -656,6 +656,37 @@ async fn call_with_retry(
                         outcome: "rate_limited".to_string(),
                         error_type: "upstream_429".to_string(),
                     });
+                } else if is_upstream_busy(status, &err.message) {
+                    state.pool_manager.report(
+                        node_id.clone(),
+                        ResultKind::Success(status.as_u16()),
+                        latency,
+                    );
+                    record_ledger(
+                        state,
+                        conf,
+                        &request_id,
+                        "upstream_busy",
+                        &node_id,
+                        &node_url,
+                        public_model,
+                        upstream_model,
+                        status.as_u16(),
+                        retry_after.map(|value| value as i64),
+                        Some("upstream_busy"),
+                        latency,
+                        attempt,
+                        request_meta.stream,
+                    );
+                    retry_chain.push(RequestAttemptTelemetry {
+                        attempt,
+                        node_id: node_id.clone(),
+                        node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                        status: status.as_u16(),
+                        latency_ms: latency,
+                        outcome: "upstream_busy".to_string(),
+                        error_type: "upstream_busy".to_string(),
+                    });
                 } else {
                     let (error_kind, outcome, error_type) = classify_app_error(&err);
                     state.pool_manager.report(
@@ -693,6 +724,8 @@ async fn call_with_retry(
                     let (error_kind, outcome, _) = classify_app_error(&err);
                     let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
                         "rate_limited"
+                    } else if is_upstream_busy(status, &err.message) {
+                        "upstream_busy"
                     } else if matches!(
                         error_kind,
                         ErrorKind::Timeout
@@ -850,6 +883,12 @@ fn report_status_failure(
             stream,
         );
     }
+}
+
+fn is_upstream_busy(status: StatusCode, message: &str) -> bool {
+    status == StatusCode::SERVICE_UNAVAILABLE
+        && (message.contains("Service is too busy")
+            || message.contains("service_unavailable_error"))
 }
 
 fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str) {
