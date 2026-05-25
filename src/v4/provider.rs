@@ -180,6 +180,7 @@ pub async fn handle_v4_proxy(
             state.upstream_health.record(status);
             let mut response = if streaming {
                 metered_stream_response(
+                    state.clone(),
                     result.response,
                     path.to_string(),
                     telemetry,
@@ -497,11 +498,71 @@ async fn call_with_retry(
                         .get("x-zen-observed-exit-ip")
                         .and_then(|value| value.to_str().ok())
                         .map(ToOwned::to_owned);
-                    state.pool_manager.report(
-                        node_id.clone(),
-                        ResultKind::Success(status.as_u16()),
-                        latency,
-                    );
+                    let (response, body_bytes_len, usage, has_output) = if request_meta.stream {
+                        (response, 0, UsageCounts::default(), true)
+                    } else {
+                        buffered_response_with_usage(response, path).await?
+                    };
+                    if !request_meta.stream && !has_output {
+                        state.pool_manager.report(
+                            node_id.clone(),
+                            ResultKind::Error {
+                                kind: ErrorKind::Other,
+                            },
+                            latency,
+                        );
+                        record_ledger(
+                            state,
+                            conf,
+                            &request_id,
+                            "empty_output",
+                            &node_id,
+                            &node_url,
+                            public_model,
+                            upstream_model,
+                            StatusCode::BAD_GATEWAY.as_u16(),
+                            None,
+                            Some("empty_output"),
+                            latency,
+                            attempt,
+                            request_meta.stream,
+                        );
+                        retry_chain.push(RequestAttemptTelemetry {
+                            attempt,
+                            node_id: node_id.clone(),
+                            node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                            status: StatusCode::BAD_GATEWAY.as_u16(),
+                            latency_ms: latency,
+                            outcome: "empty_output".to_string(),
+                            error_type: "empty_output".to_string(),
+                        });
+                        last_status = StatusCode::BAD_GATEWAY;
+                        if attempt >= max {
+                            return Err(V4CallError::after_dispatch(
+                                StatusCode::BAD_GATEWAY,
+                                "upstream returned no assistant content or tool call",
+                                None,
+                                request_id,
+                                node_id,
+                                &node_url,
+                                upstream_model,
+                                "empty_output",
+                                attempt,
+                                was_rate_limited,
+                                latency,
+                                "empty_output",
+                                retry_chain,
+                            ));
+                        }
+                        continue;
+                    }
+                    if !request_meta.stream {
+                        state.pool_manager.report(
+                            node_id.clone(),
+                            ResultKind::Success(status.as_u16()),
+                            latency,
+                        );
+                    }
                     record_ledger(
                         state,
                         conf,
@@ -527,11 +588,6 @@ async fn call_with_retry(
                         outcome: "success".to_string(),
                         error_type: String::new(),
                     });
-                    let (response, body_bytes_len, usage) = if request_meta.stream {
-                        (response, 0, UsageCounts::default())
-                    } else {
-                        buffered_response_with_usage(response, path).await?
-                    };
                     return Ok(V4CallResult {
                         response,
                         request_id,
@@ -1021,7 +1077,7 @@ async fn buffered_response(response: Response) -> Result<(Response, u64), V4Call
 async fn buffered_response_with_usage(
     response: Response,
     path: &str,
-) -> Result<(Response, u64, UsageCounts), V4CallError> {
+) -> Result<(Response, u64, UsageCounts, bool), V4CallError> {
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), 1024 * 1024)
@@ -1034,13 +1090,50 @@ async fn buffered_response_with_usage(
         })?;
     let len = bytes.len() as u64;
     let usage = extract_usage_counts(path, &bytes);
+    let has_output = response_has_assistant_output(path, &bytes) || usage.completion_tokens > 0;
     let mut rebuilt = Response::new(Body::from(bytes));
     *rebuilt.status_mut() = status;
     *rebuilt.headers_mut() = headers;
-    Ok((rebuilt, len, usage))
+    Ok((rebuilt, len, usage, has_output))
+}
+
+fn response_has_assistant_output(path: &str, bytes: &Bytes) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    if path == "messages" {
+        return value
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    matches!(item.get("type").and_then(Value::as_str), Some("tool_use"))
+                        || item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                })
+            });
+    }
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .is_some_and(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
+                || message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| !items.is_empty())
+        })
 }
 
 fn metered_stream_response(
+    state: Arc<AppState>,
     response: Response,
     path: String,
     telemetry: RequestTelemetry,
@@ -1085,6 +1178,35 @@ fn metered_stream_response(
         telemetry.timings.first_chunk_ms = first_chunk_ms;
         telemetry.timings.stream_complete_ms = stream_complete_ms;
         telemetry.timings.total_ms = stream_complete_ms;
+        let empty_output = usage.completion_tokens == 0 && !metrics.has_assistant_output();
+        if empty_output {
+            telemetry.outcome = "empty_output".to_string();
+            telemetry.failure_kind = "empty_output".to_string();
+            telemetry.failure_message =
+                "upstream returned no assistant content or tool call".to_string();
+            telemetry.retry_chain.push(RequestAttemptTelemetry {
+                attempt: telemetry.retry_count,
+                node_id: telemetry.selected_node_id.clone(),
+                node_url_redacted: telemetry.selected_node_url_redacted.clone(),
+                status: telemetry.status,
+                latency_ms: stream_complete_ms,
+                outcome: "empty_output".to_string(),
+                error_type: "empty_output".to_string(),
+            });
+            state.pool_manager.report(
+                telemetry.selected_node_id.clone(),
+                ResultKind::Error {
+                    kind: ErrorKind::Other,
+                },
+                stream_complete_ms,
+            );
+        } else {
+            state.pool_manager.report(
+                telemetry.selected_node_id.clone(),
+                ResultKind::Success(telemetry.status),
+                stream_complete_ms,
+            );
+        }
         collector.record_request(&telemetry);
     });
 
@@ -1100,6 +1222,8 @@ struct StreamMetrics {
     usage: UsageCounts,
     fallback_usage: UsageCounts,
     completion_text: String,
+    tool_output_chunks: u64,
+    text_output_chunks: u64,
     buffer: String,
 }
 
@@ -1140,6 +1264,40 @@ impl StreamMetrics {
 
     fn ingest_usage_value(&mut self, path: &str, value: &Value) {
         if path == "messages" {
+            match value.get("type").and_then(Value::as_str) {
+                Some("content_block_start") => {
+                    if value
+                        .get("content_block")
+                        .and_then(|block| block.get("type"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind == "tool_use")
+                    {
+                        self.tool_output_chunks = self.tool_output_chunks.saturating_add(1);
+                    }
+                }
+                Some("content_block_delta") => {
+                    if let Some(delta) = value.get("delta") {
+                        if delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                        {
+                            self.text_output_chunks = self.text_output_chunks.saturating_add(1);
+                        }
+                        if delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .is_some_and(|json| !json.trim().is_empty())
+                        {
+                            self.tool_output_chunks = self.tool_output_chunks.saturating_add(1);
+                        }
+                    }
+                }
+                Some("error") => {
+                    self.usage.completion_tokens = 0;
+                }
+                _ => {}
+            }
             if let Some(usage) = value
                 .get("message")
                 .and_then(|message| message.get("usage"))
@@ -1167,6 +1325,20 @@ impl StreamMetrics {
             .and_then(|content| content.as_str())
         {
             self.completion_text.push_str(text);
+            if !text.trim().is_empty() {
+                self.text_output_chunks = self.text_output_chunks.saturating_add(1);
+            }
+        }
+        if value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("tool_calls"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        {
+            self.tool_output_chunks = self.tool_output_chunks.saturating_add(1);
         }
 
         let Some(usage) = value.get("usage") else {
@@ -1199,7 +1371,8 @@ impl StreamMetrics {
         let completion_tokens = self.usage.completion_tokens.max(
             self.fallback_usage
                 .completion_tokens
-                .max(estimate_text_tokens(&self.completion_text)),
+                .max(estimate_text_tokens(&self.completion_text))
+                .max(if self.tool_output_chunks > 0 { 1 } else { 0 }),
         );
         let total_tokens = self
             .usage
@@ -1210,6 +1383,13 @@ impl StreamMetrics {
             completion_tokens,
             total_tokens,
         }
+    }
+
+    fn has_assistant_output(&self) -> bool {
+        !self.completion_text.trim().is_empty()
+            || self.text_output_chunks > 0
+            || self.tool_output_chunks > 0
+            || self.usage.completion_tokens > 0
     }
 }
 
@@ -1290,4 +1470,42 @@ fn estimate_text_tokens(text: &str) -> u32 {
     let word_like = text.split_whitespace().count() as u32;
     let char_like = text.chars().count().div_ceil(4) as u32;
     word_like.max(char_like)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+
+    #[test]
+    fn detects_openai_empty_assistant_output() {
+        let body = Bytes::from_static(
+            br#"{"choices":[{"message":{"role":"assistant","content":""}}],"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10}}"#,
+        );
+        assert!(!response_has_assistant_output("chat/completions", &body));
+    }
+
+    #[test]
+    fn detects_openai_tool_output_as_assistant_output() {
+        let body = Bytes::from_static(
+            br#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"type":"function","function":{"name":"Task","arguments":"{}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10}}"#,
+        );
+        assert!(response_has_assistant_output("chat/completions", &body));
+    }
+
+    #[test]
+    fn detects_anthropic_empty_assistant_output() {
+        let body = Bytes::from_static(
+            br#"{"content":[{"type":"text","text":""}],"usage":{"input_tokens":10,"output_tokens":0}}"#,
+        );
+        assert!(!response_has_assistant_output("messages", &body));
+    }
+
+    #[test]
+    fn detects_anthropic_tool_use_as_assistant_output() {
+        let body = Bytes::from_static(
+            br#"{"content":[{"type":"tool_use","id":"toolu_1","name":"Task","input":{}}],"usage":{"input_tokens":10,"output_tokens":0}}"#,
+        );
+        assert!(response_has_assistant_output("messages", &body));
+    }
 }
