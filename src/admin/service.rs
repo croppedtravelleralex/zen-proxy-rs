@@ -198,6 +198,18 @@ impl AdminService {
             "v4_model_registry_active": cfg.v4_model_registry_active(),
             "upstream_base": cfg.upstream_base,
             "allow_direct_fallback": cfg.allow_direct_fallback,
+            "context_governance": {
+                "request_body_limit_mb": cfg.request_body_limit_mb,
+                "compactor_mode": cfg.zen_compactor_mode.to_string(),
+                "artifact_cache_mode": cfg.zen_artifact_cache_mode.to_string(),
+                "warn_body_mb": cfg.context_warn_body_mb,
+                "compact_body_mb": cfg.context_compact_body_mb,
+                "target_body_mb": cfg.context_target_body_mb,
+                "upstream_body_limit_mb": cfg.context_upstream_body_limit_mb,
+                "token_warn": cfg.context_token_warn,
+                "token_compact": cfg.context_token_compact,
+                "token_target": cfg.context_token_target,
+            },
             "global_budget": cfg.global_budget_redis_url.as_ref().map(|_| json!({
                 "configured": true,
                 "instance_id": cfg.instance_id,
@@ -467,6 +479,23 @@ impl AdminService {
             "proxy_api_key_configured": cfg.proxy_api_key.is_some(),
             "instance_id": cfg.instance_id,
             "global_budget_redis_configured": cfg.global_budget_redis_url.is_some(),
+            "context_governance": {
+                "request_body_limit_mb": cfg.request_body_limit_mb,
+                "compactor_mode": cfg.zen_compactor_mode.to_string(),
+                "artifact_cache_mode": cfg.zen_artifact_cache_mode.to_string(),
+                "artifact_cache_dir": cfg.artifact_cache_dir,
+                "artifact_cache_max_mb": cfg.artifact_cache_max_mb,
+                "artifact_cache_ttl_hours": cfg.artifact_cache_ttl_hours,
+                "warn_body_mb": cfg.context_warn_body_mb,
+                "compact_body_mb": cfg.context_compact_body_mb,
+                "target_body_mb": cfg.context_target_body_mb,
+                "upstream_body_limit_mb": cfg.context_upstream_body_limit_mb,
+                "token_warn": cfg.context_token_warn,
+                "token_compact": cfg.context_token_compact,
+                "token_target": cfg.context_token_target,
+                "large_chunk_bytes": cfg.context_large_chunk_bytes,
+                "preserve_recent_messages": cfg.context_preserve_recent_messages,
+            },
             "node_budget": {
                 "max_calls_per_window": cfg.node_max_calls_per_window,
                 "max_tokens_per_window": cfg.node_max_tokens_per_window,
@@ -497,6 +526,19 @@ impl AdminService {
         if cfg.allow_direct_fallback {
             warnings
                 .push("ALLOW_DIRECT_FALLBACK is enabled — requests may bypass proxy pool".into());
+        }
+        if cfg.context_target_body_mb >= cfg.context_upstream_body_limit_mb {
+            warnings.push(
+                "CONTEXT_TARGET_BODY_MB should stay below CONTEXT_UPSTREAM_BODY_LIMIT_MB".into(),
+            );
+        }
+        if cfg.zen_compactor_mode.to_string() == "off"
+            && cfg.request_body_limit_mb > cfg.context_upstream_body_limit_mb
+        {
+            warnings.push(
+                "ZEN_COMPACTOR_MODE=off with a large ingress limit may forward overlarge upstream requests"
+                    .into(),
+            );
         }
         Self::ok_response(json!({
             "valid": warnings.is_empty(),

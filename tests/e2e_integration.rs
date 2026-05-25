@@ -371,6 +371,94 @@ mod e2e {
     }
 
     #[test]
+    fn test_v4_ingress_accepts_body_over_axum_default_limit() {
+        let (child, port) = start_server_with_env(
+            19802,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let body = serde_json::json!({
+            "model": "not-a-v4-model",
+            "messages": [{"role": "user", "content": "x".repeat(3 * 1024 * 1024)}],
+            "stream": false
+        })
+        .to_string();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .expect("large invalid v4 request");
+        assert_eq!(resp.status(), 400);
+        let text = resp.text().unwrap();
+        assert!(
+            text.contains("unsupported V4 model"),
+            "large request should reach V4 handler, got {text}"
+        );
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_compactor_trims_large_old_tool_result_before_upstream() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19803,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+                ("ZEN_COMPACTOR_MODE", "enforce"),
+                ("ZEN_ARTIFACT_CACHE_MODE", "off"),
+                ("CONTEXT_COMPACT_BODY_MB", "1"),
+                ("CONTEXT_TARGET_BODY_MB", "1"),
+                ("CONTEXT_LARGE_CHUNK_BYTES", "1024"),
+                ("CONTEXT_PRESERVE_RECENT_MESSAGES", "8"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "tool", "content": "x".repeat(2 * 1024 * 1024), "tool_call_id": "old-tool"},
+                    {"role": "assistant", "content": "recent assistant"},
+                    {"role": "user", "content": "latest user"}
+                ],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 compacted openai request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-context-trimmed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-context-action")
+                .and_then(|value| value.to_str().ok()),
+            Some("compact")
+        );
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
+        assert_eq!(upstream_messages.last().unwrap()["content"], "latest user");
+        let compacted_tool = upstream_messages[0]["content"].as_str().unwrap();
+        assert!(compacted_tool.contains("ZenProxy context compactor"));
+        assert!(compacted_tool.len() < 16 * 1024);
+        stop_server(child, port);
+    }
+
+    #[test]
     fn test_v4_stream_telemetry_records_bytes_and_usage() {
         let (upstream_base, _) = start_mock_zen();
         let (child, port) = start_server_with_env(

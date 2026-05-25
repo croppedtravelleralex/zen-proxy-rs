@@ -37,6 +37,78 @@ impl FromStr for ProviderMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactorMode {
+    Off,
+    Observe,
+    Enforce,
+}
+
+impl CompactorMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+impl fmt::Display for CompactorMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CompactorMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "observe" | "observe_only" | "observe-only" => Ok(Self::Observe),
+            "enforce" | "on" => Ok(Self::Enforce),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactCacheMode {
+    Off,
+    Metadata,
+    Full,
+}
+
+impl ArtifactCacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Metadata => "metadata",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl fmt::Display for ArtifactCacheMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ArtifactCacheMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "metadata" | "meta" => Ok(Self::Metadata),
+            "full" | "on" => Ok(Self::Full),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
@@ -87,6 +159,21 @@ pub struct Config {
     pub node_lease_ttl_secs: u64,
     pub global_budget_redis_url: Option<String>,
     pub instance_id: String,
+    pub request_body_limit_mb: usize,
+    pub context_warn_body_mb: usize,
+    pub context_compact_body_mb: usize,
+    pub context_target_body_mb: usize,
+    pub context_upstream_body_limit_mb: usize,
+    pub context_token_warn: u64,
+    pub context_token_compact: u64,
+    pub context_token_target: u64,
+    pub context_large_chunk_bytes: usize,
+    pub context_preserve_recent_messages: usize,
+    pub zen_compactor_mode: CompactorMode,
+    pub zen_artifact_cache_mode: ArtifactCacheMode,
+    pub artifact_cache_dir: String,
+    pub artifact_cache_max_mb: u64,
+    pub artifact_cache_ttl_hours: u64,
 }
 
 impl Config {
@@ -164,6 +251,28 @@ impl Config {
             },
             instance_id: env::var("INSTANCE_ID")
                 .unwrap_or_else(|_| format!("zen-{}-{}", std::process::id(), uuid::Uuid::new_v4())),
+            request_body_limit_mb: load_env_var("REQUEST_BODY_LIMIT_MB", 64usize),
+            context_warn_body_mb: load_env_var("CONTEXT_WARN_BODY_MB", 24usize),
+            context_compact_body_mb: load_env_var("CONTEXT_COMPACT_BODY_MB", 30usize),
+            context_target_body_mb: load_env_var("CONTEXT_TARGET_BODY_MB", 26usize),
+            context_upstream_body_limit_mb: load_env_var("CONTEXT_UPSTREAM_BODY_LIMIT_MB", 32usize),
+            context_token_warn: load_env_var("CONTEXT_TOKEN_WARN", 600_000u64),
+            context_token_compact: load_env_var("CONTEXT_TOKEN_COMPACT", 850_000u64),
+            context_token_target: load_env_var("CONTEXT_TOKEN_TARGET", 750_000u64),
+            context_large_chunk_bytes: load_env_var("CONTEXT_LARGE_CHUNK_BYTES", 256 * 1024usize),
+            context_preserve_recent_messages: load_env_var(
+                "CONTEXT_PRESERVE_RECENT_MESSAGES",
+                8usize,
+            ),
+            zen_compactor_mode: load_env_var("ZEN_COMPACTOR_MODE", CompactorMode::Observe),
+            zen_artifact_cache_mode: load_env_var(
+                "ZEN_ARTIFACT_CACHE_MODE",
+                ArtifactCacheMode::Metadata,
+            ),
+            artifact_cache_dir: env::var("ARTIFACT_CACHE_DIR")
+                .unwrap_or_else(|_| "/tmp/zen-proxy-artifacts".into()),
+            artifact_cache_max_mb: load_env_var("ARTIFACT_CACHE_MAX_MB", 2048u64),
+            artifact_cache_ttl_hours: load_env_var("ARTIFACT_CACHE_TTL_HOURS", 24u64),
         }
     }
 
@@ -334,26 +443,41 @@ mod tests {
             "NODE_LEASE_TTL_SECS",
             "GLOBAL_BUDGET_REDIS_URL",
             "INSTANCE_ID",
+            "REQUEST_BODY_LIMIT_MB",
+            "CONTEXT_WARN_BODY_MB",
+            "CONTEXT_COMPACT_BODY_MB",
+            "CONTEXT_TARGET_BODY_MB",
+            "CONTEXT_UPSTREAM_BODY_LIMIT_MB",
+            "CONTEXT_TOKEN_WARN",
+            "CONTEXT_TOKEN_COMPACT",
+            "CONTEXT_TOKEN_TARGET",
+            "CONTEXT_LARGE_CHUNK_BYTES",
+            "CONTEXT_PRESERVE_RECENT_MESSAGES",
+            "ZEN_COMPACTOR_MODE",
+            "ZEN_ARTIFACT_CACHE_MODE",
+            "ARTIFACT_CACHE_DIR",
+            "ARTIFACT_CACHE_MAX_MB",
+            "ARTIFACT_CACHE_TTL_HOURS",
         ]);
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 4000);
         assert!(cfg.admin_api_key.is_none());
         assert!(cfg.model_override.is_none());
-        assert_eq!(cfg.allow_direct_fallback, false);
-        assert_eq!(cfg.benchmark_mode, false);
+        assert!(!cfg.allow_direct_fallback);
+        assert!(!cfg.benchmark_mode);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.probe_timeout_secs, 30);
         assert_eq!(cfg.probe_batch_size, 5);
         assert_eq!(cfg.dispatch_capacity, 100);
         assert_eq!(cfg.ledger_events_path, "/tmp/zen-proxy-ledger-events.jsonl");
-        assert_eq!(cfg.opencode_headers_enabled, true);
+        assert!(cfg.opencode_headers_enabled);
         assert_eq!(cfg.opencode_client_name, "cli");
         assert_eq!(cfg.opencode_project_seed, "zen-proxy-rs");
         assert_eq!(cfg.opencode_session_ttl_secs, 1800);
         assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
-        assert_eq!(cfg.v4_model_registry_enabled, false);
-        assert_eq!(cfg.v4_model_registry_active(), false);
+        assert!(!cfg.v4_model_registry_enabled);
+        assert!(!cfg.v4_model_registry_active());
         assert_eq!(cfg.node_max_calls_per_window, 100);
         assert_eq!(cfg.node_max_tokens_per_window, 250_000);
         assert_eq!(cfg.node_max_kb_per_window, 64 * 1024);
@@ -362,6 +486,21 @@ mod tests {
         assert_eq!(cfg.node_lease_ttl_secs, 180);
         assert!(cfg.global_budget_redis_url.is_none());
         assert!(cfg.instance_id.starts_with("zen-"));
+        assert_eq!(cfg.request_body_limit_mb, 64);
+        assert_eq!(cfg.context_warn_body_mb, 24);
+        assert_eq!(cfg.context_compact_body_mb, 30);
+        assert_eq!(cfg.context_target_body_mb, 26);
+        assert_eq!(cfg.context_upstream_body_limit_mb, 32);
+        assert_eq!(cfg.context_token_warn, 600_000);
+        assert_eq!(cfg.context_token_compact, 850_000);
+        assert_eq!(cfg.context_token_target, 750_000);
+        assert_eq!(cfg.context_large_chunk_bytes, 256 * 1024);
+        assert_eq!(cfg.context_preserve_recent_messages, 8);
+        assert_eq!(cfg.zen_compactor_mode, CompactorMode::Observe);
+        assert_eq!(cfg.zen_artifact_cache_mode, ArtifactCacheMode::Metadata);
+        assert_eq!(cfg.artifact_cache_dir, "/tmp/zen-proxy-artifacts");
+        assert_eq!(cfg.artifact_cache_max_mb, 2048);
+        assert_eq!(cfg.artifact_cache_ttl_hours, 24);
     }
 
     #[test]
@@ -382,16 +521,31 @@ mod tests {
         unsafe { env::set_var("NODE_LEASE_TTL_SECS", "270") };
         unsafe { env::set_var("GLOBAL_BUDGET_REDIS_URL", "redis://127.0.0.1:6379/") };
         unsafe { env::set_var("INSTANCE_ID", "test-instance") };
+        unsafe { env::set_var("REQUEST_BODY_LIMIT_MB", "128") };
+        unsafe { env::set_var("CONTEXT_WARN_BODY_MB", "20") };
+        unsafe { env::set_var("CONTEXT_COMPACT_BODY_MB", "29") };
+        unsafe { env::set_var("CONTEXT_TARGET_BODY_MB", "25") };
+        unsafe { env::set_var("CONTEXT_UPSTREAM_BODY_LIMIT_MB", "31") };
+        unsafe { env::set_var("CONTEXT_TOKEN_WARN", "500000") };
+        unsafe { env::set_var("CONTEXT_TOKEN_COMPACT", "900000") };
+        unsafe { env::set_var("CONTEXT_TOKEN_TARGET", "700000") };
+        unsafe { env::set_var("CONTEXT_LARGE_CHUNK_BYTES", "65536") };
+        unsafe { env::set_var("CONTEXT_PRESERVE_RECENT_MESSAGES", "12") };
+        unsafe { env::set_var("ZEN_COMPACTOR_MODE", "enforce") };
+        unsafe { env::set_var("ZEN_ARTIFACT_CACHE_MODE", "full") };
+        unsafe { env::set_var("ARTIFACT_CACHE_DIR", "/tmp/zen-test-artifacts") };
+        unsafe { env::set_var("ARTIFACT_CACHE_MAX_MB", "64") };
+        unsafe { env::set_var("ARTIFACT_CACHE_TTL_HOURS", "2") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.probe_batch_size, 10);
-        assert_eq!(cfg.opencode_headers_enabled, true);
+        assert!(cfg.opencode_headers_enabled);
         assert_eq!(cfg.opencode_client_name, "desktop-cli");
         assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
-        assert_eq!(cfg.v4_model_registry_enabled, true);
-        assert_eq!(cfg.v4_model_registry_active(), true);
+        assert!(cfg.v4_model_registry_enabled);
+        assert!(cfg.v4_model_registry_active());
         assert_eq!(cfg.node_max_calls_per_window, 7);
         assert_eq!(cfg.node_max_tokens_per_window, 777);
         assert_eq!(cfg.node_max_kb_per_window, 77);
@@ -403,6 +557,21 @@ mod tests {
             Some("redis://127.0.0.1:6379/")
         );
         assert_eq!(cfg.instance_id, "test-instance");
+        assert_eq!(cfg.request_body_limit_mb, 128);
+        assert_eq!(cfg.context_warn_body_mb, 20);
+        assert_eq!(cfg.context_compact_body_mb, 29);
+        assert_eq!(cfg.context_target_body_mb, 25);
+        assert_eq!(cfg.context_upstream_body_limit_mb, 31);
+        assert_eq!(cfg.context_token_warn, 500_000);
+        assert_eq!(cfg.context_token_compact, 900_000);
+        assert_eq!(cfg.context_token_target, 700_000);
+        assert_eq!(cfg.context_large_chunk_bytes, 65_536);
+        assert_eq!(cfg.context_preserve_recent_messages, 12);
+        assert_eq!(cfg.zen_compactor_mode, CompactorMode::Enforce);
+        assert_eq!(cfg.zen_artifact_cache_mode, ArtifactCacheMode::Full);
+        assert_eq!(cfg.artifact_cache_dir, "/tmp/zen-test-artifacts");
+        assert_eq!(cfg.artifact_cache_max_mb, 64);
+        assert_eq!(cfg.artifact_cache_ttl_hours, 2);
 
         remove_env_vars(&[
             "PORT",
@@ -420,6 +589,21 @@ mod tests {
             "NODE_LEASE_TTL_SECS",
             "GLOBAL_BUDGET_REDIS_URL",
             "INSTANCE_ID",
+            "REQUEST_BODY_LIMIT_MB",
+            "CONTEXT_WARN_BODY_MB",
+            "CONTEXT_COMPACT_BODY_MB",
+            "CONTEXT_TARGET_BODY_MB",
+            "CONTEXT_UPSTREAM_BODY_LIMIT_MB",
+            "CONTEXT_TOKEN_WARN",
+            "CONTEXT_TOKEN_COMPACT",
+            "CONTEXT_TOKEN_TARGET",
+            "CONTEXT_LARGE_CHUNK_BYTES",
+            "CONTEXT_PRESERVE_RECENT_MESSAGES",
+            "ZEN_COMPACTOR_MODE",
+            "ZEN_ARTIFACT_CACHE_MODE",
+            "ARTIFACT_CACHE_DIR",
+            "ARTIFACT_CACHE_MAX_MB",
+            "ARTIFACT_CACHE_TTL_HOURS",
         ]);
     }
 

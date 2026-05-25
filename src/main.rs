@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::Json,
     routing::{any, get},
@@ -307,6 +307,10 @@ async fn main() {
         });
     }
 
+    let request_body_limit = config
+        .request_body_limit_mb
+        .max(1)
+        .saturating_mul(1024 * 1024);
     let app = Router::new()
         .merge(admin::admin_router())
         .route("/", get(index_handler))
@@ -316,6 +320,7 @@ async fn main() {
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{model_id}", get(model_detail_handler))
         .route("/v1/{*path}", any(proxy::proxy_handler))
+        .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 

@@ -177,6 +177,7 @@ pub async fn proxy_handler(
                 total_tokens: 0,
                 bytes_sent: body_len,
                 bytes_received: pr.body_bytes.len() as u64,
+                context: None,
             };
 
             state.collector.record_request(&tele);

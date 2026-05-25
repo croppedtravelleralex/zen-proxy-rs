@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::ledger::LedgerEvent;
 use crate::pool::{DispatchError, ErrorKind, RequestMeta, ResultKind};
 use crate::state::AppState;
+use crate::v4::context;
 use crate::v4::model::{ModelError, ModelRegistry, StaticModelRegistry};
 
 pub async fn handle_v4_proxy(
@@ -43,6 +44,13 @@ pub async fn handle_v4_proxy(
             );
         }
     };
+    let context_plan = match context::govern_request(&conf, path, parsed, body.len()) {
+        Ok(plan) => plan,
+        Err(reject) => return error_response(reject.status, reject.message),
+    };
+    let mut context_telemetry = context_plan.telemetry();
+    let parsed = context_plan.body;
+
     let streaming = parsed
         .get("stream")
         .and_then(|value| value.as_bool())
@@ -57,6 +65,8 @@ pub async fn handle_v4_proxy(
         model = %public_model,
         stream_seen_by_zenproxy = streaming,
         body_size = body.len(),
+        context_action = %context_telemetry.action,
+        effective_body_size = context_telemetry.effective_body_bytes,
         "v4 ingress request"
     );
     let registry = StaticModelRegistry;
@@ -79,10 +89,19 @@ pub async fn handle_v4_proxy(
     {
         upstream_body["max_tokens"] = Value::from(1024);
     }
+    let effective_body_len = serde_json::to_vec(&upstream_body)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(context_telemetry.effective_body_bytes);
+    context_telemetry.effective_body_bytes = effective_body_len;
+    context_telemetry.trimmed = effective_body_len < context_telemetry.original_body_bytes;
+    context_telemetry.trimmed_bytes = context_telemetry
+        .original_body_bytes
+        .saturating_sub(effective_body_len);
+
     let request_meta = RequestMeta {
         model: public_model.clone(),
         stream: streaming,
-        body_size: body.len() as u64,
+        body_size: effective_body_len,
     };
     let stream_usage_fallback = if streaming {
         UsageCounts {
@@ -138,8 +157,9 @@ pub async fn handle_v4_proxy(
                 prompt_tokens: result.usage.prompt_tokens,
                 completion_tokens: result.usage.completion_tokens,
                 total_tokens: result.usage.total_tokens,
-                bytes_sent: body.len() as u64,
+                bytes_sent: effective_body_len,
                 bytes_received: result.body_bytes_len,
+                context: Some(context_telemetry.clone()),
             };
             state.upstream_health.record(status);
             let mut response = if streaming {
@@ -158,6 +178,7 @@ pub async fn handle_v4_proxy(
                 "x-zen-stream-seen",
                 HeaderValue::from_static(if streaming { "true" } else { "false" }),
             );
+            insert_context_headers(response.headers_mut(), &context_telemetry);
             response
         }
         Err(err) => {
@@ -195,8 +216,9 @@ pub async fn handle_v4_proxy(
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     total_tokens: 0,
-                    bytes_sent: body.len() as u64,
+                    bytes_sent: effective_body_len,
                     bytes_received: 0,
+                    context: Some(context_telemetry.clone()),
                 });
             }
             let mut response = error_response(err.status, err.message);
@@ -206,6 +228,7 @@ pub async fn handle_v4_proxy(
                     HeaderValue::from_str(&retry_after.to_string()).unwrap(),
                 );
             }
+            insert_context_headers(response.headers_mut(), &context_telemetry);
             response
         }
     }
@@ -735,6 +758,22 @@ fn retry_after(response: &Response) -> Option<u64> {
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok())
+}
+
+fn insert_context_headers(headers: &mut HeaderMap, telemetry: &crate::collector::ContextTelemetry) {
+    if let Ok(value) = HeaderValue::from_str(&telemetry.action) {
+        headers.insert("x-zen-context-action", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&telemetry.original_body_bytes.to_string()) {
+        headers.insert("x-zen-context-original-bytes", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&telemetry.effective_body_bytes.to_string()) {
+        headers.insert("x-zen-context-effective-bytes", value);
+    }
+    headers.insert(
+        "x-zen-context-trimmed",
+        HeaderValue::from_static(if telemetry.trimmed { "true" } else { "false" }),
+    );
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {

@@ -32,6 +32,9 @@ release gates pass
 | Transport Failure | fault injection | timeout/refused/SOCKS failure moves node to Dead |
 | Sticky Retry | fault injection | retry tries same node before spending another node |
 | Dead Probe | scheduler tests | 60-120 minute jitter and adaptive batch rules hold |
+| Context Ingress | e2e request-size test | >2MB bodies reach V4 handler under configured limit |
+| Context Governance | e2e compaction test | old tool output is trimmed before upstream; latest user message preserved |
+| Context Observability | admin request detail | original/effective bytes, token estimate, action, cache stats, trace recorded |
 | No-Retry Semantics | fault injection | `POOL_MAX_RETRIES=0` sends exactly one upstream request |
 | Observability | admin/WAL/metrics check | same request id appears across request detail, WAL, metrics-derived data |
 | Rollback | runtime drill | switch between legacy and FreeModel mode without rebuild |
@@ -182,6 +185,18 @@ retry_count
 latency_total_ms
 upstream_ms
 ttft_ms, for stream
+context.original_body_bytes
+context.effective_body_bytes
+context.estimated_prompt_tokens
+context.message_count
+context.tools_count
+context.largest_message_bytes
+context.tool_result_bytes
+context.action
+context.trimmed_bytes
+context.artifact_cache_hits
+context.artifact_cache_writes
+context.trace
 ```
 
 No secrets may be emitted in admin, metrics, or WAL output.
@@ -206,6 +221,35 @@ process count: 1
 idle RSS target: <= 50 MB unless justified
 proxy overhead P95 target: <= 30 ms excluding upstream/model latency
 ```
+
+## Large Context Acceptance
+
+ZenProxyRS must separate ingress capability from upstream forwarding safety.
+
+Required defaults:
+
+```text
+REQUEST_BODY_LIMIT_MB=64
+CONTEXT_WARN_BODY_MB=24
+CONTEXT_COMPACT_BODY_MB=30
+CONTEXT_TARGET_BODY_MB=26
+CONTEXT_UPSTREAM_BODY_LIMIT_MB=32
+CONTEXT_TOKEN_WARN=600000
+CONTEXT_TOKEN_COMPACT=850000
+CONTEXT_TOKEN_TARGET=750000
+ZEN_COMPACTOR_MODE=observe
+ZEN_ARTIFACT_CACHE_MODE=metadata
+```
+
+Required evidence:
+
+- a 3MB request is no longer rejected by Axum's default body limit.
+- observe mode records that compaction would happen but does not mutate the body.
+- enforce mode trims old tool output before upstream dispatch.
+- the latest user message and recent tool chain are preserved.
+- if a 32-64MB body cannot be safely reduced below the upstream-safe budget, the
+  response is a structured 413.
+- artifact cache is limited to large repeated content and has TTL/disk caps.
 
 ## Rollback Acceptance
 
@@ -242,6 +286,10 @@ Rollback requirements:
 | old legacy code remains active accidentally | V4 behavior is inconsistent | provider mode gate and request record mode field |
 | observability has two truth sources | admin/debugging becomes unreliable | canonical `RequestRecord` |
 | rollback is not tested | production recovery is slow | rollback drill in release gate |
+| ingress limit is raised without compaction | upstream 32MB limit still fails | budgeter and enforce-mode compaction |
+| compaction removes current context | answer quality drops | preserve latest user message and recent tool chain |
+| cache grows without bounds | disk pressure | TTL, LRU cleanup, metadata default |
+| summary is used too early | lost detail and wrong answers | structural trimming before any semantic summary |
 
 ## Score Target
 

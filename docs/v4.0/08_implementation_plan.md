@@ -42,6 +42,7 @@ each phase must compile before the next phase starts
 | T5.2 | 5 | Align ledger and collector | ledger/collector modules | T5.1 | admin, WAL, metrics share request id |
 | T5.3 | 5 | Add admin V4.0 views | admin service/router | T5.2 | pools, requests, events, config endpoints work |
 | T5.4 | 5 | Add exit proof reporting | admin/ledger | T3.3/T5.1 | request detail shows selected node and proof when available |
+| T5.5 | 5 | Add large-context governance | V4 context/provider/admin | T5.1 | ingress limit, profile, budget, compaction telemetry work |
 | T6.1 | 6 | Add mock Zen server tests | integration tests | T2.2/T2.3 | protocol tests run offline |
 | T6.2 | 6 | Add fault injection suite | integration tests | T3.2 | 429/500/timeout/bad SSE are covered |
 | T6.3 | 6 | Run release gate | whole repo | all | fmt, clippy, test, release build pass |
@@ -210,17 +211,62 @@ Tasks:
   - retry count
   - outcome
   - TTFT
+- Add context governance fields:
+  - original body bytes
+  - effective body bytes
+  - estimated prompt tokens
+  - message count
+  - tools count
+  - largest message bytes
+  - tool result bytes
+  - context action
+  - trimmed bytes
+  - artifact cache hits/writes
+  - compaction trace
 
 Acceptance:
 
 - admin request detail, metrics, and WAL refer to the same request id.
 - no endpoint depends on a separate incompatible request model.
 - high-cardinality raw secrets are not emitted.
+- a >2MB request reaches V4 handler when `REQUEST_BODY_LIMIT_MB` allows it.
+- enforce mode trims old low-value context before upstream dispatch.
+- observe mode records intent without mutating the request.
 
 Stop line:
 
 - If two systems disagree on request status or node id, resolve before moving to
-  release gate.
+release gate.
+
+### Phase 5.5 - Large Context Governance
+
+Goal: make Claude Code long sessions survivable without client-side truncation.
+
+Tasks:
+
+- Raise Axum ingress limit through `REQUEST_BODY_LIMIT_MB`.
+- Add lightweight profiling for bytes, message count, tools, largest message,
+  tool-result bytes, and token estimate.
+- Add budget thresholds for warn/compact/upstream-safe body size.
+- Add `ZEN_COMPACTOR_MODE=off|observe|enforce`.
+- Add structural compaction for old tool results, old large text, and old
+  prefixes while preserving latest context.
+- Add narrow artifact cache with `off|metadata|full`, TTL, and disk cap.
+- Add telemetry and response headers for context action and effective size.
+
+Acceptance:
+
+- small requests remain pass-through.
+- 3MB requests are not rejected by Axum's default 2MB extractor limit.
+- 32MB-class requests can be reduced to the configured upstream-safe target in
+  enforce mode when the oversized content is old tool/file output.
+- unsafe overlarge requests return structured 413.
+- compaction is visible through admin request records.
+
+Stop line:
+
+- If compaction must touch the latest user message to fit, reject instead of
+  silently degrading answer quality.
 
 ## Phase 6 - Release Gate
 
@@ -268,4 +314,3 @@ chore(v4): pass release gate
 
 Avoid commits that mix contracts, adapter wiring, pool behavior, and admin
 changes at the same time.
-

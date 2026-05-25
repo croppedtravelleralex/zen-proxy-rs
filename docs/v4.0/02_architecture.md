@@ -8,7 +8,7 @@ and exposes a narrow contract to the next layer.
 ```text
 L7 HTTP/API
 L6 Application Services
-L5 Policy
+L5 Context Governance and Policy
 L4 Provider Adapter / FreeModelKernel
 L3 Transport
 L2 Pool State
@@ -42,10 +42,14 @@ Owns orchestration:
 It builds `RequestContext`, calls policy, calls pool/transport/provider, and
 records outcomes.
 
-### L5 Policy
+### L5 Context Governance and Policy
 
 Owns decisions:
 
+- `ContextProfiler`
+- `ContextBudgeter`
+- `ContextCompactor`
+- `ArtifactCache`
 - `ModelRegistry`
 - `RouteSelector`
 - `RetryPolicy`
@@ -54,6 +58,27 @@ Owns decisions:
 - `RateLimitPolicy`
 
 Policy does not send HTTP requests.
+
+The context governance path is deliberately staged:
+
+```text
+profile -> budget -> observe or compact -> provider
+```
+
+Default behavior is low overhead:
+
+- small requests are passed through after lightweight profiling.
+- warning thresholds record risk but do not mutate content.
+- compaction is only allowed when `ZEN_COMPACTOR_MODE=enforce`.
+- artifact cache is narrow: repeated large blocks only, with TTL and disk cap.
+
+The compactor must preserve current-task quality:
+
+- keep system/developer messages.
+- keep tool schemas.
+- keep the latest user message.
+- keep the recent tool-use/tool-result chain.
+- prefer trimming old tool outputs, old bash output, and repeated file snapshots.
 
 ### L4 Provider Adapter / FreeModelKernel
 
@@ -102,6 +127,7 @@ Owns facts:
 - metrics
 - WAL/JSONL
 - admin query views
+- context profile and compaction trace
 
 There should be one canonical request record model. Derived counters must come
 from it or explicitly document why they are separate.
@@ -139,4 +165,3 @@ Observability -> request orchestration
 The actual Zen request must use the transport selected by `PoolManager`. Any
 implementation that lets the FreeModel path create an unrelated global client is
 not V4.0-compliant.
-

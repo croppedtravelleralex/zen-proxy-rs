@@ -16,7 +16,7 @@ visibility.
 Target chain:
 
 ```text
-Client / NewAPI / Claude Code
+Client / external gateway / Claude Code
 -> ZenProxyRS V4.0 Public API
 -> Auth / RequestContext / ModelRegistry
 -> PoolManager selects a proxy node

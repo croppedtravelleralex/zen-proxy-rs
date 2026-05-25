@@ -37,6 +37,26 @@ pub struct RequestTelemetry {
     pub total_tokens: u32,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub context: Option<ContextTelemetry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTelemetry {
+    pub original_body_bytes: u64,
+    pub effective_body_bytes: u64,
+    pub estimated_prompt_tokens: u64,
+    pub message_count: u32,
+    pub tools_count: u32,
+    pub largest_message_bytes: u64,
+    pub tool_result_bytes: u64,
+    pub mode: String,
+    pub action: String,
+    pub trimmed: bool,
+    pub trimmed_bytes: u64,
+    pub artifact_cache_mode: String,
+    pub artifact_cache_hits: u32,
+    pub artifact_cache_writes: u32,
+    pub trace: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
