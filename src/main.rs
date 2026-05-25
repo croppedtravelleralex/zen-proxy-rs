@@ -209,7 +209,8 @@ async fn main() {
             slow_latency_ms: config.v43_aimd_slow_latency_ms,
         },
         config.v43_dispatch_shards,
-    );
+    )
+    .with_global_budget_fail_open(config.v43_global_budget_fail_open);
     if config.v43_global_budget_mode == config::GlobalBudgetMode::SyncRedis {
         if let Some(redis_url) = config.global_budget_redis_url.clone() {
             match GlobalBudgetRegistry::new(GlobalBudgetConfig {

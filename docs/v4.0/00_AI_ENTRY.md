@@ -126,6 +126,9 @@ Confirmed on 2026-05-25:
 - V4.3 global budget mode is explicit through `V43_GLOBAL_BUDGET_MODE`; keep
   `sync_redis` for multi-instance runtime and use `off` only for single-process
   profiles.
+- V4.3 global budget fail-open is explicit through
+  `V43_GLOBAL_BUDGET_FAIL_OPEN`; keep it true so Docker Redis restart windows
+  degrade to local budget instead of no available node.
 - `/admin/runtime` exposes `data_plane.node_registry` and
   `data_plane.transport` for the current process.
 - NewAPI channel 19 is the active user path into ZenProxy.
@@ -142,6 +145,10 @@ Latest V4.3 verification on 2026-05-25:
 - `/admin/runtime` shows `data_plane.node_registry.nodes=100`,
   `v43_lanes.enabled=true`, `v43_lanes.dispatch_shards=16`, and
   `v43_lanes.global_budget_mode=sync_redis`.
+- After the no-reply incident on 2026-05-25, V4.3 global budget fail-open was
+  enabled and verified: a temporary instance with Redis pointed at a dead port
+  still returned HTTP 200 by degrading to local node budget, while logging
+  `global budget unavailable; failing open to local budget`.
 - NewAPI logs show 940 calls on 2026-05-25 CST at the time of analysis.
 - Nginx uses `least_conn` over `127.0.0.1:4001`, `127.0.0.1:4002`,
   and `127.0.0.1:4004`. Port 4003 was skipped because it hit a local

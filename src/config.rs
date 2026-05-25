@@ -228,6 +228,7 @@ pub struct Config {
     pub v43_aimd_failure_percent: u32,
     pub v43_aimd_slow_latency_ms: u64,
     pub v43_global_budget_mode: GlobalBudgetMode,
+    pub v43_global_budget_fail_open: bool,
 }
 
 impl Config {
@@ -355,6 +356,7 @@ impl Config {
                 "V43_GLOBAL_BUDGET_MODE",
                 GlobalBudgetMode::SyncRedis,
             ),
+            v43_global_budget_fail_open: load_env_var("V43_GLOBAL_BUDGET_FAIL_OPEN", true),
         }
     }
 
@@ -618,6 +620,7 @@ mod tests {
         assert_eq!(cfg.v43_aimd_failure_percent, 50);
         assert_eq!(cfg.v43_aimd_slow_latency_ms, 30_000);
         assert_eq!(cfg.v43_global_budget_mode, GlobalBudgetMode::SyncRedis);
+        assert!(cfg.v43_global_budget_fail_open);
     }
 
     #[test]
@@ -674,6 +677,7 @@ mod tests {
         unsafe { env::set_var("V43_AIMD_FAILURE_PERCENT", "40") };
         unsafe { env::set_var("V43_AIMD_SLOW_LATENCY_MS", "12345") };
         unsafe { env::set_var("V43_GLOBAL_BUDGET_MODE", "off") };
+        unsafe { env::set_var("V43_GLOBAL_BUDGET_FAIL_OPEN", "false") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
@@ -731,6 +735,7 @@ mod tests {
         assert_eq!(cfg.v43_aimd_failure_percent, 40);
         assert_eq!(cfg.v43_aimd_slow_latency_ms, 12_345);
         assert_eq!(cfg.v43_global_budget_mode, GlobalBudgetMode::Off);
+        assert!(!cfg.v43_global_budget_fail_open);
 
         remove_env_vars(&[
             "PORT",
@@ -784,6 +789,7 @@ mod tests {
             "V43_AIMD_FAILURE_PERCENT",
             "V43_AIMD_SLOW_LATENCY_MS",
             "V43_GLOBAL_BUDGET_MODE",
+            "V43_GLOBAL_BUDGET_FAIL_OPEN",
         ]);
     }
 

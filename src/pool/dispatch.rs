@@ -368,6 +368,7 @@ pub struct DispatchPool {
     idle_since: AtomicI64,
     budget_limits: NodeBudgetLimits,
     global_budget: Option<GlobalBudgetRegistry>,
+    global_budget_fail_open: bool,
     aimd: AimdConfig,
 }
 
@@ -395,12 +396,18 @@ impl DispatchPool {
             idle_since: AtomicI64::new(chrono::Utc::now().timestamp()),
             budget_limits,
             global_budget: None,
+            global_budget_fail_open: true,
             aimd,
         }
     }
 
     pub fn with_global_budget(mut self, global_budget: GlobalBudgetRegistry) -> Self {
         self.global_budget = Some(global_budget);
+        self
+    }
+
+    pub fn with_global_budget_fail_open(mut self, fail_open: bool) -> Self {
+        self.global_budget_fail_open = fail_open;
         self
     }
 
@@ -437,17 +444,29 @@ impl DispatchPool {
             Ok(_) => true,
             Err(reason) => {
                 let mut budget = node.budget.write().unwrap();
-                if matches!(
-                    reason.as_str(),
-                    "max_calls" | "max_tokens" | "max_kb" | "cooldown"
-                ) {
+                if Self::is_global_budget_rejection(&reason) {
                     budget.cooldown(chrono::Utc::now().timestamp(), format!("global_{reason}"));
                 } else {
                     budget.budget_hit_reason = Some(format!("global_{reason}"));
+                    if self.global_budget_fail_open {
+                        tracing::warn!(
+                            node_id = %node.node.id,
+                            reason = %reason,
+                            "global budget unavailable; failing open to local budget"
+                        );
+                        return true;
+                    }
                 }
                 false
             }
         }
+    }
+
+    fn is_global_budget_rejection(reason: &str) -> bool {
+        matches!(
+            reason,
+            "max_calls" | "max_tokens" | "max_kb" | "cooldown" | "max_concurrent"
+        )
     }
 
     fn request_exceeds_single_node_budget(&self, meta: &RequestMeta) -> bool {
@@ -844,6 +863,18 @@ mod tests {
             .as_u64()
             .unwrap();
         assert!(reduced < expanded);
+    }
+
+    #[test]
+    fn global_budget_rejection_classifier_keeps_budget_limits_fail_closed() {
+        assert!(DispatchPool::is_global_budget_rejection("max_calls"));
+        assert!(DispatchPool::is_global_budget_rejection("max_tokens"));
+        assert!(DispatchPool::is_global_budget_rejection("max_kb"));
+        assert!(DispatchPool::is_global_budget_rejection("cooldown"));
+        assert!(DispatchPool::is_global_budget_rejection("max_concurrent"));
+        assert!(!DispatchPool::is_global_budget_rejection(
+            "Connection refused"
+        ));
     }
 
     #[test]

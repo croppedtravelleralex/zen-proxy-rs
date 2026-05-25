@@ -262,6 +262,7 @@ impl AdminService {
                 "aimd_failure_percent": cfg.v43_aimd_failure_percent,
                 "aimd_slow_latency_ms": cfg.v43_aimd_slow_latency_ms,
                 "global_budget_mode": cfg.v43_global_budget_mode.to_string(),
+                "global_budget_fail_open": cfg.v43_global_budget_fail_open,
                 "runtime": state.lanes.snapshot(),
             },
             "global_budget": cfg.global_budget_redis_url.as_ref().map(|_| json!({
@@ -270,6 +271,7 @@ impl AdminService {
                 "window_secs": cfg.node_budget_window_secs,
                 "lease_ttl_secs": cfg.node_lease_ttl_secs,
                 "mode": cfg.v43_global_budget_mode.to_string(),
+                "fail_open": cfg.v43_global_budget_fail_open,
             })).unwrap_or_else(|| json!({"configured": false})),
             "data_plane": state.pool_manager.runtime_details(),
             "pools": {
