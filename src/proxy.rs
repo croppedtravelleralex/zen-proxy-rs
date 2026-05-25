@@ -128,13 +128,20 @@ pub async fn proxy_handler(
         }
     }
 
+    let lane_permit = match state.lanes.acquire(&conf, &path, &body).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+
     if conf.zen_provider_mode == ProviderMode::FreeModelKernel
         && matches!(path.as_str(), "chat/completions" | "messages")
     {
-        return crate::v4::provider::handle_v4_proxy(
+        let mut response = crate::v4::provider::handle_v4_proxy(
             &state, &path, &method, &headers, body, &client_id, start,
         )
         .await;
+        state.lanes.attach(&mut response, lane_permit);
+        return response;
     }
     let (streaming, modified_body) = if body.is_empty() {
         (false, body.to_vec())
@@ -169,7 +176,7 @@ pub async fn proxy_handler(
     )
     .await;
 
-    match result {
+    let mut response = match result {
         Ok(pr) => {
             let status = pr.response.status().as_u16();
             let latency = start.elapsed().as_millis() as u64;
@@ -289,7 +296,9 @@ pub async fn proxy_handler(
 
             resp
         }
-    }
+    };
+    state.lanes.attach(&mut response, lane_permit);
+    response
 }
 
 #[allow(clippy::too_many_arguments)]

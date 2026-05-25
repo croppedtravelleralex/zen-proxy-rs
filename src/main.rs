@@ -4,6 +4,7 @@ mod admin;
 mod collector;
 mod config;
 mod health;
+mod lanes;
 mod ledger;
 mod opencode_headers;
 mod pool;
@@ -26,13 +27,13 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
-use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{prelude::*, reload, EnvFilter, Registry};
 
 use collector::default::DefaultCollector;
 use collector::export::JsonBackend;
 use collector::DataCollector;
+use lanes::LaneLimiter;
 use pool::active::ActivePool;
 use pool::dead::DeadPoolImpl;
 use pool::dispatch::{DispatchPool, NodeBudgetLimits};
@@ -247,6 +248,7 @@ async fn main() {
     ));
 
     let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
+    let lanes = Arc::new(LaneLimiter::from_config(&config));
 
     let ledger = ledger::LedgerCounters::new();
     ledger.set_events_path(Some(config.ledger_events_path.clone()));
@@ -259,6 +261,7 @@ async fn main() {
         active_pool: active.clone() as Arc<dyn Pool>,
         collector,
         upstream_health,
+        lanes,
         ledger,
         startup_time: Instant::now(),
     });
@@ -312,7 +315,6 @@ async fn main() {
         .request_body_limit_mb
         .max(1)
         .saturating_mul(1024 * 1024);
-    let v1_max_concurrent_requests = config.v1_max_concurrent_requests.max(1);
     let app = Router::new()
         .merge(admin::admin_router())
         .route("/", get(index_handler))
@@ -321,10 +323,7 @@ async fn main() {
         .route("/models", get(models_handler))
         .route("/v1/models", get(models_handler))
         .route("/v1/models/{model_id}", get(model_detail_handler))
-        .route(
-            "/v1/{*path}",
-            any(proxy::proxy_handler).layer(ConcurrencyLimitLayer::new(v1_max_concurrent_requests)),
-        )
+        .route("/v1/{*path}", any(proxy::proxy_handler))
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(CorsLayer::permissive())
         .with_state(app_state);

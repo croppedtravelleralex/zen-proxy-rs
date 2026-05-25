@@ -185,6 +185,14 @@ pub trait DataCollector: Send + Sync {
     fn audit_nodes(&self, filter: &RequestFilter) -> serde_json::Value;
     fn audit_anomalies(&self, filter: &RequestFilter) -> serde_json::Value;
     fn audit_export(&self, filter: &RequestFilter) -> String;
+    fn audit_timeseries(&self, filter: &RequestFilter, bucket_ms: i64) -> serde_json::Value;
+    fn audit_top_requests(&self, filter: &RequestFilter, by: &str) -> serde_json::Value;
+    fn audit_top_nodes(&self, filter: &RequestFilter, by: &str) -> serde_json::Value;
+    fn audit_failures(&self, filter: &RequestFilter) -> serde_json::Value;
+    fn audit_node_detail(&self, filter: &RequestFilter, node_id: &str) -> serde_json::Value;
+    fn audit_by_external_id(&self, external_id: &str, limit: usize) -> serde_json::Value;
+    fn audit_reconcile(&self, filter: &RequestFilter) -> serde_json::Value;
+    fn audit_budget_history(&self, filter: &RequestFilter, bucket_ms: i64) -> serde_json::Value;
 }
 
 pub struct RequestFilter {

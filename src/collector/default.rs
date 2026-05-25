@@ -325,6 +325,62 @@ impl DataCollector for DefaultCollector {
             None => String::new(),
         }
     }
+
+    fn audit_timeseries(&self, filter: &RequestFilter, bucket_ms: i64) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.timeseries(filter, bucket_ms),
+            None => serde_json::json!([]),
+        }
+    }
+
+    fn audit_top_requests(&self, filter: &RequestFilter, by: &str) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.top_requests(filter, by),
+            None => serde_json::json!([]),
+        }
+    }
+
+    fn audit_top_nodes(&self, filter: &RequestFilter, by: &str) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.top_nodes(filter, by),
+            None => serde_json::json!([]),
+        }
+    }
+
+    fn audit_failures(&self, filter: &RequestFilter) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.failures(filter),
+            None => serde_json::json!([]),
+        }
+    }
+
+    fn audit_node_detail(&self, filter: &RequestFilter, node_id: &str) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.node_detail(filter, node_id),
+            None => serde_json::json!({"node_id": node_id, "stats": {"requests": 0}, "recent": []}),
+        }
+    }
+
+    fn audit_by_external_id(&self, external_id: &str, limit: usize) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.by_external_id(external_id, limit),
+            None => serde_json::json!([]),
+        }
+    }
+
+    fn audit_reconcile(&self, filter: &RequestFilter) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.reconcile(filter),
+            None => serde_json::json!({"requests": 0, "disabled": true}),
+        }
+    }
+
+    fn audit_budget_history(&self, filter: &RequestFilter, bucket_ms: i64) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.budget_history(filter, bucket_ms),
+            None => serde_json::json!([]),
+        }
+    }
 }
 
 fn load_audit_store() -> Option<AuditStore> {

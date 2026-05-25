@@ -47,6 +47,13 @@ each phase must compile before the next phase starts
 | T6.2 | 6 | Add fault injection suite | integration tests | T3.2 | 429/500/timeout/bad SSE are covered |
 | T6.3 | 6 | Run release gate | whole repo | all | fmt, clippy, test, release build pass |
 | T6.4 | 6 | Rollback drill | config/runtime | T2.4 | switch to legacy and back without rebuild |
+| T7.1 | 7 | Add V4.3 lane limiter | `src/lanes.rs`, proxy boundary | T5.5 | short/stream/large/huge lanes are visible in `/admin/runtime` |
+| T7.2 | 7 | Move request telemetry to async event bus | collector/audit | T7.1 | hot path uses non-blocking event enqueue |
+| T7.3 | 7 | Unify node and transport registries | pool/transport | T7.1 | one client cache owns per-node `reqwest::Client` |
+| T7.4 | 7 | Add sharded ready queues | pool dispatch | T7.3 | dispatch does not scan all nodes per request |
+| T7.5 | 7 | Add local hot budget and Redis batch coordination | pool budget | T7.4 | single-host hot path does not block on Redis |
+| T7.6 | 7 | Add AIMD per-node concurrency | pool scoring | T7.4 | success raises, 429/timeout/busy lowers node concurrency |
+| T7.7 | 7 | Run 1C2G V4.3 benchmark matrix | scripts/docs | T7.1-T7.6 | stream/large/tool-heavy results are recorded |
 
 ## Phase 0 - Contract Freeze
 

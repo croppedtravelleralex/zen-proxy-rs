@@ -24,6 +24,7 @@ Start here:
 | [08_implementation_plan.md](./v4.0/08_implementation_plan.md) | Ordered implementation tasks |
 | [09_acceptance_and_risks.md](./v4.0/09_acceptance_and_risks.md) | Acceptance gates, known risks, rollback |
 | [10_2026-05-25_operations_report.md](./v4.0/10_2026-05-25_operations_report.md) | V4.1-A maintenance notes and 2026-05-25 NewAPI call analysis |
+| [11_v4.3_scalable_data_plane.md](./v4.0/11_v4.3_scalable_data_plane.md) | V4.3 scalable data-plane target and lane isolation |
 
 ## AI Maintenance Rule
 

@@ -6,7 +6,9 @@ ZenProxyRS V4.0/V4.1-A is a Rust proxy control plane that keeps `zen-proxy-rs`
 responsible for proxy rotation, pool state, retry, admin, and observability,
 while moving Zen protocol adaptation into a reusable `free-model-client-rs`
 kernel. The active local runtime is now a multi-instance deployment behind one
-Nginx entrypoint on port 4000.
+Nginx entrypoint on port 4000. V4.3 work has started to replace coarse
+multi-process scaling with a scalable data plane built around lane isolation,
+shared state, and measurable long-stream capacity.
 
 ## Current Goal
 
@@ -53,6 +55,7 @@ root-level legacy audit reports as active guidance.
 5. [Implementation Plan](./08_implementation_plan.md)
 6. [Acceptance and Risks](./09_acceptance_and_risks.md)
 7. [2026-05-25 Operations Report](./10_2026-05-25_operations_report.md)
+8. [V4.3 Scalable Data Plane](./11_v4.3_scalable_data_plane.md)
 
 ## Hard Decisions
 
@@ -109,6 +112,8 @@ Confirmed on 2026-05-25:
 - `V1_MAX_CONCURRENT_REQUESTS=12` per ZenProxy instance
 - `AUDIT_LOG_ENABLED=true`
 - `AUDIT_LOG_DIR=/tmp/zen-proxy-audit` unless overridden
+- V4.3 lane isolation is implemented in code but must be enabled through
+  `V43_LANES_ENABLED=true` and process restart.
 - NewAPI channel 19 is the active user path into ZenProxy.
 - NewAPI logs show 940 calls on 2026-05-25 CST at the time of analysis.
 - Nginx uses `least_conn` over `127.0.0.1:4001`, `127.0.0.1:4002`,

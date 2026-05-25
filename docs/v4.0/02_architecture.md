@@ -165,3 +165,26 @@ Observability -> request orchestration
 The actual Zen request must use the transport selected by `PoolManager`. Any
 implementation that lets the FreeModel path create an unrelated global client is
 not V4.0-compliant.
+
+## V4.3 Data-Plane Direction
+
+The V4.0 layer boundaries remain valid, but V4.3 adds a performance rule:
+data-plane work must be separated into lanes before it reaches provider and pool
+execution.
+
+```text
+HTTP/API
+-> auth and request classification
+-> lane limiter
+   -> short_nonstream
+   -> normal_stream
+   -> large_context
+   -> huge_context
+-> pool dispatch
+-> selected transport
+-> FreeModelKernel
+```
+
+Admin, health, metrics, and model discovery endpoints must bypass data-plane
+lane saturation. A 64 MB request must never be allowed to consume capacity from
+the same lane that serves short interactive requests.

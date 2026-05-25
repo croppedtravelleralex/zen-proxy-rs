@@ -1,6 +1,7 @@
 use crate::collector::DataCollector;
 use crate::config::Config;
 use crate::health::UpstreamHealth;
+use crate::lanes::LaneLimiter;
 use crate::ledger::LedgerCounters;
 
 use crate::pool::{DeadPool, Pool, PoolManager, RateLimitedPool};
@@ -12,6 +13,7 @@ pub struct AppState {
     pub pool_manager: Arc<dyn PoolManager>,
     pub collector: Arc<dyn DataCollector>,
     pub upstream_health: Arc<UpstreamHealth>,
+    pub lanes: Arc<LaneLimiter>,
     pub ledger: LedgerCounters,
     pub startup_time: Instant,
     pub dead_pool: Arc<dyn DeadPool>,

@@ -244,6 +244,17 @@ impl AdminService {
                 "token_compact": cfg.context_token_compact,
                 "token_target": cfg.context_token_target,
             },
+            "v43_lanes": {
+                "enabled": cfg.v43_lanes_enabled,
+                "short_nonstream_concurrency": cfg.v43_short_nonstream_concurrency,
+                "stream_concurrency": cfg.v43_stream_concurrency,
+                "large_context_concurrency": cfg.v43_large_context_concurrency,
+                "huge_context_concurrency": cfg.v43_huge_context_concurrency,
+                "large_context_body_mb": cfg.v43_large_context_body_mb,
+                "huge_context_body_mb": cfg.v43_huge_context_body_mb,
+                "wait_timeout_ms": cfg.v43_lane_wait_timeout_ms,
+                "runtime": state.lanes.snapshot(),
+            },
             "global_budget": cfg.global_budget_redis_url.as_ref().map(|_| json!({
                 "configured": true,
                 "instance_id": cfg.instance_id,
@@ -581,6 +592,42 @@ impl AdminService {
             .header("content-type", "application/x-ndjson")
             .body(axum::body::Body::from(state.collector.audit_export(filter)))
             .unwrap()
+    }
+
+    pub fn audit_timeseries(state: &AppState, filter: &RequestFilter, bucket_ms: i64) -> Response {
+        Self::ok_response(state.collector.audit_timeseries(filter, bucket_ms))
+    }
+
+    pub fn audit_top_requests(state: &AppState, filter: &RequestFilter, by: &str) -> Response {
+        Self::ok_response(state.collector.audit_top_requests(filter, by))
+    }
+
+    pub fn audit_top_nodes(state: &AppState, filter: &RequestFilter, by: &str) -> Response {
+        Self::ok_response(state.collector.audit_top_nodes(filter, by))
+    }
+
+    pub fn audit_failures(state: &AppState, filter: &RequestFilter) -> Response {
+        Self::ok_response(state.collector.audit_failures(filter))
+    }
+
+    pub fn audit_node_detail(state: &AppState, filter: &RequestFilter, node_id: &str) -> Response {
+        Self::ok_response(state.collector.audit_node_detail(filter, node_id))
+    }
+
+    pub fn audit_by_external_id(state: &AppState, external_id: &str, limit: usize) -> Response {
+        Self::ok_response(state.collector.audit_by_external_id(external_id, limit))
+    }
+
+    pub fn audit_reconcile(state: &AppState, filter: &RequestFilter) -> Response {
+        Self::ok_response(state.collector.audit_reconcile(filter))
+    }
+
+    pub fn audit_budget_history(
+        state: &AppState,
+        filter: &RequestFilter,
+        bucket_ms: i64,
+    ) -> Response {
+        Self::ok_response(state.collector.audit_budget_history(filter, bucket_ms))
     }
 
     // --- Events ---

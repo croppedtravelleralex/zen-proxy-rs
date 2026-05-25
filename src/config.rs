@@ -178,6 +178,14 @@ pub struct Config {
     pub artifact_cache_dir: String,
     pub artifact_cache_max_mb: u64,
     pub artifact_cache_ttl_hours: u64,
+    pub v43_lanes_enabled: bool,
+    pub v43_short_nonstream_concurrency: usize,
+    pub v43_stream_concurrency: usize,
+    pub v43_large_context_concurrency: usize,
+    pub v43_huge_context_concurrency: usize,
+    pub v43_large_context_body_mb: usize,
+    pub v43_huge_context_body_mb: usize,
+    pub v43_lane_wait_timeout_ms: u64,
 }
 
 impl Config {
@@ -282,6 +290,17 @@ impl Config {
                 .unwrap_or_else(|_| "/tmp/zen-proxy-artifacts".into()),
             artifact_cache_max_mb: load_env_var("ARTIFACT_CACHE_MAX_MB", 2048u64),
             artifact_cache_ttl_hours: load_env_var("ARTIFACT_CACHE_TTL_HOURS", 24u64),
+            v43_lanes_enabled: load_env_var("V43_LANES_ENABLED", false),
+            v43_short_nonstream_concurrency: load_env_var(
+                "V43_SHORT_NONSTREAM_CONCURRENCY",
+                32usize,
+            ),
+            v43_stream_concurrency: load_env_var("V43_STREAM_CONCURRENCY", 96usize),
+            v43_large_context_concurrency: load_env_var("V43_LARGE_CONTEXT_CONCURRENCY", 16usize),
+            v43_huge_context_concurrency: load_env_var("V43_HUGE_CONTEXT_CONCURRENCY", 2usize),
+            v43_large_context_body_mb: load_env_var("V43_LARGE_CONTEXT_BODY_MB", 8usize),
+            v43_huge_context_body_mb: load_env_var("V43_HUGE_CONTEXT_BODY_MB", 32usize),
+            v43_lane_wait_timeout_ms: load_env_var("V43_LANE_WAIT_TIMEOUT_MS", 1_000u64),
         }
     }
 
@@ -471,6 +490,14 @@ mod tests {
             "ARTIFACT_CACHE_DIR",
             "ARTIFACT_CACHE_MAX_MB",
             "ARTIFACT_CACHE_TTL_HOURS",
+            "V43_LANES_ENABLED",
+            "V43_SHORT_NONSTREAM_CONCURRENCY",
+            "V43_STREAM_CONCURRENCY",
+            "V43_LARGE_CONTEXT_CONCURRENCY",
+            "V43_HUGE_CONTEXT_CONCURRENCY",
+            "V43_LARGE_CONTEXT_BODY_MB",
+            "V43_HUGE_CONTEXT_BODY_MB",
+            "V43_LANE_WAIT_TIMEOUT_MS",
         ]);
 
         let cfg = Config::from_env();
@@ -518,6 +545,14 @@ mod tests {
         assert_eq!(cfg.artifact_cache_dir, "/tmp/zen-proxy-artifacts");
         assert_eq!(cfg.artifact_cache_max_mb, 2048);
         assert_eq!(cfg.artifact_cache_ttl_hours, 24);
+        assert!(!cfg.v43_lanes_enabled);
+        assert_eq!(cfg.v43_short_nonstream_concurrency, 32);
+        assert_eq!(cfg.v43_stream_concurrency, 96);
+        assert_eq!(cfg.v43_large_context_concurrency, 16);
+        assert_eq!(cfg.v43_huge_context_concurrency, 2);
+        assert_eq!(cfg.v43_large_context_body_mb, 8);
+        assert_eq!(cfg.v43_huge_context_body_mb, 32);
+        assert_eq!(cfg.v43_lane_wait_timeout_ms, 1_000);
     }
 
     #[test]
@@ -557,6 +592,14 @@ mod tests {
         unsafe { env::set_var("ARTIFACT_CACHE_DIR", "/tmp/zen-test-artifacts") };
         unsafe { env::set_var("ARTIFACT_CACHE_MAX_MB", "64") };
         unsafe { env::set_var("ARTIFACT_CACHE_TTL_HOURS", "2") };
+        unsafe { env::set_var("V43_LANES_ENABLED", "true") };
+        unsafe { env::set_var("V43_SHORT_NONSTREAM_CONCURRENCY", "33") };
+        unsafe { env::set_var("V43_STREAM_CONCURRENCY", "99") };
+        unsafe { env::set_var("V43_LARGE_CONTEXT_CONCURRENCY", "17") };
+        unsafe { env::set_var("V43_HUGE_CONTEXT_CONCURRENCY", "3") };
+        unsafe { env::set_var("V43_LARGE_CONTEXT_BODY_MB", "9") };
+        unsafe { env::set_var("V43_HUGE_CONTEXT_BODY_MB", "33") };
+        unsafe { env::set_var("V43_LANE_WAIT_TIMEOUT_MS", "1500") };
 
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
@@ -597,6 +640,14 @@ mod tests {
         assert_eq!(cfg.artifact_cache_dir, "/tmp/zen-test-artifacts");
         assert_eq!(cfg.artifact_cache_max_mb, 64);
         assert_eq!(cfg.artifact_cache_ttl_hours, 2);
+        assert!(cfg.v43_lanes_enabled);
+        assert_eq!(cfg.v43_short_nonstream_concurrency, 33);
+        assert_eq!(cfg.v43_stream_concurrency, 99);
+        assert_eq!(cfg.v43_large_context_concurrency, 17);
+        assert_eq!(cfg.v43_huge_context_concurrency, 3);
+        assert_eq!(cfg.v43_large_context_body_mb, 9);
+        assert_eq!(cfg.v43_huge_context_body_mb, 33);
+        assert_eq!(cfg.v43_lane_wait_timeout_ms, 1500);
 
         remove_env_vars(&[
             "PORT",
@@ -633,6 +684,14 @@ mod tests {
             "ARTIFACT_CACHE_DIR",
             "ARTIFACT_CACHE_MAX_MB",
             "ARTIFACT_CACHE_TTL_HOURS",
+            "V43_LANES_ENABLED",
+            "V43_SHORT_NONSTREAM_CONCURRENCY",
+            "V43_STREAM_CONCURRENCY",
+            "V43_LARGE_CONTEXT_CONCURRENCY",
+            "V43_HUGE_CONTEXT_CONCURRENCY",
+            "V43_LARGE_CONTEXT_BODY_MB",
+            "V43_HUGE_CONTEXT_BODY_MB",
+            "V43_LANE_WAIT_TIMEOUT_MS",
         ]);
     }
 
