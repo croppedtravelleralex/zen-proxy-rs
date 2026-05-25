@@ -412,7 +412,8 @@ async fn call_with_retry(
     public_model: &str,
     upstream_model: &str,
 ) -> Result<V4CallResult, V4CallError> {
-    let max = conf.pool_max_retries;
+    let base_max = conf.pool_max_retries;
+    let empty_upstream_max = conf.v4_empty_upstream_max_retries.max(base_max);
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_node_id = String::new();
     let mut was_rate_limited = false;
@@ -420,17 +421,19 @@ async fn call_with_retry(
     let mut retry_chain = Vec::new();
     let retry_budget_ms = conf.v4_retry_budget_ms;
 
-    for attempt in 0..=max {
+    for attempt in 0..=empty_upstream_max {
         let dispatch_start = Instant::now();
         let dispatch_result = if attempt == 0 {
-            dispatch_or_wait(state, &request_meta, attempt, max).await?
+            dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?
         } else {
             match state
                 .pool_manager
                 .dispatch_sticky(&request_meta, &last_node_id)
             {
                 Ok(result) => result,
-                Err(_) => dispatch_or_wait(state, &request_meta, attempt, max).await?,
+                Err(_) => {
+                    dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?
+                }
             }
         };
         dispatch_wait_ms =
@@ -537,7 +540,7 @@ async fn call_with_retry(
                             error_type: "empty_output".to_string(),
                         });
                         last_status = StatusCode::BAD_GATEWAY;
-                        if attempt >= max {
+                        if attempt >= empty_upstream_max {
                             return Err(V4CallError::after_dispatch(
                                 StatusCode::BAD_GATEWAY,
                                 "upstream returned no assistant content or tool call",
@@ -647,7 +650,7 @@ async fn call_with_retry(
                     },
                     error_type: failure_kind.to_string(),
                 });
-                if attempt >= max {
+                if attempt >= base_max {
                     let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
                         "rate_limited"
                     } else {
@@ -776,7 +779,12 @@ async fn call_with_retry(
                         error_type: error_type.to_string(),
                     });
                 }
-                if attempt >= max {
+                let max_for_error = if is_empty_upstream_error(&err) {
+                    empty_upstream_max
+                } else {
+                    base_max
+                };
+                if attempt >= max_for_error {
                     let (error_kind, outcome, _) = classify_app_error(&err);
                     let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
                         "rate_limited"
@@ -949,6 +957,9 @@ fn is_upstream_busy(status: StatusCode, message: &str) -> bool {
 
 fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str) {
     let message = err.message.to_ascii_lowercase();
+    if is_empty_upstream_message(&message) {
+        return (ErrorKind::Other, "empty_output", "empty_output");
+    }
     if err.status == StatusCode::GATEWAY_TIMEOUT || message.contains("timeout") {
         return (ErrorKind::Timeout, "transport_error", "timeout");
     }
@@ -973,6 +984,15 @@ fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str)
         return (ErrorKind::Other, "transport_error", "network");
     }
     (ErrorKind::Upstream5xx, "upstream_error", "upstream_error")
+}
+
+fn is_empty_upstream_error(err: &AppError) -> bool {
+    is_empty_upstream_message(&err.message.to_ascii_lowercase())
+}
+
+fn is_empty_upstream_message(message: &str) -> bool {
+    message.contains("no assistant content or tool call")
+        || message.contains("upstream returned no assistant content")
 }
 
 #[allow(clippy::too_many_arguments)]
