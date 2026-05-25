@@ -150,6 +150,8 @@ pub struct Config {
     pub global_backoff_cooldown_secs: u64,
     pub nodes_file: String,
     pub ledger_events_path: String,
+    pub audit_log_enabled: bool,
+    pub audit_log_dir: String,
     pub zen_provider_mode: ProviderMode,
     pub v4_model_registry_enabled: bool,
     pub node_max_calls_per_window: u64,
@@ -239,6 +241,9 @@ impl Config {
             global_backoff_cooldown_secs: load_env_var("GLOBAL_BACKOFF_COOLDOWN_SECS", 30u64),
             ledger_events_path: env::var("LEDGER_EVENTS_PATH")
                 .unwrap_or_else(|_| "/tmp/zen-proxy-ledger-events.jsonl".into()),
+            audit_log_enabled: load_env_var("AUDIT_LOG_ENABLED", true),
+            audit_log_dir: env::var("AUDIT_LOG_DIR")
+                .unwrap_or_else(|_| "/tmp/zen-proxy-audit".into()),
             zen_provider_mode: load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy),
             v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
             node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
@@ -438,6 +443,8 @@ mod tests {
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
             "V4_RETRY_BUDGET_MS",
+            "AUDIT_LOG_ENABLED",
+            "AUDIT_LOG_DIR",
             "NODE_MAX_CALLS_PER_WINDOW",
             "NODE_MAX_TOKENS_PER_WINDOW",
             "NODE_MAX_KB_PER_WINDOW",
@@ -474,6 +481,8 @@ mod tests {
         assert_eq!(cfg.probe_batch_size, 5);
         assert_eq!(cfg.dispatch_capacity, 100);
         assert_eq!(cfg.ledger_events_path, "/tmp/zen-proxy-ledger-events.jsonl");
+        assert!(cfg.audit_log_enabled);
+        assert_eq!(cfg.audit_log_dir, "/tmp/zen-proxy-audit");
         assert!(cfg.opencode_headers_enabled);
         assert_eq!(cfg.opencode_client_name, "cli");
         assert_eq!(cfg.opencode_project_seed, "zen-proxy-rs");
@@ -518,6 +527,8 @@ mod tests {
         unsafe { env::set_var("ZEN_PROVIDER_MODE", "free_model_kernel") };
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
         unsafe { env::set_var("V4_RETRY_BUDGET_MS", "12345") };
+        unsafe { env::set_var("AUDIT_LOG_ENABLED", "false") };
+        unsafe { env::set_var("AUDIT_LOG_DIR", "/tmp/zen-audit-test") };
         unsafe { env::set_var("NODE_MAX_CALLS_PER_WINDOW", "7") };
         unsafe { env::set_var("NODE_MAX_TOKENS_PER_WINDOW", "777") };
         unsafe { env::set_var("NODE_MAX_KB_PER_WINDOW", "77") };
@@ -551,6 +562,8 @@ mod tests {
         assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
         assert!(cfg.v4_model_registry_enabled);
         assert_eq!(cfg.v4_retry_budget_ms, 12_345);
+        assert!(!cfg.audit_log_enabled);
+        assert_eq!(cfg.audit_log_dir, "/tmp/zen-audit-test");
         assert!(cfg.v4_model_registry_active());
         assert_eq!(cfg.node_max_calls_per_window, 7);
         assert_eq!(cfg.node_max_tokens_per_window, 777);
@@ -587,6 +600,9 @@ mod tests {
             "OPENCODE_CLIENT_NAME",
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
+            "V4_RETRY_BUDGET_MS",
+            "AUDIT_LOG_ENABLED",
+            "AUDIT_LOG_DIR",
             "NODE_MAX_CALLS_PER_WINDOW",
             "NODE_MAX_TOKENS_PER_WINDOW",
             "NODE_MAX_KB_PER_WINDOW",

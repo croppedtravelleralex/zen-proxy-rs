@@ -72,6 +72,26 @@ fn is_streaming(body: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn extract_external_request_id(headers: &HeaderMap) -> String {
+    for name in [
+        "x-newapi-request-id",
+        "x-one-api-request-id",
+        "x-request-id",
+        "x-client-request-id",
+        "cf-ray",
+    ] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            return value.to_string();
+        }
+    }
+    String::new()
+}
+
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     method: Method,
@@ -81,6 +101,16 @@ pub async fn proxy_handler(
 ) -> Response {
     let start = Instant::now();
     let client_id = extract_proxy_token(&headers).unwrap_or_default();
+    let external_request_id = extract_external_request_id(&headers);
+    let gateway = if headers.contains_key("x-newapi-request-id")
+        || headers.contains_key("x-one-api-request-id")
+    {
+        "newapi".to_string()
+    } else if external_request_id.is_empty() {
+        String::new()
+    } else {
+        "external".to_string()
+    };
     let conf = state.config.read().unwrap().clone();
 
     // PROXY_API_KEY 校验
@@ -147,6 +177,13 @@ pub async fn proxy_handler(
             let tele = RequestTelemetry {
                 rid: uuid::Uuid::new_v4().to_string(),
                 ts: chrono::Utc::now().timestamp_millis(),
+                external_request_id: external_request_id.clone(),
+                gateway: gateway.clone(),
+                gateway_channel_id: headers
+                    .get("x-newapi-channel-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
                 model: pr.model.clone(),
                 public_model: pr.model.clone(),
                 upstream_model: pr.model.clone(),

@@ -198,10 +198,9 @@ Ledger WAL: current WAL file events, not a complete historical billing source.
 
 ## Next Maintenance Actions
 
-- Add a ZenProxy admin endpoint or script that joins NewAPI request ids with
-  ZenProxy request ids when available.
-- Persist ZenProxy request telemetry beyond the current ring buffer if full-day
-  Zen-only analysis is required.
+- Use the new ZenProxy `/admin/audit/*` endpoints for durable Zen-side history.
+- Improve NewAPI request-id propagation if NewAPI can be configured to forward
+  `x-newapi-request-id`, `x-one-api-request-id`, or `x-request-id`.
 - Add an operations script that exports:
   NewAPI logs, ZenProxy recent requests, Redis budget buckets, and WAL counts
   into one timestamped report.
@@ -210,3 +209,38 @@ Ledger WAL: current WAL file events, not a complete historical billing source.
   `frt=-1000` on stream requests.
 - Keep NewAPI read-only during ZenProxy maintenance unless the task explicitly
   targets NewAPI.
+
+## V4.1-B Audit Ledger Update
+
+After this report was created, ZenProxy gained the first 99+ durable audit
+implementation:
+
+```text
+AUDIT_LOG_ENABLED=true by default
+AUDIT_LOG_DIR=/tmp/zen-proxy-audit by default
+records stored as requests-YYYY-MM-DD.jsonl
+```
+
+New admin endpoints:
+
+```text
+GET /admin/audit/summary
+GET /admin/audit/requests
+GET /admin/audit/requests/{rid}
+GET /admin/audit/models
+GET /admin/audit/nodes
+GET /admin/audit/anomalies
+GET /admin/audit/export
+```
+
+This fixes the main gap identified above: ZenProxy now has its own restart-safe
+request ledger for future traffic. It does not backfill old NewAPI-only rows;
+2026-05-25's earlier 940-call analysis still comes from NewAPI PostgreSQL.
+
+Remaining 99+ work:
+
+- Configure `AUDIT_LOG_DIR=/var/log/zen-proxy-rs/audit` for long-lived VPS
+  deployment.
+- Add SQLite/DuckDB aggregation if JSONL historical scans become slow.
+- Ensure NewAPI forwards a stable request id so ZenProxy `external_request_id`
+  can be reconciled with NewAPI `logs.request_id`.

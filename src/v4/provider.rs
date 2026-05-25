@@ -25,7 +25,7 @@ pub async fn handle_v4_proxy(
     state: &Arc<AppState>,
     path: &str,
     method: &Method,
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     body: Bytes,
     client_id: &str,
     start: Instant,
@@ -48,6 +48,8 @@ pub async fn handle_v4_proxy(
         Ok(plan) => plan,
         Err(reject) => return error_response(reject.status, reject.message),
     };
+    let external_request_id = extract_external_request_id(headers);
+    let gateway = infer_gateway(headers, &external_request_id);
     let mut context_telemetry = context_plan.telemetry();
     let parsed = context_plan.body;
 
@@ -135,6 +137,10 @@ pub async fn handle_v4_proxy(
             let telemetry = RequestTelemetry {
                 rid: result.request_id.clone(),
                 ts: chrono::Utc::now().timestamp_millis(),
+                external_request_id: external_request_id.clone(),
+                gateway: gateway.clone(),
+                gateway_channel_id: extract_header(headers, "x-newapi-channel-id")
+                    .unwrap_or_default(),
                 model: public_model.clone(),
                 public_model: public_model.clone(),
                 upstream_model: result.upstream_model,
@@ -199,6 +205,10 @@ pub async fn handle_v4_proxy(
                 state.collector.record_request(&RequestTelemetry {
                     rid: rid.clone(),
                     ts: chrono::Utc::now().timestamp_millis(),
+                    external_request_id: external_request_id.clone(),
+                    gateway: gateway.clone(),
+                    gateway_channel_id: extract_header(headers, "x-newapi-channel-id")
+                        .unwrap_or_default(),
                     model: public_model.clone(),
                     public_model: public_model.clone(),
                     upstream_model: err.upstream_model.clone(),
@@ -251,6 +261,51 @@ pub async fn handle_v4_proxy(
             response
         }
     }
+}
+
+fn extract_external_request_id(headers: &HeaderMap) -> String {
+    for name in [
+        "x-newapi-request-id",
+        "x-one-api-request-id",
+        "x-request-id",
+        "x-client-request-id",
+        "cf-ray",
+    ] {
+        if let Some(value) = extract_header(headers, name) {
+            return value;
+        }
+    }
+    String::new()
+}
+
+fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn infer_gateway(headers: &HeaderMap, external_request_id: &str) -> String {
+    extract_header(headers, "x-gateway")
+        .or_else(|| {
+            if headers.contains_key("x-newapi-request-id")
+                || headers.contains_key("x-one-api-request-id")
+            {
+                Some("newapi".to_string())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            if !external_request_id.is_empty() {
+                Some("external".to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 struct V4CallResult {

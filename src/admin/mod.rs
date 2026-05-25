@@ -206,6 +206,76 @@ async fn requests_export_h(
     let limit = p.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10000);
     AdminService::requests_export(&st, limit)
 }
+async fn audit_summary_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::audit_summary(&st, &AdminService::audit_filter(&p))
+}
+async fn audit_requests_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::audit_requests(&st, &AdminService::audit_filter(&p))
+}
+async fn audit_request_detail_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(rid): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::audit_request_detail(&st, &rid)
+}
+async fn audit_models_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::audit_models(&st, &AdminService::audit_filter(&p))
+}
+async fn audit_nodes_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::audit_nodes(&st, &AdminService::audit_filter(&p))
+}
+async fn audit_anomalies_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::audit_anomalies(&st, &AdminService::audit_filter(&p))
+}
+async fn audit_export_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::audit_export(&st, &AdminService::audit_filter(&p))
+}
 async fn sys_log_level_h(
     State(st): State<Arc<AppState>>,
     h: HeaderMap,
@@ -243,6 +313,13 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/requests/models", get(requests_models_h))
         .route("/admin/requests/nodes", get(requests_nodes_h))
         .route("/admin/requests/{rid}", get(request_detail_h))
+        .route("/admin/audit/summary", get(audit_summary_h))
+        .route("/admin/audit/requests", get(audit_requests_h))
+        .route("/admin/audit/requests/{rid}", get(audit_request_detail_h))
+        .route("/admin/audit/models", get(audit_models_h))
+        .route("/admin/audit/nodes", get(audit_nodes_h))
+        .route("/admin/audit/anomalies", get(audit_anomalies_h))
+        .route("/admin/audit/export", get(audit_export_h))
         .route("/admin/events", get(events_h))
         .route("/admin/ledger", get(ledger_h))
         .route("/admin/ledger/models", get(ledger_models_h))

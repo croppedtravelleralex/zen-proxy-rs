@@ -6,7 +6,8 @@ ZenProxyRS V4.0/V4.1-A is a single-process Rust proxy control plane that keeps
 `zen-proxy-rs` responsible for proxy rotation, pool state, retry, admin, and
 observability, while moving Zen protocol adaptation into a reusable
 `free-model-client-rs` kernel. V4.1-A has landed real node latency scoring,
-retry-chain/failure telemetry, and a bounded V4 retry budget.
+retry-chain/failure telemetry, a bounded V4 retry budget, and the first
+durable 99+ audit ledger path.
 
 ## Current Goal
 
@@ -100,6 +101,8 @@ Confirmed on 2026-05-25:
 - `REQUEST_BODY_LIMIT_MB=64`
 - `ZEN_COMPACTOR_MODE=enforce`
 - `V4_RETRY_BUDGET_MS=45000`
+- `AUDIT_LOG_ENABLED=true`
+- `AUDIT_LOG_DIR=/tmp/zen-proxy-audit` unless overridden
 - NewAPI channel 19 is the active user path into ZenProxy.
 - NewAPI logs show 940 calls on 2026-05-25 CST at the time of analysis.
 
@@ -122,8 +125,10 @@ prove that the observed Zen egress path matches the selected node.
 For operations analysis, use sources in this order:
 
 1. NewAPI PostgreSQL `logs` table for user-visible call counts and durations.
-2. ZenProxy `/admin/requests/*` for current-process request detail and timings.
-3. Redis `zprs:budget:*` keys for global node budget distribution.
-4. `/tmp/zen-proxy-ledger-events.jsonl` for V4 ledger events from the current
+2. ZenProxy `/admin/audit/*` for durable ZenProxy request history after the
+   99+ audit ledger landed.
+3. ZenProxy `/admin/requests/*` for current-process request detail and timings.
+4. Redis `zprs:budget:*` keys for global node budget distribution.
+5. `/tmp/zen-proxy-ledger-events.jsonl` for V4 ledger events from the current
    WAL file.
-5. systemd service environment and logs for effective runtime configuration.
+6. systemd service environment and logs for effective runtime configuration.

@@ -44,6 +44,31 @@ impl AdminService {
         (code, Json(json!({ "success": false, "error": msg.into() }))).into_response()
     }
 
+    pub fn audit_filter(params: &std::collections::HashMap<String, String>) -> RequestFilter {
+        RequestFilter {
+            rid: params.get("rid").cloned(),
+            model: params.get("model").cloned(),
+            node_url: params
+                .get("node")
+                .cloned()
+                .or_else(|| params.get("node_id").cloned()),
+            status: params.get("status").and_then(|v| v.parse().ok()),
+            since: params
+                .get("from")
+                .or_else(|| params.get("since"))
+                .and_then(|v| parse_ts(v)),
+            until: params
+                .get("to")
+                .or_else(|| params.get("until"))
+                .and_then(|v| parse_ts(v)),
+            limit: params
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+            cursor: None,
+        }
+    }
+
     // --- Health ---
     pub fn health(state: &AppState) -> Response {
         let pools = state.pool_manager.pool_stats();
@@ -164,6 +189,13 @@ impl AdminService {
                 {"method":"GET","path":"/admin/requests/nodes"},
                 {"method":"GET","path":"/admin/requests/{rid}"},
                 {"method":"GET","path":"/admin/requests/export"},
+                {"method":"GET","path":"/admin/audit/summary"},
+                {"method":"GET","path":"/admin/audit/requests"},
+                {"method":"GET","path":"/admin/audit/requests/{rid}"},
+                {"method":"GET","path":"/admin/audit/models"},
+                {"method":"GET","path":"/admin/audit/nodes"},
+                {"method":"GET","path":"/admin/audit/anomalies"},
+                {"method":"GET","path":"/admin/audit/export"},
                 {"method":"GET","path":"/admin/events"},
                 {"method":"GET","path":"/admin/events/recent"},
                 {"method":"GET","path":"/admin/events/probes"},
@@ -508,6 +540,48 @@ impl AdminService {
             .unwrap()
     }
 
+    // --- Durable audit ---
+    pub fn audit_summary(state: &AppState, filter: &RequestFilter) -> Response {
+        Self::ok_response(state.collector.audit_summary(filter))
+    }
+
+    pub fn audit_requests(state: &AppState, filter: &RequestFilter) -> Response {
+        let result = state.collector.query_audit_requests(filter);
+        let items: Vec<Value> = result.items.iter().map(|r| json!(r)).collect();
+        Self::ok_response(items)
+    }
+
+    pub fn audit_request_detail(state: &AppState, rid: &str) -> Response {
+        let result = state.collector.query_audit_requests(&RequestFilter {
+            rid: Some(rid.to_string()),
+            limit: 1,
+            ..Default::default()
+        });
+        match result.items.into_iter().next() {
+            Some(item) => Self::ok_response(item),
+            None => Self::error_response(StatusCode::NOT_FOUND, "audit request not found"),
+        }
+    }
+
+    pub fn audit_models(state: &AppState, filter: &RequestFilter) -> Response {
+        Self::ok_response(state.collector.audit_models(filter))
+    }
+
+    pub fn audit_nodes(state: &AppState, filter: &RequestFilter) -> Response {
+        Self::ok_response(state.collector.audit_nodes(filter))
+    }
+
+    pub fn audit_anomalies(state: &AppState, filter: &RequestFilter) -> Response {
+        Self::ok_response(state.collector.audit_anomalies(filter))
+    }
+
+    pub fn audit_export(state: &AppState, filter: &RequestFilter) -> Response {
+        Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .body(axum::body::Body::from(state.collector.audit_export(filter)))
+            .unwrap()
+    }
+
     // --- Events ---
     pub fn events(state: &AppState) -> Response {
         let s = state.collector.snapshot();
@@ -554,6 +628,10 @@ impl AdminService {
             "pool_starvation_retry_after_secs": cfg.pool_starvation_retry_after_secs,
             "zen_provider_mode": cfg.zen_provider_mode.to_string(),
             "v4_model_registry_enabled": cfg.v4_model_registry_enabled,
+            "audit": {
+                "enabled": cfg.audit_log_enabled,
+                "log_dir": cfg.audit_log_dir,
+            },
             "admin_api_key_configured": cfg.admin_api_key.is_some(),
             "proxy_api_key_configured": cfg.proxy_api_key.is_some(),
             "instance_id": cfg.instance_id,
@@ -669,5 +747,14 @@ impl AdminService {
     pub fn probe_now(state: &AppState) -> Response {
         state.pool_manager.probe_all();
         Self::ok_status()
+    }
+}
+
+fn parse_ts(value: &str) -> Option<i64> {
+    let parsed = value.parse::<i64>().ok()?;
+    if parsed < 10_000_000_000 {
+        Some(parsed.saturating_mul(1000))
+    } else {
+        Some(parsed)
     }
 }

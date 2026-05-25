@@ -1,4 +1,5 @@
 use crate::collector::aggregator::RollingAggregator;
+use crate::collector::audit::{AuditGroup, AuditStore};
 use crate::collector::ring_buffer::RingBuffer;
 use crate::collector::wal::WAL;
 use crate::collector::*;
@@ -20,6 +21,7 @@ pub struct DefaultCollector {
     ring_buffer: RingBuffer,
     aggregator: RollingAggregator,
     wal: Option<WAL>,
+    audit: Option<AuditStore>,
     backend: RwLock<Option<Box<dyn StorageBackend>>>,
     pool_dims: RwLock<PoolDimensionStats>,
     pool_events: RwLock<VecDeque<PoolEvent>>,
@@ -46,6 +48,7 @@ impl DefaultCollector {
                 .ok()
                 .as_deref()
                 .map(WAL::new),
+            audit: load_audit_store(),
             backend: RwLock::new(None),
             pool_dims: RwLock::new(PoolDimensionStats {
                 dispatch_size: 0,
@@ -113,6 +116,9 @@ impl DataCollector for DefaultCollector {
 
         if let Some(ref wal) = self.wal {
             let _ = wal.append(tele);
+        }
+        if let Some(ref audit) = self.audit {
+            let _ = audit.append(tele);
         }
     }
 
@@ -274,4 +280,64 @@ impl DataCollector for DefaultCollector {
             .cloned()
             .collect()
     }
+
+    fn query_audit_requests(&self, filter: &RequestFilter) -> RequestQueryResult {
+        match &self.audit {
+            Some(audit) => audit.query_requests(filter),
+            None => RequestQueryResult {
+                items: Vec::new(),
+                next_cursor: None,
+            },
+        }
+    }
+
+    fn audit_summary(&self, filter: &RequestFilter) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.summary(filter),
+            None => serde_json::json!({"requests": 0, "disabled": true}),
+        }
+    }
+
+    fn audit_models(&self, filter: &RequestFilter) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.grouped(filter, AuditGroup::Model),
+            None => serde_json::json!([]),
+        }
+    }
+
+    fn audit_nodes(&self, filter: &RequestFilter) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.grouped(filter, AuditGroup::Node),
+            None => serde_json::json!([]),
+        }
+    }
+
+    fn audit_anomalies(&self, filter: &RequestFilter) -> serde_json::Value {
+        match &self.audit {
+            Some(audit) => audit.anomalies(filter),
+            None => serde_json::json!([]),
+        }
+    }
+
+    fn audit_export(&self, filter: &RequestFilter) -> String {
+        match &self.audit {
+            Some(audit) => audit.export(filter),
+            None => String::new(),
+        }
+    }
+}
+
+fn load_audit_store() -> Option<AuditStore> {
+    if cfg!(test) && std::env::var("AUDIT_LOG_ENABLED").is_err() {
+        return None;
+    }
+    let enabled = std::env::var("AUDIT_LOG_ENABLED")
+        .ok()
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    let dir = std::env::var("AUDIT_LOG_DIR").unwrap_or_else(|_| "/tmp/zen-proxy-audit".into());
+    Some(AuditStore::new(dir))
 }

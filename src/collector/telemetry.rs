@@ -7,6 +7,9 @@ pub fn new_telemetry() -> RequestTelemetry {
     RequestTelemetry {
         rid: Uuid::new_v4().to_string(),
         ts,
+        external_request_id: String::new(),
+        gateway: String::new(),
+        gateway_channel_id: String::new(),
         model: String::new(),
         public_model: String::new(),
         upstream_model: String::new(),

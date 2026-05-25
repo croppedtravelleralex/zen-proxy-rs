@@ -82,6 +82,65 @@ POST /admin/fuse
 Admin endpoints require authentication. Missing admin credentials should fail
 closed for admin routes.
 
+## Durable Audit API
+
+V4.1+ adds a durable audit layer in addition to the current-process ring buffer.
+The ring buffer is still useful for live debugging, but it is not the full-day
+truth source after restarts.
+
+Default audit behavior:
+
+```text
+AUDIT_LOG_ENABLED=true
+AUDIT_LOG_DIR=/tmp/zen-proxy-audit
+file pattern: requests-YYYY-MM-DD.jsonl
+record format: one RequestTelemetry JSON object per line
+```
+
+For production/VPS deployment, set `AUDIT_LOG_DIR` to a persistent location
+such as `/var/log/zen-proxy-rs/audit` and configure log rotation or archival.
+
+Durable audit endpoints:
+
+```text
+GET /admin/audit/summary?from=&to=&model=&status=&node=
+GET /admin/audit/requests?from=&to=&model=&status=&node=&limit=
+GET /admin/audit/requests/{rid}
+GET /admin/audit/models?from=&to=
+GET /admin/audit/nodes?from=&to=
+GET /admin/audit/anomalies?from=&to=&limit=
+GET /admin/audit/export?from=&to=&format=jsonl
+```
+
+`from` and `to` accept Unix seconds or Unix milliseconds. Query results come
+from audit files, not from the in-memory ring buffer.
+
+Audit records include V4.1 fields:
+
+- `external_request_id`
+- `gateway`
+- `gateway_channel_id`
+- `failure_kind`
+- `failure_message`
+- `retry_chain`
+- context governance telemetry
+- timing breakdown
+- token and byte counters
+
+Current anomaly classes:
+
+- `empty_output`: completion tokens are 0
+- `low_completion`: completion tokens are 1-3
+- `large_context`: prompt tokens >= 100k
+- `huge_context`: prompt tokens >= 200k
+- `slow_ttft`: TTFT >= 10s
+- `slow_total`: total latency >= 30s
+- `compacted`: context governance trimmed the request
+- `failure`: non-empty `failure_kind`
+
+The current durable store is JSONL. SQLite/DuckDB aggregation remains the next
+step if historical queries become too slow at higher volume.
+
 ## Event Types
 
 Required event records:
@@ -97,4 +156,3 @@ Required event records:
 - config_reloaded
 - fuse_opened
 - fuse_closed
-

@@ -1,4 +1,5 @@
 pub mod aggregator;
+pub mod audit;
 pub mod default;
 pub mod export;
 pub mod ring_buffer;
@@ -11,6 +12,12 @@ use serde::{Deserialize, Serialize};
 pub struct RequestTelemetry {
     pub rid: String,
     pub ts: i64,
+    #[serde(default)]
+    pub external_request_id: String,
+    #[serde(default)]
+    pub gateway: String,
+    #[serde(default)]
+    pub gateway_channel_id: String,
     pub model: String,
     pub public_model: String,
     pub upstream_model: String,
@@ -172,6 +179,12 @@ pub trait DataCollector: Send + Sync {
     fn aggregator_snapshot(&self) -> serde_json::Value;
     fn persist(&self);
     fn recent_events(&self, limit: usize) -> Vec<PoolEvent>;
+    fn query_audit_requests(&self, filter: &RequestFilter) -> RequestQueryResult;
+    fn audit_summary(&self, filter: &RequestFilter) -> serde_json::Value;
+    fn audit_models(&self, filter: &RequestFilter) -> serde_json::Value;
+    fn audit_nodes(&self, filter: &RequestFilter) -> serde_json::Value;
+    fn audit_anomalies(&self, filter: &RequestFilter) -> serde_json::Value;
+    fn audit_export(&self, filter: &RequestFilter) -> String;
 }
 
 pub struct RequestFilter {
@@ -252,6 +265,8 @@ mod tests {
         let telemetry: RequestTelemetry = serde_json::from_value(value).unwrap();
 
         assert_eq!(telemetry.timings.first_chunk_ms, 0);
+        assert!(telemetry.external_request_id.is_empty());
+        assert!(telemetry.gateway.is_empty());
         assert!(telemetry.failure_kind.is_empty());
         assert!(telemetry.retry_chain.is_empty());
         assert_eq!(telemetry.latency_total_ms, 10);
