@@ -379,6 +379,50 @@ impl DispatchPool {
         meta.request_kb() > self.budget_limits.max_kb_per_window
             || self.budget_limits.max_calls_per_window == 0
     }
+
+    fn try_sampled_acquire(
+        &self,
+        nodes: &[PoolNode],
+        meta: &RequestMeta,
+        now: i64,
+    ) -> Option<NodeRef> {
+        let sample_count = nodes.len().min(8);
+        if sample_count == 0 {
+            return None;
+        }
+
+        let mut best_idx = None;
+        let mut best_score = f64::MIN;
+        for _ in 0..sample_count {
+            let idx = fastrand::usize(..nodes.len());
+            let node = &nodes[idx];
+            let concurrent_now = node.active_leases.load(Ordering::Relaxed);
+            let max_concurrent = node.max_concurrent.load(Ordering::Relaxed);
+            if node
+                .budget
+                .read()
+                .unwrap()
+                .can_admit(meta, now, concurrent_now, max_concurrent)
+                .is_err()
+            {
+                continue;
+            }
+            let score = node.score();
+            if score > best_score {
+                best_score = score;
+                best_idx = Some(idx);
+            }
+        }
+
+        let node = &nodes[best_idx?];
+        if node.try_admit(meta, now) {
+            if self.global_admit(node, meta) {
+                return Some(node.node.clone());
+            }
+            node.rollback_local_admit(meta);
+        }
+        None
+    }
 }
 
 impl Default for DispatchPool {
@@ -407,6 +451,10 @@ impl Pool for DispatchPool {
         }
 
         let now = chrono::Utc::now().timestamp();
+        if let Some(node) = self.try_sampled_acquire(&nodes, meta, now) {
+            return Some(node);
+        }
+
         let eligible: Vec<&PoolNode> = nodes
             .iter()
             .filter(|node| {
