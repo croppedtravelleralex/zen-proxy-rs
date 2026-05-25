@@ -41,6 +41,13 @@ impl AppError {
         )
     }
 
+    pub fn empty_upstream() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "upstream returned no assistant content or tool call",
+        )
+    }
+
     pub fn upstream(status: u16, body_text: String, retry_after: Option<String>) -> Self {
         let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut headers = Vec::new();

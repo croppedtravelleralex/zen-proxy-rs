@@ -22,8 +22,13 @@ pub async fn handle_anthropic_messages(
         .map(|t| translate::anthropic_tools_to_openai(t))
         .unwrap_or_default();
     let max_tok = body.max_tokens.max(32);
-    let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()}});
+    let tool_choice = body
+        .tool_choice
+        .as_ref()
+        .map(translate::anthropic_tool_choice_to_openai);
+    let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":tool_choice});
     translate::disable_thinking_for_assistant_history(&mut zb, &msgs);
+    translate::disable_thinking_for_tool_use(&mut zb);
     let cr = ChatRequest {
         model: model.clone(),
         messages: msgs,
@@ -32,7 +37,7 @@ pub async fn handle_anthropic_messages(
         temperature: body.temperature,
         top_p: None,
         tools: if tools.is_empty() { None } else { Some(tools) },
-        tool_choice: None,
+        tool_choice,
     };
     if body.stream.unwrap_or(false) {
         handle_stream(client, config, &cr, &zb).await
@@ -56,32 +61,68 @@ async fn handle_non_stream(
     )
     .await?;
     let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
-    let (content, _reasoning, usage) = crate::zen::client::collect_stream_text(resp).await?;
-    let content = crate::redact::redact_text(&content);
+    let collected = crate::zen::client::collect_stream_parts(resp).await?;
+    let content = crate::redact::redact_text(&collected.content);
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    if content.trim().is_empty() {
-        let fb = synthesis::text::synthesize_text_fallback(&prompt);
-        return Ok(with_observed_exit_ip(
-            text_resp(
-                ts,
-                &cr.model,
-                &crate::redact::redact_text(&fb),
-                estimate(&prompt),
-                estimate(&fb),
-            )
-            .into_response(),
-            observed_exit_ip,
-        ));
+    if content.trim().is_empty() && collected.tool_calls.is_empty() {
+        return Err(AppError::empty_upstream());
     }
-    let input_tokens = usage
+    if !collected.tool_calls.is_empty() {
+        let blocks = collected
+            .tool_calls
+            .iter()
+            .filter(|tool| !tool.name.is_empty())
+            .map(|tool| AnthropicContentBlock {
+                block_type: "tool_use".to_string(),
+                text: None,
+                id: Some(
+                    tool.id
+                        .clone()
+                        .filter(|id| !id.is_empty())
+                        .unwrap_or_else(|| format!("call_{}", tool.index)),
+                ),
+                name: Some(tool.name.clone()),
+                input: Some(serde_json::from_str(&tool.arguments).unwrap_or(Value::Null)),
+            })
+            .collect::<Vec<_>>();
+        if !blocks.is_empty() {
+            let input_tokens = collected
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens)
+                .unwrap_or_else(|| estimate(&prompt));
+            let output_tokens = collected
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.completion_tokens)
+                .unwrap_or_else(|| {
+                    estimate(
+                        &collected
+                            .tool_calls
+                            .iter()
+                            .map(|tool| format!("{} {}", tool.name, tool.arguments))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                    .max(1)
+                });
+            return Ok(with_observed_exit_ip(
+                tool_resp(ts, &cr.model, blocks, input_tokens, output_tokens),
+                observed_exit_ip,
+            ));
+        }
+    }
+    let input_tokens = collected
+        .usage
         .as_ref()
         .and_then(|usage| usage.prompt_tokens)
         .unwrap_or_else(|| estimate(&prompt));
-    let output_tokens = usage
+    let output_tokens = collected
+        .usage
         .as_ref()
         .and_then(|usage| usage.completion_tokens)
         .unwrap_or_else(|| estimate(&content));
@@ -93,6 +134,16 @@ async fn handle_non_stream(
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
     Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"text","text":text}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":output_tokens}})).into_response()
+}
+
+fn tool_resp(
+    ts: u128,
+    model: &str,
+    blocks: Vec<AnthropicContentBlock>,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Response {
+    Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":blocks,"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":output_tokens}})).into_response()
 }
 
 fn with_observed_exit_ip(
@@ -183,12 +234,7 @@ async fn handle_stream(
                 yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":tidx}).to_string()));
             }
         } else if text.is_empty() {
-            let fb=synthesis::text::synthesize_text_fallback(&translate::build_prompt_text(&body.messages));
-            yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
-            let fb = crate::redact::redact_text(&fb);
-            yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":fb}}).to_string()));
-            yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string()));
-            text = fb;
+            yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"empty_output","message":"upstream returned no assistant content or tool call"}}).to_string()));
         }
         let stop_reason = if !tcs.is_empty() { "tool_use" } else { "end_turn" };
         let output_tokens = if !text.is_empty() {
@@ -196,7 +242,7 @@ async fn handle_stream(
         } else if !tcs.is_empty() {
             estimate(&tcs.iter().map(|(_,name,args,_)| format!("{name} {args}")).collect::<Vec<_>>().join("\n")).max(1)
         } else {
-            1
+            0
         };
         yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));

@@ -190,12 +190,46 @@ pub fn anthropic_tools_to_openai(tools: &[ToolDef]) -> Vec<OpenAITool> {
     }).collect()
 }
 
+pub fn anthropic_tool_choice_to_openai(choice: &Value) -> Value {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("auto") => Value::String("auto".to_string()),
+        Some("any") => Value::String("required".to_string()),
+        Some("tool") => choice
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": name }
+                })
+            })
+            .unwrap_or_else(|| Value::String("required".to_string())),
+        _ => choice.clone(),
+    }
+}
+
 pub fn disable_thinking_for_assistant_history(body: &mut Value, messages: &[Message]) {
     let has_assistant_history = messages.iter().any(|msg| msg.role == "assistant");
     if !has_assistant_history || body.get("thinking").is_some() {
         return;
     }
     body["thinking"] = serde_json::json!({"type":"disabled"});
+}
+
+pub fn disable_thinking_for_tool_use(body: &mut Value) {
+    if body.get("thinking").is_some() {
+        return;
+    }
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let has_tool_choice = body
+        .get("tool_choice")
+        .is_some_and(|choice| !choice.is_null());
+    if has_tools || has_tool_choice {
+        body["thinking"] = serde_json::json!({"type":"disabled"});
+    }
 }
 
 pub fn estimate_tokens(text: &str) -> u64 {

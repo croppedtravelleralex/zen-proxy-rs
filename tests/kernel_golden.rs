@@ -23,6 +23,8 @@ struct ObservedRequest {
     proof_header: Option<String>,
     extra_header: Option<String>,
     model: Option<String>,
+    tool_choice: Option<Value>,
+    thinking: Option<Value>,
 }
 
 async fn mock_zen_handler(
@@ -43,6 +45,8 @@ async fn mock_zen_handler(
             .get("model")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned),
+        tool_choice: body.get("tool_choice").cloned(),
+        thinking: body.get("thinking").cloned(),
     });
 
     let prompt = body
@@ -170,6 +174,7 @@ fn anthropic_request(model: &str, prompt: &str, stream: bool) -> AnthropicReques
         temperature: None,
         system: None,
         tools: None,
+        tool_choice: None,
     }
 }
 
@@ -282,7 +287,41 @@ async fn tool_delta_is_preserved_in_streaming_openai_response() {
 }
 
 #[tokio::test]
-async fn openai_empty_stream_with_tools_uses_text_fallback_not_synthetic_tool_call() {
+async fn tool_delta_is_preserved_in_non_streaming_openai_response() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "tool-delta", false, None),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("README.md"));
+    assert!(body.contains("tool_calls"));
+    assert!(body.contains("tool_calls"));
+}
+
+#[tokio::test]
+async fn tool_delta_is_preserved_in_non_streaming_anthropic_response() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "tool-delta", false),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("README.md"));
+    assert!(body.contains("tool_use"));
+    assert!(body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn openai_empty_stream_with_tools_reports_empty_output_without_synthetic_tool_call() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let tools = vec![OpenAITool {
@@ -306,12 +345,12 @@ async fn openai_empty_stream_with_tools_uses_text_fallback_not_synthetic_tool_ca
         .await
         .unwrap();
     let body = response_text(response).await;
-    assert!(body.contains("NO_TOOL_CALL"));
+    assert!(body.contains("empty_output"));
     assert!(!body.contains("tool_calls"));
 }
 
 #[tokio::test]
-async fn anthropic_empty_stream_with_tools_uses_text_fallback_not_synthetic_tool_use() {
+async fn anthropic_empty_stream_with_tools_reports_empty_output_without_synthetic_tool_use() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let response = kernel
@@ -333,7 +372,7 @@ async fn anthropic_empty_stream_with_tools_uses_text_fallback_not_synthetic_tool
         .await
         .unwrap();
     let body = response_text(response).await;
-    assert!(body.contains("NO_TOOL_CALL"));
+    assert!(body.contains("empty_output"));
     assert!(!body.contains("tool_use"));
 }
 
@@ -371,6 +410,59 @@ async fn anthropic_tool_use_history_is_preserved_as_openai_tool_calls() {
     assert_eq!(messages[1].role, "tool");
     assert_eq!(messages[1].tool_call_id.as_deref(), Some("toolu_1"));
     assert_eq!(messages[1].content, json!("hello"));
+}
+
+#[tokio::test]
+async fn openai_tool_choice_is_forwarded_to_upstream() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = chat_request(
+        "deepseek-v4-flash-free",
+        "use Task",
+        false,
+        Some(vec![OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: "Task".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }]),
+    );
+    req.tool_choice = Some(json!({"type":"function","function":{"name":"Task"}}));
+    let _ = kernel.openai_chat(&client, req).await.unwrap();
+    let sent = observed.requests.lock().unwrap();
+    assert_eq!(
+        sent[0].tool_choice.as_ref(),
+        Some(&json!({"type":"function","function":{"name":"Task"}}))
+    );
+    assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+}
+
+#[tokio::test]
+async fn anthropic_tool_choice_is_translated_to_openai_function_choice() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let req = AnthropicRequest {
+        tools: Some(vec![free_model_client_rs::protocol::types::ToolDef {
+            name: "Task".to_string(),
+            description: "Launch subagent".to_string(),
+            input_schema: free_model_client_rs::protocol::types::ToolInputSchema {
+                schema_type: "object".to_string(),
+                properties: Some(json!({"prompt":{"type":"string"}})),
+                required: Some(vec!["prompt".to_string()]),
+            },
+        }]),
+        tool_choice: Some(json!({"type":"tool","name":"Task"})),
+        ..anthropic_request("deepseek-v4-flash-free", "use Task", false)
+    };
+    let _ = kernel.anthropic_messages(&client, req).await.unwrap();
+    let sent = observed.requests.lock().unwrap();
+    assert_eq!(
+        sent[0].tool_choice.as_ref(),
+        Some(&json!({"type":"function","function":{"name":"Task"}}))
+    );
+    assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
 }
 
 #[test]
@@ -414,22 +506,18 @@ fn anthropic_tool_result_content_is_redacted_before_upstream() {
 }
 
 #[tokio::test]
-async fn reasoning_only_output_uses_deterministic_text_fallback() {
+async fn reasoning_only_output_is_rejected_as_empty_upstream() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let response = kernel
+    let err = kernel
         .openai_chat(
             &client,
             chat_request("deepseek-v4-flash-free", "reasoning-only", false, None),
         )
         .await
-        .unwrap();
-    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_ne!(
-        body["choices"][0]["message"]["content"],
-        "hidden chain only"
-    );
-    assert_eq!(body["choices"][0]["message"]["content"], "NO_TOOL_CALL");
+        .unwrap_err();
+    assert_eq!(err.status, axum::http::StatusCode::BAD_GATEWAY);
+    assert!(err.message.contains("no assistant content"));
 }
 
 #[tokio::test]

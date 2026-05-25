@@ -53,6 +53,22 @@ pub struct ZenUsage {
     pub total_tokens: Option<u64>,
 }
 
+#[derive(Debug, Default)]
+pub struct CollectedStream {
+    pub content: String,
+    pub reasoning: String,
+    pub usage: Option<ZenUsage>,
+    pub tool_calls: Vec<CollectedToolCall>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CollectedToolCall {
+    pub index: i64,
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: String,
+}
+
 fn make_id(prefix: &str) -> String {
     let alphabet: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut rng = rand::thread_rng();
@@ -129,11 +145,16 @@ pub async fn fetch_zen_stream_with_headers(
 pub async fn collect_stream_text(
     resp: reqwest::Response,
 ) -> Result<(String, String, Option<ZenUsage>), crate::error::AppError> {
+    let collected = collect_stream_parts(resp).await?;
+    Ok((collected.content, collected.reasoning, collected.usage))
+}
+
+pub async fn collect_stream_parts(
+    resp: reqwest::Response,
+) -> Result<CollectedStream, crate::error::AppError> {
     let mut stream = resp.bytes_stream();
     let mut buffer = BytesMut::new();
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut usage = None;
+    let mut collected = CollectedStream::default();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
             crate::error::AppError::new(
@@ -157,15 +178,47 @@ pub async fn collect_stream_text(
                             format!("stream parse error: {e}"),
                         )
                     })?;
-                    usage = event.usage.or(usage);
+                    collected.usage = event.usage.or(collected.usage);
                     if let Some(choices) = event.choices {
                         for choice in choices {
                             if let Some(delta) = choice.delta {
                                 if let Some(c) = delta.content {
-                                    content.push_str(&c);
+                                    collected.content.push_str(&c);
                                 }
                                 if let Some(r) = delta.reasoning_content {
-                                    reasoning.push_str(&r);
+                                    collected.reasoning.push_str(&r);
+                                }
+                                if let Some(tool_calls) = delta.tool_calls {
+                                    for tc in tool_calls {
+                                        let index = tc.index.unwrap_or(0);
+                                        let existing = collected
+                                            .tool_calls
+                                            .iter_mut()
+                                            .find(|item| item.index == index);
+                                        let item = if let Some(item) = existing {
+                                            item
+                                        } else {
+                                            collected.tool_calls.push(CollectedToolCall {
+                                                index,
+                                                id: tc.id.clone(),
+                                                ..CollectedToolCall::default()
+                                            });
+                                            collected.tool_calls.last_mut().unwrap()
+                                        };
+                                        if item.id.is_none() {
+                                            item.id = tc.id.clone();
+                                        }
+                                        if let Some(function) = tc.function {
+                                            if let Some(name) = function.name {
+                                                if !name.is_empty() {
+                                                    item.name = name;
+                                                }
+                                            }
+                                            if let Some(arguments) = function.arguments {
+                                                item.arguments.push_str(&arguments);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -174,7 +227,7 @@ pub async fn collect_stream_text(
             }
         }
     }
-    Ok((content, reasoning, usage))
+    Ok(collected)
 }
 
 pub fn stream_sse_events(
