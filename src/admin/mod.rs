@@ -55,6 +55,7 @@ auth_h!(pools_h, AdminService::pools);
 auth_h!(fuse_get_h, AdminService::fuse_status);
 auth_h!(requests_recent_h, AdminService::requests_recent);
 auth_h!(requests_summary_h, AdminService::requests_summary);
+auth_h!(requests_timings_h, AdminService::requests_timings);
 auth_h!(requests_models_h, AdminService::requests_models);
 auth_h!(requests_nodes_h, AdminService::requests_nodes);
 auth_h!(events_h, AdminService::events);
@@ -238,6 +239,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/requests", get(requests_h))
         .route("/admin/requests/recent", get(requests_recent_h))
         .route("/admin/requests/summary", get(requests_summary_h))
+        .route("/admin/requests/timings", get(requests_timings_h))
         .route("/admin/requests/models", get(requests_models_h))
         .route("/admin/requests/nodes", get(requests_nodes_h))
         .route("/admin/requests/{rid}", get(request_detail_h))

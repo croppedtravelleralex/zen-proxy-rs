@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::collector::{DataCollector, RequestTelemetry};
+use crate::collector::{DataCollector, RequestTelemetry, RequestTimings};
 use crate::config::Config;
 use crate::ledger::LedgerEvent;
 use crate::pool::{DispatchError, ErrorKind, RequestMeta, ResultKind};
@@ -126,6 +126,12 @@ pub async fn handle_v4_proxy(
         Ok(result) => {
             let latency = start.elapsed().as_millis() as u64;
             let status = result.response.status().as_u16();
+            let mut timings = result.timings.clone();
+            timings.total_ms = latency;
+            if !streaming {
+                timings.stream_complete_ms = latency;
+                timings.first_chunk_ms = timings.first_chunk_ms.max(result.ttft_ms.unwrap_or(0));
+            }
             let telemetry = RequestTelemetry {
                 rid: result.request_id.clone(),
                 ts: chrono::Utc::now().timestamp_millis(),
@@ -154,6 +160,7 @@ pub async fn handle_v4_proxy(
                 latency_total_ms: latency,
                 upstream_ms: result.upstream_ms,
                 ttft_ms: result.ttft_ms.unwrap_or_default(),
+                timings,
                 prompt_tokens: result.usage.prompt_tokens,
                 completion_tokens: result.usage.completion_tokens,
                 total_tokens: result.usage.total_tokens,
@@ -167,6 +174,7 @@ pub async fn handle_v4_proxy(
                     result.response,
                     path.to_string(),
                     telemetry,
+                    start,
                     stream_usage_fallback,
                     state.collector.clone(),
                 )
@@ -213,6 +221,11 @@ pub async fn handle_v4_proxy(
                     latency_total_ms: latency,
                     upstream_ms: err.upstream_ms,
                     ttft_ms: 0,
+                    timings: RequestTimings {
+                        upstream_response_ms: err.upstream_ms,
+                        total_ms: latency,
+                        ..RequestTimings::default()
+                    },
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     total_tokens: 0,
@@ -246,6 +259,7 @@ struct V4CallResult {
     was_rate_limited: bool,
     upstream_ms: u64,
     ttft_ms: Option<u64>,
+    timings: RequestTimings,
     body_bytes_len: u64,
     usage: UsageCounts,
 }
@@ -331,8 +345,10 @@ async fn call_with_retry(
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_node_id = String::new();
     let mut was_rate_limited = false;
+    let mut dispatch_wait_ms = 0u64;
 
     for attempt in 0..=max {
+        let dispatch_start = Instant::now();
         let dispatch_result = if attempt == 0 {
             dispatch_or_wait(state, &request_meta, attempt, max).await?
         } else {
@@ -344,6 +360,8 @@ async fn call_with_retry(
                 Err(_) => dispatch_or_wait(state, &request_meta, attempt, max).await?,
             }
         };
+        dispatch_wait_ms =
+            dispatch_wait_ms.saturating_add(dispatch_start.elapsed().as_millis() as u64);
 
         let node_id = dispatch_result.node.id.clone();
         let node_url = dispatch_result.url.clone();
@@ -445,6 +463,13 @@ async fn call_with_retry(
                         was_rate_limited,
                         upstream_ms: latency,
                         ttft_ms: Some(latency),
+                        timings: RequestTimings {
+                            dispatch_wait_ms,
+                            upstream_response_ms: latency,
+                            first_chunk_ms: if request_meta.stream { 0 } else { latency },
+                            stream_complete_ms: 0,
+                            total_ms: latency,
+                        },
                         body_bytes_len,
                         usage,
                     });
@@ -835,6 +860,7 @@ fn metered_stream_response(
     response: Response,
     path: String,
     telemetry: RequestTelemetry,
+    request_start: Instant,
     fallback_usage: UsageCounts,
     collector: Arc<dyn DataCollector>,
 ) -> Response {
@@ -844,10 +870,15 @@ fn metered_stream_response(
     let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(16);
 
     tokio::spawn(async move {
+        let mut telemetry = telemetry;
         let mut metrics = StreamMetrics::new(fallback_usage);
+        let mut first_chunk_ms = 0u64;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(bytes) => {
+                    if first_chunk_ms == 0 {
+                        first_chunk_ms = request_start.elapsed().as_millis() as u64;
+                    }
                     metrics.ingest(&path, &bytes);
                     if tx.send(Ok(bytes)).await.is_err() {
                         break;
@@ -859,12 +890,17 @@ fn metered_stream_response(
                 }
             }
         }
-        let mut telemetry = telemetry;
+        let stream_complete_ms = request_start.elapsed().as_millis() as u64;
         telemetry.bytes_received = metrics.bytes_received;
         let usage = metrics.final_usage();
         telemetry.prompt_tokens = usage.prompt_tokens;
         telemetry.completion_tokens = usage.completion_tokens;
         telemetry.total_tokens = usage.total_tokens;
+        telemetry.latency_total_ms = stream_complete_ms;
+        telemetry.ttft_ms = first_chunk_ms;
+        telemetry.timings.first_chunk_ms = first_chunk_ms;
+        telemetry.timings.stream_complete_ms = stream_complete_ms;
+        telemetry.timings.total_ms = stream_complete_ms;
         collector.record_request(&telemetry);
     });
 

@@ -172,6 +172,13 @@ pub async fn proxy_handler(
                 latency_total_ms: latency,
                 upstream_ms: pr.upstream_ms,
                 ttft_ms: pr.ttft_ms,
+                timings: crate::collector::RequestTimings {
+                    upstream_response_ms: pr.upstream_ms,
+                    first_chunk_ms: pr.ttft_ms,
+                    stream_complete_ms: latency,
+                    total_ms: latency,
+                    ..crate::collector::RequestTimings::default()
+                },
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,

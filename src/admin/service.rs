@@ -159,6 +159,7 @@ impl AdminService {
                 {"method":"GET","path":"/admin/requests"},
                 {"method":"GET","path":"/admin/requests/recent"},
                 {"method":"GET","path":"/admin/requests/summary"},
+                {"method":"GET","path":"/admin/requests/timings"},
                 {"method":"GET","path":"/admin/requests/models"},
                 {"method":"GET","path":"/admin/requests/nodes"},
                 {"method":"GET","path":"/admin/requests/{rid}"},
@@ -405,6 +406,81 @@ impl AdminService {
         Self::ok_response(
             json!({"total":s.requests.total,"success":s.requests.success,"count_429":s.requests.count_429,"count_4xx":s.requests.count_4xx,"count_5xx":s.requests.count_5xx,"rpm":s.requests.rpm,"avg_latency_ms":s.requests.avg_latency_ms}),
         )
+    }
+    pub fn requests_timings(state: &AppState) -> Response {
+        let result = state.collector.query_requests(&RequestFilter {
+            limit: 100,
+            ..Default::default()
+        });
+        let count = result.items.len() as u64;
+        let mut sums = serde_json::Map::new();
+        let mut add_avg = |name: &str, sum: u64| {
+            sums.insert(
+                name.to_string(),
+                json!(if count > 0 {
+                    sum as f64 / count as f64
+                } else {
+                    0.0
+                }),
+            );
+        };
+        add_avg(
+            "dispatch_wait_ms",
+            result
+                .items
+                .iter()
+                .map(|r| r.timings.dispatch_wait_ms)
+                .sum(),
+        );
+        add_avg(
+            "upstream_response_ms",
+            result
+                .items
+                .iter()
+                .map(|r| r.timings.upstream_response_ms)
+                .sum(),
+        );
+        add_avg(
+            "first_chunk_ms",
+            result.items.iter().map(|r| r.timings.first_chunk_ms).sum(),
+        );
+        add_avg(
+            "stream_complete_ms",
+            result
+                .items
+                .iter()
+                .map(|r| r.timings.stream_complete_ms)
+                .sum(),
+        );
+        add_avg(
+            "total_ms",
+            result.items.iter().map(|r| r.timings.total_ms).sum(),
+        );
+        let recent: Vec<Value> = result
+            .items
+            .iter()
+            .map(|r| {
+                json!({
+                    "rid": r.rid,
+                    "ts": r.ts,
+                    "model": r.model,
+                    "status": r.status,
+                    "stream": r.is_streaming,
+                    "node": r.selected_node_id,
+                    "timings": r.timings,
+                    "legacy": {
+                        "latency_total_ms": r.latency_total_ms,
+                        "upstream_ms": r.upstream_ms,
+                        "ttft_ms": r.ttft_ms
+                    }
+                })
+            })
+            .collect();
+        Self::ok_response(json!({
+            "count": count,
+            "avg": sums,
+            "recent": recent
+        }))
     }
     pub fn requests_models(state: &AppState) -> Response {
         Self::stats_models(state)

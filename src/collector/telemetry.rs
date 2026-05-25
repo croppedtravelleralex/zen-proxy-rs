@@ -1,4 +1,4 @@
-use crate::collector::RequestTelemetry;
+use crate::collector::{RequestTelemetry, RequestTimings};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -28,6 +28,7 @@ pub fn new_telemetry() -> RequestTelemetry {
         latency_total_ms: 0,
         upstream_ms: 0,
         ttft_ms: 0,
+        timings: RequestTimings::default(),
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,

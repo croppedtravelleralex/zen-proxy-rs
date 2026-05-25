@@ -32,12 +32,23 @@ pub struct RequestTelemetry {
     pub latency_total_ms: u64,
     pub upstream_ms: u64,
     pub ttft_ms: u64,
+    #[serde(default)]
+    pub timings: RequestTimings,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub context: Option<ContextTelemetry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestTimings {
+    pub dispatch_wait_ms: u64,
+    pub upstream_response_ms: u64,
+    pub first_chunk_ms: u64,
+    pub stream_complete_ms: u64,
+    pub total_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,4 +191,50 @@ pub struct RequestQueryResult {
 pub trait StorageBackend: Send + Sync {
     fn write(&self, snapshot: &DataSnapshot);
     fn name(&self) -> &'static str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn request_telemetry_defaults_missing_timings_for_old_records() {
+        let value = json!({
+            "rid": "r1",
+            "ts": 1,
+            "model": "deepseek-v4-flash",
+            "public_model": "deepseek-v4-flash",
+            "upstream_model": "deepseek-v4-flash-free",
+            "protocol": "anthropic_messages",
+            "client_id": "sk-dev",
+            "path": "messages",
+            "method": "POST",
+            "is_streaming": true,
+            "node_url": "node",
+            "selected_node_id": "n1",
+            "selected_node_url_redacted": "node",
+            "observed_exit_ip": "",
+            "outcome": "success",
+            "pool": "dispatch",
+            "exit_ip": "",
+            "status": 200,
+            "rate_limited": false,
+            "retry_count": 0,
+            "latency_total_ms": 10,
+            "upstream_ms": 8,
+            "ttft_ms": 7,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+            "bytes_sent": 100,
+            "bytes_received": 50,
+            "context": null
+        });
+
+        let telemetry: RequestTelemetry = serde_json::from_value(value).unwrap();
+
+        assert_eq!(telemetry.timings.first_chunk_ms, 0);
+        assert_eq!(telemetry.latency_total_ms, 10);
+    }
 }
