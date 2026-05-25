@@ -232,6 +232,39 @@ pub fn disable_thinking_for_tool_use(body: &mut Value) {
     }
 }
 
+pub fn stabilize_short_user_prompt(body: &mut Value) {
+    if body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return;
+    }
+
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return;
+    };
+    let Some(content) = last_user.get_mut("content") else {
+        return;
+    };
+    let Some(text) = content.as_str() else {
+        return;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 2 {
+        return;
+    }
+
+    *content = Value::String("只回复 ok".to_string());
+}
+
 pub fn estimate_tokens(text: &str) -> u64 {
     ((text.len() as f64) / 4.0).ceil() as u64
 }

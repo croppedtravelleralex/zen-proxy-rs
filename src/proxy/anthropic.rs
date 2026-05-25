@@ -29,6 +29,7 @@ pub async fn handle_anthropic_messages(
     let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":tool_choice});
     translate::disable_thinking_for_assistant_history(&mut zb, &msgs);
     translate::disable_thinking_for_tool_use(&mut zb);
+    translate::stabilize_short_user_prompt(&mut zb);
     let cr = ChatRequest {
         model: model.clone(),
         messages: msgs,

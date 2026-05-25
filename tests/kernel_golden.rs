@@ -484,6 +484,26 @@ fn thinking_is_disabled_when_assistant_history_has_no_reasoning() {
 }
 
 #[test]
+fn short_user_prompt_is_stabilized_before_upstream() {
+    let mut body = json!({
+        "messages": [{"role": "user", "content": "1"}],
+        "tools": null
+    });
+    free_model_client_rs::protocol::translate::stabilize_short_user_prompt(&mut body);
+    assert_eq!(body["messages"][0]["content"], "只回复 ok");
+}
+
+#[test]
+fn short_user_prompt_with_tools_is_not_rewritten() {
+    let mut body = json!({
+        "messages": [{"role": "user", "content": "1"}],
+        "tools": [{"type":"function","function":{"name":"Task"}}]
+    });
+    free_model_client_rs::protocol::translate::stabilize_short_user_prompt(&mut body);
+    assert_eq!(body["messages"][0]["content"], "1");
+}
+
+#[test]
 fn anthropic_tool_result_content_is_redacted_before_upstream() {
     let req = AnthropicRequest {
         messages: vec![AnthropicMessage {
