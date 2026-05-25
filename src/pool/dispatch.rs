@@ -1,11 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
-use std::time::Duration;
 
 use crate::pool::global_budget::GlobalBudgetRegistry;
 use crate::pool::*;
-use reqwest::Client;
 use serde_json::{json, Value};
 
 const SCORE_SCALE: u64 = 100;
@@ -147,11 +145,10 @@ struct PoolNode {
     max_concurrent: AtomicU32,
     active_leases: AtomicU32,
     budget: RwLock<NodeBudget>,
-    client: Client,
 }
 
 impl PoolNode {
-    fn new(node: NodeRef, client: Client, limits: NodeBudgetLimits) -> Self {
+    fn new(node: NodeRef, limits: NodeBudgetLimits) -> Self {
         Self {
             node,
             base_score: AtomicU64::new(80 * SCORE_SCALE),
@@ -162,7 +159,6 @@ impl PoolNode {
             max_concurrent: AtomicU32::new(5),
             active_leases: AtomicU32::new(0),
             budget: RwLock::new(NodeBudget::from(limits)),
-            client,
         }
     }
 
@@ -520,13 +516,7 @@ impl Pool for DispatchPool {
     fn add(&self, node: NodeRef) {
         let mut nodes = self.nodes.write().unwrap();
         if !nodes.iter().any(|n| n.node.id == node.id) {
-            let client = reqwest::Client::builder()
-                .proxy(reqwest::Proxy::all(&node.url).unwrap())
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap();
-            nodes.push(PoolNode::new(node, client, self.budget_limits.clone()));
+            nodes.push(PoolNode::new(node, self.budget_limits.clone()));
         }
     }
 
