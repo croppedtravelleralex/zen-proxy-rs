@@ -170,6 +170,9 @@ pub async fn handle_v4_proxy(
                 prompt_tokens: result.usage.prompt_tokens,
                 completion_tokens: result.usage.completion_tokens,
                 total_tokens: result.usage.total_tokens,
+                cached_tokens: result.usage.cached_tokens,
+                cache_creation_input_tokens: result.usage.cache_creation_input_tokens,
+                cache_read_input_tokens: result.usage.cache_read_input_tokens,
                 bytes_sent: effective_body_len,
                 bytes_received: result.body_bytes_len,
                 failure_kind: String::new(),
@@ -243,6 +246,9 @@ pub async fn handle_v4_proxy(
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     total_tokens: 0,
+                    cached_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
                     bytes_sent: effective_body_len,
                     bytes_received: 0,
                     failure_kind: err.failure_kind.clone(),
@@ -332,6 +338,9 @@ struct UsageCounts {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    cached_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
 }
 
 struct V4CallError {
@@ -1237,6 +1246,9 @@ fn metered_stream_response(
         telemetry.prompt_tokens = usage.prompt_tokens;
         telemetry.completion_tokens = usage.completion_tokens;
         telemetry.total_tokens = usage.total_tokens;
+        telemetry.cached_tokens = usage.cached_tokens;
+        telemetry.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+        telemetry.cache_read_input_tokens = usage.cache_read_input_tokens;
         telemetry.latency_total_ms = stream_complete_ms;
         telemetry.ttft_ms = first_chunk_ms;
         telemetry.timings.first_chunk_ms = first_chunk_ms;
@@ -1374,6 +1386,10 @@ impl StreamMetrics {
                     .usage
                     .prompt_tokens
                     .saturating_add(self.usage.completion_tokens);
+                self.usage.cache_creation_input_tokens =
+                    usage_u32(usage, "cache_creation_input_tokens");
+                self.usage.cache_read_input_tokens = usage_u32(usage, "cache_read_input_tokens");
+                self.usage.cached_tokens = self.usage.cache_read_input_tokens;
             }
             return;
         }
@@ -1423,6 +1439,20 @@ impl StreamMetrics {
                 .prompt_tokens
                 .saturating_add(self.usage.completion_tokens);
         }
+        self.usage.cached_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                usage
+                    .get("cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            })
+            .min(u32::MAX as u64) as u32;
+        self.usage.cache_creation_input_tokens = usage_u32(usage, "cache_creation_input_tokens");
+        self.usage.cache_read_input_tokens =
+            usage_u32(usage, "cache_read_input_tokens").max(self.usage.cached_tokens);
     }
 
     fn final_usage(&self) -> UsageCounts {
@@ -1444,6 +1474,18 @@ impl StreamMetrics {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cached_tokens: self
+                .usage
+                .cached_tokens
+                .max(self.fallback_usage.cached_tokens),
+            cache_creation_input_tokens: self
+                .usage
+                .cache_creation_input_tokens
+                .max(self.fallback_usage.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .usage
+                .cache_read_input_tokens
+                .max(self.fallback_usage.cache_read_input_tokens),
         }
     }
 
@@ -1477,12 +1519,29 @@ fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cached_tokens: usage_u32(usage, "cache_read_input_tokens"),
+            cache_creation_input_tokens: usage_u32(usage, "cache_creation_input_tokens"),
+            cache_read_input_tokens: usage_u32(usage, "cache_read_input_tokens"),
         }
     } else {
+        let cached_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                usage
+                    .get("cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            })
+            .min(u32::MAX as u64) as u32;
         UsageCounts {
             prompt_tokens: usage_u32(usage, "prompt_tokens"),
             completion_tokens: usage_u32(usage, "completion_tokens"),
             total_tokens: usage_u32(usage, "total_tokens"),
+            cached_tokens,
+            cache_creation_input_tokens: usage_u32(usage, "cache_creation_input_tokens"),
+            cache_read_input_tokens: usage_u32(usage, "cache_read_input_tokens").max(cached_tokens),
         }
     }
 }
@@ -1569,5 +1628,34 @@ mod tests {
             br#"{"content":[{"type":"tool_use","id":"toolu_1","name":"Task","input":{}}],"usage":{"input_tokens":10,"output_tokens":0}}"#,
         );
         assert!(response_has_assistant_output("messages", &body));
+    }
+
+    #[test]
+    fn extracts_openai_cache_usage_counts() {
+        let body = Bytes::from_static(
+            br#"{"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80}}}"#,
+        );
+
+        let usage = extract_usage_counts("chat/completions", &body);
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.cached_tokens, 80);
+        assert_eq!(usage.cache_read_input_tokens, 80);
+    }
+
+    #[test]
+    fn extracts_anthropic_cache_usage_counts() {
+        let body = Bytes::from_static(
+            br#"{"usage":{"input_tokens":100,"output_tokens":5,"cache_creation_input_tokens":20,"cache_read_input_tokens":70}}"#,
+        );
+
+        let usage = extract_usage_counts("messages", &body);
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.cached_tokens, 70);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 70);
     }
 }

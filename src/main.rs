@@ -90,7 +90,15 @@ async fn index_handler() -> Json<Value> {
 }
 
 async fn metrics_handler(State(st): State<Arc<AppState>>) -> String {
-    let snapshot = st.collector.snapshot();
+    let mut snapshot = st.collector.snapshot();
+    let pools = st.pool_manager.pool_stats();
+    snapshot.pools.dispatch_size = pools.dispatch_size;
+    snapshot.pools.active_size = pools.active_size;
+    snapshot.pools.ratelimited_size = pools.ratelimited_size;
+    snapshot.pools.dead_size = pools.dead_size;
+    snapshot.pools.pool_transitions = pools.pool_transitions;
+    snapshot.pools.active_concurrency = pools.active_concurrency;
+    snapshot.system.uptime_secs = st.startup_time.elapsed().as_secs();
     let backend = collector::export::PrometheusBackend;
     backend.encode(&snapshot)
 }

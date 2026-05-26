@@ -45,6 +45,12 @@ pub struct RequestTelemetry {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(default)]
+    pub cached_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     #[serde(default)]

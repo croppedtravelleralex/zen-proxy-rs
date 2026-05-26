@@ -133,7 +133,8 @@ mod e2e {
 
     #[test]
     fn test_metrics() {
-        let (child, port) = start_server(19782);
+        let (child, port) =
+            start_server_with_env(19782, &[("PREFERRED_PROXY_URLS", "http://127.0.0.1:7897")]);
         let resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/metrics", port))
             .expect("metrics endpoint");
         assert_eq!(resp.status(), 200);
@@ -141,6 +142,10 @@ mod e2e {
         assert!(
             text.contains("zen_proxy_requests_total"),
             "metrics should contain counter"
+        );
+        assert!(
+            text.contains("zen_proxy_pool_size{pool=\"dispatch\"} 1"),
+            "metrics should contain live dispatch pool size: {text}"
         );
         stop_server(child, port);
     }

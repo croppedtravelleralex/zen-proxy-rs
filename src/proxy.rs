@@ -226,6 +226,9 @@ pub async fn proxy_handler(
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                cached_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 bytes_sent: body_len,
                 bytes_received: pr.body_bytes.len() as u64,
                 failure_kind: if status < 400 {
