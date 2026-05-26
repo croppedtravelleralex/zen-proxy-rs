@@ -11,7 +11,10 @@ concurrency, and reduced Redis budget overhead. V4.4 hardens pool fault
 classification so upstream 5xx, timeout, empty-output, and retry-budget
 failures do not incorrectly bury healthy proxy nodes. V4.5 adds cache-affinity
 and effective-TTFT routing so repeated large contexts prefer paths that have
-already shown good cache and first-content behavior.
+already shown good cache and first-content behavior. V4.6 adds a protocol graph
+guard and pair-aware compactor so malformed tool-call history from Hermes,
+OpenClaw, Claude Code, CherryStudio, OpenAI SDKs, and Anthropic SDKs is repaired
+or safely downgraded before DeepSeek sees it.
 
 ## Current Goal
 
@@ -60,6 +63,7 @@ root-level legacy audit reports as active guidance.
 8. [V4.3 Scalable Data Plane](./11_v4.3_scalable_data_plane.md)
 9. [V4.4 Pool Fault Isolation](./12_v4.4_pool_fault_isolation.md)
 10. [V4.5 Cache Affinity and Effective TTFT](./13_v4.5_cache_affinity_ttft.md)
+11. [V4.6 Protocol Graph Guard and Pair-Aware Compactor](./14_v4.6_protocol_guard.md)
 
 ## Hard Decisions
 
@@ -78,6 +82,9 @@ root-level legacy audit reports as active guidance.
 - NewAPI is not part of this repository and must not be modified when fixing
   ZenProxy behavior. The intended external chain is:
   `client -> NewAPI -> ZenProxyRS :4000 -> free-model-client kernel -> Zen`.
+- Protocol compatibility fixes belong in ZenProxy/free-model-client, not in
+  NewAPI or Claude Code. Tool-call history must be repaired or downgraded before
+  it reaches the DeepSeek-compatible upstream.
 
 ## Current Runtime Entry Points
 
@@ -165,6 +172,12 @@ Current V4.4 verification on 2026-05-26:
   `timings.first_content_token_ms`; a repeated 150KB same-path stream improved
   from about 2.33s first chunk to about 1.09s first chunk with
   `affinity_hit=true`.
+- V4.6 landed and is deployed on `panda` after V4.5: `ProtocolGuard` repairs or downgrades
+  malformed OpenAI/Anthropic tool history before typed free-model-client
+  conversion, and the final guard pass runs after context compaction so orphan
+  tool results are not sent upstream. Deployed release SHA1:
+  `27b14d90f6c9ebaccc6252ec896bc3593d2080f7`; production malformed
+  `tool_call_id` smoke returned HTTP 200 and audit showed `post_valid=true`.
 - 2026-05-26 production smoke after deploy: direct ZenProxy stream returned
   HTTP 200 with `time_starttransfer=1.410657s`; recent 220k+ cached-token
   audit rows were still around 2.4-4.0s TTFT, showing the remaining bottleneck

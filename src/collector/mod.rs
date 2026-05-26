@@ -50,6 +50,8 @@ pub struct RequestTelemetry {
     pub affinity_node_id: String,
     #[serde(default)]
     pub body_size_bucket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_guard: Option<ProtocolGuardTelemetry>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
@@ -68,6 +70,88 @@ pub struct RequestTelemetry {
     #[serde(default)]
     pub retry_chain: Vec<RequestAttemptTelemetry>,
     pub context: Option<ContextTelemetry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProtocolGuardTelemetry {
+    pub mode: String,
+    pub source_client: String,
+    pub applied: bool,
+    pub pre_invalid: bool,
+    pub post_valid: bool,
+    pub missing_tool_call_id_count: u32,
+    pub missing_tool_use_id_count: u32,
+    pub synthetic_tool_id_count: u32,
+    pub paired_tool_result_count: u32,
+    pub orphan_tool_result_count: u32,
+    pub downgraded_tool_result_count: u32,
+    pub orphan_assistant_call_count: u32,
+    pub message_count_before: u32,
+    pub message_count_after: u32,
+    pub quality_risk: String,
+    pub scan_ms: u64,
+    pub repair_ms: u64,
+    pub validate_ms: u64,
+    pub total_ms: u64,
+}
+
+impl ProtocolGuardTelemetry {
+    pub fn merge(&mut self, other: Self) {
+        if self.mode.is_empty() {
+            self.mode = other.mode.clone();
+        }
+        if self.source_client.is_empty() {
+            self.source_client = other.source_client.clone();
+        }
+        self.applied |= other.applied;
+        self.pre_invalid |= other.pre_invalid;
+        self.post_valid &= other.post_valid;
+        self.missing_tool_call_id_count = self
+            .missing_tool_call_id_count
+            .saturating_add(other.missing_tool_call_id_count);
+        self.missing_tool_use_id_count = self
+            .missing_tool_use_id_count
+            .saturating_add(other.missing_tool_use_id_count);
+        self.synthetic_tool_id_count = self
+            .synthetic_tool_id_count
+            .saturating_add(other.synthetic_tool_id_count);
+        self.paired_tool_result_count = self
+            .paired_tool_result_count
+            .saturating_add(other.paired_tool_result_count);
+        self.orphan_tool_result_count = self
+            .orphan_tool_result_count
+            .saturating_add(other.orphan_tool_result_count);
+        self.downgraded_tool_result_count = self
+            .downgraded_tool_result_count
+            .saturating_add(other.downgraded_tool_result_count);
+        self.orphan_assistant_call_count = self
+            .orphan_assistant_call_count
+            .saturating_add(other.orphan_assistant_call_count);
+        self.message_count_before = self.message_count_before.max(other.message_count_before);
+        self.message_count_after = other.message_count_after.max(self.message_count_after);
+        self.quality_risk = max_quality_risk(&self.quality_risk, &other.quality_risk).to_string();
+        self.scan_ms = self.scan_ms.saturating_add(other.scan_ms);
+        self.repair_ms = self.repair_ms.saturating_add(other.repair_ms);
+        self.validate_ms = self.validate_ms.saturating_add(other.validate_ms);
+        self.total_ms = self.total_ms.saturating_add(other.total_ms);
+    }
+}
+
+fn max_quality_risk<'a>(left: &'a str, right: &'a str) -> &'a str {
+    fn rank(value: &str) -> u8 {
+        match value {
+            "critical" => 4,
+            "high" => 3,
+            "medium" => 2,
+            "low" => 1,
+            _ => 0,
+        }
+    }
+    if rank(right) > rank(left) {
+        right
+    } else {
+        left
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

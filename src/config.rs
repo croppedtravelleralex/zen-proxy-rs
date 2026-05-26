@@ -110,6 +110,81 @@ impl FromStr for ArtifactCacheMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolGuardMode {
+    Off,
+    Observe,
+    Repair,
+    Strict,
+    RepairShadow,
+}
+
+impl ProtocolGuardMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+            Self::Repair => "repair",
+            Self::Strict => "strict",
+            Self::RepairShadow => "repair_shadow",
+        }
+    }
+}
+
+impl fmt::Display for ProtocolGuardMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProtocolGuardMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "observe" | "observe_only" | "observe-only" => Ok(Self::Observe),
+            "repair" | "on" => Ok(Self::Repair),
+            "strict" => Ok(Self::Strict),
+            "repair_shadow" | "repair-shadow" | "shadow" => Ok(Self::RepairShadow),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolGuardOrphanPolicy {
+    Downgrade,
+    Reject,
+}
+
+impl ProtocolGuardOrphanPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Downgrade => "downgrade",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+impl fmt::Display for ProtocolGuardOrphanPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProtocolGuardOrphanPolicy {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "downgrade" | "recover" => Ok(Self::Downgrade),
+            "reject" | "error" => Ok(Self::Reject),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalBudgetMode {
     Off,
     SyncRedis,
@@ -213,6 +288,13 @@ pub struct Config {
     pub artifact_cache_dir: String,
     pub artifact_cache_max_mb: u64,
     pub artifact_cache_ttl_hours: u64,
+    pub protocol_guard_mode: ProtocolGuardMode,
+    pub protocol_guard_orphan_policy: ProtocolGuardOrphanPolicy,
+    pub protocol_guard_synthetic_ids: bool,
+    pub protocol_guard_log_sample_rate: f64,
+    pub protocol_guard_max_ms: u64,
+    pub protocol_guard_max_graph_messages: usize,
+    pub protocol_guard_max_repair_actions: usize,
     pub v43_lanes_enabled: bool,
     pub v43_short_nonstream_concurrency: usize,
     pub v43_stream_concurrency: usize,
@@ -337,6 +419,22 @@ impl Config {
                 .unwrap_or_else(|_| "/tmp/zen-proxy-artifacts".into()),
             artifact_cache_max_mb: load_env_var("ARTIFACT_CACHE_MAX_MB", 2048u64),
             artifact_cache_ttl_hours: load_env_var("ARTIFACT_CACHE_TTL_HOURS", 24u64),
+            protocol_guard_mode: load_env_var("PROTOCOL_GUARD_MODE", ProtocolGuardMode::Repair),
+            protocol_guard_orphan_policy: load_env_var(
+                "PROTOCOL_GUARD_ORPHAN_POLICY",
+                ProtocolGuardOrphanPolicy::Downgrade,
+            ),
+            protocol_guard_synthetic_ids: load_env_var("PROTOCOL_GUARD_SYNTHETIC_IDS", true),
+            protocol_guard_log_sample_rate: load_env_var("PROTOCOL_GUARD_LOG_SAMPLE_RATE", 1.0f64),
+            protocol_guard_max_ms: load_env_var("PROTOCOL_GUARD_MAX_MS", 30u64),
+            protocol_guard_max_graph_messages: load_env_var(
+                "PROTOCOL_GUARD_MAX_GRAPH_MESSAGES",
+                2000usize,
+            ),
+            protocol_guard_max_repair_actions: load_env_var(
+                "PROTOCOL_GUARD_MAX_REPAIR_ACTIONS",
+                200usize,
+            ),
             v43_lanes_enabled: load_env_var("V43_LANES_ENABLED", false),
             v43_short_nonstream_concurrency: load_env_var(
                 "V43_SHORT_NONSTREAM_CONCURRENCY",
@@ -584,6 +682,13 @@ mod tests {
             "ARTIFACT_CACHE_DIR",
             "ARTIFACT_CACHE_MAX_MB",
             "ARTIFACT_CACHE_TTL_HOURS",
+            "PROTOCOL_GUARD_MODE",
+            "PROTOCOL_GUARD_ORPHAN_POLICY",
+            "PROTOCOL_GUARD_SYNTHETIC_IDS",
+            "PROTOCOL_GUARD_LOG_SAMPLE_RATE",
+            "PROTOCOL_GUARD_MAX_MS",
+            "PROTOCOL_GUARD_MAX_GRAPH_MESSAGES",
+            "PROTOCOL_GUARD_MAX_REPAIR_ACTIONS",
             "V43_LANES_ENABLED",
             "V43_SHORT_NONSTREAM_CONCURRENCY",
             "V43_STREAM_CONCURRENCY",
@@ -642,6 +747,16 @@ mod tests {
         assert_eq!(cfg.artifact_cache_dir, "/tmp/zen-proxy-artifacts");
         assert_eq!(cfg.artifact_cache_max_mb, 2048);
         assert_eq!(cfg.artifact_cache_ttl_hours, 24);
+        assert_eq!(cfg.protocol_guard_mode, ProtocolGuardMode::Repair);
+        assert_eq!(
+            cfg.protocol_guard_orphan_policy,
+            ProtocolGuardOrphanPolicy::Downgrade
+        );
+        assert!(cfg.protocol_guard_synthetic_ids);
+        assert_eq!(cfg.protocol_guard_log_sample_rate, 1.0);
+        assert_eq!(cfg.protocol_guard_max_ms, 30);
+        assert_eq!(cfg.protocol_guard_max_graph_messages, 2000);
+        assert_eq!(cfg.protocol_guard_max_repair_actions, 200);
         assert!(!cfg.v43_lanes_enabled);
         assert_eq!(cfg.v43_short_nonstream_concurrency, 32);
         assert_eq!(cfg.v43_stream_concurrency, 96);
@@ -700,6 +815,13 @@ mod tests {
         unsafe { env::set_var("ARTIFACT_CACHE_DIR", "/tmp/zen-test-artifacts") };
         unsafe { env::set_var("ARTIFACT_CACHE_MAX_MB", "64") };
         unsafe { env::set_var("ARTIFACT_CACHE_TTL_HOURS", "2") };
+        unsafe { env::set_var("PROTOCOL_GUARD_MODE", "strict") };
+        unsafe { env::set_var("PROTOCOL_GUARD_ORPHAN_POLICY", "reject") };
+        unsafe { env::set_var("PROTOCOL_GUARD_SYNTHETIC_IDS", "false") };
+        unsafe { env::set_var("PROTOCOL_GUARD_LOG_SAMPLE_RATE", "0.5") };
+        unsafe { env::set_var("PROTOCOL_GUARD_MAX_MS", "11") };
+        unsafe { env::set_var("PROTOCOL_GUARD_MAX_GRAPH_MESSAGES", "123") };
+        unsafe { env::set_var("PROTOCOL_GUARD_MAX_REPAIR_ACTIONS", "9") };
         unsafe { env::set_var("V43_LANES_ENABLED", "true") };
         unsafe { env::set_var("V43_SHORT_NONSTREAM_CONCURRENCY", "33") };
         unsafe { env::set_var("V43_STREAM_CONCURRENCY", "99") };
@@ -765,6 +887,16 @@ mod tests {
         assert_eq!(cfg.artifact_cache_dir, "/tmp/zen-test-artifacts");
         assert_eq!(cfg.artifact_cache_max_mb, 64);
         assert_eq!(cfg.artifact_cache_ttl_hours, 2);
+        assert_eq!(cfg.protocol_guard_mode, ProtocolGuardMode::Strict);
+        assert_eq!(
+            cfg.protocol_guard_orphan_policy,
+            ProtocolGuardOrphanPolicy::Reject
+        );
+        assert!(!cfg.protocol_guard_synthetic_ids);
+        assert_eq!(cfg.protocol_guard_log_sample_rate, 0.5);
+        assert_eq!(cfg.protocol_guard_max_ms, 11);
+        assert_eq!(cfg.protocol_guard_max_graph_messages, 123);
+        assert_eq!(cfg.protocol_guard_max_repair_actions, 9);
         assert!(cfg.v43_lanes_enabled);
         assert_eq!(cfg.v43_short_nonstream_concurrency, 33);
         assert_eq!(cfg.v43_stream_concurrency, 99);
@@ -820,6 +952,13 @@ mod tests {
             "ARTIFACT_CACHE_DIR",
             "ARTIFACT_CACHE_MAX_MB",
             "ARTIFACT_CACHE_TTL_HOURS",
+            "PROTOCOL_GUARD_MODE",
+            "PROTOCOL_GUARD_ORPHAN_POLICY",
+            "PROTOCOL_GUARD_SYNTHETIC_IDS",
+            "PROTOCOL_GUARD_LOG_SAMPLE_RATE",
+            "PROTOCOL_GUARD_MAX_MS",
+            "PROTOCOL_GUARD_MAX_GRAPH_MESSAGES",
+            "PROTOCOL_GUARD_MAX_REPAIR_ACTIONS",
             "V43_LANES_ENABLED",
             "V43_SHORT_NONSTREAM_CONCURRENCY",
             "V43_STREAM_CONCURRENCY",

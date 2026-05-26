@@ -244,6 +244,15 @@ impl AdminService {
                 "token_compact": cfg.context_token_compact,
                 "token_target": cfg.context_token_target,
             },
+            "protocol_guard": {
+                "mode": cfg.protocol_guard_mode.to_string(),
+                "orphan_policy": cfg.protocol_guard_orphan_policy.to_string(),
+                "synthetic_ids": cfg.protocol_guard_synthetic_ids,
+                "log_sample_rate": cfg.protocol_guard_log_sample_rate,
+                "max_ms": cfg.protocol_guard_max_ms,
+                "max_graph_messages": cfg.protocol_guard_max_graph_messages,
+                "max_repair_actions": cfg.protocol_guard_max_repair_actions,
+            },
             "v43_lanes": {
                 "enabled": cfg.v43_lanes_enabled,
                 "short_nonstream_concurrency": cfg.v43_short_nonstream_concurrency,
@@ -714,6 +723,15 @@ impl AdminService {
                 "token_target": cfg.context_token_target,
                 "large_chunk_bytes": cfg.context_large_chunk_bytes,
                 "preserve_recent_messages": cfg.context_preserve_recent_messages,
+            },
+            "protocol_guard": {
+                "mode": cfg.protocol_guard_mode.to_string(),
+                "orphan_policy": cfg.protocol_guard_orphan_policy.to_string(),
+                "synthetic_ids": cfg.protocol_guard_synthetic_ids,
+                "log_sample_rate": cfg.protocol_guard_log_sample_rate,
+                "max_ms": cfg.protocol_guard_max_ms,
+                "max_graph_messages": cfg.protocol_guard_max_graph_messages,
+                "max_repair_actions": cfg.protocol_guard_max_repair_actions,
             },
             "node_budget": {
                 "max_calls_per_window": cfg.node_max_calls_per_window,

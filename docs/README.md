@@ -26,6 +26,8 @@ Start here:
 | [10_2026-05-25_operations_report.md](./v4.0/10_2026-05-25_operations_report.md) | V4.1-A maintenance notes and 2026-05-25 NewAPI call analysis |
 | [11_v4.3_scalable_data_plane.md](./v4.0/11_v4.3_scalable_data_plane.md) | V4.3 scalable data-plane target and lane isolation |
 | [12_v4.4_pool_fault_isolation.md](./v4.0/12_v4.4_pool_fault_isolation.md) | V4.4 pool fault isolation, node anti-mis-injury, and 2026-05-26 deployment evidence |
+| [13_v4.5_cache_affinity_ttft.md](./v4.0/13_v4.5_cache_affinity_ttft.md) | V4.5 cache-affinity routing and effective TTFT telemetry |
+| [14_v4.6_protocol_guard.md](./v4.0/14_v4.6_protocol_guard.md) | V4.6 protocol graph guard and pair-aware compactor |
 
 ## AI Maintenance Rule
 

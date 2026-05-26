@@ -431,6 +431,7 @@ mod e2e {
             .json(&serde_json::json!({
                 "model": "deepseek-v4-flash",
                 "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "old-tool", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]},
                     {"role": "tool", "content": "x".repeat(2 * 1024 * 1024), "tool_call_id": "old-tool"},
                     {"role": "assistant", "content": "recent assistant"},
                     {"role": "user", "content": "latest user"}
@@ -457,9 +458,72 @@ mod e2e {
         assert_eq!(seen.len(), 1);
         let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
         assert_eq!(upstream_messages.last().unwrap()["content"], "latest user");
-        let compacted_tool = upstream_messages[0]["content"].as_str().unwrap();
+        let compacted_tool = upstream_messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("paired tool result should remain protocol-shaped");
         assert!(compacted_tool.contains("ZenProxy context compactor"));
         assert!(compacted_tool.len() < 16 * 1024);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_protocol_guard_repairs_openai_tool_history_before_upstream() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19804,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("PROTOCOL_GUARD_MODE", "repair"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("user-agent", "OpenClaw-test")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role":"assistant","content":null,"tool_calls":[{"id":"call_guard_1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+                    {"role":"tool","content":"file contents"},
+                    {"role":"user","content":"continue"}
+                ],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 protocol guard request");
+        assert_eq!(resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
+        let tool_message = upstream_messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("tool message should remain protocol-shaped");
+        assert_eq!(tool_message["tool_call_id"], "call_guard_1");
+        drop(seen);
+
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let record = requests_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["protocol_guard"]["applied"] == true)
+            .expect("protocol guard telemetry record");
+        assert_eq!(record["protocol_guard"]["source_client"], "openclaw");
+        assert_eq!(record["protocol_guard"]["missing_tool_call_id_count"], 1);
+        assert_eq!(record["protocol_guard"]["post_valid"], true);
         stop_server(child, port);
     }
 

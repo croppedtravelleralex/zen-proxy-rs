@@ -228,6 +228,7 @@ pub async fn proxy_handler(
                 affinity_hit: false,
                 affinity_node_id: String::new(),
                 body_size_bucket: body_size_bucket(body_len).to_string(),
+                protocol_guard: None,
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,

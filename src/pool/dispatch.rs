@@ -261,7 +261,7 @@ impl PoolNode {
         if success {
             self.raise_base_score();
             let prev = self.consecutive_successes.fetch_add(1, Ordering::Relaxed);
-            if prev.saturating_add(1) % 3 == 0 {
+            if prev.saturating_add(1).is_multiple_of(3) {
                 let _ =
                     self.max_concurrent
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -869,9 +869,7 @@ impl Pool for DispatchPool {
             return;
         }
         let mut affinity = self.affinity.write().unwrap();
-        let nodes = affinity
-            .entry(affinity_key.to_string())
-            .or_insert_with(VecDeque::new);
+        let nodes = affinity.entry(affinity_key.to_string()).or_default();
         nodes.retain(|id| id != node_id);
         nodes.push_front(node_id.clone());
         while nodes.len() > AFFINITY_MAX_NODES {

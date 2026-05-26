@@ -36,6 +36,7 @@ pub fn new_telemetry() -> RequestTelemetry {
         affinity_hit: false,
         affinity_node_id: String::new(),
         body_size_bucket: String::new(),
+        protocol_guard: None,
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,

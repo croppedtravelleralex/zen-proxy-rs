@@ -5,9 +5,11 @@
 ```text
 POST /v1/chat/completions
 -> parse and validate request
+-> protocol guard pre-scan repairs or marks unsafe tool history
 -> profile request body, messages, tools, and estimated tokens
 -> budget decision: pass, warn, observe_compact, compact, or reject
--> optionally compact old low-value context before upstream dispatch
+-> pair-aware compactor trims old low-value context without orphaning tool pairs
+-> protocol guard final validation before upstream dispatch
 -> build RequestContext
 -> ModelRegistry resolves public model to upstream model
 -> PoolManager dispatch selects node
@@ -25,9 +27,11 @@ POST /v1/chat/completions
 ```text
 POST /v1/messages
 -> parse and validate Anthropic request
+-> protocol guard pre-scan repairs or marks unsafe tool_use/tool_result history
 -> profile request body, messages, tools, and estimated tokens
 -> budget decision: pass, warn, observe_compact, compact, or reject
--> optionally compact old low-value context before upstream dispatch
+-> pair-aware compactor trims old low-value context without orphaning tool pairs
+-> protocol guard final validation before upstream dispatch
 -> build RequestContext
 -> map public model
 -> select node and transport
@@ -43,9 +47,11 @@ POST /v1/messages
 ```text
 request reaches ZenProxyRS ingress
 -> ContextProfiler records body bytes, token estimate, messages, tools, largest message
+-> ProtocolGraph records tool-call/tool-result pairing boundaries
 -> ContextBudgeter compares against body and token thresholds
 -> observe mode: record intended compaction, pass body unchanged
--> enforce mode: trim old tool results / old large text / old prefixes
+-> enforce mode: trim old tool results / old large text / old prefixes while preserving or downgrading tool pairs
+-> final protocol validation prevents orphan tool results from reaching upstream
 -> if still above upstream-safe body limit: return structured 413
 -> otherwise continue normal provider flow
 ```
@@ -55,7 +61,26 @@ Required behavior:
 - ingress body limit is configurable and must exceed Axum's default 2MB.
 - upstream-safe target stays below the standard 32MB body budget.
 - current user input and recent tool chain are preserved.
+- assistant tool calls and tool results are preserved as pairs or downgraded as
+  ordinary context.
+- compaction must not create orphan `role=tool` messages or orphan assistant
+  tool calls.
 - every compaction action is visible in request telemetry.
+
+### Malformed Tool History
+
+```text
+request contains missing tool_call_id / tool_use_id / orphan tool result
+-> ProtocolGuard builds a lightweight protocol graph
+-> safe unique pairing is repaired in place
+-> uncertain or orphan tool results are downgraded to ordinary text context
+-> final validator checks the compacted body
+-> unrecoverable structure returns a clear ZenProxy 400
+```
+
+DeepSeek-compatible upstreams must not receive invalid tool-message structures.
+ZenProxy should return or repair the error at the source layer instead of
+letting a strict upstream deserialization error leak back to the client.
 
 ### 429 or FreeUsageLimitError
 

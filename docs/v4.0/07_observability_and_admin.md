@@ -142,6 +142,34 @@ Audit records include V4.1 fields:
 - timing breakdown
 - token and byte counters
 - V4.5 effective-TTFT and cache-affinity fields
+- V4.6 protocol guard summary when tool-call history is scanned or repaired
+
+V4.6 protocol guard telemetry is nested under `protocol_guard`. It records
+counts and risk only, not raw tool output content:
+
+```json
+"protocol_guard": {
+  "mode": "repair",
+  "source_client": "openclaw",
+  "applied": true,
+  "pre_invalid": true,
+  "post_valid": true,
+  "missing_tool_call_id_count": 1,
+  "missing_tool_use_id_count": 0,
+  "synthetic_tool_id_count": 1,
+  "paired_tool_result_count": 1,
+  "orphan_tool_result_count": 0,
+  "downgraded_tool_result_count": 0,
+  "orphan_assistant_call_count": 0,
+  "message_count_before": 20,
+  "message_count_after": 20,
+  "quality_risk": "low",
+  "scan_ms": 0,
+  "repair_ms": 0,
+  "validate_ms": 0,
+  "total_ms": 0
+}
+```
 
 Current anomaly classes:
 

@@ -14,13 +14,17 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::collector::{DataCollector, RequestAttemptTelemetry, RequestTelemetry, RequestTimings};
+use crate::collector::{
+    DataCollector, ProtocolGuardTelemetry, RequestAttemptTelemetry, RequestTelemetry,
+    RequestTimings,
+};
 use crate::config::Config;
 use crate::ledger::LedgerEvent;
 use crate::pool::{body_size_bucket, DispatchError, ErrorKind, RequestMeta, ResultKind};
 use crate::state::AppState;
 use crate::v4::context;
 use crate::v4::model::{ModelError, ModelRegistry, StaticModelRegistry};
+use crate::v4::protocol_guard::{self, GuardPhase};
 
 pub async fn handle_v4_proxy(
     state: &Arc<AppState>,
@@ -36,7 +40,7 @@ pub async fn handle_v4_proxy(
     }
 
     let conf = state.config.read().unwrap().clone();
-    let parsed: Value = match serde_json::from_slice(&body) {
+    let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => {
             return error_response(
@@ -45,6 +49,21 @@ pub async fn handle_v4_proxy(
             );
         }
     };
+    let source_client = infer_source_client(headers);
+    let mut protocol_guard_summary: Option<ProtocolGuardTelemetry> = None;
+    let raw_has_tool_markers = protocol_guard::raw_body_has_tool_markers(&body);
+    match protocol_guard::guard_body(
+        &conf,
+        path,
+        &mut parsed,
+        &source_client,
+        GuardPhase::PreCompact,
+        raw_has_tool_markers,
+    ) {
+        Ok(summary) => merge_protocol_guard_summary(&mut protocol_guard_summary, summary),
+        Err(reject) => return error_response(reject.status, reject.message),
+    }
+
     let context_plan = match context::govern_request(&conf, path, parsed, body.len()) {
         Ok(plan) => plan,
         Err(reject) => return error_response(reject.status, reject.message),
@@ -52,7 +71,22 @@ pub async fn handle_v4_proxy(
     let external_request_id = extract_external_request_id(headers);
     let gateway = infer_gateway(headers, &external_request_id);
     let mut context_telemetry = context_plan.telemetry();
-    let parsed = context_plan.body;
+    let mut parsed = context_plan.body;
+    let force_final_guard = protocol_guard_summary
+        .as_ref()
+        .is_some_and(|summary| summary.applied || summary.pre_invalid)
+        || context_telemetry.trimmed;
+    match protocol_guard::guard_body(
+        &conf,
+        path,
+        &mut parsed,
+        &source_client,
+        GuardPhase::PostCompact,
+        force_final_guard,
+    ) {
+        Ok(summary) => merge_protocol_guard_summary(&mut protocol_guard_summary, summary),
+        Err(reject) => return error_response(reject.status, reject.message),
+    }
 
     let streaming = parsed
         .get("stream")
@@ -193,6 +227,7 @@ pub async fn handle_v4_proxy(
                 failure_message: String::new(),
                 retry_chain: result.retry_chain,
                 context: Some(context_telemetry.clone()),
+                protocol_guard: protocol_guard_summary.clone(),
             };
             state.upstream_health.record(status);
             let mut response = if streaming {
@@ -284,6 +319,7 @@ pub async fn handle_v4_proxy(
                     failure_message: err.message.clone(),
                     retry_chain: err.retry_chain.clone(),
                     context: Some(context_telemetry.clone()),
+                    protocol_guard: protocol_guard_summary.clone(),
                 });
             }
             let mut response = error_response(err.status, err.message);
@@ -366,6 +402,49 @@ fn infer_gateway(headers: &HeaderMap, external_request_id: &str) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+fn infer_source_client(headers: &HeaderMap) -> String {
+    if let Some(value) = extract_header(headers, "x-zen-source-client")
+        .or_else(|| extract_header(headers, "x-client-name"))
+        .or_else(|| extract_header(headers, "x-stainless-package-version"))
+    {
+        return normalize_source_client(&value);
+    }
+    let user_agent = extract_header(headers, "user-agent").unwrap_or_default();
+    normalize_source_client(&user_agent)
+}
+
+fn normalize_source_client(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("openclaw") {
+        "openclaw".to_string()
+    } else if lower.contains("hermes") {
+        "hermes".to_string()
+    } else if lower.contains("claude") {
+        "claude-code".to_string()
+    } else if lower.contains("cherrystudio") || lower.contains("cherry studio") {
+        "cherrystudio".to_string()
+    } else if lower.contains("anthropic") {
+        "anthropic-sdk".to_string()
+    } else if lower.contains("openai") {
+        "openai-sdk".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn merge_protocol_guard_summary(
+    target: &mut Option<ProtocolGuardTelemetry>,
+    summary: ProtocolGuardTelemetry,
+) {
+    if !summary.applied && !summary.pre_invalid {
+        return;
+    }
+    match target {
+        Some(existing) => existing.merge(summary),
+        None => *target = Some(summary),
+    }
 }
 
 struct V4CallResult {
@@ -1463,15 +1542,14 @@ impl StreamMetrics {
     fn ingest_usage_value(&mut self, path: &str, value: &Value) {
         if path == "messages" {
             match value.get("type").and_then(Value::as_str) {
-                Some("content_block_start") => {
+                Some("content_block_start")
                     if value
                         .get("content_block")
                         .and_then(|block| block.get("type"))
                         .and_then(Value::as_str)
-                        .is_some_and(|kind| kind == "tool_use")
-                    {
-                        self.tool_output_chunks = self.tool_output_chunks.saturating_add(1);
-                    }
+                        .is_some_and(|kind| kind == "tool_use") =>
+                {
+                    self.tool_output_chunks = self.tool_output_chunks.saturating_add(1);
                 }
                 Some("content_block_delta") => {
                     if let Some(delta) = value.get("delta") {

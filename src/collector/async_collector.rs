@@ -9,7 +9,7 @@ use crate::collector::{
 };
 
 enum CollectorEvent {
-    Request(RequestTelemetry),
+    Request(Box<RequestTelemetry>),
     Pool(PoolEvent),
     Schedule(ScheduleEvent),
     Probe(ProbeEvent),
@@ -29,7 +29,7 @@ impl AsyncCollector {
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
-                    CollectorEvent::Request(item) => worker_inner.record_request(&item),
+                    CollectorEvent::Request(item) => worker_inner.record_request(item.as_ref()),
                     CollectorEvent::Pool(item) => worker_inner.record_pool(&item),
                     CollectorEvent::Schedule(item) => worker_inner.record_schedule(&item),
                     CollectorEvent::Probe(item) => worker_inner.record_probe(&item),
@@ -58,12 +58,15 @@ impl AsyncCollector {
 
 impl DataCollector for AsyncCollector {
     fn record_request(&self, tele: &RequestTelemetry) {
-        match self.tx.try_send(CollectorEvent::Request(tele.clone())) {
+        match self
+            .tx
+            .try_send(CollectorEvent::Request(Box::new(tele.clone())))
+        {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(CollectorEvent::Request(item)))
             | Err(mpsc::error::TrySendError::Closed(CollectorEvent::Request(item))) => {
                 self.dropped_events.fetch_add(1, Ordering::Relaxed);
-                self.inner.record_request(&item);
+                self.inner.record_request(item.as_ref());
             }
             Err(_) => {
                 self.dropped_events.fetch_add(1, Ordering::Relaxed);
