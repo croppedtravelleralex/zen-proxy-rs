@@ -93,7 +93,11 @@ Current runtime services:
 
 ```text
 Current panda deployment:
-zen-proxy-rs.service: listens on 0.0.0.0:4000
+nginx.service: listens on 0.0.0.0:4000 and load-balances ZenProxy backends
+zen-proxy-rs@1.service: 127.0.0.1:4001, INSTANCE_ID=panda-zen-1
+zen-proxy-rs@2.service: 127.0.0.1:4002, INSTANCE_ID=panda-zen-2
+zen-proxy-rs@3.service: 127.0.0.1:4004, INSTANCE_ID=panda-zen-3
+redis-server.service: 127.0.0.1:6379 for V4.3 global node budget
 ```
 
 ## Current V4.1-A Evidence
@@ -131,15 +135,20 @@ Confirmed on 2026-05-25:
 
 Current V4.4 verification on 2026-05-26:
 
-- `zen-proxy-rs.service` on `panda` is active on port 4000.
+- `panda` now uses nginx on port 4000 in front of three ZenProxyRS instances.
 - deployed binary SHA1:
   `7207a649be4cebe74b265a5a61f85bfc0ba5c602`.
 - `V4_RETRY_BUDGET_MS=60000`.
-- after restart, `/admin/runtime` showed `dispatch=90`, `dead=0`,
-  `active=0`, `leased=0`.
+- each instance uses `V43_GLOBAL_BUDGET_MODE=sync_redis` and
+  `GLOBAL_BUDGET_REDIS_URL=redis://127.0.0.1:6379/`.
+- after multi-instance rollout, all three instances showed `dispatch=90`,
+  `dead=0`, `active=0`, `leased=0`.
 - NewAPI `http://127.0.0.1:8081` with key `sk-dev` returned HTTP 200 for
   `deepseek-v4-flash` and `deepseek-v4-flash-lite`, both streaming and
   non-streaming.
+- a 12-call NewAPI smoke distributed evenly through nginx:
+  4 calls on `zen-proxy-rs@1`, 4 on `zen-proxy-rs@2`, and 4 on
+  `zen-proxy-rs@3`.
 
 Latest V4.3 verification on 2026-05-25:
 
