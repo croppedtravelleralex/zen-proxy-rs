@@ -4,6 +4,8 @@ use rand::Rng;
 
 use reqwest::Client;
 use serde::Deserialize;
+use std::hash::{Hash, Hasher};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const UA: &str = "opencode/1.15.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
@@ -46,11 +48,14 @@ pub struct ZenFunctionDelta {
     pub arguments: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ZenUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub prompt_tokens_details: Option<serde_json::Value>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -81,14 +86,44 @@ fn make_id(prefix: &str) -> String {
     format!("{}_{}", prefix, tail)
 }
 
-pub fn zen_headers(api_key: &str) -> Vec<(String, String)> {
+fn short_hash(input: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn stable_session_id(api_key: &str, body: &serde_json::Value) -> String {
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let ttl_secs = std::env::var("ZEN_UPSTREAM_SESSION_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(3600)
+        .max(1);
+    let bucket = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / ttl_secs;
+    format!(
+        "ses_{}",
+        short_hash(&format!("{}:{}:{}", short_hash(api_key), model, bucket))
+    )
+}
+
+pub fn zen_headers(api_key: &str, body: &serde_json::Value) -> Vec<(String, String)> {
     vec![
         ("authorization".into(), format!("Bearer {}", api_key)),
         ("user-agent".into(), UA.into()),
         ("x-opencode-client".into(), "cli".into()),
         ("x-opencode-project".into(), "global".into()),
         ("x-opencode-request".into(), make_id("msg")),
-        ("x-opencode-session".into(), make_id("ses")),
+        (
+            "x-opencode-session".into(),
+            stable_session_id(api_key, body),
+        ),
     ]
 }
 
@@ -109,7 +144,7 @@ pub async fn fetch_zen_stream_with_headers(
     extra_headers: &[(String, String)],
 ) -> Result<reqwest::Response, crate::error::AppError> {
     let mut req = client.post(zen_url).json(body);
-    for (k, v) in zen_headers(api_key) {
+    for (k, v) in zen_headers(api_key, body) {
         req = req.header(k, v);
     }
     for (k, v) in extra_headers {
@@ -295,5 +330,46 @@ pub fn stream_sse_events(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn header_value(headers: &[(String, String)], name: &str) -> String {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .unwrap()
+    }
+
+    #[test]
+    fn opencode_session_is_stable_for_same_key_and_model() {
+        let body = json!({"model":"deepseek-v4-flash-free"});
+        let first = zen_headers("sk-test", &body);
+        let second = zen_headers("sk-test", &body);
+
+        assert_eq!(
+            header_value(&first, "x-opencode-session"),
+            header_value(&second, "x-opencode-session")
+        );
+        assert_ne!(
+            header_value(&first, "x-opencode-request"),
+            header_value(&second, "x-opencode-request")
+        );
+    }
+
+    #[test]
+    fn opencode_session_changes_by_model() {
+        let first = zen_headers("sk-test", &json!({"model":"deepseek-v4-flash-free"}));
+        let second = zen_headers("sk-test", &json!({"model":"big pickle"}));
+
+        assert_ne!(
+            header_value(&first, "x-opencode-session"),
+            header_value(&second, "x-opencode-session")
+        );
     }
 }

@@ -4,6 +4,7 @@ use crate::protocol::translate::estimate_tokens as estimate;
 use crate::protocol::{translate, types::*};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -17,6 +18,7 @@ pub async fn handle_openai_chat(
     let tools = body.tools.clone().unwrap_or_default();
     let max_tok = body.max_tokens.unwrap_or(1024).max(32);
     let mut zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":body.tool_choice});
+    translate::disable_thinking_by_default(&mut zb);
     translate::disable_thinking_for_assistant_history(&mut zb, &body.messages);
     translate::disable_thinking_for_tool_use(&mut zb);
     translate::stabilize_short_user_prompt(&mut zb);
@@ -30,6 +32,30 @@ pub async fn handle_openai_chat(
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice: body.tool_choice.clone(),
     };
+    if translate::is_short_no_tool_health_request(&cr) {
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let prompt_tokens = estimate(&translate::build_prompt_text(&cr.messages)).max(1);
+        let completion_tokens = 1;
+        if body.stream.unwrap_or(false) {
+            return Ok(oa_ok_stream_resp(
+                created,
+                &cr.model,
+                prompt_tokens,
+                completion_tokens,
+            ));
+        }
+        return Ok(oa_text_resp(
+            created,
+            &cr.model,
+            "ok",
+            prompt_tokens,
+            completion_tokens,
+            prompt_tokens + completion_tokens,
+        ));
+    }
     if body.stream.unwrap_or(false) {
         handle_oa_stream(client, config, &cr, &zb).await
     } else {
@@ -154,6 +180,20 @@ fn oa_text_resp(ts: u64, model: &str, text: &str, pt: u64, ct: u64, total: u64) 
     Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total}})).into_response()
 }
 
+fn oa_ok_stream_resp(ts: u64, model: &str, pt: u64, ct: u64) -> Response {
+    use axum::response::sse::{Event, Sse};
+    use std::convert::Infallible;
+    let id = format!("chatcmpl_{ts}");
+    let model = model.to_string();
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":ts,"model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+        yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":ts,"model":model,"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}).to_string()));
+        yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":ts,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":pt + ct}}).to_string()));
+        yield Ok(Event::default().data("[DONE]"));
+    };
+    Sse::new(stream).into_response()
+}
+
 fn oa_tool_resp(
     ts: u64,
     model: &str,
@@ -185,19 +225,7 @@ async fn handle_oa_stream(
 ) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
-    let resp = crate::zen::client::fetch_zen_stream_with_headers(
-        client,
-        &config.zen_chat_url,
-        &config.zen_api_key,
-        zb,
-        &config.extra_headers,
-    )
-    .await?;
-    let collected = crate::zen::client::collect_stream_parts(resp).await?;
-    let text = crate::redact::redact_text(&collected.content);
-    if text.trim().is_empty() && collected.tool_calls.is_empty() {
-        return Err(AppError::empty_upstream());
-    }
+
     let model = cr.model.clone();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -206,11 +234,56 @@ async fn handle_oa_stream(
     let cid = format!("chatcmpl_{created}");
     let m = model.clone();
     let id = cid.clone();
-    let tool_calls = collected.tool_calls;
+    let prompt = translate::build_prompt_text(&cr.messages);
+    let resp = crate::zen::client::fetch_zen_stream_with_headers(
+        client,
+        &config.zen_chat_url,
+        &config.zen_api_key,
+        zb,
+        &config.extra_headers,
+    )
+    .await?;
+    let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
-        if !text.trim().is_empty() {
-            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}).to_string()));
+        let mut text = String::new();
+        let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
+        let mut usage: Option<crate::zen::client::ZenUsage> = None;
+        loop {
+            let event = match upstream.next().await {
+                Some(result) => result,
+                None => break,
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(err) => {
+                    yield Ok(Event::default().data(serde_json::json!({"error":{"message":err.message}}).to_string()));
+                    return;
+                }
+            };
+            if event.usage.is_some() {
+                usage = event.usage;
+            }
+            if let Some(choices) = event.choices {
+                for choice in choices {
+                    let Some(delta) = choice.delta else { continue; };
+                    if let Some(content) = delta.content {
+                        let content = crate::redact::redact_text(&content);
+                        if !content.trim().is_empty() {
+                            text.push_str(&content);
+                            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string()));
+                        }
+                    }
+                    if let Some(items) = delta.tool_calls {
+                        merge_tool_deltas(&mut tool_calls, items);
+                    }
+                }
+            }
+        }
+        if text.trim().is_empty() && tool_calls.is_empty() {
+            yield Ok(Event::default().data(serde_json::json!({"error":{"message":"upstream returned no assistant content or tool call"}}).to_string()));
+            yield Ok(Event::default().data("[DONE]"));
+            return;
         }
         for tool in tool_calls.iter() {
             let clean_id = tool.id.clone().unwrap_or_else(|| format!("call_{}", tool.index));
@@ -218,11 +291,60 @@ async fn handle_oa_stream(
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":tool.index,"id":clean_id,"type":"function","function":{"name":tool.name,"arguments":tool.arguments}}]},"finish_reason":null}]}).to_string()));
         }
         let finish_reason = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
-        yield Ok(Event::default().data(serde_json::json!({
+        let mut final_chunk = serde_json::json!({
             "id": id, "object": "chat.completion.chunk", "created": created,
             "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-        }).to_string()));
+        });
+        if let Some(usage) = usage {
+            let pt = usage.prompt_tokens.unwrap_or_else(|| estimate(&prompt));
+            let ct = usage.completion_tokens.unwrap_or_else(|| if !text.trim().is_empty() { estimate(&text) } else { estimate(&tool_calls.iter().map(|tool| format!("{} {}", tool.name, tool.arguments)).collect::<Vec<_>>().join("\n")).max(1) });
+            let total = usage.total_tokens.unwrap_or(pt + ct);
+            final_chunk["usage"] = serde_json::json!({"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total});
+            if let Some(details) = usage.prompt_tokens_details {
+                final_chunk["usage"]["prompt_tokens_details"] = details;
+            }
+            if let Some(cache_read) = usage.cache_read_input_tokens {
+                final_chunk["usage"]["cache_read_input_tokens"] = serde_json::json!(cache_read);
+            }
+            if let Some(cache_creation) = usage.cache_creation_input_tokens {
+                final_chunk["usage"]["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
+            }
+        }
+        yield Ok(Event::default().data(final_chunk.to_string()));
         yield Ok(Event::default().data("[DONE]"));
     };
     Ok(Sse::new(stream).into_response())
+}
+
+fn merge_tool_deltas(
+    tool_calls: &mut Vec<crate::zen::client::CollectedToolCall>,
+    deltas: Vec<crate::zen::client::ZenToolCallDelta>,
+) {
+    for delta in deltas {
+        let index = delta.index.unwrap_or(0);
+        let existing = tool_calls.iter_mut().find(|item| item.index == index);
+        let item = if let Some(item) = existing {
+            item
+        } else {
+            tool_calls.push(crate::zen::client::CollectedToolCall {
+                index,
+                id: delta.id.clone(),
+                ..crate::zen::client::CollectedToolCall::default()
+            });
+            tool_calls.last_mut().unwrap()
+        };
+        if item.id.is_none() {
+            item.id = delta.id;
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                if !name.is_empty() {
+                    item.name = name;
+                }
+            }
+            if let Some(arguments) = function.arguments {
+                item.arguments.push_str(&arguments);
+            }
+        }
+    }
 }

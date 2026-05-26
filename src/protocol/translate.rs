@@ -216,6 +216,13 @@ pub fn disable_thinking_for_assistant_history(body: &mut Value, messages: &[Mess
     body["thinking"] = serde_json::json!({"type":"disabled"});
 }
 
+pub fn disable_thinking_by_default(body: &mut Value) {
+    if body.get("thinking").is_some() {
+        return;
+    }
+    body["thinking"] = serde_json::json!({"type":"disabled"});
+}
+
 pub fn disable_thinking_for_tool_use(body: &mut Value) {
     if body.get("thinking").is_some() {
         return;
@@ -277,6 +284,28 @@ pub fn build_prompt_text(msgs: &[Message]) -> String {
 pub fn has_tools(body: &ChatRequest) -> bool {
     body.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false)
 }
+
+pub fn is_short_no_tool_health_request(body: &ChatRequest) -> bool {
+    if has_tools(body) || body.tool_choice.is_some() {
+        return false;
+    }
+
+    let user_messages = body
+        .messages
+        .iter()
+        .filter(|msg| msg.role == "user")
+        .collect::<Vec<_>>();
+    if user_messages.len() != 1 || body.messages.iter().any(|msg| msg.role == "assistant") {
+        return false;
+    }
+
+    let Some(text) = user_messages[0].content.as_str() else {
+        return false;
+    };
+    let trimmed = text.trim();
+    !trimmed.is_empty() && trimmed.chars().count() <= 2
+}
+
 pub fn is_reasoning_only_error(msg: &str) -> bool {
     msg.contains("reasoning_content without final content")
 }

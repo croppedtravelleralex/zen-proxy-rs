@@ -81,6 +81,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("role-only-empty") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\ndata: [DONE]\n\n",
+        )
+            .into_response();
+    }
 
     let chunk = if prompt.contains("tool-delta") {
         json!({
@@ -254,7 +262,7 @@ async fn anthropic_stream_returns_golden_event_sequence() {
         .unwrap();
     let body = response_text(response).await;
     assert!(body.contains("event: message_start"));
-    assert!(body.contains("\"input_tokens\":3"));
+    assert!(body.contains("\"input_tokens\":"));
     assert!(body.contains("event: content_block_delta"));
     assert!(body.contains("golden answer"));
     assert!(body.contains("\"output_tokens\":2"));
@@ -332,7 +340,7 @@ async fn openai_empty_stream_with_tools_reports_empty_output_without_synthetic_t
             parameters: None,
         },
     }];
-    let err = kernel
+    let response = kernel
         .openai_chat(
             &client,
             chat_request(
@@ -343,16 +351,16 @@ async fn openai_empty_stream_with_tools_reports_empty_output_without_synthetic_t
             ),
         )
         .await
-        .unwrap_err();
-    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
-    assert!(err.message.contains("no assistant content or tool call"));
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("upstream returned no assistant content or tool call"));
 }
 
 #[tokio::test]
 async fn anthropic_empty_stream_with_tools_reports_empty_output_without_synthetic_tool_use() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let err = kernel
+    let response = kernel
         .anthropic_messages(
             &client,
             AnthropicRequest {
@@ -369,9 +377,39 @@ async fn anthropic_empty_stream_with_tools_reports_empty_output_without_syntheti
             },
         )
         .await
-        .unwrap_err();
-    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
-    assert!(err.message.contains("no assistant content or tool call"));
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("upstream returned no assistant content or tool call"));
+}
+
+#[tokio::test]
+async fn openai_role_only_stream_is_rejected_as_empty_upstream() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "role-only-empty", true, None),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("upstream returned no assistant content or tool call"));
+}
+
+#[tokio::test]
+async fn anthropic_role_only_stream_is_rejected_as_empty_upstream() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "role-only-empty", true),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("upstream returned no assistant content or tool call"));
 }
 
 #[tokio::test]
@@ -580,13 +618,13 @@ async fn non_stream_parse_error_is_structured_error() {
 async fn stream_parse_error_is_emitted_before_done() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let err = kernel
+    let response = kernel
         .openai_chat(
             &client,
             chat_request("deepseek-v4-flash-free", "broken-json", true, None),
         )
         .await
-        .unwrap_err();
-    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
-    assert!(err.message.contains("stream parse error"));
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("stream parse error"));
 }

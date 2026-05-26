@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -27,11 +27,45 @@ pub struct ToolFunction {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: ToolInputSchema,
+}
+
+impl<'de> Deserialize<'de> for ToolDef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Helper {
+            name: Option<String>,
+            description: Option<String>,
+            input_schema: Option<ToolInputSchema>,
+            function: Option<OpenAIToolFunction>,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+        if let Some(function) = helper.function {
+            return Ok(Self {
+                name: function.name,
+                description: function.description.unwrap_or_default(),
+                input_schema: ToolInputSchema::from_openai_parameters(function.parameters),
+            });
+        }
+
+        Ok(Self {
+            name: helper
+                .name
+                .ok_or_else(|| serde::de::Error::missing_field("name"))?,
+            description: helper.description.unwrap_or_default(),
+            input_schema: helper
+                .input_schema
+                .ok_or_else(|| serde::de::Error::missing_field("input_schema"))?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +74,42 @@ pub struct ToolInputSchema {
     pub schema_type: String,
     pub required: Option<Vec<String>>,
     pub properties: Option<serde_json::Value>,
+}
+
+impl ToolInputSchema {
+    pub fn from_openai_parameters(parameters: Option<serde_json::Value>) -> Self {
+        let Some(parameters) = parameters else {
+            return Self {
+                schema_type: "object".to_string(),
+                required: None,
+                properties: Some(serde_json::Value::Object(Default::default())),
+            };
+        };
+
+        let schema_type = parameters
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("object")
+            .to_string();
+        let required = parameters.get("required").and_then(|value| {
+            value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect::<Vec<_>>()
+            })
+        });
+        let properties = parameters
+            .get("properties")
+            .cloned()
+            .or_else(|| Some(serde_json::Value::Object(Default::default())));
+
+        Self {
+            schema_type,
+            required,
+            properties,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,4 +250,38 @@ pub struct ErrorDetail {
     #[serde(rename = "type")]
     pub error_type: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_def_accepts_openai_function_shape() {
+        let tool: ToolDef = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "Task",
+                "description": "run subagent",
+                "parameters": {
+                    "type": "object",
+                    "required": ["description", "prompt"],
+                    "properties": {
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"}
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(tool.name, "Task");
+        assert_eq!(tool.description, "run subagent");
+        assert_eq!(tool.input_schema.schema_type, "object");
+        assert_eq!(
+            tool.input_schema.required,
+            Some(vec!["description".to_string(), "prompt".to_string()])
+        );
+        assert!(tool.input_schema.properties.is_some());
+    }
 }
