@@ -85,16 +85,26 @@ where
             return Err(DispatchError::NoResource);
         }
         self.dispatch.preflight(req)?;
-        let node = self
+        let (node, affinity_hit, affinity_node_id) = self
             .dispatch
-            .acquire_for(req)
-            .ok_or(DispatchError::NoResource)
+            .try_acquire_affinity(req)
+            .map(|(node, affinity_node_id)| (node, true, affinity_node_id))
+            .or_else(|_| {
+                self.dispatch
+                    .acquire_for(req)
+                    .map(|node| (node, false, String::new()))
+                    .ok_or(DispatchError::NoResource)
+            })
             .or_else(|_| {
                 if self.allow_direct_fallback {
-                    Ok(NodeRef {
-                        id: DIRECT_NODE_ID.to_string(),
-                        url: DIRECT_NODE_URL.to_string(),
-                    })
+                    Ok((
+                        NodeRef {
+                            id: DIRECT_NODE_ID.to_string(),
+                            url: DIRECT_NODE_URL.to_string(),
+                        },
+                        false,
+                        String::new(),
+                    ))
                 } else {
                     Err(DispatchError::NoResource)
                 }
@@ -113,7 +123,13 @@ where
             self.transport.client_for_node(&node)
         };
 
-        Ok(DispatchResult { node, client, url })
+        Ok(DispatchResult {
+            node,
+            client,
+            url,
+            affinity_hit,
+            affinity_node_id,
+        })
     }
 
     fn dispatch_sticky(
@@ -136,7 +152,13 @@ where
             self.nodes.insert(node.clone());
             let url = node.url.clone();
             let client = self.transport.client_for_node(&node);
-            return Ok(DispatchResult { node, client, url });
+            return Ok(DispatchResult {
+                node,
+                client,
+                url,
+                affinity_hit: false,
+                affinity_node_id: String::new(),
+            });
         }
         // 回退到普通 dispatch
         self.dispatch(meta)
@@ -222,6 +244,22 @@ where
             return;
         }
         self.dispatch.record_latency_hint(&node_id, latency_ms);
+    }
+
+    fn record_bucket_latency_hint(&self, node_id: NodeId, bucket: &str, latency_ms: u64) {
+        if node_id == DIRECT_NODE_ID {
+            return;
+        }
+        self.dispatch
+            .record_bucket_latency_hint(&node_id, bucket, latency_ms);
+    }
+
+    fn record_affinity_success(&self, affinity_key: &str, node_id: NodeId) {
+        if node_id == DIRECT_NODE_ID {
+            return;
+        }
+        self.dispatch
+            .record_affinity_success(affinity_key, &node_id);
     }
 
     fn pool_stats(&self) -> PoolStats {
@@ -436,6 +474,7 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             stream: false,
             body_size: 128,
+            affinity_key: String::new(),
         };
         let dispatched = manager.dispatch(&meta).unwrap();
         manager.report(dispatched.node.id.clone(), ResultKind::EmptyOutput, 1500);
@@ -470,6 +509,7 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             stream: true,
             body_size: 350_000,
+            affinity_key: String::new(),
         };
         let dispatched = manager.dispatch(&meta).unwrap();
         manager.report(
@@ -511,6 +551,7 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             stream: true,
             body_size: 128,
+            affinity_key: String::new(),
         };
         let dispatched = manager.dispatch(&meta).unwrap();
         manager.report(

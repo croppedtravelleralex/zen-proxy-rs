@@ -50,6 +50,8 @@ pub struct DispatchResult {
     pub node: NodeRef,
     pub client: reqwest::Client,
     pub url: String,
+    pub affinity_hit: bool,
+    pub affinity_node_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,7 @@ pub struct RequestMeta {
     pub model: String,
     pub stream: bool,
     pub body_size: u64,
+    pub affinity_key: String,
 }
 
 impl RequestMeta {
@@ -93,6 +96,20 @@ impl RequestMeta {
 
     pub fn request_kb(&self) -> u64 {
         self.body_size.div_ceil(1024).max(1)
+    }
+
+    pub fn body_size_bucket(&self) -> &'static str {
+        body_size_bucket(self.body_size)
+    }
+}
+
+pub fn body_size_bucket(body_size: u64) -> &'static str {
+    match body_size {
+        0..=131_071 => "tiny",
+        131_072..=262_143 => "small",
+        262_144..=524_287 => "medium",
+        524_288..=1_048_575 => "large",
+        _ => "huge",
     }
 }
 
@@ -125,6 +142,14 @@ pub trait Pool: Send + Sync {
         self.release(node_id, result);
     }
     fn record_latency_hint(&self, _node_id: &NodeId, _latency_ms: u64) {}
+    fn record_bucket_latency_hint(&self, _node_id: &NodeId, _bucket: &str, _latency_ms: u64) {}
+    fn try_acquire_affinity(
+        &self,
+        _meta: &RequestMeta,
+    ) -> Result<(NodeRef, NodeId), DispatchError> {
+        Err(DispatchError::NoResource)
+    }
+    fn record_affinity_success(&self, _affinity_key: &str, _node_id: &NodeId) {}
     fn release(&self, node_id: &NodeId, result: &ResultKind);
     fn remove(&self, node_id: &NodeId);
     fn add(&self, node: NodeRef);
@@ -141,6 +166,8 @@ pub trait PoolManager: Send + Sync {
     ) -> Result<DispatchResult, DispatchError>;
     fn report(&self, node_id: NodeId, result: ResultKind, latency_us: u64);
     fn record_latency_hint(&self, node_id: NodeId, latency_ms: u64);
+    fn record_bucket_latency_hint(&self, node_id: NodeId, bucket: &str, latency_ms: u64);
+    fn record_affinity_success(&self, affinity_key: &str, node_id: NodeId);
     fn pool_stats(&self) -> PoolStats;
     fn budget_details(&self) -> Vec<serde_json::Value>;
     fn node_budget_detail(&self, node_id: &str) -> Option<serde_json::Value>;

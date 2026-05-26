@@ -15,7 +15,7 @@ use crate::collector::RequestTelemetry;
 use crate::config::ProviderMode;
 use crate::ledger::LedgerEvent;
 use crate::opencode_headers::{apply_opencode_headers, build_opencode_headers};
-use crate::pool::{DispatchError, ErrorKind, RequestMeta};
+use crate::pool::{body_size_bucket, DispatchError, ErrorKind, RequestMeta};
 use crate::sse::SseBuffer;
 use crate::state::AppState;
 use crate::utils::{
@@ -161,6 +161,7 @@ pub async fn proxy_handler(
         model: model.clone(),
         stream: streaming,
         body_size: body_len,
+        affinity_key: String::new(),
     };
 
     let result = proxy_with_retry(
@@ -223,6 +224,10 @@ pub async fn proxy_handler(
                     total_ms: latency,
                     ..crate::collector::RequestTimings::default()
                 },
+                affinity_key: String::new(),
+                affinity_hit: false,
+                affinity_node_id: String::new(),
+                body_size_bucket: body_size_bucket(body_len).to_string(),
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,

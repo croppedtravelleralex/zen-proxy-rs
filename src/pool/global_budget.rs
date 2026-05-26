@@ -322,6 +322,7 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             stream: true,
             body_size: 128,
+            affinity_key: String::new(),
         }
     }
 

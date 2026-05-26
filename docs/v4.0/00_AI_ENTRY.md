@@ -9,7 +9,9 @@ kernel. V4.3 moved the scaling path from coarse "more full processes" toward a
 measurable data plane: lanes, sharded dispatch, node registry, adaptive node
 concurrency, and reduced Redis budget overhead. V4.4 hardens pool fault
 classification so upstream 5xx, timeout, empty-output, and retry-budget
-failures do not incorrectly bury healthy proxy nodes.
+failures do not incorrectly bury healthy proxy nodes. V4.5 adds cache-affinity
+and effective-TTFT routing so repeated large contexts prefer paths that have
+already shown good cache and first-content behavior.
 
 ## Current Goal
 
@@ -57,6 +59,7 @@ root-level legacy audit reports as active guidance.
 7. [2026-05-25 Operations Report](./10_2026-05-25_operations_report.md)
 8. [V4.3 Scalable Data Plane](./11_v4.3_scalable_data_plane.md)
 9. [V4.4 Pool Fault Isolation](./12_v4.4_pool_fault_isolation.md)
+10. [V4.5 Cache Affinity and Effective TTFT](./13_v4.5_cache_affinity_ttft.md)
 
 ## Hard Decisions
 
@@ -152,6 +155,16 @@ Current V4.4 verification on 2026-05-26:
   TTFT for 100k-500k context requires real upstream prompt/KV cache hits and a
   fast selected node. ZenProxy can improve node choice and avoid extra delay,
   but cannot force a slow upstream cache read into 1s.
+- V4.5 landed after that slice: stream telemetry now splits first-frame,
+  first-content, and first-tool-call timing; large streaming requests get
+  cache-affinity routing; node learning now tracks request-size buckets.
+- Deployed V4.5 production binary SHA1:
+  `2b11dbb19861b1d0f16597d1841678d4ad3e3173`.
+- V4.5 production smoke confirmed `/admin/audit/requests` records
+  `affinity_key`, `affinity_hit`, `body_size_bucket`, and
+  `timings.first_content_token_ms`; a repeated 150KB same-path stream improved
+  from about 2.33s first chunk to about 1.09s first chunk with
+  `affinity_hit=true`.
 - 2026-05-26 production smoke after deploy: direct ZenProxy stream returned
   HTTP 200 with `time_starttransfer=1.410657s`; recent 220k+ cached-token
   audit rows were still around 2.4-4.0s TTFT, showing the remaining bottleneck

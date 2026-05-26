@@ -17,7 +17,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::collector::{DataCollector, RequestAttemptTelemetry, RequestTelemetry, RequestTimings};
 use crate::config::Config;
 use crate::ledger::LedgerEvent;
-use crate::pool::{DispatchError, ErrorKind, RequestMeta, ResultKind};
+use crate::pool::{body_size_bucket, DispatchError, ErrorKind, RequestMeta, ResultKind};
 use crate::state::AppState;
 use crate::v4::context;
 use crate::v4::model::{ModelError, ModelRegistry, StaticModelRegistry};
@@ -105,7 +105,16 @@ pub async fn handle_v4_proxy(
         model: public_model.clone(),
         stream: streaming,
         body_size: effective_body_len,
+        affinity_key: build_affinity_key(
+            &public_model,
+            path,
+            client_id,
+            effective_body_len,
+            streaming,
+        ),
     };
+    let request_body_bucket = body_size_bucket(effective_body_len).to_string();
+    let request_affinity_key = request_meta.affinity_key.clone();
     let stream_usage_fallback = if streaming {
         UsageCounts {
             prompt_tokens: estimate_prompt_tokens(path, &upstream_body),
@@ -119,7 +128,7 @@ pub async fn handle_v4_proxy(
         state,
         path,
         &conf,
-        request_meta,
+        request_meta.clone(),
         upstream_body,
         &public_model,
         &resolved.upstream_model,
@@ -168,6 +177,10 @@ pub async fn handle_v4_proxy(
                 upstream_ms: result.upstream_ms,
                 ttft_ms: result.ttft_ms.unwrap_or_default(),
                 timings,
+                affinity_key: request_affinity_key.clone(),
+                affinity_hit: result.affinity_hit,
+                affinity_node_id: result.affinity_node_id.clone(),
+                body_size_bucket: request_body_bucket.clone(),
                 prompt_tokens: result.usage.prompt_tokens,
                 completion_tokens: result.usage.completion_tokens,
                 total_tokens: result.usage.total_tokens,
@@ -193,6 +206,17 @@ pub async fn handle_v4_proxy(
                     state.collector.clone(),
                 )
             } else {
+                if !telemetry.affinity_key.is_empty() && status < 400 {
+                    state.pool_manager.record_affinity_success(
+                        &telemetry.affinity_key,
+                        telemetry.selected_node_id.clone(),
+                    );
+                    state.pool_manager.record_bucket_latency_hint(
+                        telemetry.selected_node_id.clone(),
+                        &telemetry.body_size_bucket,
+                        telemetry.ttft_ms.max(result.upstream_ms),
+                    );
+                }
                 state.collector.record_request(&telemetry);
                 result.response
             };
@@ -244,6 +268,10 @@ pub async fn handle_v4_proxy(
                         total_ms: latency,
                         ..RequestTimings::default()
                     },
+                    affinity_key: request_affinity_key.clone(),
+                    affinity_hit: false,
+                    affinity_node_id: String::new(),
+                    body_size_bucket: request_body_bucket.clone(),
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     total_tokens: 0,
@@ -295,6 +323,30 @@ fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn build_affinity_key(
+    public_model: &str,
+    path: &str,
+    client_id: &str,
+    body_size: u64,
+    streaming: bool,
+) -> String {
+    if !streaming || body_size < 128 * 1024 {
+        return String::new();
+    }
+    let client_bucket = if client_id.trim().is_empty() {
+        "anon".to_string()
+    } else {
+        LedgerEvent::short_hash(client_id)
+    };
+    format!(
+        "{}:{}:{}:{}",
+        public_model,
+        path,
+        client_bucket,
+        body_size_bucket(body_size)
+    )
+}
+
 fn infer_gateway(headers: &HeaderMap, external_request_id: &str) -> String {
     extract_header(headers, "x-gateway")
         .or_else(|| {
@@ -329,6 +381,8 @@ struct V4CallResult {
     upstream_ms: u64,
     ttft_ms: Option<u64>,
     timings: RequestTimings,
+    affinity_hit: bool,
+    affinity_node_id: String,
     retry_chain: Vec<RequestAttemptTelemetry>,
     body_bytes_len: u64,
     usage: UsageCounts,
@@ -624,7 +678,10 @@ async fn call_with_retry(
                             first_chunk_ms: if request_meta.stream { 0 } else { latency },
                             stream_complete_ms: 0,
                             total_ms: latency,
+                            ..RequestTimings::default()
                         },
+                        affinity_hit: dispatch_result.affinity_hit,
+                        affinity_node_id: dispatch_result.affinity_node_id,
                         retry_chain,
                         body_bytes_len,
                         usage,
@@ -1224,6 +1281,8 @@ fn metered_stream_response(
         let mut telemetry = telemetry;
         let mut metrics = StreamMetrics::new(fallback_usage);
         let mut first_chunk_ms = 0u64;
+        let mut first_content_token_ms = 0u64;
+        let mut first_tool_call_ms = 0u64;
         let mut stream_error: Option<String> = None;
         while let Some(item) = upstream.next().await {
             match item {
@@ -1234,8 +1293,22 @@ fn metered_stream_response(
                             telemetry.selected_node_id.clone(),
                             first_chunk_ms,
                         );
+                        state.pool_manager.record_bucket_latency_hint(
+                            telemetry.selected_node_id.clone(),
+                            &telemetry.body_size_bucket,
+                            first_chunk_ms,
+                        );
                     }
+                    let had_content = metrics.has_content_signal();
+                    let had_tool = metrics.has_tool_signal();
                     metrics.ingest(&path, &bytes);
+                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                    if first_content_token_ms == 0 && !had_content && metrics.has_content_signal() {
+                        first_content_token_ms = elapsed_ms;
+                    }
+                    if first_tool_call_ms == 0 && !had_tool && metrics.has_tool_signal() {
+                        first_tool_call_ms = elapsed_ms;
+                    }
                     if tx.send(Ok(bytes)).await.is_err() {
                         break;
                     }
@@ -1260,6 +1333,8 @@ fn metered_stream_response(
         telemetry.latency_total_ms = stream_complete_ms;
         telemetry.ttft_ms = first_chunk_ms;
         telemetry.timings.first_chunk_ms = first_chunk_ms;
+        telemetry.timings.first_content_token_ms = first_content_token_ms;
+        telemetry.timings.first_tool_call_ms = first_tool_call_ms;
         telemetry.timings.stream_complete_ms = stream_complete_ms;
         telemetry.timings.total_ms = stream_complete_ms;
         let empty_output = stream_error.is_none()
@@ -1305,6 +1380,12 @@ fn metered_stream_response(
                 stream_complete_ms,
             );
         } else {
+            if !telemetry.affinity_key.is_empty() {
+                state.pool_manager.record_affinity_success(
+                    &telemetry.affinity_key,
+                    telemetry.selected_node_id.clone(),
+                );
+            }
             state.pool_manager.report(
                 telemetry.selected_node_id.clone(),
                 ResultKind::Success(telemetry.status),
@@ -1538,6 +1619,14 @@ impl StreamMetrics {
             || self.tool_output_chunks > 0
             || self.usage.completion_tokens > 0
     }
+
+    fn has_content_signal(&self) -> bool {
+        !self.completion_text.trim().is_empty() || self.text_output_chunks > 0
+    }
+
+    fn has_tool_signal(&self) -> bool {
+        self.tool_output_chunks > 0
+    }
 }
 
 fn usage_u32(usage: &Value, name: &str) -> u32 {
@@ -1700,6 +1789,42 @@ mod tests {
         assert_eq!(usage.cached_tokens, 70);
         assert_eq!(usage.cache_creation_input_tokens, 20);
         assert_eq!(usage.cache_read_input_tokens, 70);
+    }
+
+    #[test]
+    fn stream_metrics_distinguishes_content_and_tool_signals() {
+        let mut metrics = StreamMetrics::new(UsageCounts::default());
+
+        metrics.ingest(
+            "chat/completions",
+            &Bytes::from_static(br#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#),
+        );
+        assert!(!metrics.has_content_signal());
+        assert!(!metrics.has_tool_signal());
+
+        metrics.ingest(
+            "chat/completions",
+            &Bytes::from_static(b"\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n"),
+        );
+        assert!(metrics.has_content_signal());
+        assert!(!metrics.has_tool_signal());
+
+        metrics.ingest(
+            "chat/completions",
+            &Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n",
+            ),
+        );
+        assert!(metrics.has_tool_signal());
+    }
+
+    #[test]
+    fn affinity_key_is_only_for_large_streaming_requests() {
+        assert!(build_affinity_key("m", "chat/completions", "sk", 10, true).is_empty());
+        assert!(build_affinity_key("m", "chat/completions", "sk", 200_000, false).is_empty());
+        let key = build_affinity_key("m", "chat/completions", "sk", 200_000, true);
+        assert!(key.starts_with("m:chat/completions:"));
+        assert!(key.ends_with(":small"));
     }
 
     #[test]

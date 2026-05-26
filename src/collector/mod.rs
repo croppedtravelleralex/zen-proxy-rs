@@ -42,6 +42,14 @@ pub struct RequestTelemetry {
     pub ttft_ms: u64,
     #[serde(default)]
     pub timings: RequestTimings,
+    #[serde(default)]
+    pub affinity_key: String,
+    #[serde(default)]
+    pub affinity_hit: bool,
+    #[serde(default)]
+    pub affinity_node_id: String,
+    #[serde(default)]
+    pub body_size_bucket: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
@@ -78,6 +86,8 @@ pub struct RequestTimings {
     pub dispatch_wait_ms: u64,
     pub upstream_response_ms: u64,
     pub first_chunk_ms: u64,
+    pub first_content_token_ms: u64,
+    pub first_tool_call_ms: u64,
     pub stream_complete_ms: u64,
     pub total_ms: u64,
 }

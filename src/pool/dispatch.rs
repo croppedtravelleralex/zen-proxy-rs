@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -15,6 +15,8 @@ const DEFAULT_MAX_TOKENS_PER_WINDOW: u64 = 10_000_000;
 const DEFAULT_MAX_KB_PER_WINDOW: u64 = 64 * 1024;
 const DEFAULT_COOLDOWN_SECS: i64 = 60;
 const DEFAULT_DISPATCH_SHARDS: usize = 16;
+const BUCKET_COUNT: usize = 5;
+const AFFINITY_MAX_NODES: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct AimdConfig {
@@ -166,6 +168,7 @@ struct PoolNode {
     consecutive_successes: AtomicU32,
     recent_results: RwLock<VecDeque<bool>>,
     avg_latency_ms: AtomicU64,
+    bucket_latency_ms: [AtomicU64; BUCKET_COUNT],
     idle_since: AtomicI64,
     max_concurrent: AtomicU32,
     active_leases: AtomicU32,
@@ -180,6 +183,7 @@ impl PoolNode {
             consecutive_successes: AtomicU32::new(0),
             recent_results: RwLock::new(VecDeque::with_capacity(20)),
             avg_latency_ms: AtomicU64::new(0),
+            bucket_latency_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             idle_since: AtomicI64::new(chrono::Utc::now().timestamp()),
             max_concurrent: AtomicU32::new(5u32.clamp(
                 aimd.min_concurrent.max(1),
@@ -232,7 +236,9 @@ impl PoolNode {
         let idle_secs = now - self.idle_since.load(Ordering::Relaxed);
         let idle_factor = (idle_secs as f64 / 60.0).min(1.0) * idle_weight;
 
-        let avg_lat = self.avg_latency_ms.load(Ordering::Relaxed) as f64;
+        let avg_lat =
+            meta.map(|m| self.latency_for_bucket(m.body_size_bucket()))
+                .unwrap_or_else(|| self.avg_latency_ms.load(Ordering::Relaxed)) as f64;
         let latency_factor = (1.0 - (avg_lat / 5000.0).min(1.0)).max(0.0) * latency_weight;
 
         let consec = self.consecutive_successes.load(Ordering::Relaxed) as f64;
@@ -289,6 +295,34 @@ impl PoolNode {
                     current.saturating_mul(3).saturating_add(latency_ms) / 4
                 })
             });
+    }
+
+    fn record_bucket_latency(&self, bucket: &str, latency_ms: u64) {
+        if latency_ms == 0 {
+            return;
+        }
+        self.record_latency(latency_ms);
+        let idx = bucket_index(bucket);
+        let _ = self.bucket_latency_ms[idx].fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |current| {
+                Some(if current == 0 {
+                    latency_ms
+                } else {
+                    current.saturating_mul(3).saturating_add(latency_ms) / 4
+                })
+            },
+        );
+    }
+
+    fn latency_for_bucket(&self, bucket: &str) -> u64 {
+        let bucket_latency = self.bucket_latency_ms[bucket_index(bucket)].load(Ordering::Relaxed);
+        if bucket_latency > 0 {
+            bucket_latency
+        } else {
+            self.avg_latency_ms.load(Ordering::Relaxed)
+        }
     }
 
     fn raise_base_score(&self) {
@@ -391,6 +425,13 @@ impl PoolNode {
             "consecutive_successes": self.consecutive_successes.load(Ordering::Relaxed),
             "recent_success_rate": self.recent_success_rate(),
             "avg_latency_ms": self.avg_latency_ms.load(Ordering::Relaxed),
+            "bucket_latency_ms": {
+                "tiny": self.bucket_latency_ms[0].load(Ordering::Relaxed),
+                "small": self.bucket_latency_ms[1].load(Ordering::Relaxed),
+                "medium": self.bucket_latency_ms[2].load(Ordering::Relaxed),
+                "large": self.bucket_latency_ms[3].load(Ordering::Relaxed),
+                "huge": self.bucket_latency_ms[4].load(Ordering::Relaxed),
+            },
             "idle_secs": chrono::Utc::now().timestamp().saturating_sub(self.idle_since.load(Ordering::Relaxed)),
             "local_budget": {
                 "calls_in_window": snapshot.calls_in_window,
@@ -434,6 +475,7 @@ pub struct DispatchPool {
     global_budget: Option<GlobalBudgetRegistry>,
     global_budget_fail_open: bool,
     aimd: AimdConfig,
+    affinity: RwLock<HashMap<String, VecDeque<NodeId>>>,
 }
 
 impl DispatchPool {
@@ -462,6 +504,7 @@ impl DispatchPool {
             global_budget: None,
             global_budget_fail_open: true,
             aimd,
+            affinity: RwLock::new(HashMap::new()),
         }
     }
 
@@ -679,6 +722,17 @@ impl DispatchPool {
     }
 }
 
+fn bucket_index(bucket: &str) -> usize {
+    match bucket {
+        "tiny" => 0,
+        "small" => 1,
+        "medium" => 2,
+        "large" => 3,
+        "huge" => 4,
+        _ => 0,
+    }
+}
+
 impl Default for DispatchPool {
     fn default() -> Self {
         Self::new()
@@ -691,6 +745,7 @@ impl Pool for DispatchPool {
             model: String::new(),
             stream: false,
             body_size: 1,
+            affinity_key: String::new(),
         })
     }
 
@@ -709,6 +764,25 @@ impl Pool for DispatchPool {
         }
 
         self.acquire_best_global(meta, now)
+    }
+
+    fn try_acquire_affinity(&self, meta: &RequestMeta) -> Result<(NodeRef, NodeId), DispatchError> {
+        if meta.affinity_key.is_empty() || self.request_exceeds_single_node_budget(meta) {
+            return Err(DispatchError::NoResource);
+        }
+        let candidates = self
+            .affinity
+            .read()
+            .unwrap()
+            .get(&meta.affinity_key)
+            .cloned()
+            .unwrap_or_default();
+        for node_id in candidates {
+            if let Ok(node) = self.try_acquire_sticky(meta, &node_id) {
+                return Ok((node, node_id));
+            }
+        }
+        Err(DispatchError::NoResource)
     }
 
     fn try_acquire_sticky(
@@ -779,6 +853,29 @@ impl Pool for DispatchPool {
         let nodes = self.shards[shard_idx].nodes.read().unwrap();
         if let Some(pn) = nodes.iter().find(|n| n.node.id == *node_id) {
             pn.record_latency(latency_ms);
+        }
+    }
+
+    fn record_bucket_latency_hint(&self, node_id: &NodeId, bucket: &str, latency_ms: u64) {
+        let shard_idx = self.shard_index_for_id(node_id);
+        let nodes = self.shards[shard_idx].nodes.read().unwrap();
+        if let Some(pn) = nodes.iter().find(|n| n.node.id == *node_id) {
+            pn.record_bucket_latency(bucket, latency_ms);
+        }
+    }
+
+    fn record_affinity_success(&self, affinity_key: &str, node_id: &NodeId) {
+        if affinity_key.is_empty() {
+            return;
+        }
+        let mut affinity = self.affinity.write().unwrap();
+        let nodes = affinity
+            .entry(affinity_key.to_string())
+            .or_insert_with(VecDeque::new);
+        nodes.retain(|id| id != node_id);
+        nodes.push_front(node_id.clone());
+        while nodes.len() > AFFINITY_MAX_NODES {
+            nodes.pop_back();
         }
     }
 
@@ -859,6 +956,7 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             stream: true,
             body_size,
+            affinity_key: String::new(),
         }
     }
 
@@ -940,6 +1038,39 @@ mod tests {
         let detail = pool.node_budget_detail(&node.id).unwrap();
         assert_eq!(snapshot.concurrent_now, 1);
         assert_eq!(detail["avg_latency_ms"].as_u64(), Some(1_234));
+    }
+
+    #[test]
+    fn bucket_latency_hint_updates_matching_bucket() {
+        let pool = DispatchPool::new();
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:10851".to_string(),
+        ));
+
+        let node = pool.acquire_for(&meta(600 * 1024)).unwrap();
+        pool.record_bucket_latency_hint(&node.id, "large", 2_345);
+
+        let detail = pool.node_budget_detail(&node.id).unwrap();
+        assert_eq!(detail["avg_latency_ms"].as_u64(), Some(2_345));
+        assert_eq!(detail["bucket_latency_ms"]["large"].as_u64(), Some(2_345));
+        assert_eq!(detail["bucket_latency_ms"]["medium"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn affinity_prefers_recent_success_node_when_available() {
+        let pool = DispatchPool::new();
+        let first = NodeRef::new("socks5h://user:pass@127.0.0.1:10852".to_string());
+        let second = NodeRef::new("socks5h://user:pass@127.0.0.1:10853".to_string());
+        pool.add(first.clone());
+        pool.add(second);
+        pool.record_affinity_success("affinity-a", &first.id);
+
+        let mut request = meta(600 * 1024);
+        request.affinity_key = "affinity-a".to_string();
+        let (selected, affinity_node_id) = pool.try_acquire_affinity(&request).unwrap();
+
+        assert_eq!(selected.id, first.id);
+        assert_eq!(affinity_node_id, first.id);
     }
 
     #[test]

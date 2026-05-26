@@ -23,6 +23,11 @@ Required fields:
 - total latency
 - upstream latency
 - TTFT for streaming
+- effective streaming latency breakdown:
+  `first_chunk_ms`, `first_content_token_ms`, `first_tool_call_ms`,
+  `stream_complete_ms`
+- cache-affinity diagnostics:
+  `affinity_key`, `affinity_hit`, `affinity_node_id`, `body_size_bucket`
 - token usage when available
 
 ## Exit-IP Proof
@@ -136,6 +141,7 @@ Audit records include V4.1 fields:
 - context governance telemetry
 - timing breakdown
 - token and byte counters
+- V4.5 effective-TTFT and cache-affinity fields
 
 Current anomaly classes:
 
