@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1217,12 +1218,13 @@ fn metered_stream_response(
     let status = response.status();
     let headers = response.headers().clone();
     let mut upstream = response.into_body().into_data_stream();
-    let (tx, rx) = mpsc::channel::<Result<Bytes, axum::Error>>(16);
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(16);
 
     tokio::spawn(async move {
         let mut telemetry = telemetry;
         let mut metrics = StreamMetrics::new(fallback_usage);
         let mut first_chunk_ms = 0u64;
+        let mut stream_error: Option<String> = None;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(bytes) => {
@@ -1235,7 +1237,9 @@ fn metered_stream_response(
                     }
                 }
                 Err(err) => {
-                    let _ = tx.send(Err(err)).await;
+                    let message = format!("upstream stream error: {err}");
+                    let _ = tx.send(Ok(stream_error_frame(&path, &message))).await;
+                    stream_error = Some(message);
                     break;
                 }
             }
@@ -1254,8 +1258,30 @@ fn metered_stream_response(
         telemetry.timings.first_chunk_ms = first_chunk_ms;
         telemetry.timings.stream_complete_ms = stream_complete_ms;
         telemetry.timings.total_ms = stream_complete_ms;
-        let empty_output = usage.completion_tokens == 0 && !metrics.has_assistant_output();
-        if empty_output {
+        let empty_output = stream_error.is_none()
+            && usage.completion_tokens == 0
+            && !metrics.has_assistant_output();
+        if let Some(message) = stream_error {
+            telemetry.outcome = "stream_error".to_string();
+            telemetry.failure_kind = "stream_error".to_string();
+            telemetry.failure_message = message;
+            telemetry.retry_chain.push(RequestAttemptTelemetry {
+                attempt: telemetry.retry_count,
+                node_id: telemetry.selected_node_id.clone(),
+                node_url_redacted: telemetry.selected_node_url_redacted.clone(),
+                status: telemetry.status,
+                latency_ms: stream_complete_ms,
+                outcome: "stream_error".to_string(),
+                error_type: "stream_error".to_string(),
+            });
+            state.pool_manager.report(
+                telemetry.selected_node_id.clone(),
+                ResultKind::SoftFailure {
+                    kind: ErrorKind::Other,
+                },
+                stream_complete_ms,
+            );
+        } else if empty_output {
             telemetry.outcome = "empty_output".to_string();
             telemetry.failure_kind = "empty_output".to_string();
             telemetry.failure_message =
@@ -1288,6 +1314,19 @@ fn metered_stream_response(
     *rebuilt.status_mut() = status;
     *rebuilt.headers_mut() = headers;
     rebuilt
+}
+
+fn stream_error_frame(path: &str, message: &str) -> Bytes {
+    let escaped = serde_json::to_string(message).unwrap_or_else(|_| "\"stream error\"".to_string());
+    if path == "messages" {
+        Bytes::from(format!(
+            "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":{escaped}}}}}\n\n"
+        ))
+    } else {
+        Bytes::from(format!(
+            "data: {{\"error\":{{\"message\":{escaped}}}}}\n\ndata: [DONE]\n\n"
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -1657,5 +1696,22 @@ mod tests {
         assert_eq!(usage.cached_tokens, 70);
         assert_eq!(usage.cache_creation_input_tokens, 20);
         assert_eq!(usage.cache_read_input_tokens, 70);
+    }
+
+    #[test]
+    fn stream_error_frame_is_protocol_shaped() {
+        let openai = String::from_utf8(
+            stream_error_frame("chat/completions", "upstream stream error: broken").to_vec(),
+        )
+        .unwrap();
+        assert!(openai.contains("data: {\"error\""));
+        assert!(openai.contains("data: [DONE]"));
+
+        let anthropic = String::from_utf8(
+            stream_error_frame("messages", "upstream stream error: broken").to_vec(),
+        )
+        .unwrap();
+        assert!(anthropic.contains("event: error"));
+        assert!(anthropic.contains("\"type\":\"api_error\""));
     }
 }
