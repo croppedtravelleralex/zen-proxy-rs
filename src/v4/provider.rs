@@ -415,7 +415,6 @@ async fn call_with_retry(
     let base_max = conf.pool_max_retries;
     let empty_upstream_max = conf.v4_empty_upstream_max_retries.max(base_max);
     let mut last_status = StatusCode::BAD_GATEWAY;
-    let mut last_node_id = String::new();
     let mut was_rate_limited = false;
     let mut dispatch_wait_ms = 0u64;
     let mut retry_chain = Vec::new();
@@ -423,25 +422,13 @@ async fn call_with_retry(
 
     for attempt in 0..=empty_upstream_max {
         let dispatch_start = Instant::now();
-        let dispatch_result = if attempt == 0 {
-            dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?
-        } else {
-            match state
-                .pool_manager
-                .dispatch_sticky(&request_meta, &last_node_id)
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?
-                }
-            }
-        };
+        let dispatch_result =
+            dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?;
         dispatch_wait_ms =
             dispatch_wait_ms.saturating_add(dispatch_start.elapsed().as_millis() as u64);
 
         let node_id = dispatch_result.node.id.clone();
         let node_url = dispatch_result.url.clone();
-        last_node_id = node_id.clone();
         let request_id = uuid::Uuid::new_v4().to_string();
         let kernel = FreeModelKernel::new(KernelConfig {
             zen_chat_url: conf.chat_url(),
@@ -509,9 +496,7 @@ async fn call_with_retry(
                     if !request_meta.stream && !has_output {
                         state.pool_manager.report(
                             node_id.clone(),
-                            ResultKind::Error {
-                                kind: ErrorKind::Other,
-                            },
+                            ResultKind::EmptyOutput,
                             latency,
                         );
                         record_ledger(
@@ -540,6 +525,26 @@ async fn call_with_retry(
                             error_type: "empty_output".to_string(),
                         });
                         last_status = StatusCode::BAD_GATEWAY;
+                        let elapsed_ms = retry_chain_latency_ms(&retry_chain);
+                        if retry_budget_ms > 0 && elapsed_ms >= retry_budget_ms {
+                            return Err(V4CallError::after_dispatch(
+                                StatusCode::BAD_GATEWAY,
+                                format!(
+                                    "upstream retry budget exhausted after {elapsed_ms}ms with empty_output"
+                                ),
+                                None,
+                                request_id,
+                                node_id,
+                                &node_url,
+                                upstream_model,
+                                "retry_budget_exhausted",
+                                attempt,
+                                was_rate_limited,
+                                latency,
+                                "retry_budget_exhausted",
+                                retry_chain,
+                            ));
+                        }
                         if attempt >= empty_upstream_max {
                             return Err(V4CallError::after_dispatch(
                                 StatusCode::BAD_GATEWAY,
@@ -748,11 +753,8 @@ async fn call_with_retry(
                     });
                 } else {
                     let (error_kind, outcome, error_type) = classify_app_error(&err);
-                    state.pool_manager.report(
-                        node_id.clone(),
-                        ResultKind::Error { kind: error_kind },
-                        latency,
-                    );
+                    let result = result_kind_for_classified_error(error_kind, error_type);
+                    state.pool_manager.report(node_id.clone(), result, latency);
                     record_ledger(
                         state,
                         conf,
@@ -779,6 +781,28 @@ async fn call_with_retry(
                         error_type: error_type.to_string(),
                     });
                 }
+                let elapsed_ms = retry_chain_latency_ms(&retry_chain);
+                if retry_budget_ms > 0 && elapsed_ms >= retry_budget_ms {
+                    return Err(V4CallError::after_dispatch(
+                        last_status,
+                        format!(
+                            "upstream retry budget exhausted after {}ms with status {}",
+                            elapsed_ms,
+                            last_status.as_u16()
+                        ),
+                        retry_after,
+                        request_id,
+                        node_id,
+                        &node_url,
+                        upstream_model,
+                        "retry_budget_exhausted",
+                        attempt,
+                        was_rate_limited || status == StatusCode::TOO_MANY_REQUESTS,
+                        latency,
+                        "retry_budget_exhausted",
+                        retry_chain,
+                    ));
+                }
                 let max_for_error = if is_empty_upstream_error(&err) {
                     empty_upstream_max
                 } else {
@@ -790,6 +814,8 @@ async fn call_with_retry(
                         "rate_limited"
                     } else if is_upstream_busy(status, &err.message) {
                         "upstream_busy"
+                    } else if is_empty_upstream_error(&err) {
+                        "empty_output"
                     } else if matches!(
                         error_kind,
                         ErrorKind::Timeout
@@ -821,7 +847,7 @@ async fn call_with_retry(
             }
         }
 
-        let elapsed_ms: u64 = retry_chain.iter().map(|attempt| attempt.latency_ms).sum();
+        let elapsed_ms = retry_chain_latency_ms(&retry_chain);
         if retry_budget_ms > 0 && elapsed_ms >= retry_budget_ms {
             return Err(V4CallError::after_dispatch(
                 last_status,
@@ -832,7 +858,7 @@ async fn call_with_retry(
                 ),
                 None,
                 uuid::Uuid::new_v4().to_string(),
-                last_node_id.clone(),
+                String::new(),
                 "",
                 upstream_model,
                 "retry_budget_exhausted",
@@ -851,6 +877,10 @@ async fn call_with_retry(
         last_status,
         format!("upstream error {}", last_status.as_u16()),
     ))
+}
+
+fn retry_chain_latency_ms(retry_chain: &[RequestAttemptTelemetry]) -> u64 {
+    retry_chain.iter().map(|attempt| attempt.latency_ms).sum()
 }
 
 async fn dispatch_or_wait(
@@ -925,7 +955,7 @@ fn report_status_failure(
     } else {
         state.pool_manager.report(
             node_id.to_string(),
-            ResultKind::Error {
+            ResultKind::SoftFailure {
                 kind: ErrorKind::Upstream5xx,
             },
             latency,
@@ -984,6 +1014,20 @@ fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str)
         return (ErrorKind::Other, "transport_error", "network");
     }
     (ErrorKind::Upstream5xx, "upstream_error", "upstream_error")
+}
+
+fn result_kind_for_classified_error(error_kind: ErrorKind, error_type: &str) -> ResultKind {
+    if error_type == "empty_output" {
+        return ResultKind::EmptyOutput;
+    }
+    match error_kind {
+        ErrorKind::ConnectionRefused | ErrorKind::DnsFailure | ErrorKind::SocksHandshake => {
+            ResultKind::Error { kind: error_kind }
+        }
+        ErrorKind::Timeout | ErrorKind::Upstream5xx | ErrorKind::Other => {
+            ResultKind::SoftFailure { kind: error_kind }
+        }
+    }
 }
 
 fn is_empty_upstream_error(err: &AppError) -> bool {
@@ -1215,9 +1259,7 @@ fn metered_stream_response(
             });
             state.pool_manager.report(
                 telemetry.selected_node_id.clone(),
-                ResultKind::Error {
-                    kind: ErrorKind::Other,
-                },
+                ResultKind::EmptyOutput,
                 stream_complete_ms,
             );
         } else {

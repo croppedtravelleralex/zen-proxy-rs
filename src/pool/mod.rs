@@ -30,6 +30,8 @@ impl NodeRef {
 pub enum ResultKind {
     Success(u16),
     RateLimited,
+    EmptyOutput,
+    SoftFailure { kind: ErrorKind },
     Error { kind: ErrorKind },
 }
 

@@ -183,6 +183,7 @@ pub struct Config {
     pub pool_starvation_retry_after_secs: u64,
     pub global_backoff_cooldown_secs: u64,
     pub nodes_file: String,
+    pub preferred_proxy_urls: Vec<String>,
     pub ledger_events_path: String,
     pub audit_log_enabled: bool,
     pub audit_log_dir: String,
@@ -272,6 +273,7 @@ impl Config {
             sticky_ttl_secs: load_env_var("STICKY_TTL_SECS", 180.0f64),
             nodes_file: env::var("NODES_FILE")
                 .unwrap_or_else(|_| "/etc/zen-proxy/nodes.json".into()),
+            preferred_proxy_urls: parse_proxy_list_env("PREFERRED_PROXY_URLS"),
             proxy_api_key: match env::var("PROXY_API_KEY") {
                 Ok(v) if !v.is_empty() => Some(v),
                 _ => None,
@@ -416,7 +418,8 @@ impl Config {
     }
 
     pub fn load_nodes(&self) -> Vec<String> {
-        match std::fs::read_to_string(&self.nodes_file) {
+        let mut nodes = self.preferred_proxy_urls.clone();
+        let file_nodes = match std::fs::read_to_string(&self.nodes_file) {
             Ok(contents) => match parse_nodes_file(&contents) {
                 Ok(nodes) => {
                     tracing::info!(count = nodes.len(), file = %self.nodes_file, "loaded proxy nodes");
@@ -431,7 +434,9 @@ impl Config {
                 tracing::warn!(file = %self.nodes_file, "nodes file not found, using empty pool");
                 Vec::new()
             }
-        }
+        };
+        nodes.extend(file_nodes);
+        dedupe_preserving_order(nodes)
     }
     pub fn proxy_auth_required(&self) -> bool {
         self.proxy_api_key.is_some()
@@ -490,6 +495,36 @@ fn parse_proxy_line(line: &str) -> Result<String, String> {
     }
 }
 
+fn parse_proxy_list_env(key: &str) -> Vec<String> {
+    env::var(key)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .filter_map(|item| match parse_proxy_line(item) {
+                    Ok(url) => Some(url),
+                    Err(err) => {
+                        tracing::warn!(env = key, error = %err, "ignoring invalid preferred proxy");
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn dedupe_preserving_order(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            deduped.push(item);
+        }
+    }
+    deduped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +549,7 @@ mod tests {
             "MODEL_OVERRIDE",
             "ADMIN_API_KEY",
             "LOG_LEVEL",
+            "PREFERRED_PROXY_URLS",
             "PROBE_BATCH_SIZE",
             "OPENCODE_HEADERS_ENABLED",
             "OPENCODE_CLIENT_NAME",
@@ -568,6 +604,7 @@ mod tests {
         assert!(!cfg.benchmark_mode);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.probe_timeout_secs, 30);
+        assert!(cfg.preferred_proxy_urls.is_empty());
         assert_eq!(cfg.probe_batch_size, 5);
         assert_eq!(cfg.dispatch_capacity, 100);
         assert_eq!(cfg.ledger_events_path, "/tmp/zen-proxy-ledger-events.jsonl");
@@ -630,6 +667,7 @@ mod tests {
         let _guard = env_lock();
         unsafe { env::set_var("PORT", "8080") };
         unsafe { env::set_var("LOG_LEVEL", "debug") };
+        unsafe { env::set_var("PREFERRED_PROXY_URLS", "http://127.0.0.1:7897,1.2.3.4:8080") };
         unsafe { env::set_var("PROBE_BATCH_SIZE", "10") };
         unsafe { env::set_var("OPENCODE_HEADERS_ENABLED", "true") };
         unsafe { env::set_var("OPENCODE_CLIENT_NAME", "desktop-cli") };
@@ -684,6 +722,13 @@ mod tests {
         let cfg = Config::from_env();
         assert_eq!(cfg.port, 8080);
         assert_eq!(cfg.log_level, "debug");
+        assert_eq!(
+            cfg.preferred_proxy_urls,
+            vec![
+                "http://127.0.0.1:7897".to_string(),
+                "http://1.2.3.4:8080".to_string()
+            ]
+        );
         assert_eq!(cfg.probe_batch_size, 10);
         assert!(cfg.opencode_headers_enabled);
         assert_eq!(cfg.opencode_client_name, "desktop-cli");
@@ -742,6 +787,7 @@ mod tests {
         remove_env_vars(&[
             "PORT",
             "LOG_LEVEL",
+            "PREFERRED_PROXY_URLS",
             "PROBE_BATCH_SIZE",
             "OPENCODE_HEADERS_ENABLED",
             "OPENCODE_CLIENT_NAME",
@@ -831,6 +877,29 @@ mod tests {
     fn parse_nodes_file_accepts_webshare_host_port_user_pass() {
         let nodes = parse_nodes_file("1.2.3.4:8080:user:pass\n").unwrap();
         assert_eq!(nodes, vec!["http://user:pass@1.2.3.4:8080"]);
+    }
+
+    #[test]
+    fn load_nodes_prepends_preferred_proxies_and_dedupes() {
+        let _guard = env_lock();
+        let path =
+            std::env::temp_dir().join(format!("zen-proxy-test-nodes-{}.txt", std::process::id()));
+        std::fs::write(&path, "http://127.0.0.1:7897\n5.6.7.8:9000\n").unwrap();
+        unsafe { env::set_var("NODES_FILE", &path) };
+        unsafe { env::set_var("PREFERRED_PROXY_URLS", "http://127.0.0.1:7897") };
+
+        let cfg = Config::from_env();
+        assert_eq!(
+            cfg.load_nodes(),
+            vec![
+                "http://127.0.0.1:7897".to_string(),
+                "http://5.6.7.8:9000".to_string()
+            ]
+        );
+
+        env::remove_var("NODES_FILE");
+        env::remove_var("PREFERRED_PROXY_URLS");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

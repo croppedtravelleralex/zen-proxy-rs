@@ -41,7 +41,7 @@ use pool::dispatch::{AimdConfig, DispatchPool, NodeBudgetLimits};
 use pool::global_budget::{GlobalBudgetConfig, GlobalBudgetRegistry};
 use pool::manager::PoolManagerImpl;
 use pool::ratelimited::RateLimitedPoolImpl;
-use pool::{DeadPool, NodeRef, Pool, RateLimitedPool};
+use pool::{DeadPool, NodeRef, Pool, RateLimitedPool, ResultKind};
 use provider::webshare::WebShareProvider;
 use state::AppState;
 use v4::model::ModelRegistry;
@@ -239,7 +239,14 @@ async fn main() {
     let dead = Arc::new(DeadPoolImpl::new());
 
     for url in &node_urls {
-        dispatch.add(NodeRef::new(url.clone()));
+        let node = NodeRef::new(url.clone());
+        let node_id = node.id.clone();
+        dispatch.add(node);
+        if config.preferred_proxy_urls.iter().any(|item| item == url) {
+            for _ in 0..3 {
+                dispatch.release_with_latency(&node_id, &ResultKind::Success(200), 100);
+            }
+        }
     }
     tracing::info!(count = node_urls.len(), "nodes added to dispatch pool");
 

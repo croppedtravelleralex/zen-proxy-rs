@@ -7,6 +7,9 @@ use crate::pool::*;
 use serde_json::{json, Value};
 
 const SCORE_SCALE: u64 = 100;
+const INITIAL_BASE_SCORE: u64 = 20 * SCORE_SCALE;
+const SUCCESS_SCORE_STEP: u64 = 25 * SCORE_SCALE;
+const FAILURE_SCORE_PENALTY: u64 = 60 * SCORE_SCALE;
 const DEFAULT_MAX_CALLS_PER_WINDOW: u64 = 100;
 const DEFAULT_MAX_TOKENS_PER_WINDOW: u64 = 10_000_000;
 const DEFAULT_MAX_KB_PER_WINDOW: u64 = 64 * 1024;
@@ -173,7 +176,7 @@ impl PoolNode {
     fn new(node: NodeRef, limits: NodeBudgetLimits, aimd: &AimdConfig) -> Self {
         Self {
             node,
-            base_score: AtomicU64::new(80 * SCORE_SCALE),
+            base_score: AtomicU64::new(INITIAL_BASE_SCORE),
             consecutive_successes: AtomicU32::new(0),
             recent_results: RwLock::new(VecDeque::with_capacity(20)),
             avg_latency_ms: AtomicU64::new(0),
@@ -226,6 +229,7 @@ impl PoolNode {
         self.avg_latency_ms.store(latency_ms, Ordering::Relaxed);
 
         if success {
+            self.raise_base_score();
             let prev = self.consecutive_successes.fetch_add(1, Ordering::Relaxed);
             if prev.saturating_add(1) % 3 == 0 {
                 let _ =
@@ -243,8 +247,29 @@ impl PoolNode {
             }
         } else {
             self.consecutive_successes.store(0, Ordering::Relaxed);
+            self.lower_base_score();
             self.reduce_concurrency(aimd);
         }
+    }
+
+    fn raise_base_score(&self) {
+        let _ = self
+            .base_score
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                Some(
+                    value
+                        .saturating_add(SUCCESS_SCORE_STEP)
+                        .min(100 * SCORE_SCALE),
+                )
+            });
+    }
+
+    fn lower_base_score(&self) {
+        let _ = self
+            .base_score
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                Some(value.saturating_sub(FAILURE_SCORE_PENALTY))
+            });
     }
 
     fn reduce_concurrency(&self, aimd: &AimdConfig) {
@@ -583,6 +608,33 @@ impl DispatchPool {
         None
     }
 
+    fn acquire_best_global(&self, meta: &RequestMeta, now: i64) -> Option<NodeRef> {
+        let mut candidates = Vec::new();
+        for shard in &self.shards {
+            let nodes = shard.nodes.read().unwrap();
+            for node in nodes.iter() {
+                let concurrent_now = node.active_leases.load(Ordering::Relaxed);
+                let max_concurrent = node.max_concurrent.load(Ordering::Relaxed);
+                if node
+                    .budget
+                    .read()
+                    .unwrap()
+                    .can_admit(meta, now, concurrent_now, max_concurrent)
+                    .is_ok()
+                {
+                    candidates.push((node.score(), node.node.id.clone()));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (_, node_id) in candidates.into_iter().take(8) {
+            if let Ok(node) = self.try_acquire_sticky(meta, &node_id) {
+                return Some(node);
+            }
+        }
+        None
+    }
+
     pub fn shard_count(&self) -> usize {
         self.shards.len()
     }
@@ -617,7 +669,7 @@ impl Pool for DispatchPool {
             }
         }
 
-        None
+        self.acquire_best_global(meta, now)
     }
 
     fn try_acquire_sticky(
@@ -668,6 +720,12 @@ impl Pool for DispatchPool {
                         .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
                 }
                 ResultKind::RateLimited => {
+                    pn.record_result(false, latency_ms, &self.aimd);
+                }
+                ResultKind::EmptyOutput => {
+                    pn.record_result(false, latency_ms, &self.aimd);
+                }
+                ResultKind::SoftFailure { .. } => {
                     pn.record_result(false, latency_ms, &self.aimd);
                 }
                 ResultKind::Error { .. } => {
@@ -818,6 +876,25 @@ mod tests {
     }
 
     #[test]
+    fn successful_nodes_are_promoted_above_unverified_nodes() {
+        let pool = DispatchPool::new();
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:1086".to_string(),
+        ));
+        let node = pool.acquire_for(&meta(100)).unwrap();
+        let before = pool.node_budget_detail(&node.id).unwrap()["base_score"]
+            .as_f64()
+            .unwrap();
+
+        pool.release_with_latency(&node.id, &ResultKind::Success(200), 20_000);
+
+        let after = pool.node_budget_detail(&node.id).unwrap()["base_score"]
+            .as_f64()
+            .unwrap();
+        assert!(after > before);
+    }
+
+    #[test]
     fn dispatch_pool_spreads_nodes_across_configured_shards() {
         let pool =
             DispatchPool::new_with_options(NodeBudgetLimits::default(), AimdConfig::default(), 4);
@@ -830,6 +907,35 @@ mod tests {
         assert_eq!(pool.shard_count(), 4);
         assert_eq!(pool.budget_snapshots().len(), 20);
         assert_eq!(pool.available(), 20);
+    }
+
+    #[test]
+    fn acquire_samples_before_global_best_to_avoid_hot_node_lock_in() {
+        fastrand::seed(7);
+        let pool =
+            DispatchPool::new_with_options(NodeBudgetLimits::default(), AimdConfig::default(), 8);
+        for port in 2100..2140 {
+            pool.add(NodeRef::new(format!(
+                "socks5h://user:pass@127.0.0.1:{port}"
+            )));
+        }
+
+        let first = pool.acquire_for(&meta(100)).unwrap();
+        for _ in 0..30 {
+            pool.release_with_latency(&first.id, &ResultKind::Success(200), 100);
+        }
+
+        let mut selected = std::collections::HashSet::new();
+        for _ in 0..80 {
+            let node = pool.acquire_for(&meta(100)).unwrap();
+            selected.insert(node.id.clone());
+            pool.release_with_latency(&node.id, &ResultKind::Success(200), 100);
+        }
+
+        assert!(
+            selected.len() > 8,
+            "scheduler locked into too few nodes: {selected:?}"
+        );
     }
 
     #[test]

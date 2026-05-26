@@ -2,13 +2,14 @@
 
 ## One-Line Status
 
-ZenProxyRS V4.0/V4.1-A is a Rust proxy control plane that keeps `zen-proxy-rs`
+ZenProxyRS V4.0/V4.4 is a Rust proxy control plane that keeps `zen-proxy-rs`
 responsible for proxy rotation, pool state, retry, admin, and observability,
 while moving Zen protocol adaptation into a reusable `free-model-client-rs`
-kernel. The active local runtime is now a multi-instance deployment behind one
-Nginx entrypoint on port 4000. V4.3 has moved the scaling path from coarse
-"more full processes" toward a measurable data plane: lanes, sharded dispatch,
-node registry, adaptive node concurrency, and reduced Redis budget overhead.
+kernel. V4.3 moved the scaling path from coarse "more full processes" toward a
+measurable data plane: lanes, sharded dispatch, node registry, adaptive node
+concurrency, and reduced Redis budget overhead. V4.4 hardens pool fault
+classification so upstream 5xx, timeout, empty-output, and retry-budget
+failures do not incorrectly bury healthy proxy nodes.
 
 ## Current Goal
 
@@ -21,8 +22,7 @@ Target chain:
 ```text
 Client / external gateway / Claude Code
 -> NewAPI or direct OpenAI-compatible client
--> Nginx LB on http://127.0.0.1:4000
--> ZenProxyRS instance on 4001 / 4002 / 4004
+-> ZenProxyRS on http://127.0.0.1:4000
 -> Auth / RequestContext / ModelRegistry
 -> PoolManager selects a proxy node
 -> Transport creates or reuses a per-node reqwest::Client
@@ -56,6 +56,7 @@ root-level legacy audit reports as active guidance.
 6. [Acceptance and Risks](./09_acceptance_and_risks.md)
 7. [2026-05-25 Operations Report](./10_2026-05-25_operations_report.md)
 8. [V4.3 Scalable Data Plane](./11_v4.3_scalable_data_plane.md)
+9. [V4.4 Pool Fault Isolation](./12_v4.4_pool_fault_isolation.md)
 
 ## Hard Decisions
 
@@ -91,13 +92,8 @@ NewAPI dev key:      sk-dev
 Current runtime services:
 
 ```text
-nginx.service: listens on 0.0.0.0:4000 and load-balances to ZenProxy backends
-zen-proxy-rs@1.service: 127.0.0.1:4001, INSTANCE_ID=zen-1
-zen-proxy-rs@2.service: 127.0.0.1:4002, INSTANCE_ID=zen-2
-zen-proxy-rs@3.service: 127.0.0.1:4004, INSTANCE_ID=zen-3
-
-Disabled legacy service:
-zen-proxy-rs.service
+Current panda deployment:
+zen-proxy-rs.service: listens on 0.0.0.0:4000
 ```
 
 ## Current V4.1-A Evidence
@@ -132,6 +128,18 @@ Confirmed on 2026-05-25:
 - `/admin/runtime` exposes `data_plane.node_registry` and
   `data_plane.transport` for the current process.
 - NewAPI channel 19 is the active user path into ZenProxy.
+
+Current V4.4 verification on 2026-05-26:
+
+- `zen-proxy-rs.service` on `panda` is active on port 4000.
+- deployed binary SHA1:
+  `7207a649be4cebe74b265a5a61f85bfc0ba5c602`.
+- `V4_RETRY_BUDGET_MS=60000`.
+- after restart, `/admin/runtime` showed `dispatch=90`, `dead=0`,
+  `active=0`, `leased=0`.
+- NewAPI `http://127.0.0.1:8081` with key `sk-dev` returned HTTP 200 for
+  `deepseek-v4-flash` and `deepseek-v4-flash-lite`, both streaming and
+  non-streaming.
 
 Latest V4.3 verification on 2026-05-25:
 

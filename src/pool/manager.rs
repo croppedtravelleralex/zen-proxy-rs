@@ -194,6 +194,16 @@ where
                     });
                 }
             }
+            ResultKind::EmptyOutput => {
+                self.active.release(&node_id, &result);
+                self.dispatch
+                    .release_with_latency(&node_id, &result, latency_ms);
+            }
+            ResultKind::SoftFailure { .. } => {
+                self.active.release(&node_id, &result);
+                self.dispatch
+                    .release_with_latency(&node_id, &result, latency_ms);
+            }
             ResultKind::Error { .. } => {
                 self.active.release(&node_id, &result);
                 self.dispatch
@@ -382,5 +392,130 @@ where
                 "direct_client_initialized": transport.direct_client_initialized,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::default::DefaultCollector;
+    use crate::pool::active::ActivePool;
+    use crate::pool::dead::DeadPoolImpl;
+    use crate::pool::dispatch::DispatchPool;
+    use crate::pool::ratelimited::RateLimitedPoolImpl;
+
+    #[test]
+    fn empty_output_does_not_move_node_to_dead_pool() {
+        let dispatch = Arc::new(DispatchPool::new());
+        let active = Arc::new(ActivePool::new());
+        let ratelimited = Arc::new(RateLimitedPoolImpl::new());
+        let dead = Arc::new(DeadPoolImpl::new());
+        let collector = Arc::new(DefaultCollector::new());
+        let manager = PoolManagerImpl::new(
+            dispatch.clone(),
+            active,
+            ratelimited,
+            dead.clone(),
+            collector,
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            false,
+        );
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
+        dispatch.add(node.clone());
+
+        let meta = RequestMeta {
+            model: "deepseek-v4-flash".to_string(),
+            stream: false,
+            body_size: 128,
+        };
+        let dispatched = manager.dispatch(&meta).unwrap();
+        manager.report(dispatched.node.id.clone(), ResultKind::EmptyOutput, 1500);
+
+        assert_eq!(dead.available(), 0);
+        assert_eq!(dispatch.available(), 1);
+        assert!(manager.dispatch(&meta).is_ok());
+    }
+
+    #[test]
+    fn upstream_soft_failure_does_not_move_node_to_dead_pool() {
+        let dispatch = Arc::new(DispatchPool::new());
+        let active = Arc::new(ActivePool::new());
+        let ratelimited = Arc::new(RateLimitedPoolImpl::new());
+        let dead = Arc::new(DeadPoolImpl::new());
+        let collector = Arc::new(DefaultCollector::new());
+        let manager = PoolManagerImpl::new(
+            dispatch.clone(),
+            active.clone(),
+            ratelimited,
+            dead.clone(),
+            collector,
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            false,
+        );
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
+        dispatch.add(node.clone());
+
+        let meta = RequestMeta {
+            model: "deepseek-v4-flash".to_string(),
+            stream: true,
+            body_size: 350_000,
+        };
+        let dispatched = manager.dispatch(&meta).unwrap();
+        manager.report(
+            dispatched.node.id.clone(),
+            ResultKind::SoftFailure {
+                kind: ErrorKind::Upstream5xx,
+            },
+            30_000,
+        );
+
+        assert_eq!(active.available(), 0);
+        assert_eq!(dead.available(), 0);
+        assert_eq!(dispatch.available(), 1);
+        assert!(manager.dispatch(&meta).is_ok());
+    }
+
+    #[test]
+    fn hard_proxy_error_moves_node_to_dead_pool() {
+        let dispatch = Arc::new(DispatchPool::new());
+        let active = Arc::new(ActivePool::new());
+        let ratelimited = Arc::new(RateLimitedPoolImpl::new());
+        let dead = Arc::new(DeadPoolImpl::new());
+        let collector = Arc::new(DefaultCollector::new());
+        let manager = PoolManagerImpl::new(
+            dispatch.clone(),
+            active.clone(),
+            ratelimited,
+            dead.clone(),
+            collector,
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            false,
+        );
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
+        dispatch.add(node.clone());
+
+        let meta = RequestMeta {
+            model: "deepseek-v4-flash".to_string(),
+            stream: true,
+            body_size: 128,
+        };
+        let dispatched = manager.dispatch(&meta).unwrap();
+        manager.report(
+            dispatched.node.id.clone(),
+            ResultKind::Error {
+                kind: ErrorKind::SocksHandshake,
+            },
+            100,
+        );
+
+        assert_eq!(active.available(), 0);
+        assert_eq!(dead.available(), 1);
+        assert_eq!(dispatch.available(), 0);
     }
 }

@@ -37,8 +37,18 @@ Signals:
 - SOCKS handshake failure
 - connection refused
 - DNS failure
-- connect timeout
-- repeated network timeout
+
+Soft upstream failures must not enter Dead directly:
+
+- upstream 5xx
+- app-level upstream busy
+- empty assistant output
+- request timeout after the request reached the upstream path
+- retry-budget exhaustion
+
+These soft failures reduce score and node concurrency, but keep the node in
+Dispatch. A node is buried only when evidence points to the proxy path itself,
+not when Zen or the model returned a bad application result.
 
 ## Dead Probe Policy
 
@@ -96,4 +106,5 @@ The provider adapter resolves the public model before sending upstream.
 - using probe traffic that does not include the same auth/header path as real
   requests.
 - moving 429 nodes to Dead.
-- selecting a fresh node on every retry by default.
+- burying nodes for upstream 5xx, empty-output, or retry-budget exhaustion.
+- letting one globally best node monopolize dispatch selection.

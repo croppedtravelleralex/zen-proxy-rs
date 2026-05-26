@@ -58,7 +58,12 @@ impl Pool for ActivePool {
     fn release(&self, node_id: &NodeId, result: &ResultKind) {
         let entries = self.entries.read().unwrap();
         if let Some(entry) = entries.get(node_id) {
-            entry.active_requests.fetch_sub(1, Ordering::SeqCst);
+            let _ =
+                entry
+                    .active_requests
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                        Some(value.saturating_sub(1))
+                    });
 
             match result {
                 ResultKind::Success(_) => {
@@ -66,7 +71,10 @@ impl Pool for ActivePool {
                     let next = cur.saturating_add(1).min(20);
                     entry.max_concurrent.store(next, Ordering::Relaxed);
                 }
-                _ => {
+                ResultKind::RateLimited
+                | ResultKind::EmptyOutput
+                | ResultKind::SoftFailure { .. }
+                | ResultKind::Error { .. } => {
                     let cur = entry.max_concurrent.load(Ordering::Relaxed);
                     let next = (cur / 2).max(1);
                     entry.max_concurrent.store(next, Ordering::Relaxed);
@@ -91,7 +99,7 @@ impl Pool for ActivePool {
         let entries = self.entries.read().unwrap();
         entries
             .values()
-            .map(|e| e.active_requests.load(Ordering::Relaxed) as usize)
+            .map(|e| e.active_requests.load(Ordering::Relaxed).max(0) as usize)
             .sum()
     }
 
