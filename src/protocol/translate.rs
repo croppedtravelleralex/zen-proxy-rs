@@ -1,6 +1,21 @@
 use super::types::*;
 use serde_json::Value;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ToolHistoryRepair {
+    pub synthetic_tool_ids: usize,
+    pub paired_tool_results: usize,
+    pub downgraded_tool_results: usize,
+    pub downgraded_assistant_calls: usize,
+}
+
+#[derive(Debug)]
+struct PendingToolCallState {
+    id: String,
+    message_index: usize,
+    used: bool,
+}
+
 pub fn normalize_model(model: &str) -> String {
     model
         .strip_prefix("opencode/")
@@ -30,6 +45,153 @@ pub fn anthropic_to_openai_messages(req: &AnthropicRequest) -> Vec<Message> {
         msgs.extend(anthropic_message_to_openai_messages(msg));
     }
     msgs
+}
+
+pub fn canonicalize_openai_tool_history(messages: &mut [Message]) -> ToolHistoryRepair {
+    let mut repair = ToolHistoryRepair::default();
+    let mut pending = Vec::<PendingToolCallState>::new();
+
+    for message_index in 0..messages.len() {
+        let role = messages[message_index].role.clone();
+        if role != "tool" && !pending.iter().all(|item| item.used) {
+            downgrade_unresolved_pending(messages, &mut pending, &mut repair);
+        }
+
+        match role.as_str() {
+            "assistant" => {
+                let message = &mut messages[message_index];
+                let Some(calls) = message.tool_calls.as_mut() else {
+                    continue;
+                };
+                for (tool_index, call) in calls.iter_mut().enumerate() {
+                    if call.id.as_deref().map(str::trim).is_none_or(str::is_empty) {
+                        call.id = Some(synthetic_tool_id(message_index, tool_index, call));
+                        repair.synthetic_tool_ids += 1;
+                    }
+                    if let Some(id) = call.id.as_ref().filter(|id| !id.trim().is_empty()) {
+                        pending.push(PendingToolCallState {
+                            id: id.clone(),
+                            message_index,
+                            used: false,
+                        });
+                    }
+                }
+            }
+            "tool" => {
+                let message = &mut messages[message_index];
+                let original_id = message
+                    .tool_call_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned);
+                let matched = message
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .and_then(|id| mark_pending_used(&mut pending, id))
+                    .or_else(|| consume_next_pending(&mut pending));
+
+                if let Some(id) = matched {
+                    if original_id.as_deref() != Some(id.as_str()) {
+                        message.tool_call_id = Some(id);
+                        repair.paired_tool_results += 1;
+                    }
+                } else {
+                    downgrade_tool_message(message);
+                    repair.downgraded_tool_results += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    downgrade_unresolved_pending(messages, &mut pending, &mut repair);
+    repair
+}
+
+fn downgrade_unresolved_pending(
+    messages: &mut [Message],
+    pending: &mut Vec<PendingToolCallState>,
+    repair: &mut ToolHistoryRepair,
+) {
+    let unresolved = pending
+        .iter()
+        .filter(|item| !item.used)
+        .map(|item| (item.message_index, item.id.clone()))
+        .collect::<Vec<_>>();
+    for (message_index, id) in unresolved {
+        let Some(message) = messages.get_mut(message_index) else {
+            continue;
+        };
+        let Some(calls) = message.tool_calls.as_mut() else {
+            continue;
+        };
+        let before = calls.len();
+        calls.retain(|call| call.id.as_deref() != Some(id.as_str()));
+        let removed = before.saturating_sub(calls.len());
+        repair.downgraded_assistant_calls += removed;
+        if calls.is_empty() {
+            message.tool_calls = None;
+            if message.content.is_null()
+                || message
+                    .content
+                    .as_str()
+                    .is_some_and(|content| content.trim().is_empty())
+            {
+                message.content = Value::String(
+                    "[Tool call recovered as plain context: matching tool result missing]"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    pending.clear();
+}
+
+fn mark_pending_used(pending: &mut [PendingToolCallState], id: &str) -> Option<String> {
+    let call = pending
+        .iter_mut()
+        .find(|item| item.id == id && !item.used)?;
+    call.used = true;
+    Some(call.id.clone())
+}
+
+fn consume_next_pending(pending: &mut [PendingToolCallState]) -> Option<String> {
+    let call = pending.iter_mut().find(|item| !item.used)?;
+    call.used = true;
+    Some(call.id.clone())
+}
+
+fn downgrade_tool_message(message: &mut Message) {
+    let preview = message
+        .content
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| message.content.to_string());
+    message.role = "user".to_string();
+    message.tool_call_id = None;
+    message.tool_calls = None;
+    message.content = Value::String(format!(
+        "[Tool result recovered as plain context: original tool_call_id missing or invalid]\n{preview}"
+    ));
+}
+
+fn synthetic_tool_id(message_index: usize, tool_index: usize, call: &ToolCall) -> String {
+    let hash = stable_hash64(&format!(
+        "{}:{}:{}:{}",
+        message_index, tool_index, call.function.name, call.function.arguments
+    ));
+    format!("call_fmc_{message_index}_{tool_index}_{hash:016x}")
+}
+
+fn stable_hash64(input: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn anthropic_message_to_openai_messages(msg: &AnthropicMessage) -> Vec<Message> {
@@ -109,7 +271,7 @@ fn anthropic_user_to_openai_messages(content: &Value) -> Vec<Message> {
         }];
     };
 
-    let mut messages = Vec::new();
+    let mut tool_messages = Vec::new();
     let mut user_text = Vec::new();
     for block in blocks {
         match block.get("type").and_then(|v| v.as_str()) {
@@ -121,16 +283,7 @@ fn anthropic_user_to_openai_messages(content: &Value) -> Vec<Message> {
                 }
             }
             Some("tool_result") => {
-                if !user_text.is_empty() {
-                    messages.push(Message {
-                        role: "user".to_string(),
-                        content: Value::String(user_text.join("\n")),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                    user_text.clear();
-                }
-                messages.push(Message {
+                tool_messages.push(Message {
                     role: "tool".to_string(),
                     content: crate::redact::redact_value(&Value::String(
                         anthropic_content_to_text(block.get("content").unwrap_or(&Value::Null)),
@@ -145,6 +298,7 @@ fn anthropic_user_to_openai_messages(content: &Value) -> Vec<Message> {
             _ => {}
         }
     }
+    let mut messages = tool_messages;
     if !user_text.is_empty() {
         messages.push(Message {
             role: "user".to_string(),

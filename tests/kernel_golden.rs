@@ -23,6 +23,7 @@ struct ObservedRequest {
     proof_header: Option<String>,
     extra_header: Option<String>,
     model: Option<String>,
+    messages: Option<Value>,
     tool_choice: Option<Value>,
     thinking: Option<Value>,
 }
@@ -45,6 +46,7 @@ async fn mock_zen_handler(
             .get("model")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned),
+        messages: body.get("messages").cloned(),
         tool_choice: body.get("tool_choice").cloned(),
         thinking: body.get("thinking").cloned(),
     });
@@ -446,6 +448,141 @@ async fn anthropic_tool_use_history_is_preserved_as_openai_tool_calls() {
     assert_eq!(messages[1].role, "tool");
     assert_eq!(messages[1].tool_call_id.as_deref(), Some("toolu_1"));
     assert_eq!(messages[1].content, json!("hello"));
+}
+
+#[tokio::test]
+async fn anthropic_missing_tool_result_id_is_repaired_before_upstream() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let req = AnthropicRequest {
+        messages: vec![
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: json!([
+                    {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.txt"}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"tool_result","content":"hello from tool"}
+                ]),
+            },
+        ],
+        ..anthropic_request("deepseek-v4-flash-free", "ignored", false)
+    };
+
+    let response = kernel.anthropic_messages(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = observed.requests.lock().unwrap();
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(messages[0]["tool_calls"][0]["id"], "toolu_1");
+    assert_eq!(messages[1]["role"], "tool");
+    assert_eq!(messages[1]["tool_call_id"], "toolu_1");
+}
+
+#[tokio::test]
+async fn anthropic_mixed_text_and_tool_result_keeps_tool_result_adjacent() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let req = AnthropicRequest {
+        messages: vec![
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: json!([
+                    {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"a.txt"}}
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: json!([
+                    {"type":"text","text":"extra user text before result"},
+                    {"type":"tool_result","tool_use_id":"toolu_1","content":"tool output"}
+                ]),
+            },
+        ],
+        ..anthropic_request("deepseek-v4-flash-free", "ignored", false)
+    };
+
+    let response = kernel.anthropic_messages(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = observed.requests.lock().unwrap();
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(messages[0]["role"], "assistant");
+    assert_eq!(messages[1]["role"], "tool");
+    assert_eq!(messages[1]["tool_call_id"], "toolu_1");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"], "extra user text before result");
+}
+
+#[tokio::test]
+async fn openai_interleaved_user_breaks_pending_tool_pair_safely() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = chat_request("deepseek-v4-flash-free", "ignored", false, None);
+    req.messages = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: Value::Null,
+            tool_calls: Some(vec![free_model_client_rs::protocol::types::ToolCall {
+                id: Some("call_interleaved".to_string()),
+                call_type: "function".to_string(),
+                function: free_model_client_rs::protocol::types::ToolFunction {
+                    name: "Read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                index: Some(0),
+            }]),
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: json!("interleaving text"),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "tool".to_string(),
+            content: json!("late tool result"),
+            tool_calls: None,
+            tool_call_id: Some("call_interleaved".to_string()),
+        },
+    ];
+
+    let response = kernel.openai_chat(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = observed.requests.lock().unwrap();
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    assert!(messages[0].get("tool_calls").is_none());
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[2]["role"], "user");
+    assert!(messages[2].get("tool_call_id").is_none());
+}
+
+#[tokio::test]
+async fn anthropic_orphan_tool_result_is_downgraded_before_upstream() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let req = AnthropicRequest {
+        messages: vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: json!([
+                {"type":"tool_result","content":"orphan tool output"}
+            ]),
+        }],
+        ..anthropic_request("deepseek-v4-flash-free", "ignored", false)
+    };
+
+    let response = kernel.anthropic_messages(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = observed.requests.lock().unwrap();
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(messages[0]["role"], "user");
+    assert!(messages[0].get("tool_call_id").is_none());
+    assert!(messages[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Tool result recovered as plain context"));
 }
 
 #[tokio::test]

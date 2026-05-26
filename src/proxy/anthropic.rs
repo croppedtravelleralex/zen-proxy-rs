@@ -16,7 +16,17 @@ pub async fn handle_anthropic_messages(
 ) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
     let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
-    let msgs = translate::anthropic_to_openai_messages(&body);
+    let mut msgs = translate::anthropic_to_openai_messages(&body);
+    let repair = translate::canonicalize_openai_tool_history(&mut msgs);
+    if repair != translate::ToolHistoryRepair::default() {
+        tracing::warn!(
+            synthetic_tool_ids = repair.synthetic_tool_ids,
+            paired_tool_results = repair.paired_tool_results,
+            downgraded_tool_results = repair.downgraded_tool_results,
+            downgraded_assistant_calls = repair.downgraded_assistant_calls,
+            "canonicalized anthropic tool history after openai translation"
+        );
+    }
     let tools: Vec<OpenAITool> = body
         .tools
         .as_ref()
@@ -236,11 +246,7 @@ async fn handle_stream(
         let mut text_block_open = false;
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
-        loop {
-            let event = match upstream.next().await {
-                Some(result) => result,
-                None => break,
-            };
+        while let Some(event) = upstream.next().await {
             let event = match event {
                 Ok(event) => event,
                 Err(err) => {

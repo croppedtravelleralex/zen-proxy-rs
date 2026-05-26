@@ -11,12 +11,22 @@ use serde_json::Value;
 pub async fn handle_openai_chat(
     client: &Client,
     config: &KernelConfig,
-    body: ChatRequest,
+    mut body: ChatRequest,
 ) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
     let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
     let tools = body.tools.clone().unwrap_or_default();
     let max_tok = body.max_tokens.unwrap_or(1024).max(32);
+    let repair = translate::canonicalize_openai_tool_history(&mut body.messages);
+    if repair != translate::ToolHistoryRepair::default() {
+        tracing::warn!(
+            synthetic_tool_ids = repair.synthetic_tool_ids,
+            paired_tool_results = repair.paired_tool_results,
+            downgraded_tool_results = repair.downgraded_tool_results,
+            downgraded_assistant_calls = repair.downgraded_assistant_calls,
+            "canonicalized openai tool history before upstream"
+        );
+    }
     let mut zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":body.tool_choice});
     translate::disable_thinking_by_default(&mut zb);
     translate::disable_thinking_for_assistant_history(&mut zb, &body.messages);
@@ -249,11 +259,7 @@ async fn handle_oa_stream(
         let mut text = String::new();
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
-        loop {
-            let event = match upstream.next().await {
-                Some(result) => result,
-                None => break,
-            };
+        while let Some(event) = upstream.next().await {
             let event = match event {
                 Ok(event) => event,
                 Err(err) => {
