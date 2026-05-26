@@ -217,6 +217,13 @@ where
         }
     }
 
+    fn record_latency_hint(&self, node_id: NodeId, latency_ms: u64) {
+        if node_id == DIRECT_NODE_ID {
+            return;
+        }
+        self.dispatch.record_latency_hint(&node_id, latency_ms);
+    }
+
     fn pool_stats(&self) -> PoolStats {
         let (cooldown_size, budget_limited_size, leased_count) = self.dispatch.budget_counts();
         PoolStats {

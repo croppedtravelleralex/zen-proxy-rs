@@ -1230,6 +1230,10 @@ fn metered_stream_response(
                 Ok(bytes) => {
                     if first_chunk_ms == 0 {
                         first_chunk_ms = request_start.elapsed().as_millis() as u64;
+                        state.pool_manager.record_latency_hint(
+                            telemetry.selected_node_id.clone(),
+                            first_chunk_ms,
+                        );
                     }
                     metrics.ingest(&path, &bytes);
                     if tx.send(Ok(bytes)).await.is_err() {

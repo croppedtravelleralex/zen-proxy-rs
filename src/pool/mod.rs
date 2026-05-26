@@ -124,6 +124,7 @@ pub trait Pool: Send + Sync {
         let _ = latency_ms;
         self.release(node_id, result);
     }
+    fn record_latency_hint(&self, _node_id: &NodeId, _latency_ms: u64) {}
     fn release(&self, node_id: &NodeId, result: &ResultKind);
     fn remove(&self, node_id: &NodeId);
     fn add(&self, node: NodeRef);
@@ -139,6 +140,7 @@ pub trait PoolManager: Send + Sync {
         node_id: &str,
     ) -> Result<DispatchResult, DispatchError>;
     fn report(&self, node_id: NodeId, result: ResultKind, latency_us: u64);
+    fn record_latency_hint(&self, node_id: NodeId, latency_ms: u64);
     fn pool_stats(&self) -> PoolStats;
     fn budget_details(&self) -> Vec<serde_json::Value>;
     fn node_budget_detail(&self, node_id: &str) -> Option<serde_json::Value>;

@@ -136,13 +136,26 @@ Confirmed on 2026-05-25:
 Current V4.4 verification on 2026-05-26:
 
 - `panda` now uses nginx on port 4000 in front of three ZenProxyRS instances.
-- deployed binary SHA1:
-  `7207a649be4cebe74b265a5a61f85bfc0ba5c602`.
+- deployed binary SHA1 after TTFT-aware dispatch update:
+  `b4d8fdcb2f922690e9903b0b83a0eaafda826c37`.
 - `V4_RETRY_BUDGET_MS=60000`.
 - each instance uses `V43_GLOBAL_BUDGET_MODE=sync_redis` and
   `GLOBAL_BUDGET_REDIS_URL=redis://127.0.0.1:6379/`.
 - after multi-instance rollout, all three instances showed `dispatch=90`,
   `dead=0`, `active=0`, `leased=0`.
+- V4 stream dispatch now records first-chunk latency as a non-releasing node
+  hint, so long streams no longer teach the pool only by full stream duration.
+- Large streaming requests increase dispatch score weight for recent node
+  latency. This is a source-side optimization only; NewAPI and Claude Code are
+  unchanged.
+- Public cache research and production data agree on the boundary: sub-second
+  TTFT for 100k-500k context requires real upstream prompt/KV cache hits and a
+  fast selected node. ZenProxy can improve node choice and avoid extra delay,
+  but cannot force a slow upstream cache read into 1s.
+- 2026-05-26 production smoke after deploy: direct ZenProxy stream returned
+  HTTP 200 with `time_starttransfer=1.410657s`; recent 220k+ cached-token
+  audit rows were still around 2.4-4.0s TTFT, showing the remaining bottleneck
+  is mainly upstream/cache/node path quality.
 - NewAPI `http://127.0.0.1:8081` with key `sk-dev` returned HTTP 200 for
   `deepseek-v4-flash` and `deepseek-v4-flash-lite`, both streaming and
   non-streaming.

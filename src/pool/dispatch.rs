@@ -191,14 +191,38 @@ impl PoolNode {
     }
 
     fn score(&self) -> f64 {
+        self.score_for(None)
+    }
+
+    fn score_for(&self, meta: Option<&RequestMeta>) -> f64 {
+        let large_stream = meta.is_some_and(|m| m.stream && m.body_size >= 128 * 1024);
+        let very_large_stream = meta.is_some_and(|m| m.stream && m.body_size >= 512 * 1024);
+        let health_weight = if very_large_stream {
+            0.30
+        } else if large_stream {
+            0.35
+        } else {
+            0.50
+        };
+        let success_weight = 0.20;
+        let idle_weight = if large_stream { 0.10 } else { 0.15 };
+        let latency_weight = if very_large_stream {
+            0.30
+        } else if large_stream {
+            0.25
+        } else {
+            0.10
+        };
+        let momentum_weight = if large_stream { 0.10 } else { 0.05 };
+
         let base_pct = self.base_score.load(Ordering::Relaxed) as f64 / SCORE_SCALE as f64;
-        let health = (base_pct / 100.0).clamp(0.0, 1.0) * 0.50;
+        let health = (base_pct / 100.0).clamp(0.0, 1.0) * health_weight;
 
         let recent = self.recent_results.read().unwrap();
         let total = recent.len();
         let successes = recent.iter().filter(|&&r| r).count();
         let success_rate = if total > 0 {
-            successes as f64 / total as f64 * 0.20
+            successes as f64 / total as f64 * success_weight
         } else {
             0.0
         };
@@ -206,13 +230,13 @@ impl PoolNode {
 
         let now = chrono::Utc::now().timestamp();
         let idle_secs = now - self.idle_since.load(Ordering::Relaxed);
-        let idle_factor = (idle_secs as f64 / 60.0).min(1.0) * 0.15;
+        let idle_factor = (idle_secs as f64 / 60.0).min(1.0) * idle_weight;
 
         let avg_lat = self.avg_latency_ms.load(Ordering::Relaxed) as f64;
-        let latency_factor = (1.0 - (avg_lat / 5000.0).min(1.0)).max(0.0) * 0.10;
+        let latency_factor = (1.0 - (avg_lat / 5000.0).min(1.0)).max(0.0) * latency_weight;
 
         let consec = self.consecutive_successes.load(Ordering::Relaxed) as f64;
-        let momentum = (consec / 10.0).min(1.0) * 0.05;
+        let momentum = (consec / 10.0).min(1.0) * momentum_weight;
 
         health + success_rate + idle_factor + latency_factor + momentum
     }
@@ -226,7 +250,7 @@ impl PoolNode {
             }
         }
 
-        self.avg_latency_ms.store(latency_ms, Ordering::Relaxed);
+        self.record_latency(latency_ms);
 
         if success {
             self.raise_base_score();
@@ -250,6 +274,21 @@ impl PoolNode {
             self.lower_base_score();
             self.reduce_concurrency(aimd);
         }
+    }
+
+    fn record_latency(&self, latency_ms: u64) {
+        if latency_ms == 0 {
+            return;
+        }
+        let _ = self
+            .avg_latency_ms
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(if current == 0 {
+                    latency_ms
+                } else {
+                    current.saturating_mul(3).saturating_add(latency_ms) / 4
+                })
+            });
     }
 
     fn raise_base_score(&self) {
@@ -526,7 +565,7 @@ impl DispatchPool {
             {
                 continue;
             }
-            let score = node.score();
+            let score = node.score_for(Some(meta));
             if score > best_score {
                 best_score = score;
                 best_idx = Some(idx);
@@ -585,7 +624,7 @@ impl DispatchPool {
             return None;
         }
 
-        let total: f64 = eligible.iter().map(|n| n.score()).sum();
+        let total: f64 = eligible.iter().map(|n| n.score_for(Some(meta))).sum();
         if total <= 0.0 {
             return None;
         }
@@ -593,7 +632,7 @@ impl DispatchPool {
         let threshold = fastrand::f64() * total;
         let mut cumulative = 0.0;
         for n in eligible {
-            cumulative += n.score();
+            cumulative += n.score_for(Some(meta));
             if cumulative >= threshold {
                 if n.try_admit(meta, now) {
                     if self.global_admit(n, meta) {
@@ -622,7 +661,7 @@ impl DispatchPool {
                     .can_admit(meta, now, concurrent_now, max_concurrent)
                     .is_ok()
                 {
-                    candidates.push((node.score(), node.node.id.clone()));
+                    candidates.push((node.score_for(Some(meta)), node.node.id.clone()));
                 }
             }
         }
@@ -732,6 +771,14 @@ impl Pool for DispatchPool {
                     pn.record_result(false, latency_ms, &self.aimd);
                 }
             }
+        }
+    }
+
+    fn record_latency_hint(&self, node_id: &NodeId, latency_ms: u64) {
+        let shard_idx = self.shard_index_for_id(node_id);
+        let nodes = self.shards[shard_idx].nodes.read().unwrap();
+        if let Some(pn) = nodes.iter().find(|n| n.node.id == *node_id) {
+            pn.record_latency(latency_ms);
         }
     }
 
@@ -873,6 +920,26 @@ mod tests {
 
         let detail = pool.node_budget_detail(&node.id).unwrap();
         assert_eq!(detail["avg_latency_ms"].as_u64(), Some(12_345));
+    }
+
+    #[test]
+    fn latency_hint_updates_score_without_releasing_lease() {
+        let pool = DispatchPool::new();
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:10850".to_string(),
+        ));
+
+        let node = pool.acquire_for(&meta(256 * 1024)).unwrap();
+        pool.record_latency_hint(&node.id, 1_234);
+
+        let snapshot = pool
+            .budget_snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.node_id == node.id)
+            .unwrap();
+        let detail = pool.node_budget_detail(&node.id).unwrap();
+        assert_eq!(snapshot.concurrent_now, 1);
+        assert_eq!(detail["avg_latency_ms"].as_u64(), Some(1_234));
     }
 
     #[test]
