@@ -178,6 +178,23 @@ Current V4.4 verification on 2026-05-26:
   tool results are not sent upstream. Deployed release SHA1:
   `27b14d90f6c9ebaccc6252ec896bc3593d2080f7`; production malformed
   `tool_call_id` smoke returned HTTP 200 and audit showed `post_valid=true`.
+- V4.6 follow-up found one more boundary in production Hermes-style traffic:
+  raw Anthropic `/v1/messages` guard could pass while the embedded
+  free-model-client Anthropic-to-OpenAI translation later produced an upstream
+  OpenAI `role=tool` message without `tool_call_id`. The fix is a kernel-side
+  OpenAI tool-history canonicalizer in `free-model-client-rs`, applied both to
+  direct OpenAI requests and after Anthropic translation. No NewAPI or client
+  workaround is part of the fix.
+- V4.6 second follow-up tightened the kernel translator for real
+  Hermes/OpenClaw tool histories: mixed Anthropic `text + tool_result` user
+  content is translated with OpenAI tool messages adjacent to the preceding
+  assistant tool call, and the OpenAI canonicalizer refuses to pair tool
+  results across an intervening non-tool message. This prevents strict upstream
+  errors caused by invalid tool-pair ordering, not just missing IDs.
+- Local V4.6 second follow-up release SHA1:
+  `8bfd54f83f4f25555bcdc93ec6e9466e0a7d1f95`. Hermes/OpenClaw local smokes now
+  reach ZenProxy through NewAPI but currently fail on Webshare-to-Zen
+  `transport_error`, not protocol guard validation.
 - 2026-05-26 production smoke after deploy: direct ZenProxy stream returned
   HTTP 200 with `time_starttransfer=1.410657s`; recent 220k+ cached-token
   audit rows were still around 2.4-4.0s TTFT, showing the remaining bottleneck

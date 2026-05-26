@@ -164,7 +164,13 @@ fn count_invalid_openai(body: &Value) -> u32 {
     let mut invalid = 0u32;
     let mut pending = Vec::<PendingCall>::new();
     for (idx, message) in messages.iter().enumerate() {
-        match message.get("role").and_then(Value::as_str) {
+        let role = message.get("role").and_then(Value::as_str);
+        if role != Some("tool") && !pending.iter().all(|item| item.used) {
+            invalid =
+                invalid.saturating_add(pending.iter().filter(|item| !item.used).count() as u32);
+            pending.clear();
+        }
+        match role {
             Some("assistant") => {
                 if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
                     for call in calls {
@@ -207,9 +213,18 @@ fn repair_openai(conf: &Config, body: &mut Value, telemetry: &mut ProtocolGuardT
     }
 
     let mut pending = Vec::<PendingCall>::new();
-    for (idx, message) in messages.iter_mut().enumerate() {
-        match message.get("role").and_then(Value::as_str) {
+    for idx in 0..messages.len() {
+        let role = messages[idx]
+            .get("role")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if role.as_deref() != Some("tool") && !pending.iter().all(|item| item.used) {
+            downgrade_unresolved_openai_tool_calls(messages, &pending, telemetry);
+            pending.clear();
+        }
+        match role.as_deref() {
             Some("assistant") => {
+                let message = &mut messages[idx];
                 let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut)
                 else {
                     continue;
@@ -226,6 +241,7 @@ fn repair_openai(conf: &Config, body: &mut Value, telemetry: &mut ProtocolGuardT
                 }
             }
             Some("tool") => {
+                let message = &mut messages[idx];
                 let current_id =
                     non_empty_str(message.get("tool_call_id")).map(ToString::to_string);
                 let matched = match current_id {
@@ -734,6 +750,36 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert!(body["messages"][0].get("tool_call_id").is_none());
         assert!(telemetry.post_valid);
+        assert_eq!(telemetry.downgraded_tool_result_count, 1);
+    }
+
+    #[test]
+    fn openai_intervening_user_breaks_tool_pair() {
+        let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+                {"role":"user","content":"ordinary text before result"},
+                {"role":"tool","tool_call_id":"call_1","content":"late result"}
+            ]
+        });
+
+        let telemetry = guard_body(
+            &cfg(),
+            "chat/completions",
+            &mut body,
+            "openclaw",
+            GuardPhase::PreCompact,
+            true,
+        )
+        .unwrap();
+
+        assert!(body["messages"][0].get("tool_calls").is_none());
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert!(body["messages"][2].get("tool_call_id").is_none());
+        assert!(telemetry.post_valid);
+        assert_eq!(telemetry.orphan_assistant_call_count, 1);
         assert_eq!(telemetry.downgraded_tool_result_count, 1);
     }
 
