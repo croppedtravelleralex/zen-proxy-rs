@@ -94,6 +94,10 @@ impl RequestMeta {
         (self.body_size / 4).max(1)
     }
 
+    pub fn token_bucket(&self) -> &'static str {
+        token_bucket(self.estimated_input_tokens())
+    }
+
     pub fn request_kb(&self) -> u64 {
         self.body_size.div_ceil(1024).max(1)
     }
@@ -110,6 +114,16 @@ pub fn body_size_bucket(body_size: u64) -> &'static str {
         262_144..=524_287 => "medium",
         524_288..=1_048_575 => "large",
         _ => "huge",
+    }
+}
+
+pub fn token_bucket(tokens: u64) -> &'static str {
+    match tokens {
+        0..=49_999 => "under_50k",
+        50_000..=99_999 => "50k_100k",
+        100_000..=199_999 => "100k_200k",
+        200_000..=399_999 => "200k_400k",
+        _ => "400k_plus",
     }
 }
 
