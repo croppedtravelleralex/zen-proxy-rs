@@ -23,32 +23,30 @@ impl SseBuffer {
         }
         let mut lines: Vec<Vec<u8>> = Vec::new();
         let mut current_line: Vec<u8> = Vec::new();
-        let mut found_lf = false;
         while let Some(&b) = self.buf.front() {
             if b == b'\n' || b == b'\r' {
                 let _ = self.buf.pop_front();
                 if b == b'\r' && self.buf.front() == Some(&b'\n') {
                     let _ = self.buf.pop_front();
                 }
-                if !current_line.is_empty() || (!found_lf && current_line.is_empty()) {
-                    if !self.done {
-                        let patched = patch_sse_line(&current_line);
-                        if !patched.is_empty() {
-                            let mut line_with_nl = patched;
-                            line_with_nl.push(b'\n');
-                            lines.push(line_with_nl);
-                        }
-                    }
-                } else if current_line.is_empty() && found_lf && !self.done {
-                    lines.push(vec![b'\n']);
+                if self.done {
+                    current_line.clear();
+                    continue;
                 }
-                if !self.done && (current_line == b"data: [DONE]" || current_line == b"data:[DONE]")
-                {
+                if current_line == b"data: [DONE]" || current_line == b"data:[DONE]" {
                     self.done = true;
                     lines.push(b"data: [DONE]\n".to_vec());
+                } else if current_line.is_empty() {
+                    lines.push(vec![b'\n']);
+                } else {
+                    let patched = patch_sse_line(&current_line);
+                    if !patched.is_empty() {
+                        let mut line_with_nl = patched;
+                        line_with_nl.push(b'\n');
+                        lines.push(line_with_nl);
+                    }
                 }
                 current_line.clear();
-                found_lf = true;
             } else {
                 current_line.push(b);
                 let _ = self.buf.pop_front();
@@ -59,7 +57,10 @@ impl SseBuffer {
 }
 
 fn patch_sse_line(line: &[u8]) -> Vec<u8> {
-    if line.is_empty() || !line.starts_with(b"data") {
+    if line.is_empty() || line.starts_with(b":") {
+        return line.to_vec();
+    }
+    if !line.starts_with(b"data") {
         return line.to_vec();
     }
     if line == b"data: [DONE]" || line == b"data:[DONE]" {
@@ -124,9 +125,11 @@ mod tests {
     fn preserves_done_event() {
         let mut buf = SseBuffer::new();
         let result = buf.push_bytes(b"data: [DONE]\n\n");
-        assert!(result
+        let done_count = result
             .iter()
-            .any(|r| r.windows(b"DONE".len()).any(|w| w == b"DONE")));
+            .filter(|r| r.windows(b"DONE".len()).any(|w| w == b"DONE"))
+            .count();
+        assert_eq!(done_count, 1);
     }
 
     #[test]
@@ -181,6 +184,16 @@ mod tests {
             "got {} data lines, expected >= 2",
             payload_count
         );
+    }
+
+    #[test]
+    fn preserves_comments_and_blank_event_boundaries() {
+        let mut buf = SseBuffer::new();
+        let result = buf.push_bytes(b": keep-alive\r\n\r\ndata: {\"ok\":true}\r\n\r\n");
+        let all: Vec<u8> = result.iter().flatten().copied().collect();
+        let s = String::from_utf8_lossy(&all);
+        assert!(s.contains(": keep-alive\n\n"));
+        assert!(s.contains("data: {\"ok\":true}\n\n"));
     }
 
     #[test]
