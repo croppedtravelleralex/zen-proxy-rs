@@ -39,6 +39,8 @@ pub fn raw_body_has_tool_markers(body: &[u8]) -> bool {
         "tool_use",
         "tool_result",
         "tool_use_id",
+        "input_schema",
+        "\"tools\"",
         "\"role\":\"tool\"",
         "\"role\": \"tool\"",
     ]
@@ -128,16 +130,19 @@ fn body_has_tool_shape(path: &str, body: &Value) -> bool {
         return false;
     };
     if path == "messages" {
-        messages.iter().any(|message| {
-            content_blocks(message).is_some_and(|blocks| {
-                blocks.iter().any(|block| {
-                    matches!(
-                        block.get("type").and_then(Value::as_str),
-                        Some("tool_use" | "tool_result")
-                    )
+        body.get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+            || messages.iter().any(|message| {
+                content_blocks(message).is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        matches!(
+                            block.get("type").and_then(Value::as_str),
+                            Some("tool_use" | "tool_result")
+                        )
+                    })
                 })
             })
-        })
     } else {
         messages.iter().any(|message| {
             message
@@ -380,10 +385,10 @@ fn downgrade_openai_tool_message(message: &mut Value) {
 }
 
 fn count_invalid_anthropic(body: &Value) -> u32 {
+    let mut invalid = count_invalid_anthropic_tools(body);
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return 0;
+        return invalid;
     };
-    let mut invalid = 0u32;
     let mut pending = Vec::<PendingCall>::new();
     for (idx, message) in messages.iter().enumerate() {
         let Some(blocks) = content_blocks(message) else {
@@ -421,7 +426,30 @@ fn count_invalid_anthropic(body: &Value) -> u32 {
     invalid.saturating_add(pending.iter().filter(|item| !item.used).count() as u32)
 }
 
+fn count_invalid_anthropic_tools(body: &Value) -> u32 {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| {
+                    let Some(schema) = tool.get("input_schema") else {
+                        return true;
+                    };
+                    if !schema.is_object() {
+                        return true;
+                    }
+                    schema.get("type").and_then(Value::as_str) != Some("object")
+                        || !schema.get("properties").is_some_and(Value::is_object)
+                })
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
 fn repair_anthropic(conf: &Config, body: &mut Value, telemetry: &mut ProtocolGuardTelemetry) {
+    repair_anthropic_tools(body, telemetry);
+
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -492,6 +520,40 @@ fn repair_anthropic(conf: &Config, body: &mut Value, telemetry: &mut ProtocolGua
         }
     }
     downgrade_unresolved_anthropic_tool_uses(messages, &pending, telemetry);
+}
+
+fn repair_anthropic_tools(body: &mut Value, telemetry: &mut ProtocolGuardTelemetry) {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        let schema_is_valid = tool
+            .get("input_schema")
+            .is_some_and(|schema| schema.is_object());
+        if !schema_is_valid {
+            tool["input_schema"] = json!({
+                "type": "object",
+                "properties": {}
+            });
+            telemetry.applied = true;
+            raise_risk(telemetry, "low");
+            continue;
+        }
+
+        if tool["input_schema"].get("type").and_then(Value::as_str) != Some("object") {
+            tool["input_schema"]["type"] = Value::String("object".to_string());
+            telemetry.applied = true;
+            raise_risk(telemetry, "low");
+        }
+        if !tool["input_schema"]
+            .get("properties")
+            .is_some_and(Value::is_object)
+        {
+            tool["input_schema"]["properties"] = json!({});
+            telemetry.applied = true;
+            raise_risk(telemetry, "low");
+        }
+    }
 }
 
 fn downgrade_unresolved_anthropic_tool_uses(
@@ -810,6 +872,38 @@ mod tests {
         );
         assert!(telemetry.post_valid);
         assert_eq!(telemetry.missing_tool_use_id_count, 1);
+    }
+
+    #[test]
+    fn anthropic_tool_missing_input_schema_gets_default_schema() {
+        let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "max_tokens": 100,
+            "tools": [
+                {"name": "Read", "description": "read a file"},
+                {"name": "Write", "input_schema": {"type": "string"}}
+            ],
+            "messages": [
+                {"role":"user","content":"hello"}
+            ]
+        });
+
+        let telemetry = guard_body(
+            &cfg(),
+            "messages",
+            &mut body,
+            "hermes",
+            GuardPhase::PreCompact,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(body["tools"][0]["input_schema"]["properties"], json!({}));
+        assert_eq!(body["tools"][1]["input_schema"]["type"], "object");
+        assert_eq!(body["tools"][1]["input_schema"]["properties"], json!({}));
+        assert!(telemetry.applied);
+        assert!(telemetry.post_valid);
     }
 
     #[test]
