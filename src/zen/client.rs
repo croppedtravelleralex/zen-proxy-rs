@@ -64,6 +64,8 @@ pub struct CollectedStream {
     pub reasoning: String,
     pub usage: Option<ZenUsage>,
     pub tool_calls: Vec<CollectedToolCall>,
+    pub saw_done: bool,
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -72,6 +74,14 @@ pub struct CollectedToolCall {
     pub id: Option<String>,
     pub name: String,
     pub arguments: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SseFrame {
+    pub event: Option<String>,
+    pub id: Option<String>,
+    pub retry: Option<u64>,
+    pub data: String,
 }
 
 fn make_id(prefix: &str) -> String {
@@ -188,7 +198,7 @@ pub async fn collect_stream_parts(
     resp: reqwest::Response,
 ) -> Result<CollectedStream, crate::error::AppError> {
     let mut stream = resp.bytes_stream();
-    let mut buffer = BytesMut::new();
+    let mut parser = SseParser::default();
     let mut collected = CollectedStream::default();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
@@ -197,70 +207,14 @@ pub async fn collect_stream_parts(
                 format!("stream error: {e}"),
             )
         })?;
-        buffer.extend_from_slice(&chunk);
-        while let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-            let event_bytes = buffer.split_to(pos);
-            let _ = buffer.split_to(2); // consume the \n\n
-            let s = String::from_utf8_lossy(&event_bytes);
-            for line in s.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        continue;
-                    }
-                    let event = serde_json::from_str::<ZenSseEvent>(data).map_err(|e| {
-                        crate::error::AppError::new(
-                            axum::http::StatusCode::BAD_GATEWAY,
-                            format!("stream parse error: {e}"),
-                        )
-                    })?;
-                    collected.usage = event.usage.or(collected.usage);
-                    if let Some(choices) = event.choices {
-                        for choice in choices {
-                            if let Some(delta) = choice.delta {
-                                if let Some(c) = delta.content {
-                                    collected.content.push_str(&c);
-                                }
-                                if let Some(r) = delta.reasoning_content {
-                                    collected.reasoning.push_str(&r);
-                                }
-                                if let Some(tool_calls) = delta.tool_calls {
-                                    for tc in tool_calls {
-                                        let index = tc.index.unwrap_or(0);
-                                        let existing = collected
-                                            .tool_calls
-                                            .iter_mut()
-                                            .find(|item| item.index == index);
-                                        let item = if let Some(item) = existing {
-                                            item
-                                        } else {
-                                            collected.tool_calls.push(CollectedToolCall {
-                                                index,
-                                                id: tc.id.clone(),
-                                                ..CollectedToolCall::default()
-                                            });
-                                            collected.tool_calls.last_mut().unwrap()
-                                        };
-                                        if item.id.is_none() {
-                                            item.id = tc.id.clone();
-                                        }
-                                        if let Some(function) = tc.function {
-                                            if let Some(name) = function.name {
-                                                if !name.is_empty() {
-                                                    item.name = name;
-                                                }
-                                            }
-                                            if let Some(arguments) = function.arguments {
-                                                item.arguments.push_str(&arguments);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        parser.push(&chunk);
+        while let Some(frame) = parser.next_frame()? {
+            apply_sse_frame_to_collection(frame, &mut collected)?;
         }
+    }
+    parser.finish()?;
+    if !collected.saw_done && collected.finish_reason.is_none() {
+        return Err(truncated_stream_error());
     }
     Ok(collected)
 }
@@ -271,30 +225,33 @@ pub fn stream_sse_events(
     use futures::StreamExt;
     async_stream::stream! {
         let mut byte_stream = Box::pin(byte_stream);
-        let mut buffer = BytesMut::new();
+        let mut parser = SseParser::default();
+        let mut complete = false;
         loop {
             match byte_stream.next().await {
                 Some(Ok(chunk)) => {
-                    buffer.extend_from_slice(&chunk);
-                    while let Some(pos) = buffer.windows(2).position(|w| w == b"
-
-") {
-                        let event_bytes = buffer.split_to(pos);
-                        let _ = buffer.split_to(2);
-                        let s = String::from_utf8_lossy(&event_bytes);
-                        for line in s.lines() {
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                if data == "[DONE]" { continue; }
-                                match serde_json::from_str::<ZenSseEvent>(data) {
-                                    Ok(event) => yield Ok(event),
-                                    Err(e) => {
-                                        yield Err(crate::error::AppError::new(
-                                            axum::http::StatusCode::BAD_GATEWAY,
-                                            format!("stream parse error: {e}"),
-                                        ));
-                                        return;
-                                    }
+                    parser.push(&chunk);
+                    loop {
+                        let frame = match parser.next_frame() {
+                            Ok(Some(frame)) => frame,
+                            Ok(None) => break,
+                            Err(err) => {
+                                yield Err(err);
+                                return;
+                            }
+                        };
+                        match parse_zen_frame(frame) {
+                            Ok(Some(ParsedZenFrame::Done)) => complete = true,
+                            Ok(Some(ParsedZenFrame::Event(event))) => {
+                                if event_has_finish_reason(&event) {
+                                    complete = true;
                                 }
+                                yield Ok(event);
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                yield Err(err);
+                                return;
                             }
                         }
                     }
@@ -307,30 +264,202 @@ pub fn stream_sse_events(
                     return;
                 }
                 None => {
-                    // Process remaining buffer
-                    if !buffer.is_empty() {
-                        let s = String::from_utf8_lossy(&buffer);
-                        for line in s.lines() {
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                if data == "[DONE]" { continue; }
-                                match serde_json::from_str::<ZenSseEvent>(data) {
-                                    Ok(event) => yield Ok(event),
-                                    Err(e) => {
-                                        yield Err(crate::error::AppError::new(
-                                            axum::http::StatusCode::BAD_GATEWAY,
-                                            format!("stream parse error: {e}"),
-                                        ));
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                    if let Err(err) = parser.finish() {
+                        yield Err(err);
+                        return;
+                    }
+                    if !complete {
+                        yield Err(truncated_stream_error());
                     }
                     return;
                 }
             }
         }
     }
+}
+
+#[derive(Default)]
+struct SseParser {
+    buffer: BytesMut,
+}
+
+impl SseParser {
+    fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    fn next_frame(&mut self) -> Result<Option<SseFrame>, crate::error::AppError> {
+        let Some((pos, delimiter_len)) = next_sse_delimiter(&self.buffer) else {
+            return Ok(None);
+        };
+        let frame_bytes = self.buffer.split_to(pos);
+        let _ = self.buffer.split_to(delimiter_len);
+        parse_sse_frame(&frame_bytes).map(Some)
+    }
+
+    fn finish(&self) -> Result<(), crate::error::AppError> {
+        if self.buffer.is_empty() || self.buffer.iter().all(|byte| byte.is_ascii_whitespace()) {
+            Ok(())
+        } else {
+            Err(truncated_stream_error())
+        }
+    }
+}
+
+fn next_sse_delimiter(buffer: &BytesMut) -> Option<(usize, usize)> {
+    let lf = buffer
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|pos| (pos, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| (pos, 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(found), None) | (None, Some(found)) => Some(found),
+        (None, None) => None,
+    }
+}
+
+fn parse_sse_frame(bytes: &[u8]) -> Result<SseFrame, crate::error::AppError> {
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        crate::error::AppError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("stream utf8 error: {e}"),
+        )
+    })?;
+    let mut frame = SseFrame::default();
+    let mut data_lines = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => {
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                (field, value)
+            }
+            None => (line, ""),
+        };
+        match field {
+            "data" => data_lines.push(value.to_string()),
+            "event" => frame.event = Some(value.to_string()),
+            "id" => frame.id = Some(value.to_string()),
+            "retry" => frame.retry = value.parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    frame.data = data_lines.join("\n");
+    Ok(frame)
+}
+
+enum ParsedZenFrame {
+    Done,
+    Event(ZenSseEvent),
+}
+
+fn parse_zen_frame(frame: SseFrame) -> Result<Option<ParsedZenFrame>, crate::error::AppError> {
+    if frame.data.is_empty() {
+        return Ok(None);
+    }
+    if frame.data.trim() == "[DONE]" {
+        return Ok(Some(ParsedZenFrame::Done));
+    }
+    serde_json::from_str::<ZenSseEvent>(&frame.data)
+        .map(|event| Some(ParsedZenFrame::Event(event)))
+        .map_err(|e| {
+            crate::error::AppError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("stream parse error: {e}"),
+            )
+        })
+}
+
+fn apply_sse_frame_to_collection(
+    frame: SseFrame,
+    collected: &mut CollectedStream,
+) -> Result<(), crate::error::AppError> {
+    let Some(parsed) = parse_zen_frame(frame)? else {
+        return Ok(());
+    };
+    match parsed {
+        ParsedZenFrame::Done => {
+            collected.saw_done = true;
+        }
+        ParsedZenFrame::Event(event) => {
+            if event.usage.is_some() {
+                collected.usage = event.usage;
+            }
+            if let Some(choices) = event.choices {
+                for choice in choices {
+                    if let Some(finish_reason) = choice.finish_reason {
+                        collected.finish_reason = Some(finish_reason);
+                    }
+                    if let Some(delta) = choice.delta {
+                        if let Some(c) = delta.content {
+                            collected.content.push_str(&c);
+                        }
+                        if let Some(r) = delta.reasoning_content {
+                            collected.reasoning.push_str(&r);
+                        }
+                        if let Some(tool_calls) = delta.tool_calls {
+                            merge_collected_tool_deltas(&mut collected.tool_calls, tool_calls);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn event_has_finish_reason(event: &ZenSseEvent) -> bool {
+    event
+        .choices
+        .as_ref()
+        .is_some_and(|choices| choices.iter().any(|choice| choice.finish_reason.is_some()))
+}
+
+pub fn merge_collected_tool_deltas(
+    tool_calls: &mut Vec<CollectedToolCall>,
+    deltas: Vec<ZenToolCallDelta>,
+) {
+    for tc in deltas {
+        let index = tc.index.unwrap_or(0);
+        let existing = tool_calls.iter_mut().find(|item| item.index == index);
+        let item = if let Some(item) = existing {
+            item
+        } else {
+            tool_calls.push(CollectedToolCall {
+                index,
+                id: tc.id.clone(),
+                ..CollectedToolCall::default()
+            });
+            tool_calls.last_mut().unwrap()
+        };
+        if item.id.is_none() {
+            item.id = tc.id.clone();
+        }
+        if let Some(function) = tc.function {
+            if let Some(name) = function.name {
+                if !name.is_empty() {
+                    item.name = name;
+                }
+            }
+            if let Some(arguments) = function.arguments {
+                item.arguments.push_str(&arguments);
+            }
+        }
+    }
+}
+
+fn truncated_stream_error() -> crate::error::AppError {
+    crate::error::AppError::new(
+        axum::http::StatusCode::BAD_GATEWAY,
+        "stream truncated before DONE or finish_reason",
+    )
 }
 
 #[cfg(test)]
@@ -371,5 +500,29 @@ mod tests {
             header_value(&first, "x-opencode-session"),
             header_value(&second, "x-opencode-session")
         );
+    }
+
+    #[test]
+    fn sse_parser_accepts_protocol_fields_and_multiline_data() {
+        let mut parser = SseParser::default();
+        parser.push(b": comment\r\nevent: completion\r\nid: evt_1\r\nretry: 250\r\ndata:first\r\ndata: second\r\n\r\n");
+
+        let frame = parser.next_frame().unwrap().unwrap();
+        assert_eq!(frame.event.as_deref(), Some("completion"));
+        assert_eq!(frame.id.as_deref(), Some("evt_1"));
+        assert_eq!(frame.retry, Some(250));
+        assert_eq!(frame.data, "first\nsecond");
+        assert!(parser.next_frame().unwrap().is_none());
+        assert!(parser.finish().is_ok());
+    }
+
+    #[test]
+    fn sse_parser_rejects_unterminated_frame() {
+        let mut parser = SseParser::default();
+        parser.push(b"data: {\"choices\":[]}");
+
+        assert!(parser.next_frame().unwrap().is_none());
+        let err = parser.finish().unwrap_err();
+        assert!(err.message.contains("stream truncated"));
     }
 }

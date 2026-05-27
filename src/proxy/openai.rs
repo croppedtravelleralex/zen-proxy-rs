@@ -264,6 +264,7 @@ async fn handle_oa_stream(
                 Ok(event) => event,
                 Err(err) => {
                     yield Ok(Event::default().data(serde_json::json!({"error":{"message":err.message}}).to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
                     return;
                 }
             };

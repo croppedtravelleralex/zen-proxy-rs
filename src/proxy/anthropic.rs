@@ -286,7 +286,7 @@ async fn handle_stream(
         }
         if !tool_calls.is_empty() {
             for (ti,tool) in tool_calls.iter().enumerate() {
-                let tidx=ti as u64;
+                let tidx = ti as u64 + u64::from(text_block_open);
                 let clean_id = tool.id.clone().unwrap_or_else(||format!("call_{}", tool.index));
                 let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
                 let tc=ToolCall{id:Some(clean_id),call_type:"function".into(),function:ToolFunction{name:tool.name.clone(),arguments:tool.arguments.clone()},index:Some(tool.index)};

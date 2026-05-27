@@ -75,6 +75,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("truncated-stream") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        )
+            .into_response();
+    }
     if prompt.contains("empty-upstream") {
         return (
             StatusCode::OK,
@@ -91,8 +99,38 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("sse-protocol-fields") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            ": ignored comment\r\nevent: completion\r\nid: evt_1\r\nretry: 1000\r\ndata:{\"choices\":[\r\ndata: {\"delta\":{\"content\":\"golden answer\"}}\r\ndata:]}\r\n\r\ndata:[DONE]\r\n\r\n",
+        )
+            .into_response();
+    }
+    if prompt.contains("finish-no-done") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"golden answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )
+            .into_response();
+    }
 
-    let chunk = if prompt.contains("tool-delta") {
+    let chunk = if prompt.contains("mixed-text-tool-delta") {
+        json!({
+            "choices": [{
+                "delta": {
+                    "content": "golden answer",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+                    }]
+                }
+            }]
+        })
+    } else if prompt.contains("tool-delta") {
         json!({
             "choices": [{
                 "delta": {
@@ -234,6 +272,52 @@ async fn openai_stream_preserves_text_delta_and_done() {
 }
 
 #[tokio::test]
+async fn openai_stream_accepts_crlf_optional_space_and_multiline_data() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "sse-protocol-fields", true, None),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer"));
+    assert!(body.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn openai_non_stream_accepts_finish_reason_without_done() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "finish-no-done", false, None),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "golden answer");
+}
+
+#[tokio::test]
+async fn openai_non_stream_rejects_eof_without_done_or_finish_reason() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let err = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "truncated-stream", false, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert!(err.message.contains("stream truncated"));
+}
+
+#[tokio::test]
 async fn anthropic_non_stream_returns_golden_message_response() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -269,6 +353,24 @@ async fn anthropic_stream_returns_golden_event_sequence() {
     assert!(body.contains("golden answer"));
     assert!(body.contains("\"output_tokens\":2"));
     assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_mixed_text_and_tool_blocks_use_distinct_indexes() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "mixed-text-tool-delta", true),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("event: content_block_start"));
+    assert!(body.contains("\"index\":0"));
+    assert!(body.contains("\"index\":1"));
+    assert!(body.contains("\"type\":\"tool_use\""));
 }
 
 #[tokio::test]
@@ -764,4 +866,21 @@ async fn stream_parse_error_is_emitted_before_done() {
         .unwrap();
     let body = response_text(response).await;
     assert!(body.contains("stream parse error"));
+    assert!(body.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn stream_truncation_is_emitted_before_done() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "truncated-stream", true, None),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("stream truncated"));
+    assert!(body.contains("[DONE]"));
 }
