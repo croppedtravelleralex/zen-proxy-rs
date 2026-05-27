@@ -28,6 +28,8 @@ Start here:
 | [12_v4.4_pool_fault_isolation.md](./v4.0/12_v4.4_pool_fault_isolation.md) | V4.4 pool fault isolation, node anti-mis-injury, and 2026-05-26 deployment evidence |
 | [13_v4.5_cache_affinity_ttft.md](./v4.0/13_v4.5_cache_affinity_ttft.md) | V4.5 cache-affinity routing and effective TTFT telemetry |
 | [14_v4.6_protocol_guard.md](./v4.0/14_v4.6_protocol_guard.md) | V4.6 protocol graph guard and pair-aware compactor |
+| [15_test_records_and_client_acceptance.md](./v4.0/15_test_records_and_client_acceptance.md) | V4.7 test evidence packages, OpenClaw/Hermes acceptance, and 100K-200K TTFT experiment plan |
+| [16_v4.5_p8_95_plus_acceptance.md](./v4.0/16_v4.5_p8_95_plus_acceptance.md) | V4.5/P8 95+ acceptance plan, test matrix, Windows/WSL/panda flows, and NewAPI/ZenProxy reconciliation |
 
 ## AI Maintenance Rule
 
