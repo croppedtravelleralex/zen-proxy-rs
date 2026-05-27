@@ -9,6 +9,10 @@ struct AggWindow {
     by_node: HashMap<String, AggRow>,
     by_pool: HashMap<String, AggRow>,
     by_status: HashMap<String, AggRow>,
+    by_outcome: HashMap<String, AggRow>,
+    by_failure_kind: HashMap<String, AggRow>,
+    by_body_bucket: HashMap<String, AggRow>,
+    by_stream: HashMap<String, AggRow>,
 }
 
 #[derive(Default, Clone)]
@@ -38,6 +42,10 @@ impl RollingAggregator {
                 by_node: HashMap::new(),
                 by_pool: HashMap::new(),
                 by_status: HashMap::new(),
+                by_outcome: HashMap::new(),
+                by_failure_kind: HashMap::new(),
+                by_body_bucket: HashMap::new(),
+                by_stream: HashMap::new(),
             }),
             window_ms,
             max_windows,
@@ -58,6 +66,10 @@ impl RollingAggregator {
                     by_node: HashMap::new(),
                     by_pool: HashMap::new(),
                     by_status: HashMap::new(),
+                    by_outcome: HashMap::new(),
+                    by_failure_kind: HashMap::new(),
+                    by_body_bucket: HashMap::new(),
+                    by_stream: HashMap::new(),
                 },
             );
             let mut windows = self.windows.write().unwrap();
@@ -88,6 +100,30 @@ impl RollingAggregator {
         Self::merge_row(&mut cur.by_node, &tele.node_url, &row);
         Self::merge_row(&mut cur.by_pool, &tele.pool, &row);
         Self::merge_row(&mut cur.by_status, &status_key, &row);
+        Self::merge_row(
+            &mut cur.by_outcome,
+            non_empty_or(&tele.outcome, "unknown"),
+            &row,
+        );
+        Self::merge_row(
+            &mut cur.by_failure_kind,
+            non_empty_or(&tele.failure_kind, "none"),
+            &row,
+        );
+        Self::merge_row(
+            &mut cur.by_body_bucket,
+            non_empty_or(&tele.body_size_bucket, "unknown"),
+            &row,
+        );
+        Self::merge_row(
+            &mut cur.by_stream,
+            if tele.is_streaming {
+                "stream"
+            } else {
+                "non_stream"
+            },
+            &row,
+        );
     }
 
     fn merge_row(map: &mut HashMap<String, AggRow>, key: &str, row: &AggRow) {
@@ -127,6 +163,10 @@ impl RollingAggregator {
             "by_node": Self::rows_to_json(&w.by_node),
             "by_pool": Self::rows_to_json(&w.by_pool),
             "by_status": Self::rows_to_json(&w.by_status),
+            "by_outcome": Self::rows_to_json(&w.by_outcome),
+            "by_failure_kind": Self::rows_to_json(&w.by_failure_kind),
+            "by_body_bucket": Self::rows_to_json(&w.by_body_bucket),
+            "by_stream": Self::rows_to_json(&w.by_stream),
         })
     }
 
@@ -163,12 +203,20 @@ impl RollingAggregator {
             let by_node = Self::json_to_rows(wv.get("by_node"));
             let by_pool = Self::json_to_rows(wv.get("by_pool"));
             let by_status = Self::json_to_rows(wv.get("by_status"));
+            let by_outcome = Self::json_to_rows(wv.get("by_outcome"));
+            let by_failure_kind = Self::json_to_rows(wv.get("by_failure_kind"));
+            let by_body_bucket = Self::json_to_rows(wv.get("by_body_bucket"));
+            let by_stream = Self::json_to_rows(wv.get("by_stream"));
             windows.push(AggWindow {
                 window_start: ws,
                 by_model,
                 by_node,
                 by_pool,
                 by_status,
+                by_outcome,
+                by_failure_kind,
+                by_body_bucket,
+                by_stream,
             });
         }
     }
@@ -189,5 +237,13 @@ impl RollingAggregator {
             map.insert(k.clone(), row);
         }
         map
+    }
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
     }
 }

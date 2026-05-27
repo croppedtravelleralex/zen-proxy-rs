@@ -281,6 +281,8 @@ async fn main() {
         config.upstream_base.clone(),
         config.upstream_api_key.clone(),
         config.probe_timeout_secs,
+        config.connect_timeout(),
+        config.request_timeout(),
         config.allow_direct_fallback,
     ));
     for url in &node_urls {
@@ -330,10 +332,11 @@ async fn main() {
 
     // SIGHUP hot-reload
     {
-        let state = app_state.clone();
+        let signal_state = app_state.clone();
         tokio::spawn(async move {
             #[cfg(unix)]
             {
+                let state = signal_state;
                 let Ok(mut stream) =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
                 else {

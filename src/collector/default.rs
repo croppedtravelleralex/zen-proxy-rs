@@ -3,6 +3,7 @@ use crate::collector::audit::{AuditGroup, AuditStore};
 use crate::collector::ring_buffer::RingBuffer;
 use crate::collector::wal::WAL;
 use crate::collector::*;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -17,6 +18,7 @@ pub struct DefaultCollector {
     count_timeout: AtomicU64,
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
+    request_dims: Mutex<RequestDimensionCounters>,
     rpm_window: Mutex<VecDeque<Instant>>,
     ring_buffer: RingBuffer,
     aggregator: RollingAggregator,
@@ -41,6 +43,7 @@ impl DefaultCollector {
             count_timeout: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
+            request_dims: Mutex::new(RequestDimensionCounters::default()),
             rpm_window: Mutex::new(VecDeque::with_capacity(4096)),
             ring_buffer: RingBuffer::new(10000),
             aggregator: RollingAggregator::new(300_000, 12),
@@ -93,12 +96,16 @@ impl DataCollector for DefaultCollector {
         } else if tele.status >= 400 {
             self.count_4xx.fetch_add(1, Ordering::Relaxed);
         }
+        if tele.failure_kind == "timeout" || tele.outcome == "timeout" {
+            self.count_timeout.fetch_add(1, Ordering::Relaxed);
+        }
         self.bytes_sent
             .fetch_add(tele.bytes_sent, Ordering::Relaxed);
         self.bytes_received
             .fetch_add(tele.bytes_received, Ordering::Relaxed);
         self.bandwidth_bytes
             .fetch_add(tele.bytes_sent + tele.bytes_received, Ordering::Relaxed);
+        self.request_dims.lock().unwrap().record(tele);
 
         {
             let mut rpm = self.rpm_window.lock().unwrap();
@@ -208,6 +215,7 @@ impl DataCollector for DefaultCollector {
 
         let dims = self.pool_dims.read().unwrap().clone();
         let bps = *self.current_bps.lock().unwrap();
+        let request_dims = self.request_dims.lock().unwrap().clone();
 
         DataSnapshot {
             ts: crate::collector::telemetry::unix_ms(),
@@ -222,6 +230,11 @@ impl DataCollector for DefaultCollector {
                 bytes_received: self.bytes_received.load(Ordering::Relaxed),
                 rpm,
                 avg_latency_ms: avg_latency,
+                by_outcome: request_dims.by_outcome,
+                by_failure_kind: request_dims.by_failure_kind,
+                by_body_bucket: request_dims.by_body_bucket,
+                by_stream: request_dims.by_stream,
+                by_model: request_dims.by_model,
             },
             pools: dims,
             system: SystemStats {
@@ -383,6 +396,50 @@ impl DataCollector for DefaultCollector {
     }
 }
 
+#[derive(Clone, Default)]
+struct RequestDimensionCounters {
+    by_outcome: HashMap<String, u64>,
+    by_failure_kind: HashMap<String, u64>,
+    by_body_bucket: HashMap<String, u64>,
+    by_stream: HashMap<String, u64>,
+    by_model: HashMap<String, u64>,
+}
+
+impl RequestDimensionCounters {
+    fn record(&mut self, tele: &RequestTelemetry) {
+        increment(&mut self.by_outcome, non_empty_or(&tele.outcome, "unknown"));
+        increment(
+            &mut self.by_failure_kind,
+            non_empty_or(&tele.failure_kind, "none"),
+        );
+        increment(
+            &mut self.by_body_bucket,
+            non_empty_or(&tele.body_size_bucket, "unknown"),
+        );
+        increment(
+            &mut self.by_stream,
+            if tele.is_streaming {
+                "stream"
+            } else {
+                "non_stream"
+            },
+        );
+        increment(&mut self.by_model, non_empty_or(&tele.model, "unknown"));
+    }
+}
+
+fn increment(map: &mut HashMap<String, u64>, key: &str) {
+    *map.entry(key.to_string()).or_insert(0) += 1;
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
 fn load_audit_store() -> Option<AuditStore> {
     if cfg!(test) && std::env::var("AUDIT_LOG_ENABLED").is_err() {
         return None;
@@ -396,4 +453,107 @@ fn load_audit_store() -> Option<AuditStore> {
     }
     let dir = std::env::var("AUDIT_LOG_DIR").unwrap_or_else(|_| "/tmp/zen-proxy-audit".into());
     Some(AuditStore::new(dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_counts_request_observability_dimensions() {
+        let collector = DefaultCollector::new();
+        collector.record_request(&telemetry(
+            "stream_error",
+            "stream_error",
+            "large",
+            true,
+            "deepseek-v4-flash",
+        ));
+        collector.record_request(&telemetry(
+            "retry_budget_exhausted",
+            "retry_budget_exhausted",
+            "huge",
+            false,
+            "deepseek-v4-pro",
+        ));
+        collector.record_request(&telemetry(
+            "empty_output",
+            "empty_output",
+            "small",
+            true,
+            "deepseek-v4-flash",
+        ));
+
+        let snapshot = collector.snapshot();
+
+        assert_eq!(snapshot.requests.by_outcome["stream_error"], 1);
+        assert_eq!(snapshot.requests.by_outcome["retry_budget_exhausted"], 1);
+        assert_eq!(snapshot.requests.by_outcome["empty_output"], 1);
+        assert_eq!(snapshot.requests.by_failure_kind["stream_error"], 1);
+        assert_eq!(
+            snapshot.requests.by_failure_kind["retry_budget_exhausted"],
+            1
+        );
+        assert_eq!(snapshot.requests.by_failure_kind["empty_output"], 1);
+        assert_eq!(snapshot.requests.by_body_bucket["large"], 1);
+        assert_eq!(snapshot.requests.by_body_bucket["huge"], 1);
+        assert_eq!(snapshot.requests.by_stream["stream"], 2);
+        assert_eq!(snapshot.requests.by_stream["non_stream"], 1);
+        assert_eq!(snapshot.requests.by_model["deepseek-v4-flash"], 2);
+    }
+
+    fn telemetry(
+        outcome: &str,
+        failure_kind: &str,
+        body_size_bucket: &str,
+        is_streaming: bool,
+        model: &str,
+    ) -> RequestTelemetry {
+        RequestTelemetry {
+            rid: format!("{outcome}-{failure_kind}"),
+            ts: 1,
+            external_request_id: String::new(),
+            gateway: String::new(),
+            gateway_channel_id: String::new(),
+            model: model.to_string(),
+            public_model: model.to_string(),
+            upstream_model: model.to_string(),
+            protocol: "openai_chat_completions".to_string(),
+            client_id: "test".to_string(),
+            path: "chat/completions".to_string(),
+            method: "POST".to_string(),
+            is_streaming,
+            node_url: "node".to_string(),
+            selected_node_id: "n1".to_string(),
+            selected_node_url_redacted: "node".to_string(),
+            observed_exit_ip: String::new(),
+            outcome: outcome.to_string(),
+            pool: "dispatch".to_string(),
+            exit_ip: String::new(),
+            status: 502,
+            rate_limited: false,
+            retry_count: 0,
+            latency_total_ms: 10,
+            upstream_ms: 10,
+            ttft_ms: 0,
+            timings: RequestTimings::default(),
+            affinity_key: String::new(),
+            affinity_hit: false,
+            affinity_node_id: String::new(),
+            body_size_bucket: body_size_bucket.to_string(),
+            protocol_guard: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cached_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            bytes_sent: 10,
+            bytes_received: 0,
+            failure_kind: failure_kind.to_string(),
+            failure_message: String::new(),
+            retry_chain: Vec::new(),
+            context: None,
+        }
+    }
 }

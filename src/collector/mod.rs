@@ -8,6 +8,7 @@ pub mod telemetry;
 pub mod wal;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestTelemetry {
@@ -249,6 +250,16 @@ pub struct RequestCounters {
     pub bytes_received: u64,
     pub rpm: u64,
     pub avg_latency_ms: f64,
+    #[serde(default)]
+    pub by_outcome: HashMap<String, u64>,
+    #[serde(default)]
+    pub by_failure_kind: HashMap<String, u64>,
+    #[serde(default)]
+    pub by_body_bucket: HashMap<String, u64>,
+    #[serde(default)]
+    pub by_stream: HashMap<String, u64>,
+    #[serde(default)]
+    pub by_model: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

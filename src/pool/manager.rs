@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::collector::{DataCollector, ProbeEvent};
 use crate::pool::node_registry::NodeRegistry;
@@ -50,6 +51,8 @@ where
         upstream_base: String,
         upstream_api_key: String,
         probe_timeout_secs: u64,
+        connect_timeout: Duration,
+        request_timeout: Duration,
         allow_direct_fallback: bool,
     ) -> Self {
         Self {
@@ -60,7 +63,7 @@ where
             collector,
             fuse: AtomicBool::new(false),
             nodes: NodeRegistry::new(),
-            transport: TransportRegistry::new(),
+            transport: TransportRegistry::new(connect_timeout, request_timeout),
             upstream_base,
             upstream_api_key,
             probe_timeout_secs,
@@ -319,6 +322,7 @@ where
         self.ratelimited.remove(&nid);
         self.dead.remove(&nid);
         self.nodes.remove(&nid);
+        self.transport.remove_client(&nid);
     }
 
     fn probe_node(&self, node_id: &str) -> Option<ProbeResult> {
@@ -435,6 +439,8 @@ where
             "transport": {
                 "node_client_count": transport.node_client_count,
                 "direct_client_initialized": transport.direct_client_initialized,
+                "connect_timeout_secs": transport.connect_timeout_secs,
+                "request_timeout_secs": transport.request_timeout_secs,
             }
         })
     }
@@ -465,6 +471,8 @@ mod tests {
             "https://example.invalid".to_string(),
             "test".to_string(),
             1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
             false,
         );
         let node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
@@ -500,6 +508,8 @@ mod tests {
             "https://example.invalid".to_string(),
             "test".to_string(),
             1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
             false,
         );
         let node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
@@ -542,6 +552,8 @@ mod tests {
             "https://example.invalid".to_string(),
             "test".to_string(),
             1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
             false,
         );
         let node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
@@ -565,5 +577,53 @@ mod tests {
         assert_eq!(active.available(), 0);
         assert_eq!(dead.available(), 1);
         assert_eq!(dispatch.available(), 0);
+    }
+
+    #[test]
+    fn remove_node_reclaims_cached_transport_client() {
+        let dispatch = Arc::new(DispatchPool::new());
+        let active = Arc::new(ActivePool::new());
+        let ratelimited = Arc::new(RateLimitedPoolImpl::new());
+        let dead = Arc::new(DeadPoolImpl::new());
+        let collector = Arc::new(DefaultCollector::new());
+        let manager = PoolManagerImpl::new(
+            dispatch.clone(),
+            active,
+            ratelimited,
+            dead,
+            collector,
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(240),
+            false,
+        );
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
+        dispatch.add(node.clone());
+        manager.register_known_node(node.clone());
+
+        let meta = RequestMeta {
+            model: "deepseek-v4-flash".to_string(),
+            stream: false,
+            body_size: 128,
+            affinity_key: String::new(),
+        };
+        let dispatched = manager.dispatch(&meta).unwrap();
+        assert_eq!(
+            manager.runtime_details()["transport"]["node_client_count"],
+            serde_json::json!(1)
+        );
+
+        manager.remove_node(&dispatched.node.id);
+
+        assert_eq!(
+            manager.runtime_details()["transport"]["node_client_count"],
+            serde_json::json!(0)
+        );
+        assert_eq!(
+            manager.runtime_details()["transport"]["request_timeout_secs"],
+            serde_json::json!(240)
+        );
     }
 }

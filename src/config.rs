@@ -656,6 +656,8 @@ mod tests {
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
             "V4_RETRY_BUDGET_MS",
+            "CONNECT_TIMEOUT_SECS",
+            "REQUEST_TIMEOUT_SECS",
             "AUDIT_LOG_ENABLED",
             "AUDIT_LOG_DIR",
             "NODE_MAX_CALLS_PER_WINDOW",
@@ -722,6 +724,8 @@ mod tests {
         assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
         assert!(!cfg.v4_model_registry_enabled);
         assert_eq!(cfg.v4_retry_budget_ms, 45_000);
+        assert_eq!(cfg.connect_timeout_secs, 5);
+        assert_eq!(cfg.request_timeout_secs, 120);
         assert!(!cfg.v4_model_registry_active());
         assert_eq!(cfg.node_max_calls_per_window, 100);
         assert_eq!(cfg.node_max_tokens_per_window, 10_000_000);
@@ -789,6 +793,8 @@ mod tests {
         unsafe { env::set_var("ZEN_PROVIDER_MODE", "free_model_kernel") };
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
         unsafe { env::set_var("V4_RETRY_BUDGET_MS", "12345") };
+        unsafe { env::set_var("CONNECT_TIMEOUT_SECS", "9") };
+        unsafe { env::set_var("REQUEST_TIMEOUT_SECS", "600") };
         unsafe { env::set_var("AUDIT_LOG_ENABLED", "false") };
         unsafe { env::set_var("AUDIT_LOG_DIR", "/tmp/zen-audit-test") };
         unsafe { env::set_var("NODE_MAX_CALLS_PER_WINDOW", "7") };
@@ -857,6 +863,8 @@ mod tests {
         assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
         assert!(cfg.v4_model_registry_enabled);
         assert_eq!(cfg.v4_retry_budget_ms, 12_345);
+        assert_eq!(cfg.connect_timeout_secs, 9);
+        assert_eq!(cfg.request_timeout_secs, 600);
         assert!(!cfg.audit_log_enabled);
         assert_eq!(cfg.audit_log_dir, "/tmp/zen-audit-test");
         assert!(cfg.v4_model_registry_active());
@@ -926,6 +934,8 @@ mod tests {
             "ZEN_PROVIDER_MODE",
             "V4_MODEL_REGISTRY_ENABLED",
             "V4_RETRY_BUDGET_MS",
+            "CONNECT_TIMEOUT_SECS",
+            "REQUEST_TIMEOUT_SECS",
             "AUDIT_LOG_ENABLED",
             "AUDIT_LOG_DIR",
             "NODE_MAX_CALLS_PER_WINDOW",
