@@ -58,6 +58,7 @@ auth_h!(requests_summary_h, AdminService::requests_summary);
 auth_h!(requests_timings_h, AdminService::requests_timings);
 auth_h!(requests_models_h, AdminService::requests_models);
 auth_h!(requests_nodes_h, AdminService::requests_nodes);
+auth_h!(pool_state_h, AdminService::pool_state);
 auth_h!(events_h, AdminService::events);
 auth_h!(ledger_h, AdminService::ledger_summary);
 auth_h!(ledger_models_h, AdminService::ledger_models);
@@ -276,6 +277,56 @@ async fn audit_export_h(
     }
     AdminService::audit_export(&st, &AdminService::audit_filter(&p))
 }
+async fn errors_summary_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::errors_summary(&st, &AdminService::audit_filter(&p))
+}
+async fn latency_summary_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::latency_summary(&st, &AdminService::audit_filter(&p))
+}
+async fn ttft_summary_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::ttft_summary(&st, &AdminService::audit_filter(&p))
+}
+async fn protocol_guard_events_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::protocol_guard_events(&st, &AdminService::audit_filter(&p))
+}
+async fn compactor_events_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::compactor_events(&st, &AdminService::audit_filter(&p))
+}
 async fn sys_log_level_h(
     State(st): State<Arc<AppState>>,
     h: HeaderMap,
@@ -305,6 +356,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/stats/upstream", get(stats_upstream_h))
         .route("/admin/pools", get(pools_h))
         .route("/admin/pools/{name}", get(pool_by_name_h))
+        .route("/admin/pool/state", get(pool_state_h))
         .route("/admin/fuse", get(fuse_get_h).post(fuse_post_h))
         .route("/admin/requests", get(requests_h))
         .route("/admin/requests/recent", get(requests_recent_h))
@@ -320,6 +372,11 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/audit/nodes", get(audit_nodes_h))
         .route("/admin/audit/anomalies", get(audit_anomalies_h))
         .route("/admin/audit/export", get(audit_export_h))
+        .route("/admin/errors/summary", get(errors_summary_h))
+        .route("/admin/latency/summary", get(latency_summary_h))
+        .route("/admin/ttft/summary", get(ttft_summary_h))
+        .route("/admin/protocol-guard/events", get(protocol_guard_events_h))
+        .route("/admin/compactor/events", get(compactor_events_h))
         .route("/admin/events", get(events_h))
         .route("/admin/ledger", get(ledger_h))
         .route("/admin/ledger/models", get(ledger_models_h))

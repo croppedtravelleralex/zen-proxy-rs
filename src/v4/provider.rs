@@ -26,6 +26,8 @@ use crate::v4::context;
 use crate::v4::model::{ModelError, ModelRegistry, StaticModelRegistry};
 use crate::v4::protocol_guard::{self, GuardPhase};
 
+const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 pub async fn handle_v4_proxy(
     state: &Arc<AppState>,
     path: &str,
@@ -672,8 +674,11 @@ async fn call_with_retry(
                         if retry_budget_ms > 0 && elapsed_ms >= retry_budget_ms {
                             return Err(V4CallError::after_dispatch(
                                 StatusCode::BAD_GATEWAY,
-                                format!(
-                                    "upstream retry budget exhausted after {elapsed_ms}ms with empty_output"
+                                retry_budget_message(
+                                    elapsed_ms,
+                                    StatusCode::BAD_GATEWAY,
+                                    "empty_output",
+                                    &retry_chain,
                                 ),
                                 None,
                                 request_id,
@@ -931,10 +936,11 @@ async fn call_with_retry(
                 if retry_budget_ms > 0 && elapsed_ms >= retry_budget_ms {
                     return Err(V4CallError::after_dispatch(
                         last_status,
-                        format!(
-                            "upstream retry budget exhausted after {}ms with status {}",
+                        retry_budget_message(
                             elapsed_ms,
-                            last_status.as_u16()
+                            last_status,
+                            "provider_error",
+                            &retry_chain,
                         ),
                         retry_after,
                         request_id,
@@ -997,11 +1003,7 @@ async fn call_with_retry(
         if retry_budget_ms > 0 && elapsed_ms >= retry_budget_ms {
             return Err(V4CallError::after_dispatch(
                 last_status,
-                format!(
-                    "upstream retry budget exhausted after {}ms with status {}",
-                    elapsed_ms,
-                    last_status.as_u16()
-                ),
+                retry_budget_message(elapsed_ms, last_status, "provider_error", &retry_chain),
                 None,
                 uuid::Uuid::new_v4().to_string(),
                 String::new(),
@@ -1027,6 +1029,24 @@ async fn call_with_retry(
 
 fn retry_chain_latency_ms(retry_chain: &[RequestAttemptTelemetry]) -> u64 {
     retry_chain.iter().map(|attempt| attempt.latency_ms).sum()
+}
+
+fn retry_budget_message(
+    elapsed_ms: u64,
+    status: StatusCode,
+    category: &str,
+    retry_chain: &[RequestAttemptTelemetry],
+) -> String {
+    let last_error = retry_chain
+        .last()
+        .map(|attempt| attempt.error_type.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(category);
+    let attempts = retry_chain.len();
+    format!(
+        "upstream retry budget exhausted after {elapsed_ms}ms with status {} ({category}; last_error={last_error}; attempts={attempts})",
+        status.as_u16()
+    )
 }
 
 async fn dispatch_or_wait(
@@ -1269,7 +1289,7 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 async fn buffered_response(response: Response) -> Result<(Response, u64), V4CallError> {
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+    let bytes = to_bytes(response.into_body(), MAX_PROVIDER_RESPONSE_BODY_BYTES)
         .await
         .map_err(|err| {
             V4CallError::before_dispatch(
@@ -1290,7 +1310,7 @@ async fn buffered_response_with_usage(
 ) -> Result<(Response, u64, UsageCounts, bool), V4CallError> {
     let status = response.status();
     let headers = response.headers().clone();
-    let bytes = to_bytes(response.into_body(), 1024 * 1024)
+    let bytes = to_bytes(response.into_body(), MAX_PROVIDER_RESPONSE_BODY_BYTES)
         .await
         .map_err(|err| {
             V4CallError::before_dispatch(
@@ -1363,6 +1383,7 @@ fn metered_stream_response(
         let mut first_content_token_ms = 0u64;
         let mut first_tool_call_ms = 0u64;
         let mut stream_error: Option<String> = None;
+        let mut client_gone = false;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(bytes) => {
@@ -1389,12 +1410,20 @@ fn metered_stream_response(
                         first_tool_call_ms = elapsed_ms;
                     }
                     if tx.send(Ok(bytes)).await.is_err() {
+                        client_gone = true;
                         break;
                     }
                 }
                 Err(err) => {
-                    let message = format!("upstream stream error: {err}");
-                    let _ = tx.send(Ok(stream_error_frame(&path, &message))).await;
+                    let kind = classify_stream_body_error(&err);
+                    let message = format!("upstream stream error ({kind}): {err}");
+                    if tx
+                        .send(Ok(stream_error_frame(&path, &message)))
+                        .await
+                        .is_err()
+                    {
+                        client_gone = true;
+                    }
                     stream_error = Some(message);
                     break;
                 }
@@ -1419,9 +1448,23 @@ fn metered_stream_response(
         let empty_output = stream_error.is_none()
             && usage.completion_tokens == 0
             && !metrics.has_assistant_output();
-        if let Some(message) = stream_error {
+        if client_gone {
+            telemetry.outcome = "client_gone".to_string();
+            telemetry.failure_kind = "client_gone".to_string();
+            telemetry.failure_message = "client disconnected before stream completed".to_string();
+            telemetry.retry_chain.push(RequestAttemptTelemetry {
+                attempt: telemetry.retry_count,
+                node_id: telemetry.selected_node_id.clone(),
+                node_url_redacted: telemetry.selected_node_url_redacted.clone(),
+                status: 499,
+                latency_ms: stream_complete_ms,
+                outcome: "client_gone".to_string(),
+                error_type: "client_gone".to_string(),
+            });
+        } else if let Some(message) = stream_error {
+            let error_type = classify_stream_error_message(&message).to_string();
             telemetry.outcome = "stream_error".to_string();
-            telemetry.failure_kind = "stream_error".to_string();
+            telemetry.failure_kind = error_type.clone();
             telemetry.failure_message = message;
             telemetry.retry_chain.push(RequestAttemptTelemetry {
                 attempt: telemetry.retry_count,
@@ -1430,7 +1473,7 @@ fn metered_stream_response(
                 status: telemetry.status,
                 latency_ms: stream_complete_ms,
                 outcome: "stream_error".to_string(),
-                error_type: "stream_error".to_string(),
+                error_type,
             });
             state.pool_manager.report(
                 telemetry.selected_node_id.clone(),
@@ -1490,6 +1533,23 @@ fn stream_error_frame(path: &str, message: &str) -> Bytes {
         Bytes::from(format!(
             "data: {{\"error\":{{\"message\":{escaped}}}}}\n\ndata: [DONE]\n\n"
         ))
+    }
+}
+
+fn classify_stream_body_error(err: &axum::Error) -> &'static str {
+    classify_stream_error_message(&err.to_string())
+}
+
+fn classify_stream_error_message(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("decode") || lower.contains("decoding") {
+        "stream_decode_error"
+    } else if lower.contains("timeout") || lower.contains("elapsed") {
+        "stream_timeout"
+    } else if lower.contains("connection") || lower.contains("closed") || lower.contains("reset") {
+        "stream_connection_error"
+    } else {
+        "stream_error"
     }
 }
 
@@ -1920,5 +1980,41 @@ mod tests {
         .unwrap();
         assert!(anthropic.contains("event: error"));
         assert!(anthropic.contains("\"type\":\"api_error\""));
+    }
+
+    #[test]
+    fn classifies_stream_error_messages() {
+        assert_eq!(
+            classify_stream_error_message("error decoding response body"),
+            "stream_decode_error"
+        );
+        assert_eq!(
+            classify_stream_error_message("deadline elapsed while reading"),
+            "stream_timeout"
+        );
+        assert_eq!(
+            classify_stream_error_message("connection closed before message completed"),
+            "stream_connection_error"
+        );
+        assert_eq!(classify_stream_error_message("other"), "stream_error");
+    }
+
+    #[test]
+    fn retry_budget_message_includes_last_error_and_attempt_count() {
+        let chain = vec![RequestAttemptTelemetry {
+            attempt: 1,
+            node_id: "node".to_string(),
+            node_url_redacted: "redacted".to_string(),
+            status: 502,
+            latency_ms: 1200,
+            outcome: "transport_error".to_string(),
+            error_type: "timeout".to_string(),
+        }];
+
+        let message =
+            retry_budget_message(45_000, StatusCode::BAD_GATEWAY, "provider_error", &chain);
+
+        assert!(message.contains("last_error=timeout"));
+        assert!(message.contains("attempts=1"));
     }
 }

@@ -16,6 +16,7 @@ const DEFAULT_MAX_KB_PER_WINDOW: u64 = 64 * 1024;
 const DEFAULT_COOLDOWN_SECS: i64 = 60;
 const DEFAULT_DISPATCH_SHARDS: usize = 16;
 const BUCKET_COUNT: usize = 5;
+const TOKEN_BUCKET_COUNT: usize = 5;
 const AFFINITY_MAX_NODES: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -169,9 +170,13 @@ struct PoolNode {
     recent_results: RwLock<VecDeque<bool>>,
     avg_latency_ms: AtomicU64,
     bucket_latency_ms: [AtomicU64; BUCKET_COUNT],
+    token_completion_latency_ms: [AtomicU64; TOKEN_BUCKET_COUNT],
+    body_ttft_latency_ms: [AtomicU64; BUCKET_COUNT],
+    token_ttft_latency_ms: [AtomicU64; TOKEN_BUCKET_COUNT],
     idle_since: AtomicI64,
     max_concurrent: AtomicU32,
     active_leases: AtomicU32,
+    active_requests: RwLock<VecDeque<RequestMeta>>,
     budget: RwLock<NodeBudget>,
 }
 
@@ -184,12 +189,16 @@ impl PoolNode {
             recent_results: RwLock::new(VecDeque::with_capacity(20)),
             avg_latency_ms: AtomicU64::new(0),
             bucket_latency_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+            token_completion_latency_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+            body_ttft_latency_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+            token_ttft_latency_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             idle_since: AtomicI64::new(chrono::Utc::now().timestamp()),
             max_concurrent: AtomicU32::new(5u32.clamp(
                 aimd.min_concurrent.max(1),
                 aimd.max_concurrent.max(aimd.min_concurrent.max(1)),
             )),
             active_leases: AtomicU32::new(0),
+            active_requests: RwLock::new(VecDeque::new()),
             budget: RwLock::new(NodeBudget::from(limits)),
         }
     }
@@ -237,7 +246,7 @@ impl PoolNode {
         let idle_factor = (idle_secs as f64 / 60.0).min(1.0) * idle_weight;
 
         let avg_lat =
-            meta.map(|m| self.latency_for_bucket(m.body_size_bucket()))
+            meta.map(|m| self.latency_for_meta(m))
                 .unwrap_or_else(|| self.avg_latency_ms.load(Ordering::Relaxed)) as f64;
         let latency_factor = (1.0 - (avg_lat / 5000.0).min(1.0)).max(0.0) * latency_weight;
 
@@ -316,12 +325,76 @@ impl PoolNode {
         );
     }
 
-    fn latency_for_bucket(&self, bucket: &str) -> u64 {
-        let bucket_latency = self.bucket_latency_ms[bucket_index(bucket)].load(Ordering::Relaxed);
-        if bucket_latency > 0 {
-            bucket_latency
+    fn record_completion_latency_for_meta(&self, meta: &RequestMeta, latency_ms: u64) {
+        if latency_ms == 0 {
+            return;
+        }
+        self.record_bucket_latency(meta.body_size_bucket(), latency_ms);
+        update_ewma(
+            &self.token_completion_latency_ms[token_bucket_index(meta.token_bucket())],
+            latency_ms,
+        );
+    }
+
+    fn record_ttft_latency(&self, body_bucket: &str, latency_ms: u64) {
+        if latency_ms == 0 {
+            return;
+        }
+        self.record_latency(latency_ms);
+        update_ewma(
+            &self.body_ttft_latency_ms[bucket_index(body_bucket)],
+            latency_ms,
+        );
+        if let Some(meta) = self.peek_single_active_meta() {
+            update_ewma(
+                &self.token_ttft_latency_ms[token_bucket_index(meta.token_bucket())],
+                latency_ms,
+            );
+        }
+    }
+
+    fn latency_for_meta(&self, meta: &RequestMeta) -> u64 {
+        let ttft_latency = self.body_ttft_latency_ms[bucket_index(meta.body_size_bucket())]
+            .load(Ordering::Relaxed);
+        let token_ttft = self.token_ttft_latency_ms[token_bucket_index(meta.token_bucket())]
+            .load(Ordering::Relaxed);
+        let completion_latency =
+            self.bucket_latency_ms[bucket_index(meta.body_size_bucket())].load(Ordering::Relaxed);
+        let token_completion = self.token_completion_latency_ms
+            [token_bucket_index(meta.token_bucket())]
+        .load(Ordering::Relaxed);
+        for value in [
+            token_ttft,
+            ttft_latency,
+            token_completion,
+            completion_latency,
+            self.avg_latency_ms.load(Ordering::Relaxed),
+        ] {
+            if value > 0 {
+                return value;
+            }
+        }
+        0
+    }
+
+    fn remember_admit(&self, meta: &RequestMeta) {
+        let mut active = self.active_requests.write().unwrap();
+        active.push_back(meta.clone());
+        while active.len() > self.active_leases.load(Ordering::Relaxed) as usize {
+            active.pop_front();
+        }
+    }
+
+    fn take_admitted_meta(&self) -> Option<RequestMeta> {
+        self.active_requests.write().unwrap().pop_front()
+    }
+
+    fn peek_single_active_meta(&self) -> Option<RequestMeta> {
+        let active = self.active_requests.read().unwrap();
+        if active.len() == 1 {
+            active.front().cloned()
         } else {
-            self.avg_latency_ms.load(Ordering::Relaxed)
+            None
         }
     }
 
@@ -425,12 +498,40 @@ impl PoolNode {
             "consecutive_successes": self.consecutive_successes.load(Ordering::Relaxed),
             "recent_success_rate": self.recent_success_rate(),
             "avg_latency_ms": self.avg_latency_ms.load(Ordering::Relaxed),
+            "body_completion_latency_ms": {
+                "tiny": self.bucket_latency_ms[0].load(Ordering::Relaxed),
+                "small": self.bucket_latency_ms[1].load(Ordering::Relaxed),
+                "medium": self.bucket_latency_ms[2].load(Ordering::Relaxed),
+                "large": self.bucket_latency_ms[3].load(Ordering::Relaxed),
+                "huge": self.bucket_latency_ms[4].load(Ordering::Relaxed),
+            },
             "bucket_latency_ms": {
                 "tiny": self.bucket_latency_ms[0].load(Ordering::Relaxed),
                 "small": self.bucket_latency_ms[1].load(Ordering::Relaxed),
                 "medium": self.bucket_latency_ms[2].load(Ordering::Relaxed),
                 "large": self.bucket_latency_ms[3].load(Ordering::Relaxed),
                 "huge": self.bucket_latency_ms[4].load(Ordering::Relaxed),
+            },
+            "token_completion_latency_ms": {
+                "under_50k": self.token_completion_latency_ms[0].load(Ordering::Relaxed),
+                "50k_100k": self.token_completion_latency_ms[1].load(Ordering::Relaxed),
+                "100k_200k": self.token_completion_latency_ms[2].load(Ordering::Relaxed),
+                "200k_400k": self.token_completion_latency_ms[3].load(Ordering::Relaxed),
+                "400k_plus": self.token_completion_latency_ms[4].load(Ordering::Relaxed),
+            },
+            "body_ttft_latency_ms": {
+                "tiny": self.body_ttft_latency_ms[0].load(Ordering::Relaxed),
+                "small": self.body_ttft_latency_ms[1].load(Ordering::Relaxed),
+                "medium": self.body_ttft_latency_ms[2].load(Ordering::Relaxed),
+                "large": self.body_ttft_latency_ms[3].load(Ordering::Relaxed),
+                "huge": self.body_ttft_latency_ms[4].load(Ordering::Relaxed),
+            },
+            "token_ttft_latency_ms": {
+                "under_50k": self.token_ttft_latency_ms[0].load(Ordering::Relaxed),
+                "50k_100k": self.token_ttft_latency_ms[1].load(Ordering::Relaxed),
+                "100k_200k": self.token_ttft_latency_ms[2].load(Ordering::Relaxed),
+                "200k_400k": self.token_ttft_latency_ms[3].load(Ordering::Relaxed),
+                "400k_plus": self.token_ttft_latency_ms[4].load(Ordering::Relaxed),
             },
             "idle_secs": chrono::Utc::now().timestamp().saturating_sub(self.idle_since.load(Ordering::Relaxed)),
             "local_budget": {
@@ -618,6 +719,7 @@ impl DispatchPool {
         let node = &nodes[best_idx?];
         if node.try_admit(meta, now) {
             if self.global_admit(node, meta) {
+                node.remember_admit(meta);
                 return Some(node.node.clone());
             }
             node.rollback_local_admit(meta);
@@ -679,6 +781,7 @@ impl DispatchPool {
             if cumulative >= threshold {
                 if n.try_admit(meta, now) {
                     if self.global_admit(n, meta) {
+                        n.remember_admit(meta);
                         return Some(n.node.clone());
                     }
                     n.rollback_local_admit(meta);
@@ -731,6 +834,27 @@ fn bucket_index(bucket: &str) -> usize {
         "huge" => 4,
         _ => 0,
     }
+}
+
+fn token_bucket_index(bucket: &str) -> usize {
+    match bucket {
+        "under_50k" => 0,
+        "50k_100k" => 1,
+        "100k_200k" => 2,
+        "200k_400k" => 3,
+        "400k_plus" => 4,
+        _ => 0,
+    }
+}
+
+fn update_ewma(metric: &AtomicU64, latency_ms: u64) {
+    let _ = metric.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(if current == 0 {
+            latency_ms
+        } else {
+            current.saturating_mul(3).saturating_add(latency_ms) / 4
+        })
+    });
 }
 
 impl Default for DispatchPool {
@@ -803,6 +927,7 @@ impl Pool for DispatchPool {
             .ok_or(DispatchError::NoResource)?;
         if node.try_admit(_meta, now) {
             if self.global_admit(node, _meta) {
+                node.remember_admit(_meta);
                 return Ok(node.node.clone());
             }
             node.rollback_local_admit(_meta);
@@ -823,6 +948,9 @@ impl Pool for DispatchPool {
         let mut nodes = self.shards[shard_idx].nodes.write().unwrap();
         if let Some(pn) = nodes.iter_mut().find(|n| n.node.id == *node_id) {
             pn.release_lease();
+            if let Some(meta) = pn.take_admitted_meta() {
+                pn.record_completion_latency_for_meta(&meta, latency_ms);
+            }
             if let Some(registry) = &self.global_budget {
                 registry.release_one(node_id);
             }
@@ -860,7 +988,7 @@ impl Pool for DispatchPool {
         let shard_idx = self.shard_index_for_id(node_id);
         let nodes = self.shards[shard_idx].nodes.read().unwrap();
         if let Some(pn) = nodes.iter().find(|n| n.node.id == *node_id) {
-            pn.record_bucket_latency(bucket, latency_ms);
+            pn.record_ttft_latency(bucket, latency_ms);
         }
     }
 
@@ -1050,8 +1178,36 @@ mod tests {
 
         let detail = pool.node_budget_detail(&node.id).unwrap();
         assert_eq!(detail["avg_latency_ms"].as_u64(), Some(2_345));
-        assert_eq!(detail["bucket_latency_ms"]["large"].as_u64(), Some(2_345));
-        assert_eq!(detail["bucket_latency_ms"]["medium"].as_u64(), Some(0));
+        assert_eq!(
+            detail["body_ttft_latency_ms"]["large"].as_u64(),
+            Some(2_345)
+        );
+        assert_eq!(detail["body_ttft_latency_ms"]["medium"].as_u64(), Some(0));
+        assert_eq!(
+            detail["token_ttft_latency_ms"]["100k_200k"].as_u64(),
+            Some(2_345)
+        );
+    }
+
+    #[test]
+    fn release_records_body_and_token_completion_latency_from_admitted_meta() {
+        let pool = DispatchPool::new();
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:108510".to_string(),
+        ));
+
+        let node = pool.acquire_for(&meta(1_200_000)).unwrap();
+        pool.release_with_latency(&node.id, &ResultKind::Success(200), 4_321);
+
+        let detail = pool.node_budget_detail(&node.id).unwrap();
+        assert_eq!(
+            detail["body_completion_latency_ms"]["huge"].as_u64(),
+            Some(4_321)
+        );
+        assert_eq!(
+            detail["token_completion_latency_ms"]["200k_400k"].as_u64(),
+            Some(4_321)
+        );
     }
 
     #[test]

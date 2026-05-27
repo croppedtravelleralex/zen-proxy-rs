@@ -2,8 +2,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 use crate::collector::RequestFilter;
+use crate::ledger::{sanitize_json_value, sanitize_text};
 
 use crate::state::AppState;
 use crate::v4::model::{ModelRegistry, StaticModelRegistry};
@@ -35,13 +37,20 @@ impl AdminService {
     }
 
     pub fn ok_response<T: Serialize>(data: T) -> Response {
-        Json(json!({ "success": true, "data": data })).into_response()
+        Json(sanitize_json_value(
+            json!({ "success": true, "data": data }),
+        ))
+        .into_response()
     }
     pub fn ok_status() -> Response {
         Json(json!({ "success": true, "status": "ok" })).into_response()
     }
     pub fn error_response<S: Into<String>>(code: StatusCode, msg: S) -> Response {
-        (code, Json(json!({ "success": false, "error": msg.into() }))).into_response()
+        (
+            code,
+            Json(json!({ "success": false, "error": sanitize_text(&msg.into()) })),
+        )
+            .into_response()
     }
 
     pub fn audit_filter(params: &std::collections::HashMap<String, String>) -> RequestFilter {
@@ -96,7 +105,7 @@ impl AdminService {
             "dispatch_size": pools.dispatch_size,
             "ratelimited_size": pools.ratelimited_size,
             "dead_size": pools.dead_size,
-            "nodes_file": cfg.nodes_file,
+            "nodes_file": sanitize_text(&cfg.nodes_file),
         });
         if pools.dispatch_size > 0 {
             Self::ok_response(json!({ "status":"ready", "details": payload }))
@@ -180,6 +189,7 @@ impl AdminService {
                 {"method":"GET","path":"/admin/stats/upstream"},
                 {"method":"GET","path":"/admin/pools"},
                 {"method":"GET","path":"/admin/pools/{name}"},
+                {"method":"GET","path":"/admin/pool/state"},
                 {"method":"GET,POST","path":"/admin/fuse"},
                 {"method":"GET","path":"/admin/requests"},
                 {"method":"GET","path":"/admin/requests/recent"},
@@ -196,6 +206,11 @@ impl AdminService {
                 {"method":"GET","path":"/admin/audit/nodes"},
                 {"method":"GET","path":"/admin/audit/anomalies"},
                 {"method":"GET","path":"/admin/audit/export"},
+                {"method":"GET","path":"/admin/errors/summary"},
+                {"method":"GET","path":"/admin/latency/summary"},
+                {"method":"GET","path":"/admin/ttft/summary"},
+                {"method":"GET","path":"/admin/protocol-guard/events"},
+                {"method":"GET","path":"/admin/compactor/events"},
                 {"method":"GET","path":"/admin/events"},
                 {"method":"GET","path":"/admin/events/recent"},
                 {"method":"GET","path":"/admin/events/probes"},
@@ -229,7 +244,7 @@ impl AdminService {
             "port": cfg.port,
             "provider_mode": cfg.zen_provider_mode.to_string(),
             "v4_model_registry_active": cfg.v4_model_registry_active(),
-            "upstream_base": cfg.upstream_base,
+            "upstream_base": sanitize_text(&cfg.upstream_base),
             "allow_direct_fallback": cfg.allow_direct_fallback,
             "context_governance": {
                 "request_body_limit_mb": cfg.request_body_limit_mb,
@@ -448,24 +463,31 @@ impl AdminService {
     pub fn request_detail(state: &AppState, rid: &str) -> Response {
         let filter = RequestFilter {
             rid: Some(rid.into()),
+            limit: 1,
             ..Default::default()
         };
         let result = state.collector.query_requests(&filter);
         match result.items.into_iter().next() {
             Some(r) => Self::ok_response(json!(r)),
-            None => Self::error_response(StatusCode::NOT_FOUND, "request not found"),
+            None => {
+                let audit = state.collector.query_audit_requests(&filter);
+                match audit.items.into_iter().next() {
+                    Some(r) => Self::ok_response(json!(r)),
+                    None => Self::error_response(StatusCode::NOT_FOUND, "request not found"),
+                }
+            }
         }
     }
     pub fn requests_recent(state: &AppState) -> Response {
-        Self::ok_response(json!(
-            state
-                .collector
-                .query_requests(&RequestFilter {
-                    limit: 100,
-                    ..Default::default()
-                })
-                .items
-        ))
+        let filter = RequestFilter {
+            limit: 100,
+            ..Default::default()
+        };
+        let audit = state.collector.query_audit_requests(&filter);
+        if !audit.items.is_empty() {
+            return Self::ok_response(json!(audit.items));
+        }
+        Self::ok_response(json!(state.collector.query_requests(&filter).items))
     }
     pub fn requests_summary(state: &AppState) -> Response {
         let s = state.collector.snapshot();
@@ -572,6 +594,172 @@ impl AdminService {
             .header("content-type", "application/x-ndjson")
             .body(axum::body::Body::from(body))
             .unwrap()
+    }
+
+    pub fn errors_summary(state: &AppState, filter: &RequestFilter) -> Response {
+        let audit_failures = state.collector.audit_failures(filter);
+        let snapshot = state.collector.snapshot();
+        Self::ok_response(json!({
+            "snapshot": {
+                "count_429": snapshot.requests.count_429,
+                "count_4xx": snapshot.requests.count_4xx,
+                "count_5xx": snapshot.requests.count_5xx,
+                "count_timeout": snapshot.requests.count_timeout,
+                "by_outcome": snapshot.requests.by_outcome,
+                "by_failure_kind": snapshot.requests.by_failure_kind,
+            },
+            "durable": audit_failures,
+        }))
+    }
+
+    pub fn latency_summary(state: &AppState, filter: &RequestFilter) -> Response {
+        let summary = state.collector.audit_summary(filter);
+        let top = state.collector.audit_top_requests(filter, "latency");
+        let timeseries = state.collector.audit_timeseries(filter, 300_000);
+        Self::ok_response(json!({
+            "summary": summary,
+            "top_latency_requests": top,
+            "timeseries_5m": timeseries,
+        }))
+    }
+
+    pub fn ttft_summary(state: &AppState, filter: &RequestFilter) -> Response {
+        let summary = state.collector.audit_summary(filter);
+        let top = state.collector.audit_top_requests(filter, "ttft");
+        Self::ok_response(json!({
+            "summary": summary,
+            "top_ttft_requests": top,
+        }))
+    }
+
+    pub fn protocol_guard_events(state: &AppState, filter: &RequestFilter) -> Response {
+        let result = state.collector.query_audit_requests(filter);
+        let mut counters = BTreeMap::<String, u64>::new();
+        let mut recent = Vec::new();
+        for item in result.items.into_iter() {
+            let Some(guard) = item.protocol_guard else {
+                continue;
+            };
+            *counters.entry("requests".into()).or_default() += 1;
+            if guard.applied {
+                *counters.entry("applied".into()).or_default() += 1;
+            }
+            if guard.pre_invalid {
+                *counters.entry("pre_invalid".into()).or_default() += 1;
+            }
+            if guard.post_valid {
+                *counters.entry("post_valid".into()).or_default() += 1;
+            }
+            add_counter(
+                &mut counters,
+                "missing_tool_call_id",
+                guard.missing_tool_call_id_count as u64,
+            );
+            add_counter(
+                &mut counters,
+                "missing_tool_use_id",
+                guard.missing_tool_use_id_count as u64,
+            );
+            add_counter(
+                &mut counters,
+                "synthetic_tool_id",
+                guard.synthetic_tool_id_count as u64,
+            );
+            add_counter(
+                &mut counters,
+                "paired_tool_result",
+                guard.paired_tool_result_count as u64,
+            );
+            add_counter(
+                &mut counters,
+                "orphan_tool_result",
+                guard.orphan_tool_result_count as u64,
+            );
+            add_counter(
+                &mut counters,
+                "downgraded_tool_result",
+                guard.downgraded_tool_result_count as u64,
+            );
+            add_counter(
+                &mut counters,
+                "orphan_assistant_call",
+                guard.orphan_assistant_call_count as u64,
+            );
+            recent.push(json!({
+                "rid": item.rid,
+                "external_request_id": item.external_request_id,
+                "ts": item.ts,
+                "model": item.model,
+                "status": item.status,
+                "failure_kind": item.failure_kind,
+                "guard": guard,
+            }));
+        }
+        Self::ok_response(json!({
+            "summary": counters,
+            "recent": recent,
+        }))
+    }
+
+    pub fn compactor_events(state: &AppState, filter: &RequestFilter) -> Response {
+        let result = state.collector.query_audit_requests(filter);
+        let mut counters = BTreeMap::<String, u64>::new();
+        let mut recent = Vec::new();
+        for item in result.items.into_iter() {
+            let Some(context) = item.context else {
+                continue;
+            };
+            if context.action == "pass" && !context.trimmed {
+                continue;
+            }
+            *counters.entry("requests".into()).or_default() += 1;
+            if context.trimmed {
+                *counters.entry("trimmed".into()).or_default() += 1;
+            }
+            add_counter(&mut counters, "trimmed_bytes", context.trimmed_bytes);
+            add_counter(
+                &mut counters,
+                "artifact_cache_hits",
+                context.artifact_cache_hits as u64,
+            );
+            add_counter(
+                &mut counters,
+                "artifact_cache_writes",
+                context.artifact_cache_writes as u64,
+            );
+            recent.push(json!({
+                "rid": item.rid,
+                "external_request_id": item.external_request_id,
+                "ts": item.ts,
+                "model": item.model,
+                "status": item.status,
+                "context": context,
+            }));
+        }
+        Self::ok_response(json!({
+            "summary": counters,
+            "recent": recent,
+        }))
+    }
+
+    pub fn pool_state(state: &AppState) -> Response {
+        let p = state.pool_manager.pool_stats();
+        Self::ok_response(json!({
+            "pools": {
+                "dispatch": p.dispatch_size,
+                "active": p.active_size,
+                "ratelimited": p.ratelimited_size,
+                "dead": p.dead_size,
+                "cooldown": p.cooldown_size,
+                "budget_limited": p.budget_limited_size,
+                "leased": p.leased_count,
+                "total": p.total(),
+                "fuse": p.fuse,
+            },
+            "runtime": state.pool_manager.runtime_details(),
+            "budget": state.pool_manager.budget_details(),
+            "recent_events": state.collector.recent_events(100),
+        }))
     }
 
     // --- Durable audit ---
@@ -690,7 +878,7 @@ impl AdminService {
     pub fn config(state: &AppState) -> Response {
         let cfg = state.config.read().unwrap();
         Self::ok_response(json!({
-            "upstream_base": cfg.upstream_base,
+            "upstream_base": sanitize_text(&cfg.upstream_base),
             "pool_max_retries": cfg.pool_max_retries,
             "v4_retry_budget_ms": cfg.v4_retry_budget_ms,
             "connect_timeout_secs": cfg.connect_timeout_secs,
@@ -702,7 +890,7 @@ impl AdminService {
             "v4_model_registry_enabled": cfg.v4_model_registry_enabled,
             "audit": {
                 "enabled": cfg.audit_log_enabled,
-                "log_dir": cfg.audit_log_dir,
+                "log_dir": sanitize_text(&cfg.audit_log_dir),
             },
             "admin_api_key_configured": cfg.admin_api_key.is_some(),
             "proxy_api_key_configured": cfg.proxy_api_key.is_some(),
@@ -713,7 +901,7 @@ impl AdminService {
                 "v1_max_concurrent_requests": cfg.v1_max_concurrent_requests,
                 "compactor_mode": cfg.zen_compactor_mode.to_string(),
                 "artifact_cache_mode": cfg.zen_artifact_cache_mode.to_string(),
-                "artifact_cache_dir": cfg.artifact_cache_dir,
+                "artifact_cache_dir": sanitize_text(&cfg.artifact_cache_dir),
                 "artifact_cache_max_mb": cfg.artifact_cache_max_mb,
                 "artifact_cache_ttl_hours": cfg.artifact_cache_ttl_hours,
                 "warn_body_mb": cfg.context_warn_body_mb,
@@ -838,5 +1026,11 @@ fn parse_ts(value: &str) -> Option<i64> {
         Some(parsed.saturating_mul(1000))
     } else {
         Some(parsed)
+    }
+}
+
+fn add_counter(counters: &mut BTreeMap<String, u64>, key: &str, value: u64) {
+    if value > 0 {
+        *counters.entry(key.to_string()).or_default() += value;
     }
 }

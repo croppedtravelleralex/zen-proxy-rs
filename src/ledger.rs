@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use crate::collector::{RequestAttemptTelemetry, RequestTelemetry};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +53,152 @@ impl LedgerEvent {
     }
 }
 
+pub fn sanitize_request_telemetry(input: &RequestTelemetry) -> RequestTelemetry {
+    let mut out = input.clone();
+    out.client_id = hash_or_empty(&out.client_id);
+    out.node_url = LedgerEvent::redact_node_url(&out.node_url);
+    out.selected_node_url_redacted =
+        LedgerEvent::redact_node_url(non_empty_or(&out.selected_node_url_redacted, &out.node_url));
+    out.failure_message = sanitize_text(&out.failure_message);
+    out.path = sanitize_text(&out.path);
+    out.gateway = sanitize_text(&out.gateway);
+    out.retry_chain = out.retry_chain.iter().map(sanitize_attempt).collect();
+    if let Some(context) = out.context.as_mut() {
+        context.trace = context
+            .trace
+            .iter()
+            .map(|item| sanitize_text(item))
+            .collect();
+    }
+    out
+}
+
+fn sanitize_attempt(input: &RequestAttemptTelemetry) -> RequestAttemptTelemetry {
+    let mut out = input.clone();
+    out.node_url_redacted = LedgerEvent::redact_node_url(&out.node_url_redacted);
+    out.error_type = sanitize_text(&out.error_type);
+    out.outcome = sanitize_text(&out.outcome);
+    out
+}
+
+pub fn sanitize_json_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(sanitize_text(&s)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sanitize_json_value).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, sanitize_json_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+pub fn sanitize_text(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let mut out = redact_bearer_like(input);
+    out = redact_proxy_credentials(&out);
+    out = redact_paths(&out);
+    out
+}
+
+fn hash_or_empty(input: &str) -> String {
+    if input.is_empty() {
+        String::new()
+    } else {
+        format!("hash:{}", LedgerEvent::short_hash(input))
+    }
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn redact_bearer_like(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|token| {
+            let lower = token.to_ascii_lowercase();
+            if token.starts_with("sk-")
+                || token.starts_with("sk_")
+                || lower.starts_with("bearer:")
+                || lower.starts_with("apikey:")
+                || lower.starts_with("api_key:")
+                || lower.starts_with("authorization:")
+            {
+                redact_token_preserving_punct(token)
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_token_preserving_punct(token: &str) -> String {
+    let end_punct = token
+        .chars()
+        .rev()
+        .take_while(|c| matches!(c, ',' | ';' | ')' | ']' | '}' | '"' | '\''))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("[redacted-secret]{end_punct}")
+}
+
+fn redact_proxy_credentials(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(scheme_pos) = rest.find("://") {
+        let (prefix, after_prefix) = rest.split_at(scheme_pos + 3);
+        out.push_str(prefix);
+        let after_scheme = after_prefix;
+        let url_end = after_scheme
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
+            .unwrap_or(after_scheme.len());
+        let (url_part, tail) = after_scheme.split_at(url_end);
+        if let Some(at_pos) = url_part.find('@') {
+            out.push_str("***@");
+            out.push_str(&url_part[at_pos + 1..]);
+        } else {
+            out.push_str(url_part);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_paths(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|token| {
+            let normalized = token.replace('\\', "/");
+            let lower = normalized.to_ascii_lowercase();
+            if lower.starts_with("/home/")
+                || lower.starts_with("/root/")
+                || lower.starts_with("/mnt/")
+                || lower.starts_with("//wsl.localhost/")
+                || (lower.len() > 3 && lower.as_bytes()[1] == b':' && lower.as_bytes()[2] == b'/')
+            {
+                redact_token_preserving_punct(token)
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct PerDimensionCounters {
     pub(crate) requests: u64,
@@ -67,6 +214,8 @@ pub struct LedgerCounters {
     by_model: RwLock<HashMap<String, PerDimensionCounters>>,
     by_key: RwLock<HashMap<String, PerDimensionCounters>>,
     by_stream: RwLock<HashMap<bool, PerDimensionCounters>>,
+    by_error_type: RwLock<HashMap<String, PerDimensionCounters>>,
+    by_status: RwLock<HashMap<String, PerDimensionCounters>>,
     total_requests: std::sync::atomic::AtomicU64,
     total_success: std::sync::atomic::AtomicU64,
     total_429: std::sync::atomic::AtomicU64,
@@ -104,6 +253,12 @@ impl LedgerCounters {
         self.inc_dimension(&self.by_model, &event.model, event.status);
         self.inc_dimension(&self.by_key, &event.upstream_api_key_hash, event.status);
         self.inc_dimension_bool(&self.by_stream, event.stream, event.status);
+        self.inc_dimension(&self.by_status, &event.status.to_string(), event.status);
+        self.inc_dimension(
+            &self.by_error_type,
+            event.error_type.as_deref().unwrap_or("none"),
+            event.status,
+        );
 
         let is_429 = event.status == 429 || event.error_type.as_deref() == Some("rate_limited");
         let is_5xx = event.status >= 500 && event.status != 429;
@@ -184,6 +339,8 @@ impl LedgerCounters {
             }
             serde_json::Value::Object(map)
         };
+        let by_error_type = dimension_json(&self.by_error_type);
+        let by_status = dimension_json(&self.by_status);
 
         json!({
             "total_requests": self.total_requests.load(Ordering::Relaxed),
@@ -192,6 +349,8 @@ impl LedgerCounters {
             "5xx": self.total_5xx.load(Ordering::Relaxed),
             "network_errors": self.total_network_error.load(Ordering::Relaxed),
             "by_node": by_node,
+            "by_error_type": by_error_type,
+            "by_status": by_status,
         })
     }
 
@@ -206,6 +365,25 @@ impl LedgerCounters {
     pub fn by_stream_summary(&self) -> HashMap<bool, PerDimensionCounters> {
         self.by_stream.read().unwrap().clone()
     }
+}
+
+fn dimension_json(map: &RwLock<HashMap<String, PerDimensionCounters>>) -> serde_json::Value {
+    use serde_json::json;
+    let m = map.read().unwrap();
+    let mut out = serde_json::Map::new();
+    for (k, v) in m.iter() {
+        out.insert(
+            k.clone(),
+            json!({
+                "requests": v.requests,
+                "success": v.success,
+                "429": v.count_429,
+                "5xx": v.count_5xx,
+                "network": v.count_network_error,
+            }),
+        );
+    }
+    serde_json::Value::Object(out)
 }
 
 #[cfg(test)]
@@ -265,6 +443,34 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("FreeUsageLimitError"));
         assert!(!json.contains("u:p@"));
+    }
+
+    #[test]
+    fn sanitize_text_redacts_key_proxy_and_paths() {
+        let input = "key sk-dev proxy socks5h://user:pass@host:1080 path /home/lenovo/app C:\\Users\\Lenovo\\secret";
+        let out = sanitize_text(input);
+        assert!(!out.contains("sk-dev"));
+        assert!(!out.contains("user:pass"));
+        assert!(!out.contains("/home/lenovo"));
+        assert!(!out.contains("C:\\Users\\Lenovo"));
+        assert!(out.contains("[redacted-secret]"));
+        assert!(out.contains("***@host:1080"));
+    }
+
+    #[test]
+    fn sanitize_request_telemetry_hashes_client_and_redacts_node() {
+        let mut tele = crate::collector::telemetry::new_telemetry();
+        tele.client_id = "sk-dev".into();
+        tele.node_url = "socks5h://user:pass@host:1080".into();
+        tele.failure_message = "failed at /home/lenovo/app with sk-secret".into();
+
+        let out = sanitize_request_telemetry(&tele);
+
+        assert_ne!(out.client_id, "sk-dev");
+        assert!(out.client_id.starts_with("hash:"));
+        assert_eq!(out.node_url, "socks5h://***@host:1080");
+        assert!(!out.failure_message.contains("/home/lenovo"));
+        assert!(!out.failure_message.contains("sk-secret"));
     }
 
     #[test]

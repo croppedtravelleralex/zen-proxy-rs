@@ -688,7 +688,14 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        kind = classify_legacy_stream_error(&err.to_string()),
+                        "legacy upstream stream ended with error"
+                    );
+                    break;
+                }
             }
         }
     });
@@ -704,4 +711,39 @@ async fn stream_to_axum(response: reqwest::Response) -> Response {
     resp.headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-cache"));
     resp
+}
+
+fn classify_legacy_stream_error(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("decode") || lower.contains("decoding") {
+        "stream_decode_error"
+    } else if lower.contains("timeout") || lower.contains("timed out") || lower.contains("elapsed")
+    {
+        "stream_timeout"
+    } else if lower.contains("connection") || lower.contains("closed") || lower.contains("reset") {
+        "stream_connection_error"
+    } else {
+        "stream_error"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_legacy_stream_error;
+
+    #[test]
+    fn classifies_legacy_stream_errors() {
+        assert_eq!(
+            classify_legacy_stream_error("error decoding response body"),
+            "stream_decode_error"
+        );
+        assert_eq!(
+            classify_legacy_stream_error("operation timed out"),
+            "stream_timeout"
+        );
+        assert_eq!(
+            classify_legacy_stream_error("connection reset by peer"),
+            "stream_connection_error"
+        );
+    }
 }

@@ -1,6 +1,8 @@
 /target
+target-1.86/
 nodes.json
 .env
 .claude/
 false/
 data/webshare_nodes.json
+test-records/runs/

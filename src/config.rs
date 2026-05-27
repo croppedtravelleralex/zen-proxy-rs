@@ -302,6 +302,10 @@ pub struct Config {
     pub v43_huge_context_concurrency: usize,
     pub v43_large_context_body_mb: usize,
     pub v43_huge_context_body_mb: usize,
+    pub v45_large_context_tokens: u64,
+    pub v45_huge_context_tokens: u64,
+    pub v45_ttft_slow_ms: u64,
+    pub v45_ttft_bad_ms: u64,
     pub v43_lane_wait_timeout_ms: u64,
     pub v43_async_collector_enabled: bool,
     pub v43_collector_queue_capacity: usize,
@@ -445,6 +449,10 @@ impl Config {
             v43_huge_context_concurrency: load_env_var("V43_HUGE_CONTEXT_CONCURRENCY", 2usize),
             v43_large_context_body_mb: load_env_var("V43_LARGE_CONTEXT_BODY_MB", 8usize),
             v43_huge_context_body_mb: load_env_var("V43_HUGE_CONTEXT_BODY_MB", 32usize),
+            v45_large_context_tokens: load_env_var("V45_LARGE_CONTEXT_TOKENS", 200_000u64),
+            v45_huge_context_tokens: load_env_var("V45_HUGE_CONTEXT_TOKENS", 500_000u64),
+            v45_ttft_slow_ms: load_env_var("V45_TTFT_SLOW_MS", 4_000u64),
+            v45_ttft_bad_ms: load_env_var("V45_TTFT_BAD_MS", 8_000u64),
             v43_lane_wait_timeout_ms: load_env_var("V43_LANE_WAIT_TIMEOUT_MS", 1_000u64),
             v43_async_collector_enabled: load_env_var("V43_ASYNC_COLLECTOR_ENABLED", false),
             v43_collector_queue_capacity: load_env_var("V43_COLLECTOR_QUEUE_CAPACITY", 8192usize),
@@ -698,6 +706,10 @@ mod tests {
             "V43_HUGE_CONTEXT_CONCURRENCY",
             "V43_LARGE_CONTEXT_BODY_MB",
             "V43_HUGE_CONTEXT_BODY_MB",
+            "V45_LARGE_CONTEXT_TOKENS",
+            "V45_HUGE_CONTEXT_TOKENS",
+            "V45_TTFT_SLOW_MS",
+            "V45_TTFT_BAD_MS",
             "V43_LANE_WAIT_TIMEOUT_MS",
             "V43_ASYNC_COLLECTOR_ENABLED",
             "V43_COLLECTOR_QUEUE_CAPACITY",
@@ -768,6 +780,10 @@ mod tests {
         assert_eq!(cfg.v43_huge_context_concurrency, 2);
         assert_eq!(cfg.v43_large_context_body_mb, 8);
         assert_eq!(cfg.v43_huge_context_body_mb, 32);
+        assert_eq!(cfg.v45_large_context_tokens, 200_000);
+        assert_eq!(cfg.v45_huge_context_tokens, 500_000);
+        assert_eq!(cfg.v45_ttft_slow_ms, 4_000);
+        assert_eq!(cfg.v45_ttft_bad_ms, 8_000);
         assert_eq!(cfg.v43_lane_wait_timeout_ms, 1_000);
         assert!(!cfg.v43_async_collector_enabled);
         assert_eq!(cfg.v43_collector_queue_capacity, 8192);
@@ -835,6 +851,10 @@ mod tests {
         unsafe { env::set_var("V43_HUGE_CONTEXT_CONCURRENCY", "3") };
         unsafe { env::set_var("V43_LARGE_CONTEXT_BODY_MB", "9") };
         unsafe { env::set_var("V43_HUGE_CONTEXT_BODY_MB", "33") };
+        unsafe { env::set_var("V45_LARGE_CONTEXT_TOKENS", "210000") };
+        unsafe { env::set_var("V45_HUGE_CONTEXT_TOKENS", "610000") };
+        unsafe { env::set_var("V45_TTFT_SLOW_MS", "3456") };
+        unsafe { env::set_var("V45_TTFT_BAD_MS", "9876") };
         unsafe { env::set_var("V43_LANE_WAIT_TIMEOUT_MS", "1500") };
         unsafe { env::set_var("V43_ASYNC_COLLECTOR_ENABLED", "true") };
         unsafe { env::set_var("V43_COLLECTOR_QUEUE_CAPACITY", "1234") };
@@ -912,6 +932,10 @@ mod tests {
         assert_eq!(cfg.v43_huge_context_concurrency, 3);
         assert_eq!(cfg.v43_large_context_body_mb, 9);
         assert_eq!(cfg.v43_huge_context_body_mb, 33);
+        assert_eq!(cfg.v45_large_context_tokens, 210_000);
+        assert_eq!(cfg.v45_huge_context_tokens, 610_000);
+        assert_eq!(cfg.v45_ttft_slow_ms, 3_456);
+        assert_eq!(cfg.v45_ttft_bad_ms, 9_876);
         assert_eq!(cfg.v43_lane_wait_timeout_ms, 1500);
         assert!(cfg.v43_async_collector_enabled);
         assert_eq!(cfg.v43_collector_queue_capacity, 1234);
@@ -976,6 +1000,10 @@ mod tests {
             "V43_HUGE_CONTEXT_CONCURRENCY",
             "V43_LARGE_CONTEXT_BODY_MB",
             "V43_HUGE_CONTEXT_BODY_MB",
+            "V45_LARGE_CONTEXT_TOKENS",
+            "V45_HUGE_CONTEXT_TOKENS",
+            "V45_TTFT_SLOW_MS",
+            "V45_TTFT_BAD_MS",
             "V43_LANE_WAIT_TIMEOUT_MS",
             "V43_ASYNC_COLLECTOR_ENABLED",
             "V43_COLLECTOR_QUEUE_CAPACITY",

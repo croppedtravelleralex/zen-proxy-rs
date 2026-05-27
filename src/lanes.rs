@@ -197,10 +197,15 @@ impl LaneLimiter {
 
 fn classify_lane(config: &Config, path: &str, body: &Bytes) -> LaneKind {
     let body_mb = body.len().div_ceil(1024 * 1024);
-    if body_mb >= config.v43_huge_context_body_mb.max(1) {
+    let estimated_tokens = estimate_request_tokens(body);
+    if body_mb >= config.v43_huge_context_body_mb.max(1)
+        || estimated_tokens >= config.v45_huge_context_tokens.max(1)
+    {
         return LaneKind::HugeContext;
     }
-    if body_mb >= config.v43_large_context_body_mb.max(1) {
+    if body_mb >= config.v43_large_context_body_mb.max(1)
+        || estimated_tokens >= config.v45_large_context_tokens.max(1)
+    {
         return LaneKind::LargeContext;
     }
     if matches!(path, "chat/completions" | "messages") && request_is_streaming(body) {
@@ -217,11 +222,93 @@ fn request_is_streaming(body: &Bytes) -> bool {
         .unwrap_or(false)
 }
 
+fn estimate_request_tokens(body: &Bytes) -> u64 {
+    if body.is_empty() {
+        return 0;
+    }
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .map(|value| estimate_value_tokens(&value))
+        .unwrap_or_else(|| (body.len() as u64 / 4).max(1))
+}
+
+fn estimate_value_tokens(value: &Value) -> u64 {
+    match value {
+        Value::String(s) => (s.len() as u64 / 4).max(1),
+        Value::Array(items) => items.iter().map(estimate_value_tokens).sum(),
+        Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "content" | "messages" | "system" | "prompt" | "tools" | "tool_calls"
+                )
+            })
+            .map(|(_, value)| estimate_value_tokens(value))
+            .sum(),
+        _ => 0,
+    }
+}
+
 fn lane_name(kind: LaneKind) -> &'static str {
     match kind {
         LaneKind::ShortNonStream => "short_nonstream",
         LaneKind::NormalStream => "normal_stream",
         LaneKind::LargeContext => "large_context",
         LaneKind::HugeContext => "huge_context",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+
+    fn cfg_with_lanes() -> Config {
+        let mut cfg = Config::from_env();
+        cfg.v43_lanes_enabled = true;
+        cfg.v43_large_context_body_mb = 8;
+        cfg.v43_huge_context_body_mb = 32;
+        cfg.v45_large_context_tokens = 200_000;
+        cfg.v45_huge_context_tokens = 500_000;
+        cfg
+    }
+
+    #[test]
+    fn token_threshold_routes_large_context_before_body_mb_threshold() {
+        let cfg = cfg_with_lanes();
+        let content = "x".repeat(820_000);
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "stream": true,
+                "messages": [{"role": "user", "content": content}]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            classify_lane(&cfg, "chat/completions", &body),
+            LaneKind::LargeContext
+        );
+    }
+
+    #[test]
+    fn token_threshold_routes_huge_context_before_body_mb_threshold() {
+        let cfg = cfg_with_lanes();
+        let content = "x".repeat(2_100_000);
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "stream": true,
+                "messages": [{"role": "user", "content": content}]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            classify_lane(&cfg, "chat/completions", &body),
+            LaneKind::HugeContext
+        );
     }
 }

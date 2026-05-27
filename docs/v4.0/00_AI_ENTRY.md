@@ -64,6 +64,8 @@ root-level legacy audit reports as active guidance.
 9. [V4.4 Pool Fault Isolation](./12_v4.4_pool_fault_isolation.md)
 10. [V4.5 Cache Affinity and Effective TTFT](./13_v4.5_cache_affinity_ttft.md)
 11. [V4.6 Protocol Graph Guard and Pair-Aware Compactor](./14_v4.6_protocol_guard.md)
+12. [V4.7 Test Records and Client Acceptance](./15_test_records_and_client_acceptance.md)
+13. [V4.5 P8 95+ Acceptance Plan](./16_v4.5_p8_95_plus_acceptance.md)
 
 ## Hard Decisions
 
@@ -241,6 +243,19 @@ cargo build --release
 For V4.0 completion, code checks are not enough. The acceptance suite must also
 prove that the observed Zen egress path matches the selected node.
 
+For V4.5/P8 evidence runs, use the unified runner:
+
+```bash
+scripts/run_v45_p8_acceptance.sh plan
+NEWAPI_API_KEY=sk-dev scripts/run_v45_p8_acceptance.sh smoke
+NEWAPI_API_KEY=sk-dev scripts/run_v45_p8_acceptance.sh clients
+NEWAPI_API_KEY=sk-dev scripts/run_v45_p8_acceptance.sh ttft --tokens 1000
+```
+
+The full P0-P8 matrix, Windows/WSL/panda workflows, and NewAPI/ZenProxy
+reconciliation rules are maintained in
+[V4.5 P8 95+ Acceptance Plan](./16_v4.5_p8_95_plus_acceptance.md).
+
 ## Runtime Data Sources
 
 For operations analysis, use sources in this order:
@@ -253,3 +268,12 @@ For operations analysis, use sources in this order:
 5. `/tmp/zen-proxy-ledger-events.jsonl` for V4 ledger events from the current
    WAL file.
 6. systemd service environment and logs for effective runtime configuration.
+7. `test-records/runs/<run_id>/summary.md` for user-visible acceptance run
+   summaries created by `scripts/collect_test_record.py`.
+
+## Repository Hygiene Notes
+
+- `test-records/runs/` is intentionally ignored because it contains generated
+  acceptance evidence packages.
+- `target-1.86/` is now ignored for future local build artifacts, but files
+  already tracked under that directory still need a separate index cleanup.
