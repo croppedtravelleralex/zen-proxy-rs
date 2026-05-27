@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![recursion_limit = "256"]
 
 mod admin;
 mod collector;

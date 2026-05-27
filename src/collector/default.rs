@@ -3,6 +3,7 @@ use crate::collector::audit::{AuditGroup, AuditStore};
 use crate::collector::ring_buffer::RingBuffer;
 use crate::collector::wal::WAL;
 use crate::collector::*;
+use crate::ledger::sanitize_request_telemetry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,27 +86,31 @@ impl DefaultCollector {
 
 impl DataCollector for DefaultCollector {
     fn record_request(&self, tele: &RequestTelemetry) {
+        let safe_tele = sanitize_request_telemetry(tele);
+
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        if tele.status >= 200 && tele.status <= 299 {
+        if safe_tele.status >= 200 && safe_tele.status <= 299 {
             self.success_count.fetch_add(1, Ordering::Relaxed);
         }
-        if tele.rate_limited {
+        if safe_tele.rate_limited {
             self.count_429.fetch_add(1, Ordering::Relaxed);
-        } else if tele.status >= 500 {
+        } else if safe_tele.status >= 500 {
             self.count_5xx.fetch_add(1, Ordering::Relaxed);
-        } else if tele.status >= 400 {
+        } else if safe_tele.status >= 400 {
             self.count_4xx.fetch_add(1, Ordering::Relaxed);
         }
-        if tele.failure_kind == "timeout" || tele.outcome == "timeout" {
+        if safe_tele.failure_kind == "timeout" || safe_tele.outcome == "timeout" {
             self.count_timeout.fetch_add(1, Ordering::Relaxed);
         }
         self.bytes_sent
-            .fetch_add(tele.bytes_sent, Ordering::Relaxed);
+            .fetch_add(safe_tele.bytes_sent, Ordering::Relaxed);
         self.bytes_received
-            .fetch_add(tele.bytes_received, Ordering::Relaxed);
-        self.bandwidth_bytes
-            .fetch_add(tele.bytes_sent + tele.bytes_received, Ordering::Relaxed);
-        self.request_dims.lock().unwrap().record(tele);
+            .fetch_add(safe_tele.bytes_received, Ordering::Relaxed);
+        self.bandwidth_bytes.fetch_add(
+            safe_tele.bytes_sent + safe_tele.bytes_received,
+            Ordering::Relaxed,
+        );
+        self.request_dims.lock().unwrap().record(&safe_tele);
 
         {
             let mut rpm = self.rpm_window.lock().unwrap();
@@ -118,14 +123,14 @@ impl DataCollector for DefaultCollector {
             }
         }
 
-        self.ring_buffer.push(tele.clone());
-        self.aggregator.record(tele);
+        self.ring_buffer.push(safe_tele.clone());
+        self.aggregator.record(&safe_tele);
 
         if let Some(ref wal) = self.wal {
-            let _ = wal.append(tele);
+            let _ = wal.append(&safe_tele);
         }
         if let Some(ref audit) = self.audit {
-            let _ = audit.append(tele);
+            let _ = audit.append(&safe_tele);
         }
     }
 

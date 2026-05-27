@@ -717,7 +717,8 @@ fn classify_legacy_stream_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("decode") || lower.contains("decoding") {
         "stream_decode_error"
-    } else if lower.contains("timeout") || lower.contains("elapsed") {
+    } else if lower.contains("timeout") || lower.contains("timed out") || lower.contains("elapsed")
+    {
         "stream_timeout"
     } else if lower.contains("connection") || lower.contains("closed") || lower.contains("reset") {
         "stream_connection_error"

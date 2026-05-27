@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NewAPI redacted log import record",
+  "type": "object",
+  "required": ["request_id", "model_name", "created_at"],
+  "properties": {
+    "request_id": { "type": "string" },
+    "upstream_request_id": { "type": "string" },
+    "channel_id": { "type": ["integer", "string", "null"] },
+    "model_name": { "type": "string" },
+    "model": { "type": "string" },
+    "status": { "type": ["integer", "string", "null"] },
+    "type": { "type": ["integer", "string", "null"] },
+    "duration_ms": { "type": ["integer", "number", "null"] },
+    "use_time": { "type": ["integer", "number", "string", "null"] },
+    "created_at": { "type": ["integer", "number", "string"] },
+    "createdAt": { "type": ["integer", "number", "string"] },
+    "created_time": { "type": ["integer", "number", "string"] },
+    "is_stream": { "type": ["boolean", "string", "null"] },
+    "stream": { "type": ["boolean", "string", "null"] },
+    "prompt_tokens": { "type": ["integer", "string", "null"] },
+    "completion_tokens": { "type": ["integer", "string", "null"] }
+  }
+}
