@@ -376,7 +376,14 @@ fn collapse_old_prefix(conf: &Config, body: &mut Value, trace: &mut Vec<String>)
         return;
     }
 
-    let split_at = messages.len().saturating_sub(preserve_recent);
+    let split_at = pair_aware_split_at(messages, messages.len().saturating_sub(preserve_recent));
+    if split_at == 0 {
+        push_trace(
+            trace,
+            "collapsed old prefix skipped: tool-call pair crossed preserve boundary",
+        );
+        return;
+    }
     let old_prefix = messages.drain(0..split_at).collect::<Vec<_>>();
     let old_bytes = serialized_len(&Value::Array(old_prefix.clone()));
     let old_hash = sha256_hex(
@@ -416,6 +423,102 @@ fn collapse_old_prefix(conf: &Config, body: &mut Value, trace: &mut Vec<String>)
             omitted_count, old_bytes
         ),
     );
+}
+
+fn pair_aware_split_at(messages: &[Value], split_at: usize) -> usize {
+    let mut adjusted = split_at.min(messages.len());
+    adjusted = adjusted.min(openai_pair_aware_split_at(messages, adjusted));
+    adjusted.min(anthropic_pair_aware_split_at(messages, adjusted))
+}
+
+fn openai_pair_aware_split_at(messages: &[Value], split_at: usize) -> usize {
+    let mut recent_tool_ids = std::collections::HashSet::<String>::new();
+    for message in messages.iter().skip(split_at) {
+        if message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "tool")
+        {
+            if let Some(id) = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                recent_tool_ids.insert(id.to_string());
+            }
+        }
+    }
+    if recent_tool_ids.is_empty() {
+        return split_at;
+    }
+
+    let mut adjusted = split_at;
+    for (idx, message) in messages.iter().take(split_at).enumerate() {
+        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        let has_recent_result = calls.iter().any(|call| {
+            call.get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|id| recent_tool_ids.contains(id))
+        });
+        if has_recent_result {
+            adjusted = adjusted.min(idx);
+        }
+    }
+    adjusted
+}
+
+fn anthropic_pair_aware_split_at(messages: &[Value], split_at: usize) -> usize {
+    let mut recent_tool_ids = std::collections::HashSet::<String>::new();
+    for message in messages.iter().skip(split_at) {
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            if block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "tool_result")
+            {
+                if let Some(id) = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                {
+                    recent_tool_ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    if recent_tool_ids.is_empty() {
+        return split_at;
+    }
+
+    let mut adjusted = split_at;
+    for (idx, message) in messages.iter().take(split_at).enumerate() {
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        let has_recent_result = blocks.iter().any(|block| {
+            block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "tool_use")
+                && block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|id| recent_tool_ids.contains(id))
+        });
+        if has_recent_result {
+            adjusted = adjusted.min(idx);
+        }
+    }
+    adjusted
 }
 
 fn trim_tool_result_blocks(
@@ -944,5 +1047,27 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("ZenProxy context compactor"));
+    }
+
+    #[test]
+    fn collapse_boundary_keeps_openai_tool_pair_together() {
+        let messages = vec![
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"call_1","content":"result"}),
+            json!({"role":"user","content":"latest"}),
+        ];
+
+        assert_eq!(pair_aware_split_at(&messages, 1), 0);
+    }
+
+    #[test]
+    fn collapse_boundary_keeps_anthropic_tool_pair_together() {
+        let messages = vec![
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result"}]}),
+            json!({"role":"user","content":"latest"}),
+        ];
+
+        assert_eq!(pair_aware_split_at(&messages, 1), 0);
     }
 }
