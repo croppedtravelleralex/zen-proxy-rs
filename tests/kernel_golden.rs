@@ -116,6 +116,23 @@ async fn mock_zen_handler(
             .into_response();
     }
 
+    if prompt.contains("inline-fence-markdown") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"```text\\nProcessBTCmd```\\n## Result\\n| a | b |\\n\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":8,\"total_tokens\":11}}\n\ndata: [DONE]\n\n",
+        )
+            .into_response();
+    }
+    if prompt.contains("unclosed-fence-markdown") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"```text\\nlog line\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\ndata: [DONE]\n\n",
+        )
+            .into_response();
+    }
+
     let chunk = if prompt.contains("mixed-text-tool-delta") {
         json!({
             "choices": [{
@@ -303,6 +320,51 @@ async fn openai_non_stream_accepts_finish_reason_without_done() {
 }
 
 #[tokio::test]
+async fn openai_non_stream_repairs_markdown_fence_boundaries() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request(
+                "deepseek-v4-flash-free",
+                "inline-fence-markdown",
+                false,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "```text\nProcessBTCmd\n```\n## Result\n| a | b |\n"
+    );
+}
+
+#[tokio::test]
+async fn openai_stream_closes_unclosed_markdown_fence() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request(
+                "deepseek-v4-flash-free",
+                "unclosed-fence-markdown",
+                true,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("```text\\nlog line"));
+    assert!(body.contains("\\n```\\n"));
+    assert!(body.contains("[DONE]"));
+}
+
+#[tokio::test]
 async fn openai_non_stream_rejects_eof_without_done_or_finish_reason() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -336,6 +398,24 @@ async fn anthropic_non_stream_returns_golden_message_response() {
 }
 
 #[tokio::test]
+async fn anthropic_non_stream_repairs_markdown_fence_boundaries() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "inline-fence-markdown", false),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(
+        body["content"][0]["text"],
+        "```text\nProcessBTCmd\n```\n## Result\n| a | b |\n"
+    );
+}
+
+#[tokio::test]
 async fn anthropic_stream_returns_golden_event_sequence() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -352,6 +432,23 @@ async fn anthropic_stream_returns_golden_event_sequence() {
     assert!(body.contains("event: content_block_delta"));
     assert!(body.contains("golden answer"));
     assert!(body.contains("\"output_tokens\":2"));
+    assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_closes_unclosed_markdown_fence() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "unclosed-fence-markdown", true),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("```text\\nlog line"));
+    assert!(body.contains("\\n```\\n"));
     assert!(body.contains("event: message_stop"));
 }
 

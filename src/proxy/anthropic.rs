@@ -92,7 +92,9 @@ async fn handle_non_stream(
     .await?;
     let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
     let collected = crate::zen::client::collect_stream_parts(resp).await?;
-    let content = crate::redact::redact_text(&collected.content);
+    let content = crate::proxy::markdown::MarkdownFenceGuard::repair_text(
+        &crate::redact::redact_text(&collected.content),
+    );
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -244,6 +246,7 @@ async fn handle_stream(
         yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
         let mut text = String::new();
         let mut text_block_open = false;
+        let mut markdown_guard = crate::proxy::markdown::MarkdownFenceGuard::new();
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
         while let Some(event) = upstream.next().await {
@@ -262,6 +265,7 @@ async fn handle_stream(
                     let Some(delta) = choice.delta else { continue; };
                     if let Some(content) = delta.content {
                         let content = crate::redact::redact_text(&content);
+                        let content = markdown_guard.push(&content);
                         if !content.trim().is_empty() {
                             if !text_block_open {
                                 text_block_open = true;
@@ -276,6 +280,15 @@ async fn handle_stream(
                     }
                 }
             }
+        }
+        let final_markdown = markdown_guard.finish();
+        if !final_markdown.is_empty() {
+            if !text_block_open {
+                text_block_open = true;
+                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
+            }
+            text.push_str(&final_markdown);
+            yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":final_markdown}}).to_string()));
         }
         if text.trim().is_empty() && tool_calls.is_empty() {
             yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":"upstream returned no assistant content or tool call"}}).to_string()));

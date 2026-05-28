@@ -89,7 +89,9 @@ async fn handle_oa_non_stream(
     .await?;
     let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
     let collected = crate::zen::client::collect_stream_parts(resp).await?;
-    let content = crate::redact::redact_text(&collected.content);
+    let content = crate::proxy::markdown::MarkdownFenceGuard::repair_text(
+        &crate::redact::redact_text(&collected.content),
+    );
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -257,6 +259,7 @@ async fn handle_oa_stream(
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
         let mut text = String::new();
+        let mut markdown_guard = crate::proxy::markdown::MarkdownFenceGuard::new();
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
         while let Some(event) = upstream.next().await {
@@ -276,6 +279,7 @@ async fn handle_oa_stream(
                     let Some(delta) = choice.delta else { continue; };
                     if let Some(content) = delta.content {
                         let content = crate::redact::redact_text(&content);
+                        let content = markdown_guard.push(&content);
                         if !content.trim().is_empty() {
                             text.push_str(&content);
                             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string()));
@@ -286,6 +290,11 @@ async fn handle_oa_stream(
                     }
                 }
             }
+        }
+        let final_markdown = markdown_guard.finish();
+        if !final_markdown.is_empty() {
+            text.push_str(&final_markdown);
+            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":final_markdown},"finish_reason":null}]}).to_string()));
         }
         if text.trim().is_empty() && tool_calls.is_empty() {
             yield Ok(Event::default().data(serde_json::json!({"error":{"message":"upstream returned no assistant content or tool call"}}).to_string()));
