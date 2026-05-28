@@ -27,6 +27,12 @@ use crate::v4::model::{ModelError, ModelRegistry, StaticModelRegistry};
 use crate::v4::protocol_guard::{self, GuardPhase};
 
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+const NONSTREAM_DEFAULT_MAX_TOKENS: u64 = 2_048;
+const NONSTREAM_MAX_TOKENS_CAP: u64 = 4_096;
+const NONSTREAM_LONG_PROMPT_TOKENS: u32 = 50_000;
+const NONSTREAM_HUGE_PROMPT_TOKENS: u32 = 100_000;
+const NONSTREAM_LONG_PROMPT_CAP: u64 = 2_048;
+const NONSTREAM_HUGE_PROMPT_CAP: u64 = 1_024;
 
 pub async fn handle_v4_proxy(
     state: &Arc<AppState>,
@@ -128,6 +134,13 @@ pub async fn handle_v4_proxy(
     {
         upstream_body["max_tokens"] = Value::from(1024);
     }
+    let nonstream_guard = match apply_nonstream_output_guard(path, &mut upstream_body) {
+        Ok(decision) => decision,
+        Err(reject) => return error_response(reject.status, reject.message),
+    };
+    if nonstream_guard.applied() {
+        context_telemetry.trace.push(nonstream_guard.trace_line());
+    }
     let effective_body_len = serde_json::to_vec(&upstream_body)
         .map(|bytes| bytes.len() as u64)
         .unwrap_or(context_telemetry.effective_body_bytes);
@@ -179,6 +192,7 @@ pub async fn handle_v4_proxy(
             if !streaming {
                 timings.stream_complete_ms = latency;
                 timings.first_chunk_ms = timings.first_chunk_ms.max(result.ttft_ms.unwrap_or(0));
+                timings.protocol_first_byte_ms = timings.first_chunk_ms;
             }
             let telemetry = RequestTelemetry {
                 rid: result.request_id.clone(),
@@ -261,6 +275,7 @@ pub async fn handle_v4_proxy(
                 "x-zen-stream-seen",
                 HeaderValue::from_static(if streaming { "true" } else { "false" }),
             );
+            insert_nonstream_guard_headers(response.headers_mut(), &nonstream_guard);
             insert_context_headers(response.headers_mut(), &context_telemetry);
             response
         }
@@ -331,10 +346,106 @@ pub async fn handle_v4_proxy(
                     HeaderValue::from_str(&retry_after.to_string()).unwrap(),
                 );
             }
+            insert_nonstream_guard_headers(response.headers_mut(), &nonstream_guard);
             insert_context_headers(response.headers_mut(), &context_telemetry);
             response
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct NonStreamGuardDecision {
+    action: &'static str,
+    prompt_tokens: u32,
+    max_tokens_before: Option<u64>,
+    max_tokens_after: Option<u64>,
+}
+
+impl NonStreamGuardDecision {
+    fn applied(&self) -> bool {
+        self.action != "pass"
+    }
+
+    fn trace_line(&self) -> String {
+        format!(
+            "nonstream_guard action={} prompt_tokens={} max_tokens_before={} max_tokens_after={}",
+            self.action,
+            self.prompt_tokens,
+            self.max_tokens_before
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.max_tokens_after
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NonStreamGuardReject {
+    status: StatusCode,
+    message: String,
+}
+
+fn apply_nonstream_output_guard(
+    path: &str,
+    body: &mut Value,
+) -> Result<NonStreamGuardDecision, NonStreamGuardReject> {
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if streaming || !matches!(path, "chat/completions" | "messages") {
+        return Ok(NonStreamGuardDecision {
+            action: "pass",
+            ..NonStreamGuardDecision::default()
+        });
+    }
+
+    let prompt_tokens = estimate_prompt_tokens(path, body);
+    let max_tokens_before = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(Value::as_u64);
+
+    if prompt_tokens >= NONSTREAM_HUGE_PROMPT_TOKENS
+        && max_tokens_before.unwrap_or(0) > NONSTREAM_MAX_TOKENS_CAP
+    {
+        return Err(NonStreamGuardReject {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!(
+                "non-streaming request is too large for long output: prompt_tokens={prompt_tokens} max_tokens={} use stream=true or reduce max_tokens",
+                max_tokens_before.unwrap_or(0)
+            ),
+        });
+    }
+
+    let mut target = max_tokens_before.unwrap_or(NONSTREAM_DEFAULT_MAX_TOKENS);
+    let mut action = if max_tokens_before.is_none() {
+        "default_2048"
+    } else {
+        "pass"
+    };
+
+    if target > NONSTREAM_MAX_TOKENS_CAP {
+        target = NONSTREAM_MAX_TOKENS_CAP;
+        action = "cap_4096";
+    }
+    if prompt_tokens >= NONSTREAM_HUGE_PROMPT_TOKENS && target > NONSTREAM_HUGE_PROMPT_CAP {
+        target = NONSTREAM_HUGE_PROMPT_CAP;
+        action = "cap_huge_prompt_1024";
+    } else if prompt_tokens >= NONSTREAM_LONG_PROMPT_TOKENS && target > NONSTREAM_LONG_PROMPT_CAP {
+        target = NONSTREAM_LONG_PROMPT_CAP;
+        action = "cap_long_prompt_2048";
+    }
+
+    if max_tokens_before != Some(target) {
+        body["max_tokens"] = Value::from(target);
+    }
+
+    Ok(NonStreamGuardDecision {
+        action,
+        prompt_tokens,
+        max_tokens_before,
+        max_tokens_after: body.get("max_tokens").and_then(Value::as_u64),
+    })
 }
 
 fn extract_external_request_id(headers: &HeaderMap) -> String {
@@ -760,7 +871,8 @@ async fn call_with_retry(
                             dispatch_wait_ms,
                             upstream_response_ms: latency,
                             first_chunk_ms: if request_meta.stream { 0 } else { latency },
-                            stream_complete_ms: 0,
+                            protocol_first_byte_ms: if request_meta.stream { 0 } else { latency },
+                            stream_complete_ms: if request_meta.stream { 0 } else { latency },
                             total_ms: latency,
                             ..RequestTimings::default()
                         },
@@ -1275,6 +1387,25 @@ fn insert_context_headers(headers: &mut HeaderMap, telemetry: &crate::collector:
     );
 }
 
+fn insert_nonstream_guard_headers(headers: &mut HeaderMap, decision: &NonStreamGuardDecision) {
+    if let Ok(value) = HeaderValue::from_str(decision.action) {
+        headers.insert("x-zen-nonstream-guard-action", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&decision.prompt_tokens.to_string()) {
+        headers.insert("x-zen-nonstream-prompt-tokens", value);
+    }
+    if let Some(max_tokens) = decision.max_tokens_before {
+        if let Ok(value) = HeaderValue::from_str(&max_tokens.to_string()) {
+            headers.insert("x-zen-nonstream-original-max-tokens", value);
+        }
+    }
+    if let Some(max_tokens) = decision.max_tokens_after {
+        if let Ok(value) = HeaderValue::from_str(&max_tokens.to_string()) {
+            headers.insert("x-zen-nonstream-max-tokens", value);
+        }
+    }
+}
+
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (
         status,
@@ -1441,6 +1572,7 @@ fn metered_stream_response(
         telemetry.latency_total_ms = stream_complete_ms;
         telemetry.ttft_ms = first_chunk_ms;
         telemetry.timings.first_chunk_ms = first_chunk_ms;
+        telemetry.timings.protocol_first_byte_ms = first_chunk_ms;
         telemetry.timings.first_content_token_ms = first_content_token_ms;
         telemetry.timings.first_tool_call_ms = first_tool_call_ms;
         telemetry.timings.stream_complete_ms = stream_complete_ms;
@@ -1927,6 +2059,65 @@ mod tests {
         assert_eq!(usage.cached_tokens, 70);
         assert_eq!(usage.cache_creation_input_tokens, 20);
         assert_eq!(usage.cache_read_input_tokens, 70);
+    }
+
+    #[test]
+    fn nonstream_guard_defaults_missing_max_tokens() {
+        let mut body = serde_json::json!({
+            "model":"deepseek-v4-flash-free",
+            "stream": false,
+            "messages":[{"role":"user","content":"hello"}]
+        });
+
+        let decision = apply_nonstream_output_guard("chat/completions", &mut body).unwrap();
+
+        assert_eq!(decision.action, "default_2048");
+        assert_eq!(body["max_tokens"], NONSTREAM_DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn nonstream_guard_caps_long_prompt_output() {
+        let mut body = serde_json::json!({
+            "model":"deepseek-v4-flash-free",
+            "stream": false,
+            "max_tokens": 4096,
+            "messages":[{"role":"user","content":"x".repeat(220_000)}]
+        });
+
+        let decision = apply_nonstream_output_guard("chat/completions", &mut body).unwrap();
+
+        assert_eq!(decision.action, "cap_long_prompt_2048");
+        assert_eq!(body["max_tokens"], NONSTREAM_LONG_PROMPT_CAP);
+    }
+
+    #[test]
+    fn nonstream_guard_caps_huge_prompt_output() {
+        let mut body = serde_json::json!({
+            "model":"deepseek-v4-flash-free",
+            "stream": false,
+            "max_tokens": 4096,
+            "messages":[{"role":"user","content":"x".repeat(440_000)}]
+        });
+
+        let decision = apply_nonstream_output_guard("chat/completions", &mut body).unwrap();
+
+        assert_eq!(decision.action, "cap_huge_prompt_1024");
+        assert_eq!(body["max_tokens"], NONSTREAM_HUGE_PROMPT_CAP);
+    }
+
+    #[test]
+    fn nonstream_guard_rejects_huge_prompt_with_very_large_output() {
+        let mut body = serde_json::json!({
+            "model":"deepseek-v4-flash-free",
+            "stream": false,
+            "max_tokens": 20_000,
+            "messages":[{"role":"user","content":"x".repeat(440_000)}]
+        });
+
+        let err = apply_nonstream_output_guard("chat/completions", &mut body).unwrap_err();
+
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.message.contains("use stream=true"));
     }
 
     #[test]

@@ -306,6 +306,11 @@ pub struct Config {
     pub v45_huge_context_tokens: u64,
     pub v45_ttft_slow_ms: u64,
     pub v45_ttft_bad_ms: u64,
+    pub v46_long_nonstream_concurrency: usize,
+    pub v46_long_output_concurrency: usize,
+    pub v46_tool_heavy_concurrency: usize,
+    pub v46_long_nonstream_tokens: u64,
+    pub v46_long_output_tokens: u64,
     pub v43_lane_wait_timeout_ms: u64,
     pub v43_async_collector_enabled: bool,
     pub v43_collector_queue_capacity: usize,
@@ -453,6 +458,11 @@ impl Config {
             v45_huge_context_tokens: load_env_var("V45_HUGE_CONTEXT_TOKENS", 500_000u64),
             v45_ttft_slow_ms: load_env_var("V45_TTFT_SLOW_MS", 4_000u64),
             v45_ttft_bad_ms: load_env_var("V45_TTFT_BAD_MS", 8_000u64),
+            v46_long_nonstream_concurrency: load_env_var("V46_LONG_NONSTREAM_CONCURRENCY", 4usize),
+            v46_long_output_concurrency: load_env_var("V46_LONG_OUTPUT_CONCURRENCY", 4usize),
+            v46_tool_heavy_concurrency: load_env_var("V46_TOOL_HEAVY_CONCURRENCY", 16usize),
+            v46_long_nonstream_tokens: load_env_var("V46_LONG_NONSTREAM_TOKENS", 10_000u64),
+            v46_long_output_tokens: load_env_var("V46_LONG_OUTPUT_TOKENS", 4_096u64),
             v43_lane_wait_timeout_ms: load_env_var("V43_LANE_WAIT_TIMEOUT_MS", 1_000u64),
             v43_async_collector_enabled: load_env_var("V43_ASYNC_COLLECTOR_ENABLED", false),
             v43_collector_queue_capacity: load_env_var("V43_COLLECTOR_QUEUE_CAPACITY", 8192usize),
@@ -784,6 +794,11 @@ mod tests {
         assert_eq!(cfg.v45_huge_context_tokens, 500_000);
         assert_eq!(cfg.v45_ttft_slow_ms, 4_000);
         assert_eq!(cfg.v45_ttft_bad_ms, 8_000);
+        assert_eq!(cfg.v46_long_nonstream_concurrency, 4);
+        assert_eq!(cfg.v46_long_output_concurrency, 4);
+        assert_eq!(cfg.v46_tool_heavy_concurrency, 16);
+        assert_eq!(cfg.v46_long_nonstream_tokens, 10_000);
+        assert_eq!(cfg.v46_long_output_tokens, 4_096);
         assert_eq!(cfg.v43_lane_wait_timeout_ms, 1_000);
         assert!(!cfg.v43_async_collector_enabled);
         assert_eq!(cfg.v43_collector_queue_capacity, 8192);
@@ -855,6 +870,11 @@ mod tests {
         unsafe { env::set_var("V45_HUGE_CONTEXT_TOKENS", "610000") };
         unsafe { env::set_var("V45_TTFT_SLOW_MS", "3456") };
         unsafe { env::set_var("V45_TTFT_BAD_MS", "9876") };
+        unsafe { env::set_var("V46_LONG_NONSTREAM_CONCURRENCY", "5") };
+        unsafe { env::set_var("V46_LONG_OUTPUT_CONCURRENCY", "6") };
+        unsafe { env::set_var("V46_TOOL_HEAVY_CONCURRENCY", "7") };
+        unsafe { env::set_var("V46_LONG_NONSTREAM_TOKENS", "11000") };
+        unsafe { env::set_var("V46_LONG_OUTPUT_TOKENS", "5000") };
         unsafe { env::set_var("V43_LANE_WAIT_TIMEOUT_MS", "1500") };
         unsafe { env::set_var("V43_ASYNC_COLLECTOR_ENABLED", "true") };
         unsafe { env::set_var("V43_COLLECTOR_QUEUE_CAPACITY", "1234") };
@@ -936,6 +956,11 @@ mod tests {
         assert_eq!(cfg.v45_huge_context_tokens, 610_000);
         assert_eq!(cfg.v45_ttft_slow_ms, 3_456);
         assert_eq!(cfg.v45_ttft_bad_ms, 9_876);
+        assert_eq!(cfg.v46_long_nonstream_concurrency, 5);
+        assert_eq!(cfg.v46_long_output_concurrency, 6);
+        assert_eq!(cfg.v46_tool_heavy_concurrency, 7);
+        assert_eq!(cfg.v46_long_nonstream_tokens, 11_000);
+        assert_eq!(cfg.v46_long_output_tokens, 5_000);
         assert_eq!(cfg.v43_lane_wait_timeout_ms, 1500);
         assert!(cfg.v43_async_collector_enabled);
         assert_eq!(cfg.v43_collector_queue_capacity, 1234);
@@ -1004,6 +1029,11 @@ mod tests {
             "V45_HUGE_CONTEXT_TOKENS",
             "V45_TTFT_SLOW_MS",
             "V45_TTFT_BAD_MS",
+            "V46_LONG_NONSTREAM_CONCURRENCY",
+            "V46_LONG_OUTPUT_CONCURRENCY",
+            "V46_TOOL_HEAVY_CONCURRENCY",
+            "V46_LONG_NONSTREAM_TOKENS",
+            "V46_LONG_OUTPUT_TOKENS",
             "V43_LANE_WAIT_TIMEOUT_MS",
             "V43_ASYNC_COLLECTOR_ENABLED",
             "V43_COLLECTOR_QUEUE_CAPACITY",

@@ -16,6 +16,9 @@ pub enum LaneKind {
     NormalStream,
     LargeContext,
     HugeContext,
+    LongNonStream,
+    LongOutput,
+    ToolHeavy,
 }
 
 #[derive(Debug)]
@@ -82,6 +85,9 @@ pub struct LaneLimiterSnapshot {
     pub normal_stream: LaneSnapshot,
     pub large_context: LaneSnapshot,
     pub huge_context: LaneSnapshot,
+    pub long_nonstream: LaneSnapshot,
+    pub long_output: LaneSnapshot,
+    pub tool_heavy: LaneSnapshot,
 }
 
 #[derive(Debug)]
@@ -91,6 +97,9 @@ pub struct LaneLimiter {
     normal_stream: Arc<LaneState>,
     large_context: Arc<LaneState>,
     huge_context: Arc<LaneState>,
+    long_nonstream: Arc<LaneState>,
+    long_output: Arc<LaneState>,
+    tool_heavy: Arc<LaneState>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +138,9 @@ impl LaneLimiter {
             normal_stream: Arc::new(LaneState::new(config.v43_stream_concurrency)),
             large_context: Arc::new(LaneState::new(config.v43_large_context_concurrency)),
             huge_context: Arc::new(LaneState::new(config.v43_huge_context_concurrency)),
+            long_nonstream: Arc::new(LaneState::new(config.v46_long_nonstream_concurrency)),
+            long_output: Arc::new(LaneState::new(config.v46_long_output_concurrency)),
+            tool_heavy: Arc::new(LaneState::new(config.v46_tool_heavy_concurrency)),
         }
     }
 
@@ -182,6 +194,9 @@ impl LaneLimiter {
             normal_stream: self.normal_stream.snapshot(),
             large_context: self.large_context.snapshot(),
             huge_context: self.huge_context.snapshot(),
+            long_nonstream: self.long_nonstream.snapshot(),
+            long_output: self.long_output.snapshot(),
+            tool_heavy: self.tool_heavy.snapshot(),
         }
     }
 
@@ -191,6 +206,9 @@ impl LaneLimiter {
             LaneKind::NormalStream => self.normal_stream.clone(),
             LaneKind::LargeContext => self.large_context.clone(),
             LaneKind::HugeContext => self.huge_context.clone(),
+            LaneKind::LongNonStream => self.long_nonstream.clone(),
+            LaneKind::LongOutput => self.long_output.clone(),
+            LaneKind::ToolHeavy => self.tool_heavy.clone(),
         }
     }
 }
@@ -208,18 +226,56 @@ fn classify_lane(config: &Config, path: &str, body: &Bytes) -> LaneKind {
     {
         return LaneKind::LargeContext;
     }
-    if matches!(path, "chat/completions" | "messages") && request_is_streaming(body) {
+    let profile = request_profile(body);
+    if !matches!(path, "chat/completions" | "messages") {
+        return LaneKind::ShortNonStream;
+    }
+    if profile.tool_heavy {
+        return LaneKind::ToolHeavy;
+    }
+    if !profile.streaming && profile.max_tokens >= config.v46_long_output_tokens.max(1) {
+        return LaneKind::LongOutput;
+    }
+    if !profile.streaming && estimated_tokens >= config.v46_long_nonstream_tokens.max(1) {
+        return LaneKind::LongNonStream;
+    }
+    if profile.streaming {
         LaneKind::NormalStream
     } else {
         LaneKind::ShortNonStream
     }
 }
 
-fn request_is_streaming(body: &Bytes) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| value.get("stream").and_then(Value::as_bool))
-        .unwrap_or(false)
+#[derive(Debug, Default)]
+struct RequestProfile {
+    streaming: bool,
+    max_tokens: u64,
+    tool_heavy: bool,
+}
+
+fn request_profile(body: &Bytes) -> RequestProfile {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return RequestProfile::default();
+    };
+    let streaming = value
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let max_tokens = value
+        .get("max_tokens")
+        .or_else(|| value.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let tools_count = value
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let tool_markers = count_tool_markers(&value);
+    RequestProfile {
+        streaming,
+        max_tokens,
+        tool_heavy: tools_count >= 16 || tool_markers >= 12,
+    }
 }
 
 fn estimate_request_tokens(body: &Bytes) -> u64 {
@@ -250,12 +306,32 @@ fn estimate_value_tokens(value: &Value) -> u64 {
     }
 }
 
+fn count_tool_markers(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => items.iter().map(count_tool_markers).sum(),
+        Value::Object(map) => {
+            let here = usize::from(
+                map.get("role").and_then(Value::as_str) == Some("tool")
+                    || map.contains_key("tool_calls")
+                    || map.contains_key("tool_call_id")
+                    || map.get("type").and_then(Value::as_str) == Some("tool_result")
+                    || map.get("type").and_then(Value::as_str) == Some("tool_use"),
+            );
+            here + map.values().map(count_tool_markers).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
 fn lane_name(kind: LaneKind) -> &'static str {
     match kind {
         LaneKind::ShortNonStream => "short_nonstream",
         LaneKind::NormalStream => "normal_stream",
         LaneKind::LargeContext => "large_context",
         LaneKind::HugeContext => "huge_context",
+        LaneKind::LongNonStream => "long_nonstream",
+        LaneKind::LongOutput => "long_output",
+        LaneKind::ToolHeavy => "tool_heavy",
     }
 }
 
@@ -271,6 +347,9 @@ mod tests {
         cfg.v43_huge_context_body_mb = 32;
         cfg.v45_large_context_tokens = 200_000;
         cfg.v45_huge_context_tokens = 500_000;
+        cfg.v46_long_nonstream_tokens = 10_000;
+        cfg.v46_long_output_tokens = 4_096;
+        cfg.v46_tool_heavy_concurrency = 4;
         cfg
     }
 
@@ -310,5 +389,82 @@ mod tests {
             classify_lane(&cfg, "chat/completions", &body),
             LaneKind::HugeContext
         );
+    }
+
+    #[test]
+    fn routes_long_nonstream_to_isolated_lane() {
+        let cfg = cfg_with_lanes();
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "stream": false,
+                "messages": [{"role": "user", "content": "x".repeat(45_000)}]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            classify_lane(&cfg, "chat/completions", &body),
+            LaneKind::LongNonStream
+        );
+    }
+
+    #[test]
+    fn routes_long_output_to_isolated_lane() {
+        let cfg = cfg_with_lanes();
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "stream": false,
+                "max_tokens": 8192,
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            classify_lane(&cfg, "chat/completions", &body),
+            LaneKind::LongOutput
+        );
+    }
+
+    #[test]
+    fn routes_tool_heavy_to_isolated_lane() {
+        let cfg = cfg_with_lanes();
+        let messages = (0..12)
+            .flat_map(|idx| {
+                [
+                    serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_{idx}"),"type":"function","function":{"name":"Read","arguments":"{}"}}]}),
+                    serde_json::json!({"role":"tool","tool_call_id":format!("call_{idx}"),"content":"ok"}),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "stream": true,
+                "messages": messages
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            classify_lane(&cfg, "chat/completions", &body),
+            LaneKind::ToolHeavy
+        );
+    }
+
+    #[test]
+    fn lane_snapshot_exposes_v46_lanes() {
+        let cfg = cfg_with_lanes();
+        let limiter = LaneLimiter::from_config(&cfg);
+        let snapshot = limiter.snapshot();
+
+        assert_eq!(
+            snapshot.long_nonstream.max,
+            cfg.v46_long_nonstream_concurrency
+        );
+        assert_eq!(snapshot.long_output.max, cfg.v46_long_output_concurrency);
+        assert_eq!(snapshot.tool_heavy.max, cfg.v46_tool_heavy_concurrency);
     }
 }

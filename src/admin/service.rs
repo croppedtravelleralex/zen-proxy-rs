@@ -533,6 +533,30 @@ impl AdminService {
             result.items.iter().map(|r| r.timings.first_chunk_ms).sum(),
         );
         add_avg(
+            "protocol_first_byte_ms",
+            result
+                .items
+                .iter()
+                .map(|r| r.timings.protocol_first_byte_ms)
+                .sum(),
+        );
+        add_avg(
+            "first_content_token_ms",
+            result
+                .items
+                .iter()
+                .map(|r| r.timings.first_content_token_ms)
+                .sum(),
+        );
+        add_avg(
+            "first_tool_call_ms",
+            result
+                .items
+                .iter()
+                .map(|r| r.timings.first_tool_call_ms)
+                .sum(),
+        );
+        add_avg(
             "stream_complete_ms",
             result
                 .items

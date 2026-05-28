@@ -171,6 +171,8 @@ pub struct RequestTimings {
     pub dispatch_wait_ms: u64,
     pub upstream_response_ms: u64,
     pub first_chunk_ms: u64,
+    #[serde(default)]
+    pub protocol_first_byte_ms: u64,
     pub first_content_token_ms: u64,
     pub first_tool_call_ms: u64,
     pub stream_complete_ms: u64,

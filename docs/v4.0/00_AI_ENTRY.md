@@ -12,9 +12,11 @@ classification so upstream 5xx, timeout, empty-output, and retry-budget
 failures do not incorrectly bury healthy proxy nodes. V4.5 adds cache-affinity
 and effective-TTFT routing so repeated large contexts prefer paths that have
 already shown good cache and first-content behavior. V4.6 adds a protocol graph
-guard and pair-aware compactor so malformed tool-call history from Hermes,
-OpenClaw, Claude Code, CherryStudio, OpenAI SDKs, and Anthropic SDKs is repaired
-or safely downgraded before DeepSeek sees it.
+guard, pair-aware compactor, source-side quality policy, non-stream output
+guard, long-request lane isolation, and split timing metrics so malformed
+tool-call history and large non-stream requests are handled before they can
+stall the production path. Compatibility targets include Hermes, OpenClaw,
+Claude Code, CherryStudio, OpenAI SDKs, and Anthropic SDKs.
 
 ## Current Goal
 
@@ -66,6 +68,7 @@ root-level legacy audit reports as active guidance.
 11. [V4.6 Protocol Graph Guard and Pair-Aware Compactor](./14_v4.6_protocol_guard.md)
 12. [V4.7 Test Records and Client Acceptance](./15_test_records_and_client_acceptance.md)
 13. [V4.5 P8 95+ Acceptance Plan](./16_v4.5_p8_95_plus_acceptance.md)
+14. [V4.6 99+ Runtime Policy](./17_v4.6_99plus_runtime_policy.md)
 
 ## Hard Decisions
 
@@ -207,6 +210,20 @@ Current V4.4 verification on 2026-05-26:
 - a 12-call NewAPI smoke distributed evenly through nginx:
   4 calls on `zen-proxy-rs@1`, 4 on `zen-proxy-rs@2`, and 4 on
   `zen-proxy-rs@3`.
+
+Current V4.6 99+ local source-side update on 2026-05-28:
+
+- `free-model-client-rs` no longer disables thinking by default for ordinary
+  requests and no longer rewrites terse prompts such as `1`, `继续`, or `执行`.
+- tool-use requests still set `thinking={"type":"disabled"}` to keep JSON/tool
+  deltas stable.
+- ZenProxy V4 NonStream Output Guard caps large `stream=false` outputs before
+  upstream dispatch and rejects huge prompt plus very large output combinations
+  with a clear 422.
+- V4 lanes now expose and isolate `long_nonstream`, `long_output`, and
+  `tool_heavy` lanes.
+- `/admin/requests/timings` now exposes `protocol_first_byte_ms`,
+  `first_content_token_ms`, and `first_tool_call_ms` averages and recent rows.
 
 Latest V4.3 verification on 2026-05-25:
 

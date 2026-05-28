@@ -469,6 +469,74 @@ mod e2e {
     }
 
     #[test]
+    fn test_v4_nonstream_guard_caps_large_prompt_before_upstream() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19805,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "x".repeat(220_000)}],
+                "max_tokens": 4096,
+                "stream": false
+            }))
+            .send()
+            .expect("v4 nonstream guarded request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-nonstream-guard-action")
+                .and_then(|value| value.to_str().ok()),
+            Some("cap_long_prompt_2048")
+        );
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["max_tokens"], 2048);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_nonstream_guard_rejects_huge_prompt_long_output() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19806,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "x".repeat(440_000)}],
+                "max_tokens": 20_000,
+                "stream": false
+            }))
+            .send()
+            .expect("v4 nonstream rejected request");
+        assert_eq!(resp.status(), 422);
+        assert!(resp.text().unwrap().contains("use stream=true"));
+        assert!(observed.lock().unwrap().is_empty());
+        stop_server(child, port);
+    }
+
+    #[test]
     fn test_v4_protocol_guard_repairs_openai_tool_history_before_upstream() {
         let (upstream_base, observed) = start_mock_zen();
         let (child, port) = start_server_with_env(
@@ -774,6 +842,7 @@ mod e2e {
             "/admin/requests",
             "/admin/requests/recent",
             "/admin/requests/summary",
+            "/admin/requests/timings",
             "/admin/requests/models",
             "/admin/requests/nodes",
             "/admin/events",
@@ -798,6 +867,21 @@ mod e2e {
                 .unwrap_or_else(|err| panic!("GET {path} failed: {err}"));
             assert_eq!(resp.status(), 200, "GET {path}");
         }
+
+        let timings = client
+            .get(format!("http://127.0.0.1:{}/admin/requests/timings", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("request timings endpoint");
+        assert_eq!(timings.status(), 200);
+        let timings_body: serde_json::Value = timings.json().unwrap();
+        let avg = &timings_body["data"]["avg"];
+        assert!(
+            avg.get("protocol_first_byte_ms").is_some(),
+            "timings avg should expose protocol_first_byte_ms"
+        );
+        assert!(avg.get("first_content_token_ms").is_some());
+        assert!(avg.get("first_tool_call_ms").is_some());
 
         let missing = client
             .get(format!(
