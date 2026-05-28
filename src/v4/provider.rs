@@ -1298,14 +1298,25 @@ fn result_kind_for_classified_error(error_kind: ErrorKind, error_type: &str) -> 
     if error_type == "empty_output" {
         return ResultKind::EmptyOutput;
     }
-    match error_kind {
-        ErrorKind::ConnectionRefused | ErrorKind::DnsFailure | ErrorKind::SocksHandshake => {
-            ResultKind::Error { kind: error_kind }
-        }
-        ErrorKind::Timeout | ErrorKind::Upstream5xx | ErrorKind::Other => {
-            ResultKind::SoftFailure { kind: error_kind }
-        }
+
+    if is_transport_error_type(error_type) {
+        return ResultKind::Error { kind: error_kind };
     }
+
+    match error_kind {
+        ErrorKind::Timeout
+        | ErrorKind::ConnectionRefused
+        | ErrorKind::DnsFailure
+        | ErrorKind::SocksHandshake => ResultKind::Error { kind: error_kind },
+        ErrorKind::Upstream5xx | ErrorKind::Other => ResultKind::SoftFailure { kind: error_kind },
+    }
+}
+
+fn is_transport_error_type(error_type: &str) -> bool {
+    matches!(
+        error_type,
+        "timeout" | "network" | "connection_refused" | "dns_failure" | "socks_handshake"
+    )
 }
 
 fn is_empty_upstream_error(err: &AppError) -> bool {
@@ -2059,6 +2070,28 @@ mod tests {
         assert_eq!(usage.cached_tokens, 70);
         assert_eq!(usage.cache_creation_input_tokens, 20);
         assert_eq!(usage.cache_read_input_tokens, 70);
+    }
+
+    #[test]
+    fn transport_errors_are_hard_proxy_failures() {
+        assert!(matches!(
+            result_kind_for_classified_error(ErrorKind::Timeout, "timeout"),
+            ResultKind::Error {
+                kind: ErrorKind::Timeout
+            }
+        ));
+        assert!(matches!(
+            result_kind_for_classified_error(ErrorKind::Other, "network"),
+            ResultKind::Error {
+                kind: ErrorKind::Other
+            }
+        ));
+        assert!(matches!(
+            result_kind_for_classified_error(ErrorKind::Upstream5xx, "upstream_error"),
+            ResultKind::SoftFailure {
+                kind: ErrorKind::Upstream5xx
+            }
+        ));
     }
 
     #[test]
