@@ -464,6 +464,11 @@ fn repair_anthropic(conf: &Config, body: &mut Value, telemetry: &mut ProtocolGua
 
     let mut pending = Vec::<PendingCall>::new();
     for (idx, message) in messages.iter_mut().enumerate() {
+        if message.get("content").is_none() {
+            message["content"] = json!([]);
+            telemetry.applied = true;
+            raise_risk(telemetry, "low");
+        }
         let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
@@ -934,6 +939,34 @@ mod tests {
         assert_eq!(body["tools"][0]["input_schema"]["properties"], json!({}));
         assert_eq!(body["tools"][1]["input_schema"]["type"], "object");
         assert_eq!(body["tools"][1]["input_schema"]["properties"], json!({}));
+        assert!(telemetry.applied);
+        assert!(telemetry.post_valid);
+    }
+
+    #[test]
+    fn anthropic_message_without_content_gets_empty_content_array() {
+        let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "max_tokens": 100,
+            "tools": [{"name": "Read"}],
+            "messages": [
+                {"role":"assistant"},
+                {"role":"user","content":[{"type":"text","text":"continue"}]}
+            ]
+        });
+
+        let telemetry = guard_body(
+            &cfg(),
+            "messages",
+            &mut body,
+            "newapi",
+            GuardPhase::PreCompact,
+            true,
+        )
+        .unwrap();
+
+        assert!(body["messages"][0]["content"].is_array());
+        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 0);
         assert!(telemetry.applied);
         assert!(telemetry.post_valid);
     }
