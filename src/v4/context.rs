@@ -608,6 +608,8 @@ fn replacement_text(
 ) -> String {
     let hash = sha256_hex(original.as_bytes());
     let cache_status = maybe_store_artifact(conf, path, kind, &hash, original, cache);
+    let head = neutralize_markdown_fences(&take_head(original, PLACEHOLDER_HEAD_CHARS));
+    let tail = neutralize_markdown_fences(&take_tail(original, PLACEHOLDER_TAIL_CHARS));
     push_trace(
         trace,
         format!(
@@ -624,8 +626,8 @@ fn replacement_text(
         original.len(),
         short_hash(&hash),
         cache_status,
-        take_head(original, PLACEHOLDER_HEAD_CHARS),
-        take_tail(original, PLACEHOLDER_TAIL_CHARS)
+        head,
+        tail
     )
 }
 
@@ -890,6 +892,33 @@ fn take_tail(text: &str, max_chars: usize) -> String {
     tail.into_iter().rev().collect()
 }
 
+fn neutralize_markdown_fences(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '`' && ch != '~' {
+            output.push(ch);
+            continue;
+        }
+
+        let mut run_len = 1usize;
+        while chars.peek().is_some_and(|next| *next == ch) {
+            chars.next();
+            run_len += 1;
+        }
+
+        if run_len >= 3 {
+            let marker = if ch == '`' { "backticks" } else { "tildes" };
+            output.push_str(&format!("[markdown fence {} x{}]", marker, run_len));
+        } else {
+            for _ in 0..run_len {
+                output.push(ch);
+            }
+        }
+    }
+    output
+}
+
 fn push_trace(trace: &mut Vec<String>, item: impl Into<String>) {
     if trace.len() < MAX_TRACE_ITEMS {
         trace.push(item.into());
@@ -1005,6 +1034,32 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("ZenProxy context compactor"));
+    }
+
+    #[test]
+    fn compactor_placeholder_neutralizes_markdown_fences_in_previews() {
+        let mut cfg = test_config(CompactorMode::Enforce);
+        cfg.context_preserve_recent_messages = 8;
+        let big = format!(
+            "```text\nProcessBTCmd```\n{}\n~~~json\n{{}}\n~~~",
+            "x".repeat(2 * MIB)
+        );
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "tool", "content": big, "tool_call_id": "old-tool"},
+                {"role": "assistant", "content": "recent assistant"},
+                {"role": "user", "content": "latest user"}
+            ]
+        });
+        let original = serialized_len(&body);
+        let plan = govern_request(&cfg, "chat/completions", body, original).unwrap();
+        let compacted = plan.body["messages"][0]["content"].as_str().unwrap();
+        assert!(compacted.contains("ZenProxy context compactor"));
+        assert!(compacted.contains("[markdown fence backticks x3]"));
+        assert!(compacted.contains("[markdown fence tildes x3]"));
+        assert!(!compacted.contains("```"));
+        assert!(!compacted.contains("~~~"));
     }
 
     #[test]
