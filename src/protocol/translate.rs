@@ -362,19 +362,12 @@ pub fn anthropic_tool_choice_to_openai(choice: &Value) -> Value {
     }
 }
 
-pub fn disable_thinking_for_assistant_history(body: &mut Value, messages: &[Message]) {
-    let has_assistant_history = messages.iter().any(|msg| msg.role == "assistant");
-    if !has_assistant_history || body.get("thinking").is_some() {
-        return;
-    }
-    body["thinking"] = serde_json::json!({"type":"disabled"});
+pub fn disable_thinking_for_assistant_history(_body: &mut Value, _messages: &[Message]) {
+    // V4.6 keeps model reasoning available for normal multi-turn context.
 }
 
-pub fn disable_thinking_by_default(body: &mut Value) {
-    if body.get("thinking").is_some() {
-        return;
-    }
-    body["thinking"] = serde_json::json!({"type":"disabled"});
+pub fn disable_thinking_by_default(_body: &mut Value) {
+    // V4.6 no longer disables thinking for ordinary requests by default.
 }
 
 pub fn disable_thinking_for_tool_use(body: &mut Value) {
@@ -393,37 +386,8 @@ pub fn disable_thinking_for_tool_use(body: &mut Value) {
     }
 }
 
-pub fn stabilize_short_user_prompt(body: &mut Value) {
-    if body
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty())
-    {
-        return;
-    }
-
-    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let Some(last_user) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-    else {
-        return;
-    };
-    let Some(content) = last_user.get_mut("content") else {
-        return;
-    };
-    let Some(text) = content.as_str() else {
-        return;
-    };
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > 2 {
-        return;
-    }
-
-    *content = Value::String("只回复 ok".to_string());
+pub fn stabilize_short_user_prompt(_body: &mut Value) {
+    // Preserve terse user intent such as "1", "继续", and "执行".
 }
 
 pub fn estimate_tokens(text: &str) -> u64 {
@@ -457,7 +421,19 @@ pub fn is_short_no_tool_health_request(body: &ChatRequest) -> bool {
         return false;
     };
     let trimmed = text.trim();
-    !trimmed.is_empty() && trimmed.chars().count() <= 2
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "ping"
+            | "health"
+            | "healthcheck"
+            | "health_check"
+            | "/health"
+            | "__health__"
+            | "__zen_health__"
+            | "__fmc_health__"
+            | "zen_health"
+            | "fmc_health"
+    ) || matches!(trimmed, "健康检查" | "健康测试")
 }
 
 pub fn is_reasoning_only_error(msg: &str) -> bool {

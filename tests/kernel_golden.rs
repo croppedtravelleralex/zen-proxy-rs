@@ -273,6 +273,30 @@ async fn openai_non_stream_uses_caller_client_and_returns_golden_response() {
 }
 
 #[tokio::test]
+async fn openai_non_stream_preserves_short_user_prompt_upstream() {
+    for prompt in ["1", "继续", "执行"] {
+        let (config, client, state) = spawn_mock_zen().await;
+        let kernel = FreeModelKernel::new(config);
+        let response = kernel
+            .openai_chat(
+                &client,
+                chat_request("deepseek-v4-flash", prompt, false, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let observed = state.requests.lock().unwrap();
+        let messages = observed[0].messages.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(messages[0]["content"], prompt);
+        assert!(
+            observed[0].thinking.is_none(),
+            "ordinary short prompt should not disable thinking by default"
+        );
+    }
+}
+
+#[tokio::test]
 async fn openai_stream_preserves_text_delta_and_done() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -838,7 +862,7 @@ async fn anthropic_tool_choice_is_translated_to_openai_function_choice() {
 }
 
 #[test]
-fn thinking_is_disabled_when_assistant_history_has_no_reasoning() {
+fn thinking_is_not_disabled_for_plain_assistant_history() {
     let mut body = json!({
         "model":"deepseek-v4-flash-free",
         "messages":[{"role":"assistant","content":null,"tool_calls":[]}]
@@ -854,17 +878,19 @@ fn thinking_is_disabled_when_assistant_history_has_no_reasoning() {
         &mut body, &messages,
     );
 
-    assert_eq!(body["thinking"], json!({"type":"disabled"}));
+    assert!(body.get("thinking").is_none());
 }
 
 #[test]
-fn short_user_prompt_is_stabilized_before_upstream() {
-    let mut body = json!({
-        "messages": [{"role": "user", "content": "1"}],
-        "tools": null
-    });
-    free_model_client_rs::protocol::translate::stabilize_short_user_prompt(&mut body);
-    assert_eq!(body["messages"][0]["content"], "只回复 ok");
+fn short_user_prompts_are_preserved_before_upstream() {
+    for prompt in ["1", "继续", "执行"] {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": prompt}],
+            "tools": null
+        });
+        free_model_client_rs::protocol::translate::stabilize_short_user_prompt(&mut body);
+        assert_eq!(body["messages"][0]["content"], prompt);
+    }
 }
 
 #[test]

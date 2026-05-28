@@ -28,10 +28,7 @@ pub async fn handle_openai_chat(
         );
     }
     let mut zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":body.tool_choice});
-    translate::disable_thinking_by_default(&mut zb);
-    translate::disable_thinking_for_assistant_history(&mut zb, &body.messages);
     translate::disable_thinking_for_tool_use(&mut zb);
-    translate::stabilize_short_user_prompt(&mut zb);
     let cr = ChatRequest {
         model: model.clone(),
         messages: body.messages.clone(),
