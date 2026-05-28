@@ -230,6 +230,11 @@ fn repair_openai(conf: &Config, body: &mut Value, telemetry: &mut ProtocolGuardT
         match role.as_deref() {
             Some("assistant") => {
                 let message = &mut messages[idx];
+                if message.get("content").is_none() {
+                    message["content"] = Value::Null;
+                    telemetry.applied = true;
+                    raise_risk(telemetry, "low");
+                }
                 let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut)
                 else {
                     continue;
@@ -788,6 +793,33 @@ mod tests {
         assert!(id.starts_with("call_zen_"));
         assert_eq!(second["messages"][0]["tool_calls"][0]["id"], id);
         assert_eq!(body["messages"][1]["tool_call_id"], id);
+    }
+
+    #[test]
+    fn openai_assistant_tool_call_without_content_gets_null_content() {
+        let mut body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role":"assistant","tool_calls":[{"type":"function","function":{"name":"Read","arguments":"{}"}}]},
+                {"role":"tool","content":"ok"}
+            ]
+        });
+
+        let telemetry = guard_body(
+            &cfg(),
+            "chat/completions",
+            &mut body,
+            "openclaw",
+            GuardPhase::PreCompact,
+            true,
+        )
+        .unwrap();
+
+        assert!(body["messages"][0].get("content").is_some());
+        assert!(body["messages"][0]["content"].is_null());
+        assert!(body["messages"][0]["tool_calls"][0].get("id").is_some());
+        assert!(body["messages"][1].get("tool_call_id").is_some());
+        assert!(telemetry.post_valid);
     }
 
     #[test]
