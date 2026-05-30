@@ -31,6 +31,8 @@ Start here:
 | [15_test_records_and_client_acceptance.md](./v4.0/15_test_records_and_client_acceptance.md) | V4.7 test evidence packages, OpenClaw/Hermes acceptance, and 100K-200K TTFT experiment plan |
 | [16_v4.5_p8_95_plus_acceptance.md](./v4.0/16_v4.5_p8_95_plus_acceptance.md) | V4.5/P8 95+ acceptance plan, test matrix, Windows/WSL/panda flows, and NewAPI/ZenProxy reconciliation |
 | [17_v4.6_99plus_runtime_policy.md](./v4.0/17_v4.6_99plus_runtime_policy.md) | V4.6 99+ source-side quality, non-stream guard, lane isolation, and timing metrics |
+| [18_v4.8_four_client_500_round_acceptance.md](./v4.0/18_v4.8_four_client_500_round_acceptance.md) | V4.8 99+ four-client 500-round acceptance plan for Windows ClaudeCode, WSL ClaudeCode, OpenClaw, and Hermes |
+| [19_2026-05-30_handoff_and_unfinished_work.md](./v4.0/19_2026-05-30_handoff_and_unfinished_work.md) | 2026-05-30 handoff: verified facts, unfinished Hermes/OpenClaw panda-NewAPI work, unimplemented V4.8 harness, and next-session guardrails |
 
 ## AI Maintenance Rule
 
