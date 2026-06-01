@@ -162,7 +162,28 @@ unknown_error
 
 ## 当前 dry-run 闸口结论
 
-正式 full run 之前必须先通过 dry run。2026-05-31 的 dry run 暂未通过，不能直接启动 4 客户端 x 500：
+正式 full run 之前必须先通过 dry run。2026-06-01 final-anchor 部署后的四客户端 dry run 仍未通过，不能直接启动 4 客户端 x 500：
+
+| 客户端/批次 | 结果 | 关键问题 |
+|-------------|------|----------|
+| Windows ClaudeCode dry 50 | 50/50 API ok，43/50 semantic ok | 6 个 huge_context `context_drift`，1 个 `subagent_not_triggered`；Windows runner 使用 UNC 工作目录导致 CMD fallback 到 Windows 目录。 |
+| WSL ClaudeCode dry 50 | 50/50 API ok，44/50 semantic ok | 6 个 huge_context 全部 `context_drift`；模型尝试读取 ClaudeCode transcript、git 状态或继续旧任务。 |
+| WSL Hermes dry 50 | 50/50 API ok，50/50 semantic ok | 功能通过，但 P50/P90/P99 total 约 54.3s/69.5s/103.5s，性能门槛未过。 |
+| WSL OpenClaw dry 50 | 50/50 API ok，49/50 semantic ok | 1 个 `deepseek-v4-flash-lite` long_context `context_drift`；subagent 5/5 observed。 |
+
+全局结果：
+
+```text
+总轮次: 200
+API OK: 200/200
+semantic OK: 186/200
+协议/认证/模型/502/504/300s timeout: runner summary 未观察到
+panda health: 三实例健康，total=90 dispatch=90 dead=0 ratelimited=0
+```
+
+脱敏报告：`docs/reports/panda-dry-run-20260601.md`。
+
+2026-05-31 历史 dry run：
 
 | 客户端/批次 | 结果 | 关键问题 |
 |-------------|------|----------|
@@ -194,9 +215,9 @@ OpenClaw profile 修复后的新增证据：
 
 继续 full run 前的硬条件：
 
-1. huge_context 不再让 ClaudeCode 进入 170-310s 级长挂起；2026-06-01 source-side smoke 已通过，但还必须用真实客户端 dry run 复验。
-2. OpenClaw subagent 修复必须在 dry-run 级别复验；smoke 通过不等于 full-run 可放量。
-3. `deepseek-v4-flash-lite` 的 huge_context 语义漂移有隔离策略，至少不能拖死短请求和工具请求。
+1. huge_context 不再让 ClaudeCode 进入 transcript/gist/git 状态续写；2026-06-01 source-side smoke 已通过，但真实 ClaudeCode dry run 仍未通过。
+2. OpenClaw subagent 已在 dry run 5/5 observed，但 `deepseek-v4-flash-lite` long_context 仍有 1 个 `context_drift`，需要复验或隔离。
+3. `deepseek-v4-flash-lite` 的长/超长上下文语义漂移有隔离策略，至少不能拖死短请求和工具请求。
 4. panda NewAPI / ZenProxy 日志确认没有持续 502/524、stream JSON 截断或 client_gone 高发。
 5. Hermes 慢路径需要拆分并设定保护阈值，避免长 agent 循环拖死短请求 lane。
 

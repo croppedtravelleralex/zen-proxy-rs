@@ -156,6 +156,29 @@ P1 待执行：
 
 P1 dry-run 结果：
 
+2026-06-01 final-anchor 部署后的四客户端 dry run 结果：
+
+| 客户端/批次 | 结果 | P50/P90/P99 total | 主要问题 |
+|-------------|------|-------------------|----------|
+| Windows ClaudeCode dry 50 | 50/50 API ok，43/50 semantic ok | 7.8s / 27.3s / 39.3s | 6 个 huge_context `context_drift`，1 个 `subagent_not_triggered`；Windows runner 使用 UNC 工作目录，CMD fallback 到 Windows 目录，影响 subagent 判断。 |
+| WSL ClaudeCode dry 50 | 50/50 API ok，44/50 semantic ok | 6.5s / 23.8s / 64.2s | 6 个 huge_context 全部 `context_drift`，模型转去读 ClaudeCode transcript、git 状态或继续旧任务。 |
+| WSL Hermes dry 50 | 50/50 API ok，50/50 semantic ok | 54.3s / 69.5s / 103.5s | 功能通过，但延迟远超 full-run 门槛；subagent 当前 runner 不支持观测，不计入触发率。 |
+| WSL OpenClaw dry 50 | 50/50 API ok，49/50 semantic ok | 14.6s / 32.7s / 66.6s | 1 个 `deepseek-v4-flash-lite` long_context `context_drift`；subagent 5/5 observed。 |
+
+全局结论：
+
+```text
+总轮次: 200
+API OK: 200/200
+semantic OK: 186/200
+认证/模型/协议 400/502/504/300s timeout: runner summary 未观察到
+panda health: 三实例健康，total=90 dispatch=90 dead=0 ratelimited=0
+```
+
+脱敏报告见 `docs/reports/panda-dry-run-20260601.md`。
+
+历史 dry-run 结果：
+
 | 客户端/批次 | 结果 | 主要问题 |
 |-------------|------|----------|
 | WSL ClaudeCode dry 50 | 49/50 API ok，47/50 semantic ok | `deepseek-v4-flash-lite` huge_context 语义漂移；一次 tool_calc 返回 `503 system cpu overloaded`。 |
@@ -180,11 +203,11 @@ smoke 耗时观察：
 
 P1 仍需执行：
 
-1. 重新跑 panda-only dry run，确认 P1.2 对真实 ClaudeCode huge_context、lite huge_context 和 OpenClaw subagent 的影响。
-2. 针对 OpenClaw subagent 继续跑 dry-run 级复测；smoke 已修复，不再把旧的 328s timeout 当成当前事实。
-3. 如果真实客户端 dry run 仍出现 `deepseek-v4-flash-lite` huge_context 语义漂移，再设置更保守的 full-run 权重或先排除出 huge lane；panda 本机 smoke 暂未复现漂移。
+1. 修复 ClaudeCode 真实客户端 huge_context：当前 source-side smoke 已过，但真实 ClaudeCode dry run 仍 12/12 huge_context 语义漂移。
+2. 修正 Windows ClaudeCode runner，使用真实 Windows 工作目录，不再从 `\\wsl.localhost` UNC 路径启动 ClaudeCode。
+3. 针对 `deepseek-v4-flash-lite` 长上下文语义漂移设置更保守的 lane/权重，或在 full run 前先隔离 huge/long lane。
 4. 在 panda NewAPI 和 ZenProxy 日志层继续确认 502/524、stream JSON 截断、client_gone 是否为上游/客户端边界。
-5. Hermes 慢路径需要先拆分客户端启动、工具 schema、上游响应和 agent 循环耗时，不能直接进入 full 2000。
+5. Hermes 慢路径需要拆分客户端启动、工具 schema、上游响应和 agent 循环耗时；当前 50/50 功能通过但 P90 约 69.5s，不能直接进入 full 2000。
 6. 提交前复查 README、维护文档、脚本和 `.codex_tmp/` 临时产物一致性。
 
 ## 临时产物归类
@@ -207,6 +230,6 @@ P1 仍需执行：
 3. OpenClaw 系统 Node 仍是 `v20.20.2`，只有显式使用隔离 Node 22 路径才满足运行要求。
 4. `.codex_tmp/` 里有大量历史测试输出，可能包含敏感信息，默认不提交。
 5. 仓库根目录存在 `configured`、`panda`、`""`、异常字符文件等未跟踪项，提交前必须逐个确认用途，不要盲目删除。
-6. 客户端策略隔离和 final-anchor 修复已在代码层落地，panda 本机 source-side huge stream smoke 通过；但真实 ClaudeCode dry run 尚未复跑，不能宣称 full-run 风险消失。
+6. 客户端策略隔离和 final-anchor 修复已在代码层落地，panda 本机 source-side huge stream smoke 通过；但真实 ClaudeCode dry run 仍显示 huge_context 语义漂移，不能进入 full run。
 7. panda ZenProxy 三实例健康且池指标正常，但 NewAPI/docker 日志里出现过上游 Cloudflare 502/524、stream JSON 截断和 client_gone，需要在正式报告中和 ZenProxy 指标分开归因。
 8. Windows ClaudeCode 不能从当前 WSL 非交互环境稳定启动时，应归类为测试执行环境问题；不要把它误判成 panda/ZenProxy 链路失败。
