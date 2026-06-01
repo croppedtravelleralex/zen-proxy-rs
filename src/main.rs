@@ -34,7 +34,7 @@ async fn main() {
         ))
         .layer(cors)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            10 * 1024 * 1024,
+            config.request_body_limit_bytes,
         ))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,

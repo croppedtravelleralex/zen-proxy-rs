@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod client_profile;
 pub mod config;
 pub mod error;
 pub mod kernel;

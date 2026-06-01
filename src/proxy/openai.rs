@@ -1,3 +1,4 @@
+use crate::client_profile::{ClientKind, ClientProfile};
 use crate::error::AppError;
 use crate::kernel::KernelConfig;
 use crate::protocol::translate::estimate_tokens as estimate;
@@ -12,12 +13,73 @@ pub async fn handle_openai_chat(
     client: &Client,
     config: &KernelConfig,
     mut body: ChatRequest,
+    profile: ClientProfile,
 ) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
     let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
     let tools = body.tools.clone().unwrap_or_default();
-    let max_tok = body.max_tokens.unwrap_or(1024).max(32);
-    let repair = translate::canonicalize_openai_tool_history(&mut body.messages);
+    let stream_requested = body.stream.unwrap_or(false);
+    let context_repair = if stream_requested {
+        let policy = if profile.kind == ClientKind::ClaudeCode {
+            translate::StreamContextPolicy::claude_code_huge_context()
+        } else {
+            translate::StreamContextPolicy::default()
+        };
+        translate::compact_stream_context_with_policy(&mut body.messages, policy)
+    } else {
+        translate::StreamContextRepair::default()
+    };
+    let appended_latest_user_anchor = stream_requested
+        && profile.kind == ClientKind::ClaudeCode
+        && context_repair.compacted_messages > 0
+        && translate::append_latest_user_anchor_message(&mut body.messages, 2 * 1024);
+    if context_repair.compacted_messages > 0 {
+        tracing::warn!(
+            before_tokens = context_repair.before_tokens,
+            after_tokens = context_repair.after_tokens,
+            compacted_messages = context_repair.compacted_messages,
+            appended_latest_user_anchor,
+            "compacted streaming openai context before upstream"
+        );
+    }
+    let max_tok = if stream_requested {
+        let policy_prompt_tokens = context_repair.before_tokens.max(translate::estimate_tokens(
+            &translate::build_prompt_text(&body.messages),
+        ));
+        let policy = translate::stream_output_policy_for_prompt_tokens(
+            policy_prompt_tokens,
+            body.max_tokens,
+        );
+        if policy.capped {
+            tracing::warn!(
+                prompt_tokens = policy.prompt_tokens,
+                requested_max_tokens = policy.requested_max_tokens,
+                effective_max_tokens = policy.effective_max_tokens,
+                "capped streaming openai max_tokens before upstream"
+            );
+        }
+        policy.effective_max_tokens
+    } else {
+        let policy = translate::non_stream_output_policy(&body.messages, body.max_tokens);
+        if policy.capped {
+            tracing::warn!(
+                prompt_tokens = policy.prompt_tokens,
+                requested_max_tokens = policy.requested_max_tokens,
+                effective_max_tokens = policy.effective_max_tokens,
+                "capped non-stream openai max_tokens before upstream"
+            );
+        }
+        policy.effective_max_tokens
+    };
+    let tool_history_policy = if profile.uses_compat_tool_history() {
+        translate::ToolHistoryPolicy::Compat
+    } else {
+        translate::ToolHistoryPolicy::Strict
+    };
+    let repair = translate::canonicalize_openai_tool_history_with_policy(
+        &mut body.messages,
+        tool_history_policy,
+    );
     if repair != translate::ToolHistoryRepair::default() {
         tracing::warn!(
             synthetic_tool_ids = repair.synthetic_tool_ids,
@@ -28,11 +90,13 @@ pub async fn handle_openai_chat(
         );
     }
     let mut zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":body.tool_choice});
-    translate::disable_thinking_for_tool_use(&mut zb);
+    if profile.disables_thinking_for_tool_use() {
+        translate::disable_thinking_for_tool_use(&mut zb);
+    }
     let cr = ChatRequest {
         model: model.clone(),
         messages: body.messages.clone(),
-        stream: Some(true),
+        stream: Some(stream_requested),
         max_tokens: Some(max_tok),
         temperature: body.temperature,
         top_p: body.top_p,
@@ -64,7 +128,7 @@ pub async fn handle_openai_chat(
         ));
     }
     if body.stream.unwrap_or(false) {
-        handle_oa_stream(client, config, &cr, &zb).await
+        handle_oa_stream(client, config, &cr, &zb, profile).await
     } else {
         handle_oa_non_stream(client, config, &cr, &zb).await
     }
@@ -231,6 +295,7 @@ async fn handle_oa_stream(
     config: &KernelConfig,
     cr: &ChatRequest,
     zb: &Value,
+    profile: ClientProfile,
 ) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
@@ -277,7 +342,10 @@ async fn handle_oa_stream(
                     if let Some(content) = delta.content {
                         let content = crate::redact::redact_text(&content);
                         let content = markdown_guard.push(&content);
-                        if !content.trim().is_empty() {
+                        let should_emit =
+                            !content.trim().is_empty()
+                                || (profile.preserves_stream_whitespace() && !content.is_empty());
+                        if should_emit {
                             text.push_str(&content);
                             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string()));
                         }

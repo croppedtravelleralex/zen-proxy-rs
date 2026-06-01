@@ -16,6 +16,12 @@ struct PendingToolCallState {
     used: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolHistoryPolicy {
+    Strict,
+    Compat,
+}
+
 pub fn normalize_model(model: &str) -> String {
     model
         .strip_prefix("opencode/")
@@ -48,13 +54,20 @@ pub fn anthropic_to_openai_messages(req: &AnthropicRequest) -> Vec<Message> {
 }
 
 pub fn canonicalize_openai_tool_history(messages: &mut [Message]) -> ToolHistoryRepair {
+    canonicalize_openai_tool_history_with_policy(messages, ToolHistoryPolicy::Compat)
+}
+
+pub fn canonicalize_openai_tool_history_with_policy(
+    messages: &mut [Message],
+    policy: ToolHistoryPolicy,
+) -> ToolHistoryRepair {
     let mut repair = ToolHistoryRepair::default();
     let mut pending = Vec::<PendingToolCallState>::new();
 
     for message_index in 0..messages.len() {
         let role = messages[message_index].role.clone();
         if role != "tool" && !pending.iter().all(|item| item.used) {
-            downgrade_unresolved_pending(messages, &mut pending, &mut repair);
+            downgrade_unresolved_pending(messages, &mut pending, &mut repair, policy);
         }
 
         match role.as_str() {
@@ -98,7 +111,7 @@ pub fn canonicalize_openai_tool_history(messages: &mut [Message]) -> ToolHistory
                         repair.paired_tool_results += 1;
                     }
                 } else {
-                    downgrade_tool_message(message);
+                    downgrade_tool_message(message, policy);
                     repair.downgraded_tool_results += 1;
                 }
             }
@@ -106,7 +119,7 @@ pub fn canonicalize_openai_tool_history(messages: &mut [Message]) -> ToolHistory
         }
     }
 
-    downgrade_unresolved_pending(messages, &mut pending, &mut repair);
+    downgrade_unresolved_pending(messages, &mut pending, &mut repair, policy);
     repair
 }
 
@@ -114,6 +127,7 @@ fn downgrade_unresolved_pending(
     messages: &mut [Message],
     pending: &mut Vec<PendingToolCallState>,
     repair: &mut ToolHistoryRepair,
+    policy: ToolHistoryPolicy,
 ) {
     let unresolved = pending
         .iter()
@@ -139,10 +153,13 @@ fn downgrade_unresolved_pending(
                     .as_str()
                     .is_some_and(|content| content.trim().is_empty())
             {
-                message.content = Value::String(
-                    "[Tool call recovered as plain context: matching tool result missing]"
-                        .to_string(),
-                );
+                message.content = match policy {
+                    ToolHistoryPolicy::Compat => Value::String(
+                        "[Tool call recovered as plain context: matching tool result missing]"
+                            .to_string(),
+                    ),
+                    ToolHistoryPolicy::Strict => Value::String(String::new()),
+                };
             }
         }
     }
@@ -163,7 +180,7 @@ fn consume_next_pending(pending: &mut [PendingToolCallState]) -> Option<String> 
     Some(call.id.clone())
 }
 
-fn downgrade_tool_message(message: &mut Message) {
+fn downgrade_tool_message(message: &mut Message, policy: ToolHistoryPolicy) {
     let preview = message
         .content
         .as_str()
@@ -172,9 +189,12 @@ fn downgrade_tool_message(message: &mut Message) {
     message.role = "user".to_string();
     message.tool_call_id = None;
     message.tool_calls = None;
-    message.content = Value::String(format!(
-        "[Tool result recovered as plain context: original tool_call_id missing or invalid]\n{preview}"
-    ));
+    message.content = match policy {
+        ToolHistoryPolicy::Compat => Value::String(format!(
+            "[Tool result recovered as plain context: original tool_call_id missing or invalid]\n{preview}"
+        )),
+        ToolHistoryPolicy::Strict => Value::String(preview),
+    };
 }
 
 fn synthetic_tool_id(message_index: usize, tool_index: usize, call: &ToolCall) -> String {
@@ -388,6 +408,374 @@ pub fn disable_thinking_for_tool_use(body: &mut Value) {
 
 pub fn stabilize_short_user_prompt(_body: &mut Value) {
     // Preserve terse user intent such as "1", "继续", and "执行".
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonStreamOutputPolicy {
+    pub prompt_tokens: u64,
+    pub requested_max_tokens: Option<u64>,
+    pub effective_max_tokens: u64,
+    pub capped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamOutputPolicy {
+    pub prompt_tokens: u64,
+    pub requested_max_tokens: Option<u64>,
+    pub effective_max_tokens: u64,
+    pub capped: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StreamContextRepair {
+    pub before_tokens: u64,
+    pub after_tokens: u64,
+    pub compacted_messages: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamContextPolicy {
+    pub compact_at_tokens: u64,
+    pub target_tokens: u64,
+    pub min_text_tokens: u64,
+    pub head_chars: usize,
+    pub compact_system_messages: bool,
+    pub anchor_latest_user_instruction: bool,
+    pub latest_user_anchor_chars: usize,
+}
+
+impl StreamContextPolicy {
+    pub const fn default() -> Self {
+        Self {
+            compact_at_tokens: 80_000,
+            target_tokens: 60_000,
+            min_text_tokens: 8_000,
+            head_chars: 8 * 1024,
+            compact_system_messages: false,
+            anchor_latest_user_instruction: false,
+            latest_user_anchor_chars: 0,
+        }
+    }
+
+    pub const fn claude_code_huge_context() -> Self {
+        Self {
+            compact_at_tokens: 80_000,
+            target_tokens: 12_000,
+            min_text_tokens: 2_000,
+            head_chars: 2 * 1024,
+            compact_system_messages: true,
+            anchor_latest_user_instruction: true,
+            latest_user_anchor_chars: 2 * 1024,
+        }
+    }
+}
+
+pub fn non_stream_output_policy(
+    messages: &[Message],
+    requested_max_tokens: Option<u64>,
+) -> NonStreamOutputPolicy {
+    let prompt_tokens = estimate_tokens(&build_prompt_text(messages));
+    let requested = requested_max_tokens.unwrap_or(2_048).max(32);
+    let cap = match prompt_tokens {
+        100_000.. => 1_024,
+        50_000.. => 2_048,
+        _ => 4_096,
+    };
+    let effective_max_tokens = requested.min(cap).max(32);
+
+    NonStreamOutputPolicy {
+        prompt_tokens,
+        requested_max_tokens,
+        effective_max_tokens,
+        capped: requested != effective_max_tokens,
+    }
+}
+
+pub fn stream_output_max_tokens(requested_max_tokens: Option<u64>) -> u64 {
+    requested_max_tokens.unwrap_or(1_024).max(32)
+}
+
+pub fn stream_output_policy(
+    messages: &[Message],
+    requested_max_tokens: Option<u64>,
+) -> StreamOutputPolicy {
+    let prompt_tokens = estimate_tokens(&build_prompt_text(messages));
+    stream_output_policy_for_prompt_tokens(prompt_tokens, requested_max_tokens)
+}
+
+pub fn stream_output_policy_for_prompt_tokens(
+    prompt_tokens: u64,
+    requested_max_tokens: Option<u64>,
+) -> StreamOutputPolicy {
+    let requested = requested_max_tokens.unwrap_or(1_024).max(32);
+    let cap = match prompt_tokens {
+        200_000.. => 512,
+        100_000.. => 768,
+        50_000.. => 1_024,
+        _ => requested,
+    };
+    let effective_max_tokens = requested.min(cap).max(32);
+
+    StreamOutputPolicy {
+        prompt_tokens,
+        requested_max_tokens,
+        effective_max_tokens,
+        capped: requested != effective_max_tokens,
+    }
+}
+
+pub fn compact_stream_context(messages: &mut [Message]) -> StreamContextRepair {
+    compact_stream_context_with_policy(messages, StreamContextPolicy::default())
+}
+
+pub fn compact_stream_context_with_policy(
+    messages: &mut [Message],
+    policy: StreamContextPolicy,
+) -> StreamContextRepair {
+    let before_tokens = estimate_tokens(&build_prompt_text(messages));
+    if before_tokens < policy.compact_at_tokens {
+        return StreamContextRepair {
+            before_tokens,
+            after_tokens: before_tokens,
+            compacted_messages: 0,
+        };
+    }
+
+    let mut over_tokens = before_tokens.saturating_sub(policy.target_tokens.max(1));
+    let mut compacted_messages = 0usize;
+    let latest_user_idx = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, msg)| msg.role == "user")
+        .map(|(idx, _)| idx);
+    let mut candidates = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, msg)| {
+            if msg.role == "system" && !policy.compact_system_messages {
+                return None;
+            }
+            let text = msg.content.as_str()?;
+            let tokens = estimate_tokens(text);
+            if tokens < policy.min_text_tokens {
+                return None;
+            }
+            let priority = if msg.role == "system" {
+                0usize
+            } else if Some(idx) == latest_user_idx {
+                2usize
+            } else {
+                1usize
+            };
+            Some((priority, tokens, idx))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+
+    for (_priority, tokens, idx) in candidates {
+        if over_tokens == 0 {
+            break;
+        }
+        let Some(text) = messages[idx].content.as_str() else {
+            continue;
+        };
+        let keep_tokens = tokens
+            .saturating_sub(over_tokens)
+            .max(policy.min_text_tokens);
+        if keep_tokens >= tokens {
+            continue;
+        }
+        let keep_chars = (keep_tokens as usize).saturating_mul(4);
+        let compacted = if messages[idx].role == "system" && policy.compact_system_messages {
+            compact_text_head(text, keep_chars)
+        } else if Some(idx) == latest_user_idx && policy.anchor_latest_user_instruction {
+            compact_text_middle_with_latest_user_anchor(
+                text,
+                keep_chars,
+                policy.head_chars,
+                policy.latest_user_anchor_chars,
+            )
+        } else {
+            compact_text_middle(text, keep_chars, policy.head_chars)
+        };
+        if compacted.len() >= text.len() {
+            continue;
+        }
+        let saved_tokens = tokens.saturating_sub(estimate_tokens(&compacted));
+        messages[idx].content = Value::String(compacted);
+        compacted_messages += 1;
+        over_tokens = over_tokens.saturating_sub(saved_tokens);
+    }
+
+    StreamContextRepair {
+        before_tokens,
+        after_tokens: estimate_tokens(&build_prompt_text(messages)),
+        compacted_messages,
+    }
+}
+
+pub fn append_latest_user_anchor_message(messages: &mut Vec<Message>, max_chars: usize) -> bool {
+    let Some(text) = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| message.content.as_str())
+    else {
+        return false;
+    };
+    let anchor = extract_latest_user_anchor(text, max_chars);
+    if anchor.trim().is_empty() {
+        return false;
+    }
+    let content =
+        format!("[free-model-client-rs context compactor: active latest user request]\n{anchor}");
+    if messages
+        .last()
+        .is_some_and(|message| message.role == "user" && message.content.as_str() == Some(&content))
+    {
+        return false;
+    }
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String(content),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    true
+}
+
+fn compact_text_middle_with_latest_user_anchor(
+    text: &str,
+    keep_chars: usize,
+    head_chars: usize,
+    anchor_chars: usize,
+) -> String {
+    let anchor = extract_latest_user_anchor(text, anchor_chars);
+    if anchor.trim().is_empty() {
+        return compact_text_middle(text, keep_chars, head_chars);
+    }
+
+    let anchor_budget = anchor.chars().count().saturating_add(256);
+    let body_keep_chars = keep_chars.saturating_sub(anchor_budget).max(1);
+    let compacted = compact_text_middle(text, body_keep_chars, head_chars);
+    format!(
+        "[free-model-client-rs context compactor: latest user excerpt preserved]\n{anchor}\n[free-model-client-rs context compactor: oversized context follows]\n{compacted}"
+    )
+}
+
+fn extract_latest_user_anchor(text: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.max(1);
+    let window = take_tail_chars(text, max_chars.saturating_mul(8));
+    let marker_start = latest_anchor_marker_start(&window);
+    let anchor = marker_start
+        .and_then(|idx| window.get(idx..))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| take_chars(value, max_chars))
+        .unwrap_or_else(|| last_non_empty_tail_lines(&window, max_chars));
+    anchor.trim().to_string()
+}
+
+fn latest_anchor_marker_start(text: &str) -> Option<usize> {
+    let ascii_lower = text.to_ascii_lowercase();
+    let ascii_markers = [
+        "final question:",
+        "final request:",
+        "final instruction:",
+        "latest user request:",
+        "my request for codex:",
+        "my request:",
+        "current request:",
+        "current task:",
+        "now:",
+    ];
+    let mut best = ascii_markers
+        .iter()
+        .filter_map(|marker| ascii_lower.rfind(marker))
+        .max();
+
+    let unicode_markers = [
+        "最终问题",
+        "最后问题",
+        "最终要求",
+        "最后要求",
+        "当前要求",
+        "当前任务",
+        "现在要求",
+        "现在的要求",
+        "只输出",
+    ];
+    for marker in unicode_markers {
+        if let Some(idx) = text.rfind(marker) {
+            best = Some(best.map_or(idx, |current| current.max(idx)));
+        }
+    }
+
+    best
+}
+
+fn last_non_empty_tail_lines(text: &str, max_chars: usize) -> String {
+    let mut kept = Vec::new();
+    let mut chars = 0usize;
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let line_chars = trimmed.chars().count();
+        if !kept.is_empty() && chars.saturating_add(line_chars) > max_chars {
+            break;
+        }
+        kept.push(trimmed.to_string());
+        chars = chars.saturating_add(line_chars).saturating_add(1);
+        if chars >= max_chars {
+            break;
+        }
+    }
+    kept.reverse();
+    let joined = kept.join("\n");
+    if joined.chars().count() <= max_chars {
+        joined
+    } else {
+        take_tail_chars(&joined, max_chars)
+    }
+}
+
+fn compact_text_middle(text: &str, keep_chars: usize, head_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= keep_chars {
+        return text.to_string();
+    }
+    let head_chars = head_chars.min(keep_chars / 2).max(1);
+    let tail_chars = keep_chars.saturating_sub(head_chars).max(1);
+    let head = take_chars(text, head_chars);
+    let tail = take_tail_chars(text, tail_chars);
+    format!(
+        "{head}\n[free-model-client-rs context compactor: omitted middle of oversized context; original_chars={char_count}; kept_head_chars={head_chars}; kept_tail_chars={tail_chars}]\n{tail}"
+    )
+}
+
+fn compact_text_head(text: &str, keep_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= keep_chars {
+        return text.to_string();
+    }
+    let keep_chars = keep_chars.max(1);
+    let head = take_chars(text, keep_chars);
+    format!(
+        "{head}\n[free-model-client-rs context compactor: omitted tail of oversized system context; original_chars={char_count}; kept_head_chars={keep_chars}]"
+    )
+}
+
+fn take_chars(text: &str, count: usize) -> String {
+    text.chars().take(count).collect()
+}
+
+fn take_tail_chars(text: &str, count: usize) -> String {
+    let mut chars = text.chars().rev().take(count).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 pub fn estimate_tokens(text: &str) -> u64 {

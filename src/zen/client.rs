@@ -117,10 +117,36 @@ fn stable_session_id(api_key: &str, body: &serde_json::Value) -> String {
         .unwrap_or_default()
         .as_secs()
         / ttl_secs;
+    let scope = session_scope(body);
     format!(
         "ses_{}",
-        short_hash(&format!("{}:{}:{}", short_hash(api_key), model, bucket))
+        short_hash(&format!(
+            "{}:{}:{}:{}",
+            short_hash(api_key),
+            model,
+            bucket,
+            scope
+        ))
     )
+}
+
+fn stable_project_id(body: &serde_json::Value) -> String {
+    let scope = session_scope(body);
+    if scope == "normal" {
+        "global".to_string()
+    } else {
+        format!("proj_{}", short_hash(&scope))
+    }
+}
+
+fn session_scope(body: &serde_json::Value) -> String {
+    let material = serde_json::to_string(&body.get("messages")).unwrap_or_default();
+    let estimated_tokens = material.len() / 4;
+    let compacted = material.contains("free-model-client-rs context compactor");
+    if compacted || estimated_tokens >= 10_000 {
+        return format!("large:{}", short_hash(&material));
+    }
+    "normal".to_string()
 }
 
 pub fn zen_headers(api_key: &str, body: &serde_json::Value) -> Vec<(String, String)> {
@@ -128,7 +154,7 @@ pub fn zen_headers(api_key: &str, body: &serde_json::Value) -> Vec<(String, Stri
         ("authorization".into(), format!("Bearer {}", api_key)),
         ("user-agent".into(), UA.into()),
         ("x-opencode-client".into(), "cli".into()),
-        ("x-opencode-project".into(), "global".into()),
+        ("x-opencode-project".into(), stable_project_id(body)),
         ("x-opencode-request".into(), make_id("msg")),
         (
             "x-opencode-session".into(),
@@ -246,7 +272,7 @@ pub fn stream_sse_events(
                                 if event_has_finish_reason(&event) {
                                     complete = true;
                                 }
-                                yield Ok(event);
+                                yield Ok(*event);
                             }
                             Ok(None) => {}
                             Err(err) => {
@@ -357,7 +383,7 @@ fn parse_sse_frame(bytes: &[u8]) -> Result<SseFrame, crate::error::AppError> {
 
 enum ParsedZenFrame {
     Done,
-    Event(ZenSseEvent),
+    Event(Box<ZenSseEvent>),
 }
 
 fn parse_zen_frame(frame: SseFrame) -> Result<Option<ParsedZenFrame>, crate::error::AppError> {
@@ -368,7 +394,7 @@ fn parse_zen_frame(frame: SseFrame) -> Result<Option<ParsedZenFrame>, crate::err
         return Ok(Some(ParsedZenFrame::Done));
     }
     serde_json::from_str::<ZenSseEvent>(&frame.data)
-        .map(|event| Some(ParsedZenFrame::Event(event)))
+        .map(|event| Some(ParsedZenFrame::Event(Box::new(event))))
         .map_err(|e| {
             crate::error::AppError::new(
                 axum::http::StatusCode::BAD_GATEWAY,
@@ -500,6 +526,32 @@ mod tests {
             header_value(&first, "x-opencode-session"),
             header_value(&second, "x-opencode-session")
         );
+    }
+
+    #[test]
+    fn opencode_session_changes_by_large_prompt_hash() {
+        let first = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"a".repeat(50_000)}]}),
+        );
+        let second = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"b".repeat(50_000)}]}),
+        );
+        let third = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"a".repeat(50_000)}]}),
+        );
+
+        assert_ne!(
+            header_value(&first, "x-opencode-session"),
+            header_value(&second, "x-opencode-session")
+        );
+        assert_eq!(
+            header_value(&first, "x-opencode-session"),
+            header_value(&third, "x-opencode-session")
+        );
+        assert_ne!(header_value(&first, "x-opencode-project"), "global");
     }
 
     #[test]

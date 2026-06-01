@@ -1,6 +1,7 @@
 use axum::response::Response;
 use reqwest::Client;
 
+use crate::client_profile::ClientProfile;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::protocol::types::{AnthropicRequest, ChatRequest};
@@ -47,7 +48,17 @@ impl FreeModelKernel {
         client: &Client,
         request: ChatRequest,
     ) -> Result<Response, AppError> {
-        crate::proxy::openai::handle_openai_chat(client, &self.config, request).await
+        self.openai_chat_with_profile(client, request, ClientProfile::unknown())
+            .await
+    }
+
+    pub async fn openai_chat_with_profile(
+        &self,
+        client: &Client,
+        request: ChatRequest,
+        profile: ClientProfile,
+    ) -> Result<Response, AppError> {
+        crate::proxy::openai::handle_openai_chat(client, &self.config, request, profile).await
     }
 
     pub async fn anthropic_messages(
@@ -55,6 +66,17 @@ impl FreeModelKernel {
         client: &Client,
         request: AnthropicRequest,
     ) -> Result<Response, AppError> {
-        crate::proxy::anthropic::handle_anthropic_messages(client, &self.config, request).await
+        self.anthropic_messages_with_profile(client, request, ClientProfile::unknown())
+            .await
+    }
+
+    pub async fn anthropic_messages_with_profile(
+        &self,
+        client: &Client,
+        request: AnthropicRequest,
+        profile: ClientProfile,
+    ) -> Result<Response, AppError> {
+        crate::proxy::anthropic::handle_anthropic_messages(client, &self.config, request, profile)
+            .await
     }
 }

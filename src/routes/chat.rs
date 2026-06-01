@@ -1,4 +1,5 @@
 use crate::auth;
+use crate::client_profile::ClientProfile;
 use crate::error::AppError;
 use crate::kernel::FreeModelKernel;
 use crate::protocol::types::{AnthropicRequest, ChatRequest};
@@ -12,10 +13,7 @@ pub async fn chat_handler(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
-    let ah = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if !auth::is_authorized(&state.config, ah) {
+    if !auth::is_authorized(&state.config, auth::request_api_key(&headers)) {
         return AppError::auth_error().into_response();
     }
     let req: ChatRequest = match serde_json::from_str(&body) {
@@ -30,7 +28,11 @@ pub async fn chat_handler(
         return AppError::invalid_model(req.model).into_response();
     }
     let kernel = FreeModelKernel::from_config(&state.config);
-    match kernel.openai_chat(&state.http_client, req).await {
+    let profile = ClientProfile::from_openai(&headers, &req);
+    match kernel
+        .openai_chat_with_profile(&state.http_client, req, profile)
+        .await
+    {
         Ok(r) => r,
         Err(e) => e.into_response(),
     }
@@ -41,12 +43,7 @@ pub async fn messages_handler(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
-    let ah = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let xkey = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-    let key_to_check = ah.or(xkey);
-    if !auth::is_authorized(&state.config, key_to_check) {
+    if !auth::is_authorized(&state.config, auth::request_api_key(&headers)) {
         return AppError::auth_error().into_response();
     }
     let req: AnthropicRequest = match serde_json::from_str(&body) {
@@ -61,7 +58,11 @@ pub async fn messages_handler(
         return AppError::invalid_model(req.model).into_response();
     }
     let kernel = FreeModelKernel::from_config(&state.config);
-    match kernel.anthropic_messages(&state.http_client, req).await {
+    let profile = ClientProfile::from_anthropic(&headers, &req);
+    match kernel
+        .anthropic_messages_with_profile(&state.http_client, req, profile)
+        .await
+    {
         Ok(r) => r,
         Err(e) => e.into_response(),
     }

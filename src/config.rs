@@ -15,6 +15,7 @@ pub struct Config {
     pub require_api_key: bool,
     pub api_key: String,
     pub timeout: Duration,
+    pub request_body_limit_bytes: usize,
     pub free_models: Vec<String>,
     pub model_mappings: Vec<ModelMapping>,
 }
@@ -61,6 +62,13 @@ impl Config {
                     .parse()
                     .unwrap_or(120_000),
             ),
+            request_body_limit_bytes: std::env::var("FREE_MODEL_REQUEST_BODY_LIMIT_MB")
+                .unwrap_or_else(|_| "64".into())
+                .parse::<usize>()
+                .unwrap_or(64)
+                .max(1)
+                * 1024
+                * 1024,
             free_models: model_mappings
                 .iter()
                 .map(|mapping| mapping.public_name.clone())

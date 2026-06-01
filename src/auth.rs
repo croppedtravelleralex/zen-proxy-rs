@@ -1,5 +1,16 @@
 use crate::config::Config;
 
+pub fn request_api_key(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+}
+
 /// Check whether the request is authorized.
 /// If require_api_key is false in config, all requests pass.
 /// Otherwise the Authorization header must match the configured API key.
@@ -25,6 +36,7 @@ mod tests {
             require_api_key,
             api_key: api_key.into(),
             timeout: Duration::from_secs(120),
+            request_body_limit_bytes: 64 * 1024 * 1024,
             free_models: vec![],
             model_mappings: vec![],
         }
@@ -53,5 +65,18 @@ mod tests {
     fn auth_fails_with_missing_header() {
         let cfg = make_config(true, "sk-secret");
         assert!(!is_authorized(&cfg, None));
+    }
+
+    #[test]
+    fn request_api_key_accepts_authorization_or_x_api_key() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-api-key", "sk-x".parse().unwrap());
+        assert_eq!(request_api_key(&headers), Some("sk-x"));
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer sk-auth".parse().unwrap(),
+        );
+        assert_eq!(request_api_key(&headers), Some("Bearer sk-auth"));
     }
 }

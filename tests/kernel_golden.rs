@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use free_model_client_rs::client_profile::{ClientKind, ClientProfile, ClientProfileSource};
 use free_model_client_rs::kernel::{FreeModelKernel, KernelConfig};
 use free_model_client_rs::protocol::types::{
     AnthropicMessage, AnthropicRequest, ChatRequest, Message, OpenAITool, OpenAIToolFunction,
@@ -26,6 +27,7 @@ struct ObservedRequest {
     messages: Option<Value>,
     tool_choice: Option<Value>,
     thinking: Option<Value>,
+    max_tokens: Option<u64>,
 }
 
 async fn mock_zen_handler(
@@ -33,7 +35,7 @@ async fn mock_zen_handler(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    state.requests.lock().unwrap().push(ObservedRequest {
+    let observed = ObservedRequest {
         proof_header: headers
             .get("x-client-proof")
             .and_then(|v| v.to_str().ok())
@@ -49,14 +51,24 @@ async fn mock_zen_handler(
         messages: body.get("messages").cloned(),
         tool_choice: body.get("tool_choice").cloned(),
         thinking: body.get("thinking").cloned(),
-    });
+        max_tokens: body.get("max_tokens").and_then(Value::as_u64),
+    };
+    let request_count = {
+        let mut requests = state.requests.lock().unwrap();
+        requests.push(observed);
+        requests.len()
+    };
 
     let prompt = body
         .get("messages")
         .and_then(|v| v.as_array())
-        .and_then(|messages| messages.last())
-        .and_then(|message| message.get("content"))
-        .and_then(|content| content.as_str())
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
         .unwrap_or_default();
 
     if prompt.contains("rate-limit") {
@@ -84,6 +96,14 @@ async fn mock_zen_handler(
             .into_response();
     }
     if prompt.contains("empty-upstream") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: [DONE]\n\n",
+        )
+            .into_response();
+    }
+    if prompt.contains("empty-once") && request_count == 1 {
         return (
             StatusCode::OK,
             [("content-type", "text/event-stream")],
@@ -129,6 +149,14 @@ async fn mock_zen_handler(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             "data: {\"choices\":[{\"delta\":{\"content\":\"```text\\nlog line\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\ndata: [DONE]\n\n",
+        )
+            .into_response();
+    }
+    if prompt.contains("whitespace-delta") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"alpha\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n    \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"beta\"}}]}\n\ndata: [DONE]\n\n",
         )
             .into_response();
     }
@@ -294,6 +322,34 @@ async fn openai_non_stream_preserves_short_user_prompt_upstream() {
             "ordinary short prompt should not disable thinking by default"
         );
     }
+}
+
+#[tokio::test]
+async fn openai_non_stream_caps_large_max_tokens_before_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = chat_request("deepseek-v4-flash", "plain", false, None);
+    req.max_tokens = Some(20_000);
+
+    let response = kernel.openai_chat(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let observed = state.requests.lock().unwrap();
+    assert_eq!(observed[0].max_tokens, Some(4_096));
+}
+
+#[tokio::test]
+async fn anthropic_non_stream_caps_large_max_tokens_before_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = anthropic_request("deepseek-v4-flash", "plain", false);
+    req.max_tokens = 20_000;
+
+    let response = kernel.anthropic_messages(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let observed = state.requests.lock().unwrap();
+    assert_eq!(observed[0].max_tokens, Some(4_096));
 }
 
 #[tokio::test]
@@ -802,10 +858,10 @@ async fn anthropic_orphan_tool_result_is_downgraded_before_upstream() {
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
     assert_eq!(messages[0]["role"], "user");
     assert!(messages[0].get("tool_call_id").is_none());
-    assert!(messages[0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("Tool result recovered as plain context"));
+    assert_eq!(
+        messages[0]["content"].as_str().unwrap(),
+        "orphan tool output"
+    );
 }
 
 #[tokio::test]
@@ -832,7 +888,112 @@ async fn openai_tool_choice_is_forwarded_to_upstream() {
         sent[0].tool_choice.as_ref(),
         Some(&json!({"type":"function","function":{"name":"Task"}}))
     );
+    assert!(
+        sent[0].thinking.is_none(),
+        "unknown/default profile must not force disabled thinking"
+    );
+}
+
+#[tokio::test]
+async fn claude_code_tools_do_not_disable_thinking() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let req = chat_request(
+        "deepseek-v4-flash-free",
+        "use Task",
+        false,
+        Some(vec![OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: "Task".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }]),
+    );
+    let _ = kernel
+        .openai_chat_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let sent = observed.requests.lock().unwrap();
+    assert!(
+        sent[0].thinking.is_none(),
+        "ClaudeCode tool requests must not be forced into disabled thinking"
+    );
+}
+
+#[tokio::test]
+async fn hermes_tools_keep_compat_thinking_policy() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let req = chat_request(
+        "deepseek-v4-flash-free",
+        "use Task",
+        false,
+        Some(vec![OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: "Task".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }]),
+    );
+    let _ = kernel
+        .openai_chat_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::Hermes, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let sent = observed.requests.lock().unwrap();
     assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+}
+
+#[tokio::test]
+async fn claude_code_stream_preserves_whitespace_delta() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat_with_profile(
+            &client,
+            chat_request("deepseek-v4-flash-free", "whitespace-delta", true, None),
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("alpha"));
+    assert!(body.contains("\\n    "));
+    assert!(body.contains("beta"));
+}
+
+#[test]
+fn explicit_client_profile_header_overrides_body_heuristic() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-fmc-client", "openclaw".parse().unwrap());
+    let req = chat_request(
+        "deepseek-v4-flash-free",
+        "use Task",
+        false,
+        Some(vec![OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: "Task".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }]),
+    );
+
+    let profile = ClientProfile::from_openai(&headers, &req);
+    assert_eq!(profile.kind, ClientKind::OpenClaw);
+    assert_eq!(profile.source, ClientProfileSource::Header);
 }
 
 #[tokio::test]
@@ -852,7 +1013,14 @@ async fn anthropic_tool_choice_is_translated_to_openai_function_choice() {
         tool_choice: Some(json!({"type":"tool","name":"Task"})),
         ..anthropic_request("deepseek-v4-flash-free", "use Task", false)
     };
-    let _ = kernel.anthropic_messages(&client, req).await.unwrap();
+    let _ = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::Hermes, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
     let sent = observed.requests.lock().unwrap();
     assert_eq!(
         sent[0].tool_choice.as_ref(),
@@ -901,6 +1069,279 @@ fn short_user_prompt_with_tools_is_not_rewritten() {
     });
     free_model_client_rs::protocol::translate::stabilize_short_user_prompt(&mut body);
     assert_eq!(body["messages"][0]["content"], "1");
+}
+
+#[test]
+fn non_stream_output_policy_caps_by_prompt_size() {
+    fn msg(chars: usize) -> Vec<Message> {
+        vec![Message {
+            role: "user".to_string(),
+            content: Value::String("x".repeat(chars)),
+            tool_calls: None,
+            tool_call_id: None,
+        }]
+    }
+
+    let missing =
+        free_model_client_rs::protocol::translate::non_stream_output_policy(&msg(4), None);
+    assert_eq!(missing.effective_max_tokens, 2_048);
+    assert!(!missing.capped);
+
+    let small =
+        free_model_client_rs::protocol::translate::non_stream_output_policy(&msg(4), Some(20_000));
+    assert_eq!(small.effective_max_tokens, 4_096);
+    assert!(small.capped);
+
+    let fifty_k = free_model_client_rs::protocol::translate::non_stream_output_policy(
+        &msg(200_000),
+        Some(20_000),
+    );
+    assert_eq!(fifty_k.prompt_tokens, 50_000);
+    assert_eq!(fifty_k.effective_max_tokens, 2_048);
+
+    let hundred_k = free_model_client_rs::protocol::translate::non_stream_output_policy(
+        &msg(400_000),
+        Some(20_000),
+    );
+    assert_eq!(hundred_k.prompt_tokens, 100_000);
+    assert_eq!(hundred_k.effective_max_tokens, 1_024);
+}
+
+#[test]
+fn stream_output_policy_caps_by_prompt_size() {
+    fn msg(chars: usize) -> Vec<Message> {
+        vec![Message {
+            role: "user".to_string(),
+            content: Value::String("x".repeat(chars)),
+            tool_calls: None,
+            tool_call_id: None,
+        }]
+    }
+
+    let small =
+        free_model_client_rs::protocol::translate::stream_output_policy(&msg(4), Some(20_000));
+    assert_eq!(small.effective_max_tokens, 20_000);
+    assert!(!small.capped);
+
+    let fifty_k = free_model_client_rs::protocol::translate::stream_output_policy(
+        &msg(200_000),
+        Some(20_000),
+    );
+    assert_eq!(fifty_k.prompt_tokens, 50_000);
+    assert_eq!(fifty_k.effective_max_tokens, 1_024);
+    assert!(fifty_k.capped);
+
+    let hundred_k = free_model_client_rs::protocol::translate::stream_output_policy(
+        &msg(400_000),
+        Some(20_000),
+    );
+    assert_eq!(hundred_k.prompt_tokens, 100_000);
+    assert_eq!(hundred_k.effective_max_tokens, 768);
+}
+
+#[test]
+fn stream_context_compactor_preserves_latest_tail() {
+    let tail = "FINAL_MARKER";
+    let mut messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String(format!("{}{}", "x".repeat(360_000), tail)),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let repair = free_model_client_rs::protocol::translate::compact_stream_context(&mut messages);
+
+    assert_eq!(repair.compacted_messages, 1);
+    assert!(repair.after_tokens < repair.before_tokens);
+    let compacted = messages[0].content.as_str().unwrap();
+    assert!(compacted.contains("context compactor"));
+    assert!(compacted.ends_with(tail));
+}
+
+#[test]
+fn claude_code_stream_context_policy_compacts_more_aggressively() {
+    let tail = "FINAL_MARKER";
+    let mut default_messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String(format!("{}{}", "x".repeat(1_000_000), tail)),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+    let mut claude_messages = default_messages.clone();
+
+    let default_repair =
+        free_model_client_rs::protocol::translate::compact_stream_context(&mut default_messages);
+    let claude_repair =
+        free_model_client_rs::protocol::translate::compact_stream_context_with_policy(
+            &mut claude_messages,
+            free_model_client_rs::protocol::translate::StreamContextPolicy::claude_code_huge_context(
+            ),
+        );
+
+    assert!(claude_repair.after_tokens < default_repair.after_tokens);
+    assert!(claude_repair.after_tokens <= 14_000);
+    assert!(claude_messages[0].content.as_str().unwrap().ends_with(tail));
+}
+
+#[test]
+fn claude_code_stream_context_policy_trims_oversized_system_tail() {
+    let mut messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String(format!(
+                "{}GIT_STATUS_NOISE",
+                "system instruction. ".repeat(40_000)
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(format!("{}FINAL_MARKER", "x".repeat(360_000))),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    let repair = free_model_client_rs::protocol::translate::compact_stream_context_with_policy(
+        &mut messages,
+        free_model_client_rs::protocol::translate::StreamContextPolicy::claude_code_huge_context(),
+    );
+
+    assert_eq!(repair.compacted_messages, 2);
+    let system = messages[0].content.as_str().unwrap();
+    let user = messages[1].content.as_str().unwrap();
+    assert!(system.contains("omitted tail of oversized system context"));
+    assert!(!system.contains("GIT_STATUS_NOISE"));
+    assert!(user.ends_with("FINAL_MARKER"));
+}
+
+#[test]
+fn claude_code_stream_context_policy_anchors_latest_user_final_question() {
+    let final_instruction = "Final question: output HUGE_OK only.";
+    let stale_transcript =
+        "Understood. Let me pick up by examining the current state of the workspace. git diff\n";
+    let mut messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String(format!(
+            "{}{}{}",
+            stale_transcript.repeat(3_000),
+            "old transcript noise\n".repeat(12_000),
+            final_instruction
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let repair = free_model_client_rs::protocol::translate::compact_stream_context_with_policy(
+        &mut messages,
+        free_model_client_rs::protocol::translate::StreamContextPolicy::claude_code_huge_context(),
+    );
+
+    assert_eq!(repair.compacted_messages, 1);
+    let compacted = messages[0].content.as_str().unwrap();
+    let final_pos = compacted.find(final_instruction).unwrap();
+    let stale_pos = compacted.find("Let me pick up").unwrap();
+    assert!(
+        final_pos < stale_pos,
+        "ClaudeCode huge compaction should foreground the latest explicit user ask"
+    );
+    assert!(compacted.ends_with(final_instruction));
+}
+
+#[tokio::test]
+async fn openai_stream_caps_and_compacts_large_context_before_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = chat_request(
+        "deepseek-v4-flash",
+        &format!("{}FINAL_MARKER", "x".repeat(420_000)),
+        true,
+        None,
+    );
+    request.max_tokens = Some(20_000);
+    let response = kernel
+        .openai_chat_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sent = state.requests.lock().unwrap();
+    assert_eq!(sent[0].max_tokens, Some(768));
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    let content = messages[0]["content"].as_str().unwrap();
+    assert!(content.contains("context compactor"));
+    assert!(content.ends_with("FINAL_MARKER"));
+}
+
+#[tokio::test]
+async fn claude_code_stream_uses_original_prompt_tokens_for_output_cap_after_compaction() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = chat_request(
+        "deepseek-v4-flash",
+        &format!("{}FINAL_MARKER", "x".repeat(1_000_000)),
+        true,
+        None,
+    );
+    request.max_tokens = Some(20_000);
+    let response = kernel
+        .openai_chat_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sent = state.requests.lock().unwrap();
+    assert_eq!(sent[0].max_tokens, Some(512));
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    let content = messages[0]["content"].as_str().unwrap();
+    assert!(content.contains("context compactor"));
+    assert!(content.ends_with("FINAL_MARKER"));
+    assert_eq!(messages.len(), 2);
+    let final_anchor = messages[1]["content"].as_str().unwrap();
+    assert!(final_anchor.contains("active latest user request"));
+    assert!(final_anchor.contains("FINAL_MARKER"));
+    assert!(
+        free_model_client_rs::protocol::translate::estimate_tokens(content) <= 13_000,
+        "ClaudeCode huge context should compact below the safer target"
+    );
+}
+
+#[tokio::test]
+async fn claude_code_huge_anthropic_stream_retries_empty_upstream_before_client_stream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash",
+        &format!(
+            "empty-once\n{}Final question: output HUGE_OK only.",
+            "x".repeat(1_000_000)
+        ),
+        true,
+    );
+    request.max_tokens = 20_000;
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer"));
+    assert!(body.contains("event: message_stop"));
+    assert_eq!(state.requests.lock().unwrap().len(), 2);
 }
 
 #[test]

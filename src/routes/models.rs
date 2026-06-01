@@ -13,11 +13,7 @@ pub async fn models_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-
-    if !auth::is_authorized(&state.config, auth_header) {
+    if !auth::is_authorized(&state.config, auth::request_api_key(&headers)) {
         return crate::error::AppError::auth_error().into_response();
     }
 
