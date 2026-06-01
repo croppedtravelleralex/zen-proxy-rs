@@ -13,11 +13,15 @@ fn start_server(port: u16) -> (Child, u16) {
 }
 
 fn start_server_with_env(port: u16, envs: &[(&str, &str)]) -> (Child, u16) {
-    let exe = if cfg!(debug_assertions) {
-        format!("{}/target/debug/zen-proxy-rs", env!("CARGO_MANIFEST_DIR"))
-    } else {
-        format!("{}/target/release/zen-proxy-rs", env!("CARGO_MANIFEST_DIR"))
-    };
+    let exe = option_env!("CARGO_BIN_EXE_zen-proxy-rs")
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if cfg!(debug_assertions) {
+                format!("{}/target/debug/zen-proxy-rs", env!("CARGO_MANIFEST_DIR"))
+            } else {
+                format!("{}/target/release/zen-proxy-rs", env!("CARGO_MANIFEST_DIR"))
+            }
+        });
 
     let mut command = Command::new(&exe);
     command
@@ -592,6 +596,61 @@ mod e2e {
         assert_eq!(record["protocol_guard"]["source_client"], "openclaw");
         assert_eq!(record["protocol_guard"]["missing_tool_call_id_count"], 1);
         assert_eq!(record["protocol_guard"]["post_valid"], true);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_free_model_kernel_propagates_client_profile() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19811,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"Task","parameters":{"type":"object","properties":{}}}}
+        ]);
+
+        let openclaw_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "openclaw")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools.clone(),
+                "stream": false
+            }))
+            .send()
+            .expect("openclaw profile request");
+        assert_eq!(openclaw_resp.status(), 200);
+
+        let claude_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools.clone(),
+                "stream": false
+            }))
+            .send()
+            .expect("claude profile request");
+        assert_eq!(claude_resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(
+            seen[0]["body"]["thinking"],
+            serde_json::json!({"type":"disabled"})
+        );
+        assert_ne!(
+            seen[1]["body"]["thinking"],
+            serde_json::json!({"type":"disabled"})
+        );
         stop_server(child, port);
     }
 

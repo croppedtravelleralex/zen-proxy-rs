@@ -6,6 +6,7 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use free_model_client_rs::client_profile::{ClientKind, ClientProfile, ClientProfileSource};
 use free_model_client_rs::error::AppError;
 use free_model_client_rs::kernel::{FreeModelKernel, KernelConfig};
 use free_model_client_rs::protocol::types::{AnthropicRequest, ChatRequest};
@@ -57,7 +58,7 @@ pub async fn handle_v4_proxy(
             );
         }
     };
-    let source_client = infer_source_client(headers);
+    let source_client = infer_source_client(path, headers, &parsed);
     let mut protocol_guard_summary: Option<ProtocolGuardTelemetry> = None;
     let raw_has_tool_markers = protocol_guard::raw_body_has_tool_markers(&body);
     match protocol_guard::guard_body(
@@ -109,6 +110,7 @@ pub async fn handle_v4_proxy(
         path,
         model = %public_model,
         stream_seen_by_zenproxy = streaming,
+        source_client = %source_client,
         body_size = body.len(),
         context_action = %context_telemetry.action,
         effective_body_size = context_telemetry.effective_body_bytes,
@@ -179,8 +181,11 @@ pub async fn handle_v4_proxy(
         &conf,
         request_meta.clone(),
         upstream_body,
-        &public_model,
-        &resolved.upstream_model,
+        UpstreamCallContext {
+            public_model: &public_model,
+            upstream_model: &resolved.upstream_model,
+            source_client: &source_client,
+        },
     )
     .await
     {
@@ -517,15 +522,125 @@ fn infer_gateway(headers: &HeaderMap, external_request_id: &str) -> String {
         .unwrap_or_default()
 }
 
-fn infer_source_client(headers: &HeaderMap) -> String {
-    if let Some(value) = extract_header(headers, "x-zen-source-client")
+fn infer_source_client(path: &str, headers: &HeaderMap, body: &Value) -> String {
+    if let Some(value) = extract_header(headers, "x-fmc-client")
+        .or_else(|| extract_header(headers, "x-zen-source-client"))
         .or_else(|| extract_header(headers, "x-client-name"))
-        .or_else(|| extract_header(headers, "x-stainless-package-version"))
     {
         return normalize_source_client(&value);
     }
+
+    if let Some(value) = infer_source_client_from_body(body) {
+        return value.to_string();
+    }
+
+    if let Some(value) = extract_header(headers, "x-stainless-package-version") {
+        let normalized = normalize_source_client(&value);
+        if normalized != "unknown" {
+            return normalized;
+        }
+    }
     let user_agent = extract_header(headers, "user-agent").unwrap_or_default();
-    normalize_source_client(&user_agent)
+    let normalized_user_agent = normalize_source_client(&user_agent);
+    if normalized_user_agent != "unknown" {
+        return normalized_user_agent;
+    }
+
+    if path == "messages" {
+        return "claude-code".to_string();
+    }
+
+    "unknown".to_string()
+}
+
+fn infer_source_client_from_body(body: &Value) -> Option<&'static str> {
+    if body_contains_client_marker(body, "openclaw") {
+        return Some("openclaw");
+    }
+    if body_contains_client_marker(body, "hermes") {
+        return Some("hermes");
+    }
+
+    let tool_names = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|tools| tools.iter())
+        .filter_map(tool_name_from_value)
+        .map(normalize_tool_name)
+        .collect::<Vec<_>>();
+
+    if tool_names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "subagents"
+                | "sessionsspawn"
+                | "sessionssend"
+                | "sessionsyield"
+                | "sessionstatus"
+                | "sessionsstatus"
+                | "sessionshistory"
+                | "sessionslist"
+                | "memoryget"
+                | "memorysearch"
+                | "webfetch"
+                | "websearch"
+        ) || name.contains("openclaw")
+    }) {
+        return Some("openclaw");
+    }
+
+    if tool_names.iter().any(|name| name.contains("hermes")) {
+        return Some("hermes");
+    }
+
+    if tool_names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "task"
+                | "bash"
+                | "read"
+                | "edit"
+                | "multiedit"
+                | "write"
+                | "todowrite"
+                | "grep"
+                | "glob"
+                | "ls"
+        )
+    }) {
+        return Some("claude-code");
+    }
+
+    None
+}
+
+fn tool_name_from_value(tool: &Value) -> Option<&str> {
+    tool.get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| tool.get("name").and_then(Value::as_str))
+}
+
+fn normalize_tool_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn body_contains_client_marker(value: &Value, marker: &str) -> bool {
+    match value {
+        Value::String(text) => text.to_ascii_lowercase().contains(marker),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| body_contains_client_marker(item, marker)),
+        Value::Object(map) => map
+            .values()
+            .any(|item| body_contains_client_marker(item, marker)),
+        _ => false,
+    }
 }
 
 fn normalize_source_client(value: &str) -> String {
@@ -545,6 +660,29 @@ fn normalize_source_client(value: &str) -> String {
     } else {
         "unknown".to_string()
     }
+}
+
+fn profile_for_openai_request(source_client: &str, request: &ChatRequest) -> ClientProfile {
+    profile_from_source_client(source_client)
+        .unwrap_or_else(|| ClientProfile::from_openai(&HeaderMap::new(), request))
+}
+
+fn profile_for_anthropic_request(source_client: &str, request: &AnthropicRequest) -> ClientProfile {
+    profile_from_source_client(source_client)
+        .unwrap_or_else(|| ClientProfile::from_anthropic(&HeaderMap::new(), request))
+}
+
+fn profile_from_source_client(source_client: &str) -> Option<ClientProfile> {
+    let kind = match normalize_source_client(source_client).as_str() {
+        "claude-code" => ClientKind::ClaudeCode,
+        "hermes" => ClientKind::Hermes,
+        "openclaw" => ClientKind::OpenClaw,
+        "cherrystudio" => ClientKind::CherryStudio,
+        "anthropic-sdk" => ClientKind::AnthropicSdk,
+        "openai-sdk" => ClientKind::OpenAiSdk,
+        _ => return None,
+    };
+    Some(ClientProfile::new(kind, ClientProfileSource::Header))
 }
 
 fn merge_protocol_guard_summary(
@@ -606,6 +744,12 @@ struct V4CallError {
     retry_chain: Vec<RequestAttemptTelemetry>,
 }
 
+struct UpstreamCallContext<'a> {
+    public_model: &'a str,
+    upstream_model: &'a str,
+    source_client: &'a str,
+}
+
 impl V4CallError {
     fn before_dispatch(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
@@ -665,9 +809,11 @@ async fn call_with_retry(
     conf: &Config,
     request_meta: RequestMeta,
     upstream_body: Value,
-    public_model: &str,
-    upstream_model: &str,
+    call_context: UpstreamCallContext<'_>,
 ) -> Result<V4CallResult, V4CallError> {
+    let public_model = call_context.public_model;
+    let upstream_model = call_context.upstream_model;
+    let source_client = call_context.source_client;
     let base_max = conf.pool_max_retries;
     let empty_upstream_max = conf.v4_empty_upstream_max_retries.max(base_max);
     let mut last_status = StatusCode::BAD_GATEWAY;
@@ -712,7 +858,10 @@ async fn call_with_retry(
                             format!("invalid OpenAI chat request: {err}"),
                         )
                     })?;
-                kernel.openai_chat(&dispatch_result.client, request).await
+                let profile = profile_for_openai_request(source_client, &request);
+                kernel
+                    .openai_chat_with_profile(&dispatch_result.client, request, profile)
+                    .await
             }
             "messages" => {
                 let request = serde_json::from_value::<AnthropicRequest>(upstream_body.clone())
@@ -722,8 +871,9 @@ async fn call_with_retry(
                             format!("invalid Anthropic messages request: {err}"),
                         )
                     })?;
+                let profile = profile_for_anthropic_request(source_client, &request);
                 kernel
-                    .anthropic_messages(&dispatch_result.client, request)
+                    .anthropic_messages_with_profile(&dispatch_result.client, request, profile)
                     .await
             }
             _ => {
@@ -2010,6 +2160,63 @@ fn estimate_text_tokens(text: &str) -> u32 {
 mod tests {
     use super::*;
     use axum::body::Bytes;
+
+    #[test]
+    fn infers_openclaw_from_body_before_generic_openai_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "OpenAI/JS 6.38.0".parse().unwrap());
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "system", "content": "You are a personal assistant running inside OpenClaw."},
+                {"role": "user", "content": "use subagent"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "read"}},
+                {"type": "function", "function": {"name": "subagents"}},
+                {"type": "function", "function": {"name": "sessions_spawn"}}
+            ]
+        });
+
+        assert_eq!(infer_source_client("messages", &headers, &body), "openclaw");
+    }
+
+    #[test]
+    fn infers_claude_code_when_only_claude_tool_names_exist() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "use task"}],
+            "tools": [
+                {"type": "function", "function": {"name": "Task"}},
+                {"type": "function", "function": {"name": "TodoWrite"}}
+            ]
+        });
+
+        assert_eq!(
+            infer_source_client("messages", &headers, &body),
+            "claude-code"
+        );
+    }
+
+    #[test]
+    fn markerless_anthropic_messages_default_to_claude_code() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "large markerless ClaudeCode prompt"}],
+            "stream": true
+        });
+
+        assert_eq!(
+            infer_source_client("messages", &headers, &body),
+            "claude-code"
+        );
+        assert_eq!(
+            infer_source_client("chat/completions", &headers, &body),
+            "unknown"
+        );
+    }
 
     #[test]
     fn detects_openai_empty_assistant_output() {

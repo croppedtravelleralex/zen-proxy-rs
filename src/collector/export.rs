@@ -203,6 +203,18 @@ impl MultiBackend {
     }
 }
 
+impl StorageBackend for MultiBackend {
+    fn write(&self, snapshot: &DataSnapshot) {
+        for backend in &self.backends {
+            backend.write(snapshot);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "multi"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,17 +279,5 @@ mod tests {
         assert!(
             encoded.contains("zen_proxy_requests_by_model_total{model=\"deepseek-v4-flash\"} 6")
         );
-    }
-}
-
-impl StorageBackend for MultiBackend {
-    fn write(&self, snapshot: &DataSnapshot) {
-        for backend in &self.backends {
-            backend.write(snapshot);
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        "multi"
     }
 }

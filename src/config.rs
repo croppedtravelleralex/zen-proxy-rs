@@ -454,8 +454,8 @@ impl Config {
             v43_huge_context_concurrency: load_env_var("V43_HUGE_CONTEXT_CONCURRENCY", 2usize),
             v43_large_context_body_mb: load_env_var("V43_LARGE_CONTEXT_BODY_MB", 8usize),
             v43_huge_context_body_mb: load_env_var("V43_HUGE_CONTEXT_BODY_MB", 32usize),
-            v45_large_context_tokens: load_env_var("V45_LARGE_CONTEXT_TOKENS", 200_000u64),
-            v45_huge_context_tokens: load_env_var("V45_HUGE_CONTEXT_TOKENS", 500_000u64),
+            v45_large_context_tokens: load_env_var("V45_LARGE_CONTEXT_TOKENS", 80_000u64),
+            v45_huge_context_tokens: load_env_var("V45_HUGE_CONTEXT_TOKENS", 180_000u64),
             v45_ttft_slow_ms: load_env_var("V45_TTFT_SLOW_MS", 4_000u64),
             v45_ttft_bad_ms: load_env_var("V45_TTFT_BAD_MS", 8_000u64),
             v46_long_nonstream_concurrency: load_env_var("V46_LONG_NONSTREAM_CONCURRENCY", 4usize),
@@ -790,8 +790,8 @@ mod tests {
         assert_eq!(cfg.v43_huge_context_concurrency, 2);
         assert_eq!(cfg.v43_large_context_body_mb, 8);
         assert_eq!(cfg.v43_huge_context_body_mb, 32);
-        assert_eq!(cfg.v45_large_context_tokens, 200_000);
-        assert_eq!(cfg.v45_huge_context_tokens, 500_000);
+        assert_eq!(cfg.v45_large_context_tokens, 80_000);
+        assert_eq!(cfg.v45_huge_context_tokens, 180_000);
         assert_eq!(cfg.v45_ttft_slow_ms, 4_000);
         assert_eq!(cfg.v45_ttft_bad_ms, 8_000);
         assert_eq!(cfg.v46_long_nonstream_concurrency, 4);
