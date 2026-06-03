@@ -104,6 +104,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("tiny-empty") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: [DONE]\n\n",
+        )
+            .into_response();
+    }
     if prompt.trim().eq_ignore_ascii_case("echo hi") {
         return (
             StatusCode::OK,
@@ -717,6 +725,27 @@ async fn openai_non_stream_channel_probe_empty_upstream_returns_local_ok() {
         .unwrap();
     let body = response_text(response).await;
     assert!(body.contains("\"content\":\"ok\""));
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn openai_claude_code_tiny_non_probe_empty_upstream_stays_error() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let err = kernel
+        .openai_chat_with_profile(
+            &client,
+            chat_request("deepseek-v4-flash-free", "tiny-empty", false, None),
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        err.message,
+        "upstream returned no assistant content or tool call"
+    );
     assert_eq!(state.requests.lock().unwrap().len(), 3);
 }
 

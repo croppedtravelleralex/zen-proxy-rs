@@ -10,16 +10,18 @@
 ```bash
 cd /home/lenovo/free-model-client-rs
 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo fmt -- --check
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo clippy --all-targets -- -D warnings
 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 ```
 
 结果：
 
 - `fmt --check` 通过。
-- `cargo test` 通过：库测试 64 条、kernel golden 70 条、doc tests 0 条。
-- 同轮 `zen-proxy-rs` 验证通过：主单元测试 129 条、e2e 26 条。
+- `clippy --all-targets -- -D warnings` 通过。
+- `cargo test` 通过：库测试 69 条、kernel golden 71 条、doc tests 0 条。
+- `zen-proxy-rs` 本轮未改；最近一次相关验证通过：主单元测试 129 条、e2e 26 条。
 
-注意：上一轮部署记录中的 `clippy -D warnings` 属于历史验证事实；本次 profile/格式误伤修复未重新跑 clippy。
+注意：上述验证覆盖本仓库当前源码；本轮 request-shape 观测改动已随 `zen-proxy-rs` release 部署到 panda。
 
 当前已实现并由测试覆盖的关键能力：
 
@@ -41,6 +43,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 16. 空内容、无工具的 OpenAI/Anthropic 健康探测会走本地短路 `ok`，不再误进上游或 huge buffered retry。
 17. ClaudeCode huge buffered stream 只在修复前估算输入 >= 50k tokens 时启用；小 `max_tokens` 健康探测不再触发 huge retry 路径。
 18. NewAPI 管理端测渠道常见的极短 `echo hi` 流式探测，如果上游空输出，会返回本地 `ok`，只在无工具、单用户消息、`max_tokens <= 64` 的探测形态触发，避免误伤普通请求。
+19. 已新增脱敏 request-shape 观测：OpenAI/Anthropic 入口统一记录 `system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`，不记录原始 prompt、请求体或 key。
+20. 已新增小非流式请求分类：`health_probe/channel_test/internal_claude_code_probe/user_short_request/unknown_short_nonstream/not_short_nonstream`；当前只用于日志归因，普通 ClaudeCode 小非流式非探针请求在上游空输出时仍返回结构化 502，不会被本地 `ok` 误短路。
 
 ## 运行链路事实
 
@@ -197,6 +201,22 @@ P1.5 ClaudeCode 格式误伤修复部署记录：
 | 测试 | 新增 ClaudeCode + Web 工具、普通 OpenClaw/Hermes 文本引用、Web-only 工具三类回归；free-model 库测试 64/64、kernel golden 70/70；ZenProxy 单元 129/129、e2e 26/26。 |
 | panda 验证 | 新 pid `365354/365378/365392` 全部健康；`/v1/models` 200 且只暴露 `deepseek-v4-flash`、`deepseek-v4-flash-lite`；受控 `Task + web_fetch` `/v1/messages` 日志显示 `source_client=claude-code`。 |
 | 运行观察 | 旧 pid `350170/350205/350216` 日志中大量 `source_client=openclaw` 属于部署前误伤；部署后新 pid 日志里的受控样本已转为 `claude-code`。 |
+
+P1.6 request-shape 观测部署记录：
+
+| 项 | 值 |
+|----|----|
+| 部署时间 | 2026-06-03 晚间 |
+| 根因 | 需要从源头拆分 ClaudeCode 300KB+ 请求体来源，并识别 `body_size=342` 这类小非流式空输出请求用途。 |
+| 本地未 strip release hash | `1e77a544b5c444b4d626b14327862259cfe1b26221ffbd6f87778c1afc321376` |
+| 部署 stripped hash | `28b25370925835bb33aa4142208a5a20f0cf4dcb74ad3ae74c3808d3c2761e2b` |
+| 旧线上 hash | `e47e2c89d7c0c497daa2cd49a9d135a8b695928e951f81a22630b206a0e2ab51` |
+| 备份 | `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-request-shape-20260603-232757-e47e2c8` |
+| 实例 | `zen-proxy-rs@1:4001` pid `462903`、`zen-proxy-rs@2:4002` pid `462918`、`zen-proxy-rs@3:4004` pid `462981`。 |
+| 验证 | `free-model-client-rs`：`fmt --check`、`clippy -D warnings`、`cargo test` 通过；库测试 69 条、kernel golden 71 条。`zen-proxy-rs`：单元测试 129 条、e2e 26 条、release build 通过。 |
+| panda 验证 | 三实例和 nginx active；4001/4002/4004/4000 `/health` 均 200；`/metrics` 显示 `200=6`、`5xx=0`、`timeout=0`、active concurrency 0、dead 0、ratelimited 0。 |
+| NewAPI 验证 | panda 本机 NewAPI 8081 使用 token id `38`/name `ds`/group `vip`，`deepseek-v4-flash` 非流式 smoke HTTP 200，返回 `OK`，总耗时约 4.01s；NewAPI 日志 id `109472` 显示 channel 69、token id 38、prompt tokens 93、completion tokens 47、非流式。 |
+| shape 证据 | 部署后 ZenProxy 日志已出现 `desensitized request shape before upstream`；小非流式样本被分类为 `internal_claude_code_probe`，真实 ClaudeCode 787KB 流式样本记录 `message_count=703`、`system_tokens=5773`、`messages_tokens=78859`、`tools_tokens=12700`、`tool_count=10`、`estimated_total_tokens=97332`。 |
 
 ## 当前数据解释
 

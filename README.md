@@ -77,6 +77,7 @@ Client (Claude Code / API)
   - estimated prompt >= 100k tokens: max 1024
 - Stream responses keep explicit `max_tokens` and default to 1024 when omitted.
 - Empty upstream assistant content without tool calls is not converted into fake tool calls.
+- Desensitized request-shape logs record token counts, message/tool counts, request kind, and prompt hash only; raw prompts, request bodies, and API keys are not logged.
 
 ## Deployment
 
@@ -91,5 +92,5 @@ FREE_MODEL_HOST=0.0.0.0 pm2 start target/release/free-model-client-rs --name fre
 ## Build
 ```bash
 cargo build --release     # Optimized binary
-cargo test                # 60 library tests + 46 kernel golden tests
+cargo test                # 69 library tests + 71 kernel golden tests
 ```

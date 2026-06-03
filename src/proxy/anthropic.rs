@@ -128,6 +128,7 @@ pub async fn handle_anthropic_messages(
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
     };
+    super::log_request_shape("anthropic", &cr, profile);
     if stream_requested && profile.protects_recovery_safe_markers() {
         if let Some(literal) = translate::claude_code_recovery_literal_from_messages(&cr.messages) {
             tracing::warn!(
@@ -201,6 +202,9 @@ async fn handle_non_stream(
     profile: ClientProfile,
 ) -> Result<Response, AppError> {
     let mut observed_exit_ip = None;
+    let request_shape = translate::request_shape(cr);
+    let short_request_kind =
+        translate::classify_short_non_stream_request(cr, profile.kind == ClientKind::ClaudeCode);
     let (collected, content) = {
         let mut last_empty = false;
         let mut output = None;
@@ -222,6 +226,11 @@ async fn handle_non_stream(
                     attempt,
                     max_attempts = NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
                     source_client = ?profile.kind,
+                    short_request_kind = short_request_kind.as_str(),
+                    prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
+                    prompt_tokens = request_shape.estimated_total_tokens,
+                    message_count = request_shape.message_count,
+                    max_tokens = ?request_shape.max_tokens,
                     "non-stream upstream returned empty output; retrying"
                 );
                 continue;
@@ -235,6 +244,11 @@ async fn handle_non_stream(
             tracing::warn!(
                 model = cr.model,
                 source_client = ?profile.kind,
+                short_request_kind = short_request_kind.as_str(),
+                prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
+                prompt_tokens = request_shape.estimated_total_tokens,
+                message_count = request_shape.message_count,
+                max_tokens = ?request_shape.max_tokens,
                 "short non-stream channel-test probe received empty upstream; returning local ok"
             );
             let prompt = translate::build_prompt_text(&cr.messages);
@@ -243,8 +257,6 @@ async fn handle_non_stream(
                 .unwrap_or_default()
                 .as_millis();
             return Ok(text_resp(ts, &cr.model, "ok", estimate(&prompt), 1));
-        } else if last_empty {
-            return Err(AppError::empty_upstream());
         } else {
             return Err(AppError::empty_upstream());
         }

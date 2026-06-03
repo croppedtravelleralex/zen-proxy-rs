@@ -45,6 +45,42 @@
 - 当前不足：代码层有错误结构化，但缺少完整阶段耗时暴露。
 - 建议指标：请求入站、认证、解析、协议修复、上游连接、上游首包、first content、first tool call、stream decode、响应结束。
 
+### ClaudeCode 请求体来源归因
+
+- 状态：第一阶段已在 `free-model-client-rs` 源码落地，并已随 `zen-proxy-rs` 部署到 panda。
+- 背景：2026-06-03 panda 日志显示 ClaudeCode 表面短 prompt 也可能产生 291KB-474KB 的 Anthropic `/v1/messages` 请求体；NewAPI/cc-switch 使用日志常见 40k-90k input tokens。
+- 已确认事实：
+  - ZenProxy `body_size` 是 HTTP JSON 字节数，不是 tokens。
+  - 21:44 的 ClaudeCode 请求 `body_size=472161/474175`，`context_action=pass`，未触发 ZenProxy 外层大体积 compactor。
+  - free-model-client-rs 对这两条只做了流式输出 cap：`prompt_tokens=72826/73017`，`max_tokens=32000 -> 1024`。
+  - Windows ClaudeCode 当前 `ANTHROPIC_BASE_URL=http://127.0.0.1:15721`，实际先走 cc-switch；Windows 设置启用 `CLAUDE_CODE_EFFORT_LEVEL=max`、agent teams、tool search 和多个插件。
+  - cc-switch 最近 Claude 日志的 provider 为 `closedeepseek -> https://sub2api.closeapi.top`，不是 `LocalNewapi -> http://127.0.0.1:4000/v1`；因此 Windows ClaudeCode 最近使用记录和 panda NewAPI channel 69 记录不能直接混为同一条链路。
+- 已完成：
+  1. `src/protocol/translate.rs` 新增 `RequestShape`，只记录 token/数量/hash，不保存原始 prompt、请求体或 key。
+  2. OpenAI/Anthropic 入口统一输出脱敏字段：`system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`。
+  3. shape 单元测试覆盖“不泄露原文”和“工具 schema 计入 tools_tokens”。
+- 待办：
+  1. 继续观察真实 ClaudeCode/Hermes/OpenClaw 请求，确认 shape 字段在长时间运行中可被稳定采集。
+  2. 如仍需要更细拆分，再补 `claude_code_shape` 二级指标，进一步拆插件/skills、历史消息和最后用户消息占比。
+  3. 对 Windows cc-switch 链路单独建验收入口：`ClaudeCode -> cc-switch(15721) -> provider`，不要把它和 panda NewAPI channel 69 直接合并统计。
+  4. 重新跑 Windows ClaudeCode raw/CLI 对照时，必须从 Windows 本地目录启动，不能从 `\\wsl.localhost` UNC cwd 启动。
+
+### ClaudeCode 小非流式空输出请求分类
+
+- 状态：第一阶段已在 `free-model-client-rs` 源码落地，并已随 `zen-proxy-rs` 部署到 panda。
+- 背景：2026-06-03 21:28 panda 日志出现 `source_client=claude-code`、`stream=false`、`body_size=342` 的 `/v1/messages` 请求，随后多次 `non-stream upstream returned empty output; retrying`。
+- 当前判断：该请求形态不像用户主对话，更像 ClaudeCode 内部非流式探测、摘要、标题、能力检查或小模型辅助请求；当前日志没有保存脱敏 request shape，无法确认具体用途。
+- 已有保护：`hi/hello/test/echo hi` 类极短无工具 channel-test probe 在上游连续空输出后会返回本地 `ok`；普通请求仍返回结构化空输出错误。
+- 已完成：
+  1. 新增分类：`health_probe/channel_test/internal_claude_code_probe/user_short_request/unknown_short_nonstream/not_short_nonstream`。
+  2. 非流式空输出 retry 日志增加 `short_request_kind/prompt_hash/prompt_tokens/message_count/max_tokens/source_client`。
+  3. `echo hi` 仍是 channel-test probe；普通短请求不是 channel-test。
+  4. 新增 kernel golden：ClaudeCode 小非流式、非探针、上游空输出时仍返回 `upstream returned no assistant content or tool call`，不会被本地 `ok` 误短路。
+- 待办：
+  1. 继续用真实小非流式样本确认分类是否稳定命中 `internal_claude_code_probe`，并记录最终是否 retry 成功。
+  2. 只有确认是 ClaudeCode 内部探测后，才评估本地安全 fallback 或短冷却；当前源码没有新增普通请求短路。
+  3. 如日志仍无法区分用途，再补不含原文的 `last_user_prefix_class`。
+
 ### 压测矩阵
 
 - 状态：方案和报告模板已落地，执行器与真实压测待落地。
@@ -59,7 +95,7 @@
 ### README 同步
 
 - 状态：已完成本轮同步。
-- 已改：根目录 README 已补 `FREE_MODEL_REQUEST_BODY_LIMIT_MB`、`ZEN_UPSTREAM_SESSION_TTL_SECS`、非流式输出保护、空上游错误行为，并把测试数量更新为库测试 60 条、kernel golden 46 条。
+- 已改：根目录 README 已补 `FREE_MODEL_REQUEST_BODY_LIMIT_MB`、`ZEN_UPSTREAM_SESSION_TTL_SECS`、非流式输出保护、空上游错误行为、脱敏 request-shape 日志说明，并把测试数量更新为库测试 69 条、kernel golden 71 条。
 - 残留：后续代码继续变化时，需要同步 README 和维护文档。
 
 ### 临时产物归类

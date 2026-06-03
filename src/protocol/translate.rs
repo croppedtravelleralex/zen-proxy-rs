@@ -206,8 +206,11 @@ fn synthetic_tool_id(message_index: usize, tool_index: usize, call: &ToolCall) -
 }
 
 fn stable_hash64(input: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in input.as_bytes() {
+    stable_hash64_update(0xcbf29ce484222325u64, input.as_bytes())
+}
+
+fn stable_hash64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -424,6 +427,171 @@ pub struct StreamOutputPolicy {
     pub requested_max_tokens: Option<u64>,
     pub effective_max_tokens: u64,
     pub capped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestShape {
+    pub system_tokens: u64,
+    pub messages_tokens: u64,
+    pub tools_tokens: u64,
+    pub tool_count: usize,
+    pub message_count: usize,
+    pub largest_message_tokens: u64,
+    pub last_user_tokens: u64,
+    pub estimated_total_tokens: u64,
+    pub stream: bool,
+    pub max_tokens: Option<u64>,
+    pub tool_choice_present: bool,
+    pub prompt_hash: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortNonStreamRequestKind {
+    NotShortNonStream,
+    HealthProbe,
+    ChannelTest,
+    InternalClaudeCodeProbe,
+    UserShortRequest,
+    UnknownShortNonStream,
+}
+
+impl ShortNonStreamRequestKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotShortNonStream => "not_short_nonstream",
+            Self::HealthProbe => "health_probe",
+            Self::ChannelTest => "channel_test",
+            Self::InternalClaudeCodeProbe => "internal_claude_code_probe",
+            Self::UserShortRequest => "user_short_request",
+            Self::UnknownShortNonStream => "unknown_short_nonstream",
+        }
+    }
+}
+
+pub fn request_shape(body: &ChatRequest) -> RequestShape {
+    let mut system_tokens = 0u64;
+    let mut messages_tokens = 0u64;
+    let mut largest_message_tokens = 0u64;
+    let mut last_user_tokens = 0u64;
+
+    for message in &body.messages {
+        let tokens = value_shape_tokens(&message.content);
+        largest_message_tokens = largest_message_tokens.max(tokens);
+        if message.role == "system" {
+            system_tokens = system_tokens.saturating_add(tokens);
+        } else {
+            messages_tokens = messages_tokens.saturating_add(tokens);
+        }
+        if message.role == "user" {
+            last_user_tokens = tokens;
+        }
+    }
+
+    let (tool_count, tools_tokens) = body
+        .tools
+        .as_ref()
+        .map(|tools| {
+            let rendered = serde_json::to_string(tools).unwrap_or_default();
+            (tools.len(), estimate_tokens(&rendered))
+        })
+        .unwrap_or((0, 0));
+    let estimated_total_tokens = system_tokens
+        .saturating_add(messages_tokens)
+        .saturating_add(tools_tokens);
+    let prompt_hash = request_prompt_hash(body, tool_count);
+
+    RequestShape {
+        system_tokens,
+        messages_tokens,
+        tools_tokens,
+        tool_count,
+        message_count: body.messages.len(),
+        largest_message_tokens,
+        last_user_tokens,
+        estimated_total_tokens,
+        stream: body.stream.unwrap_or(false),
+        max_tokens: body.max_tokens,
+        tool_choice_present: body.tool_choice.is_some(),
+        prompt_hash,
+    }
+}
+
+pub fn classify_short_non_stream_request(
+    body: &ChatRequest,
+    is_claude_code: bool,
+) -> ShortNonStreamRequestKind {
+    if body.stream.unwrap_or(false) {
+        return ShortNonStreamRequestKind::NotShortNonStream;
+    }
+    let shape = request_shape(body);
+    if shape.tool_count > 0 || shape.tool_choice_present {
+        return ShortNonStreamRequestKind::NotShortNonStream;
+    }
+    if is_short_no_tool_health_request(body) {
+        return ShortNonStreamRequestKind::HealthProbe;
+    }
+    if is_short_no_tool_channel_test_probe(body) {
+        return ShortNonStreamRequestKind::ChannelTest;
+    }
+    if shape.message_count > 4 || shape.estimated_total_tokens > 256 {
+        return ShortNonStreamRequestKind::NotShortNonStream;
+    }
+    if is_claude_code && shape.message_count <= 2 && shape.last_user_tokens <= 64 {
+        return ShortNonStreamRequestKind::InternalClaudeCodeProbe;
+    }
+
+    let user_messages = body
+        .messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count();
+    let has_assistant = body
+        .messages
+        .iter()
+        .any(|message| message.role == "assistant");
+    if user_messages == 1 && !has_assistant {
+        return ShortNonStreamRequestKind::UserShortRequest;
+    }
+    ShortNonStreamRequestKind::UnknownShortNonStream
+}
+
+fn value_shape_tokens(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => estimate_tokens(text),
+        Value::Null => 0,
+        other => estimate_tokens(&serde_json::to_string(other).unwrap_or_default()),
+    }
+}
+
+fn request_prompt_hash(body: &ChatRequest, tool_count: usize) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    hash = stable_hash64_update(hash, body.model.as_bytes());
+    hash = stable_hash64_update(hash, b"\x1f");
+    let stream_label: &[u8] = if body.stream.unwrap_or(false) {
+        b"stream"
+    } else {
+        b"nonstream"
+    };
+    hash = stable_hash64_update(hash, stream_label);
+    hash = stable_hash64_update(hash, b"\x1f");
+    hash = stable_hash64_update(hash, tool_count.to_string().as_bytes());
+
+    for message in &body.messages {
+        hash = stable_hash64_update(hash, b"\x1e");
+        hash = stable_hash64_update(hash, message.role.as_bytes());
+        hash = stable_hash64_update(hash, b"\x1f");
+        match &message.content {
+            Value::String(text) => {
+                hash = stable_hash64_update(hash, text.as_bytes());
+            }
+            other => {
+                let rendered = serde_json::to_string(other).unwrap_or_default();
+                hash = stable_hash64_update(hash, rendered.as_bytes());
+            }
+        }
+    }
+
+    hash
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1178,4 +1346,117 @@ pub fn is_short_no_tool_channel_test_probe(body: &ChatRequest) -> bool {
 
 pub fn is_reasoning_only_error(msg: &str) -> bool {
     msg.contains("reasoning_content without final content")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn message(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn request(content: &str, stream: bool, max_tokens: Option<u64>) -> ChatRequest {
+        ChatRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![message("user", content)],
+            stream: Some(stream),
+            max_tokens,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    fn tool(name: &str) -> OpenAITool {
+        OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: name.to_string(),
+                description: Some("SECRET_TOOL_DESCRIPTION".to_string()),
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "SECRET_PATH_DESCRIPTION"}
+                    }
+                })),
+            },
+        }
+    }
+
+    #[test]
+    fn request_shape_counts_parts_without_exposing_raw_text() {
+        let mut body = request("SECRET_USER_TEXT", true, Some(1024));
+        body.messages
+            .insert(0, message("system", "SECRET_SYSTEM_TEXT"));
+        body.tools = Some(vec![tool("Read")]);
+
+        let shape = request_shape(&body);
+        let rendered = format!("{shape:?}");
+
+        assert_eq!(shape.message_count, 2);
+        assert_eq!(shape.tool_count, 1);
+        assert!(shape.system_tokens > 0);
+        assert!(shape.messages_tokens > 0);
+        assert!(shape.tools_tokens > 0);
+        assert!(shape.largest_message_tokens > 0);
+        assert!(shape.last_user_tokens > 0);
+        assert!(shape.estimated_total_tokens >= shape.system_tokens + shape.messages_tokens);
+        assert_ne!(shape.prompt_hash, 0);
+        assert!(!rendered.contains("SECRET_SYSTEM_TEXT"));
+        assert!(!rendered.contains("SECRET_USER_TEXT"));
+        assert!(!rendered.contains("SECRET_TOOL_DESCRIPTION"));
+    }
+
+    #[test]
+    fn echo_hi_stays_channel_test_probe() {
+        let body = request("echo hi", false, Some(64));
+
+        assert!(is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(
+            classify_short_non_stream_request(&body, false),
+            ShortNonStreamRequestKind::ChannelTest
+        );
+    }
+
+    #[test]
+    fn ordinary_short_user_request_is_not_channel_test() {
+        let body = request("write a title", false, Some(256));
+
+        assert!(!is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(
+            classify_short_non_stream_request(&body, false),
+            ShortNonStreamRequestKind::UserShortRequest
+        );
+    }
+
+    #[test]
+    fn claude_code_tiny_nonstream_non_probe_is_observed_but_not_channel_test() {
+        let body = request("session title", false, Some(64));
+
+        assert!(!is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(
+            classify_short_non_stream_request(&body, true),
+            ShortNonStreamRequestKind::InternalClaudeCodeProbe
+        );
+    }
+
+    #[test]
+    fn short_request_with_tools_is_not_short_nonstream() {
+        let mut body = request("echo hi", false, Some(64));
+        body.tools = Some(vec![tool("Read")]);
+
+        assert!(!is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(
+            classify_short_non_stream_request(&body, true),
+            ShortNonStreamRequestKind::NotShortNonStream
+        );
+    }
 }

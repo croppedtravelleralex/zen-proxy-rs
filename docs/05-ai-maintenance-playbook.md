@@ -104,6 +104,10 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - prompt tokens 稳定在约 60k：默认流式 compactor 在超过 80k 后压到约 60k；如果 ClaudeCode 被误判为 OpenClaw，就不会走 ClaudeCode huge-context 约 12k 目标。
 - NewAPI cache tokens 几乎为 0：当前链路只转发上游 usage 里的缓存字段；上游不返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 `cached_tokens` 时，ZenProxy 不自行制造缓存计数。
 - ClaudeCode CLI Markdown/表格/代码块/列表显示异常：先抓 raw SSE 和 `source_client`。若新 pid 仍不是 `claude-code`，优先查 profile 识别；若 raw SSE 正确但终端显示错，再归类为 CLI 渲染问题。
+- NewAPI 看到 70k-90k input tokens：不要直接判定为 NewAPI 输入墙。先对齐三种口径：ZenProxy `body_size` 是 JSON 字节数；free-model-client-rs `prompt_tokens` 是估算/策略口径；NewAPI/cc-switch usage 是最终账单口径。若日志出现 `compacted streaming ... before_tokens=... after_tokens=...`，说明是内核消息压缩后的上游输入；若 `context_action=pass` 且只有 `capped streaming ... max_tokens`，说明输入未被外层裁剪，只限制了输出。
+- Windows ClaudeCode 当前可能先走 cc-switch：检查 `C:\Users\Lenovo\.claude\settings.json` 里的 `ANTHROPIC_BASE_URL`，再查 cc-switch provider。不要把 `ClaudeCode -> cc-switch -> closeapi` 的记录和 `panda NewAPI channel 69 -> ZenProxy` 的记录合并归因。
+- ClaudeCode 表面短 prompt 不等于短请求：ClaudeCode 会带系统提示、工具 schema、plugins/skills、agent 信息、历史上下文和模型别名。当前源码已增加并部署脱敏 request-shape 采样，字段包括 `system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`；禁止保存原始 prompt、请求体或密钥。
+- `body_size=342` 这类小非流式空输出：先看 `short_request_kind`。当前分类只用于观测，`internal_claude_code_probe` 不会自动本地 `ok`；只有 `channel_test` 且上游连续空输出时才允许本地 `ok`，普通短请求仍应返回结构化空上游错误。
 
 必须记录：
 
