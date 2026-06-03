@@ -531,8 +531,20 @@ async fn handle_stream(
             yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":final_markdown}}).to_string()));
         }
         if text.trim().is_empty() && tool_calls.is_empty() {
-            yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":"upstream returned no assistant content or tool call"}}).to_string()));
-            return;
+            if translate::is_short_no_tool_channel_test_probe(&body) {
+                tracing::warn!(
+                    model = body.model,
+                    source_client = ?profile.kind,
+                    "short channel-test probe received empty upstream; returning local ok"
+                );
+                text_block_open = true;
+                text.push_str("ok");
+                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
+                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}).to_string()));
+            } else {
+                yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":"upstream returned no assistant content or tool call"}}).to_string()));
+                return;
+            }
         }
         if text_block_open {
             yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string()));

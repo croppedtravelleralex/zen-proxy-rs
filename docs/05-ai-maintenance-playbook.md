@@ -90,6 +90,7 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - 2026-05-31 晚间 OpenClaw subagent 的 profile 误识别已修复，OpenClaw-only smoke 5/5、WSL 三客户端 smoke 15/15；但仍需重新跑 dry run 后才能进入 full run。
 - 2026-06-01 已在 panda 部署 ClaudeCode huge_context final-anchor 修复；panda 本机 `/v1/messages` 约 1.0MB source-side smoke 中 flash 3/3、lite 3/3 均返回 `HUGE_OK`，但这不是四客户端真实 dry run。
 - 2026-06-03 已在 panda 部署 channel 69 健康测试误判修复；空内容无工具探测应短路为 `ok`，小 `max_tokens` 请求不得进入 ClaudeCode huge buffered retry。
+- 2026-06-03 已补管理端测渠道第二层兜底：`echo hi`/`hi`/`hello`/`test` 类极短流式无工具探测，只有在上游空输出时才降级为本地 `ok`；普通请求不应提前短路。
 - huge stream 日志里若出现 `ClaudeCode huge stream buffered upstream returned empty output`，先按 buffered retry 已兜底处理归类；只有最终裸透给客户端或耗尽重试才算失败。
 - 如果需要临时中止压测，保留已有 `raw-results.jsonl`，再生成 partial summary，不要补写伪造的完成数。
 

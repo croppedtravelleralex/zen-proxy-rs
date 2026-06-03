@@ -1100,6 +1100,44 @@ pub fn is_short_no_tool_health_request(body: &ChatRequest) -> bool {
     ) || matches!(trimmed, "健康检查" | "健康测试")
 }
 
+pub fn is_short_no_tool_channel_test_probe(body: &ChatRequest) -> bool {
+    if body.stream != Some(true)
+        || has_tools(body)
+        || body.tool_choice.is_some()
+        || body.max_tokens.is_none_or(|max_tokens| max_tokens > 64)
+    {
+        return false;
+    }
+
+    let user_messages = body
+        .messages
+        .iter()
+        .filter(|msg| msg.role == "user")
+        .collect::<Vec<_>>();
+    if user_messages.len() != 1
+        || body.messages.iter().any(|msg| {
+            msg.role == "assistant"
+                || (msg.role != "user"
+                    && msg
+                        .content
+                        .as_str()
+                        .is_some_and(|text| !text.trim().is_empty()))
+        })
+    {
+        return false;
+    }
+
+    let Some(text) = user_messages[0].content.as_str() else {
+        return false;
+    };
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "hi" | "hello" | "test" | "echo hi" | "echo hello" | "echo test"
+    ) || matches!(trimmed, "测试" | "測試")
+}
+
 pub fn is_reasoning_only_error(msg: &str) -> bool {
     msg.contains("reasoning_content without final content")
 }

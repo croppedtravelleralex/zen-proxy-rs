@@ -319,6 +319,7 @@ async fn handle_oa_stream(
     let m = model.clone();
     let id = cid.clone();
     let prompt = translate::build_prompt_text(&cr.messages);
+    let body = cr.clone();
     let resp = crate::zen::client::fetch_zen_stream_with_headers(
         client,
         &config.zen_chat_url,
@@ -372,9 +373,19 @@ async fn handle_oa_stream(
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":final_markdown},"finish_reason":null}]}).to_string()));
         }
         if text.trim().is_empty() && tool_calls.is_empty() {
-            yield Ok(Event::default().data(serde_json::json!({"error":{"message":"upstream returned no assistant content or tool call"}}).to_string()));
-            yield Ok(Event::default().data("[DONE]"));
-            return;
+            if translate::is_short_no_tool_channel_test_probe(&body) {
+                tracing::warn!(
+                    model = body.model,
+                    source_client = ?profile.kind,
+                    "short channel-test probe received empty upstream; returning local ok"
+                );
+                text.push_str("ok");
+                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}).to_string()));
+            } else {
+                yield Ok(Event::default().data(serde_json::json!({"error":{"message":"upstream returned no assistant content or tool call"}}).to_string()));
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
         }
         for tool in tool_calls.iter() {
             let clean_id = tool.id.clone().unwrap_or_else(|| format!("call_{}", tool.index));

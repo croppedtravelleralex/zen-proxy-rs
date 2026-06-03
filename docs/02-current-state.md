@@ -18,7 +18,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - `fmt --check` 通过。
 - `clippy -D warnings` 通过。
-- `cargo test` 通过：库测试 61 条、kernel golden 62 条、doc tests 0 条。
+- `cargo test` 通过：库测试 61 条、kernel golden 64 条、doc tests 0 条。
 
 当前已实现并由测试覆盖的关键能力：
 
@@ -39,6 +39,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 15. 客户端 profile 已支持显式 `x-fmc-client`、header、UA 和 body/toolset 推断；OpenClaw 专属工具和 `OpenClaw` marker 优先于 ClaudeCode 共用工具名。
 16. 空内容、无工具的 OpenAI/Anthropic 健康探测会走本地短路 `ok`，不再误进上游或 huge buffered retry。
 17. ClaudeCode huge buffered stream 只在修复前估算输入 >= 50k tokens 时启用；小 `max_tokens` 健康探测不再触发 huge retry 路径。
+18. NewAPI 管理端测渠道常见的极短 `echo hi` 流式探测，如果上游空输出，会返回本地 `ok`，只在无工具、单用户消息、`max_tokens <= 64` 的探测形态触发，避免误伤普通请求。
 
 ## 运行链路事实
 
@@ -168,8 +169,10 @@ P1.3 channel 69 健康测试/空输出误判修复部署记录：
 | 实例 | `zen-proxy-rs@1:4001`、`zen-proxy-rs@2:4002`、`zen-proxy-rs@3:4004` |
 | 根因 | ClaudeCode 小 `max_tokens` 流式请求会误进 huge buffered retry；NewAPI channel test 的小/空探测因此被当作大上下文重试，最终出现 `upstream returned no assistant content or tool call`。 |
 | 修复 | 空内容无工具健康探测短路为本地 `ok`；ClaudeCode huge buffer 改为只按修复前输入 tokens >= 50k 触发。 |
-| 代码验证 | `free-model-client-rs` 的 `fmt --check`、`clippy -D warnings`、`cargo test` 通过。 |
+| 后续补强 | 对管理端测渠道常见的 `echo hi` 极短流式探测增加空上游 fallback：先尝试上游，只有上游空输出才返回本地 `ok`。 |
+| 代码验证 | `free-model-client-rs` 的 `fmt --check`、`clippy -D warnings`、`cargo test` 通过；kernel golden 64 条。 |
 | panda 验证 | channel 69 管理测试日志成功；有效 `vip` 组 token 下 `/v1/models`、OpenAI 非流式、Anthropic 流式均 200。 |
+| 第二层验收 | panda NewAPI 有效 `vip` 组 token 下，`echo hi`/`max_tokens=16`/stream 探测 10/10 返回 200，`empty_error=0`；ZenProxy 日志确认上游空流被本地 `ok` 兜底。 |
 
 P1 待执行：
 

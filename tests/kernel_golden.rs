@@ -104,6 +104,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.trim().eq_ignore_ascii_case("echo hi") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: [DONE]\n\n",
+        )
+            .into_response();
+    }
     if prompt.contains("HUGE_EMPTY_OK") {
         return (
             StatusCode::OK,
@@ -1517,6 +1525,53 @@ async fn claude_code_small_low_max_tokens_stream_does_not_use_huge_buffer_retry(
 
     let body = response_text(response).await;
     assert!(body.contains("upstream returned no assistant content or tool call"));
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn anthropic_channel_test_probe_empty_upstream_falls_back_to_ok() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "echo hi", true);
+    request.max_tokens = 16;
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("\"text\":\"ok\""));
+    assert!(body.contains("event: message_stop"));
+    assert!(!body.contains("upstream returned no assistant content or tool call"));
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn openai_channel_test_probe_empty_upstream_falls_back_to_ok() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = chat_request("deepseek-v4-flash", "echo hi", true, None);
+    request.max_tokens = Some(16);
+
+    let response = kernel
+        .openai_chat_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("\"content\":\"ok\""));
+    assert!(!body.contains("upstream returned no assistant content or tool call"));
     assert_eq!(state.requests.lock().unwrap().len(), 1);
 }
 

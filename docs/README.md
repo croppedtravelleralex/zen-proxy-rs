@@ -63,10 +63,11 @@ P0 已完成但待文档收尾：
 2. 无密钥 panda 压测执行器已落地到 `scripts/panda_pressure_runner.py`。
 3. 2026-06-02 exact-output TTL guard 已部署到 panda，ZenProxy 4000/4001/4002/4004 直连健康。
 4. 2026-06-03 channel 69 空输出/健康测试误判已从源头修复并部署到 panda；`Zenproxyrs4.3` channel 69 当前启用，`vip` 组，指向 `http://172.17.0.1:4000`。
-5. `sk-dev` 已不是有效压测 token，且属于历史 default 组；测试 channel 69 必须使用 NewAPI 中有效的 `vip` 组 token，报告中不得打印明文 key。
-6. preflight 已补充 `auth_error`、`channel_unavailable`、`blocker` 分类；无有效 NewAPI token 或目标渠道不可用时会阻断，不进入 smoke/dry/full。
-7. OpenClaw body/profile 识别修复已部署到 panda，OpenClaw-only smoke 5/5 通过，WSL 三客户端 smoke 15/15 通过。
-8. dry run 仍未重新通过：huge_context、`deepseek-v4-flash-lite` 长上下文语义漂移、Hermes 慢路径和上游 overload/502/524 仍需处理。
+5. 2026-06-03 已补第二层兜底：NewAPI 管理端测渠道常见的极短 `echo hi` 流式探测，如果上游只吐空流，会由 ZenProxy/free-model-client-rs 返回本地 `ok`，不再裸透 `upstream returned no assistant content or tool call`。
+6. `sk-dev` 已不是有效压测 token，且属于历史 default 组；测试 channel 69 必须使用 NewAPI 中有效的 `vip` 组 token，报告中不得打印明文 key。
+7. preflight 已补充 `auth_error`、`channel_unavailable`、`blocker` 分类；无有效 NewAPI token 或目标渠道不可用时会阻断，不进入 smoke/dry/full。
+8. OpenClaw body/profile 识别修复已部署到 panda，OpenClaw-only smoke 5/5 通过，WSL 三客户端 smoke 15/15 通过。
+9. dry run 仍未重新通过：huge_context、`deepseek-v4-flash-lite` 长上下文语义漂移、Hermes 慢路径和上游 overload/502/524 仍需处理。
 
 仍需执行：
 
