@@ -25,13 +25,13 @@ pub async fn handle_anthropic_messages(
     let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
     let mut msgs = translate::anthropic_to_openai_messages(&body);
     let stream_requested = body.stream.unwrap_or(false);
-    let context_repair = if stream_requested {
-        let policy = if profile.kind == ClientKind::ClaudeCode {
-            translate::StreamContextPolicy::claude_code_huge_context()
-        } else {
-            translate::StreamContextPolicy::default()
-        };
-        translate::compact_stream_context_with_policy(&mut msgs, policy)
+    let context_repair = if profile.kind == ClientKind::ClaudeCode {
+        translate::compact_claude_code_huge_session_context(&mut msgs)
+    } else if stream_requested {
+        translate::compact_stream_context_with_policy(
+            &mut msgs,
+            translate::StreamContextPolicy::default(),
+        )
     } else {
         translate::StreamContextRepair::default()
     };
@@ -39,20 +39,29 @@ pub async fn handle_anthropic_messages(
         && profile.kind == ClientKind::ClaudeCode
         && context_repair.compacted_messages > 0
         && translate::reduce_to_exact_output_anchor_message(&mut msgs, 2 * 1024);
-    let appended_latest_user_anchor = stream_requested
-        && profile.kind == ClientKind::ClaudeCode
+    let appended_latest_user_anchor = profile.kind == ClientKind::ClaudeCode
         && context_repair.compacted_messages > 0
         && !reduced_exact_output_anchor
         && translate::append_latest_user_anchor_message(&mut msgs, 2 * 1024);
     if context_repair.compacted_messages > 0 {
-        tracing::warn!(
-            before_tokens = context_repair.before_tokens,
-            after_tokens = context_repair.after_tokens,
-            compacted_messages = context_repair.compacted_messages,
-            reduced_exact_output_anchor,
-            appended_latest_user_anchor,
-            "compacted streaming anthropic context before upstream"
-        );
+        if stream_requested {
+            tracing::warn!(
+                before_tokens = context_repair.before_tokens,
+                after_tokens = context_repair.after_tokens,
+                compacted_messages = context_repair.compacted_messages,
+                reduced_exact_output_anchor,
+                appended_latest_user_anchor,
+                "compacted streaming anthropic context before upstream"
+            );
+        } else {
+            tracing::warn!(
+                before_tokens = context_repair.before_tokens,
+                after_tokens = context_repair.after_tokens,
+                compacted_messages = context_repair.compacted_messages,
+                appended_latest_user_anchor,
+                "compacted non-stream anthropic context before upstream"
+            );
+        }
     }
     let tool_history_policy = if profile.uses_compat_tool_history() {
         translate::ToolHistoryPolicy::Compat
@@ -96,7 +105,13 @@ pub async fn handle_anthropic_messages(
         }
         policy.effective_max_tokens
     } else {
-        let policy = translate::non_stream_output_policy(&msgs, Some(body.max_tokens));
+        let policy_prompt_tokens = context_repair.before_tokens.max(translate::estimate_tokens(
+            &translate::build_prompt_text(&msgs),
+        ));
+        let policy = translate::non_stream_output_policy_for_prompt_tokens(
+            policy_prompt_tokens,
+            Some(body.max_tokens),
+        );
         if policy.capped {
             tracing::warn!(
                 prompt_tokens = policy.prompt_tokens,

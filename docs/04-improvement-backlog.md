@@ -47,7 +47,7 @@
 
 ### ClaudeCode 请求体来源归因
 
-- 状态：第一阶段已在 `free-model-client-rs` 源码落地，并已随 `zen-proxy-rs` 部署到 panda。
+- 状态：第二阶段已在 `free-model-client-rs` 源码落地，并已随 `zen-proxy-rs` 部署到 panda。
 - 背景：2026-06-03 panda 日志显示 ClaudeCode 表面短 prompt 也可能产生 291KB-474KB 的 Anthropic `/v1/messages` 请求体；NewAPI/cc-switch 使用日志常见 40k-90k input tokens。
 - 已确认事实：
   - ZenProxy `body_size` 是 HTTP JSON 字节数，不是 tokens。
@@ -55,15 +55,24 @@
   - free-model-client-rs 对这两条只做了流式输出 cap：`prompt_tokens=72826/73017`，`max_tokens=32000 -> 1024`。
   - Windows ClaudeCode 当前 `ANTHROPIC_BASE_URL=http://127.0.0.1:15721`，实际先走 cc-switch；Windows 设置启用 `CLAUDE_CODE_EFFORT_LEVEL=max`、agent teams、tool search 和多个插件。
   - cc-switch 最近 Claude 日志的 provider 为 `closedeepseek -> https://sub2api.closeapi.top`，不是 `LocalNewapi -> http://127.0.0.1:4000/v1`；因此 Windows ClaudeCode 最近使用记录和 panda NewAPI channel 69 记录不能直接混为同一条链路。
+  - 2026-06-03 23:01-23:46 panda channel 69 真实 ClaudeCode 请求中，流式 body 从约 674KB 增长到 788KB，`message_count` 从 600 多增长到 705，`last_user_tokens` 多数只有 36-96。
+  - 同一窗口 NewAPI channel 69 共 61 条：57 条流式、4 条非流式；53 条 prompt tokens 落在 70k-90k，2 条非流式超过 200k，2 条流式 prompt tokens 记 0 且内容为 `upstream returned no assistant content or tool call`。
+  - `prompt_tokens>=200k` 的两条是非流式大请求/fallback：id `109370` 为 213248 prompt tokens，id `109461` 为 225416 prompt tokens。对应 ZenProxy 非流式路径只做输出 cap，未做输入 compactor。
+  - ClaudeCode huge-context 流式 compactor 的 `target_tokens=12k` 没在真实会话达到，根因不是 profile 误识别，而是 700+ 旧短消息和工具 schema 残留；当前 compactor 主要处理单条大文本，短轮次历史不进候选。
 - 已完成：
   1. `src/protocol/translate.rs` 新增 `RequestShape`，只记录 token/数量/hash，不保存原始 prompt、请求体或 key。
   2. OpenAI/Anthropic 入口统一输出脱敏字段：`system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`。
   3. shape 单元测试覆盖“不泄露原文”和“工具 schema 计入 tools_tokens”。
+  4. 新增 ClaudeCode huge-session compactor：折叠旧短轮次历史，保留系统消息、最近 48 条消息、最新用户目标和少量脱敏状态信号。
+  5. Anthropic/OpenAI 两个入口均接入 ClaudeCode huge-session compactor；大非流式 fallback 不再只 cap 输出，也会先压输入。
+  6. 非流式输出 cap 使用压缩前原始 prompt token 口径，避免 200k fallback 被压缩后误放宽输出上限。
 - 待办：
-  1. 继续观察真实 ClaudeCode/Hermes/OpenClaw 请求，确认 shape 字段在长时间运行中可被稳定采集。
-  2. 如仍需要更细拆分，再补 `claude_code_shape` 二级指标，进一步拆插件/skills、历史消息和最后用户消息占比。
-  3. 对 Windows cc-switch 链路单独建验收入口：`ClaudeCode -> cc-switch(15721) -> provider`，不要把它和 panda NewAPI channel 69 直接合并统计。
-  4. 重新跑 Windows ClaudeCode raw/CLI 对照时，必须从 Windows 本地目录启动，不能从 `\\wsl.localhost` UNC cwd 启动。
+  1. 记录并统计 `stream empty -> non-stream fallback` 链路，避免上游一次空流导致 ClaudeCode 把同一大历史重发并继续膨胀。
+  2. 继续观察真实 ClaudeCode/Hermes/OpenClaw 请求，确认 shape 字段在长时间运行中可被稳定采集。
+  3. 如仍需要更细拆分，再补 `claude_code_shape` 二级指标，进一步拆插件/skills、历史消息和最后用户消息占比。
+  4. 对 Windows cc-switch 链路单独建验收入口：`ClaudeCode -> cc-switch(15721) -> provider`，不要把它和 panda NewAPI channel 69 直接合并统计。
+  5. 重新跑 Windows ClaudeCode raw/CLI 对照时，必须从 Windows 本地目录启动，不能从 `\\wsl.localhost` UNC cwd 启动。
+  6. 用真实 ClaudeCode 长会话复测：导出/扫码/等待外部动作这类任务不得再反复提交任务、反复重启或杀掉已登录进程。
 
 ### ClaudeCode 小非流式空输出请求分类
 

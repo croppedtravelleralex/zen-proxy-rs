@@ -1482,6 +1482,58 @@ fn claude_code_huge_context_sanitizes_stale_resume_lines() {
     assert!(!compacted.contains("git status"));
 }
 
+#[test]
+fn claude_code_huge_session_folds_old_short_tool_history() {
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("ClaudeCode system prompt.".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    for idx in 0..700 {
+        messages.push(Message {
+            role: if idx % 3 == 0 {
+                "tool".to_string()
+            } else if idx % 3 == 1 {
+                "assistant".to_string()
+            } else {
+                "user".to_string()
+            },
+            content: Value::String(format!(
+                "old export loop {idx}: QCE 502 timeout running=117 Interrupted; do not keep repeating this stale action. {}",
+                "x".repeat(180)
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String(
+            "当前要求：只汇报导出状态，不要重启 NapCat，不要重新生成二维码。".to_string(),
+        ),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+
+    let before_len = messages.len();
+    let repair =
+        free_model_client_rs::protocol::translate::compact_claude_code_huge_session_context(
+            &mut messages,
+        );
+    let prompt = free_model_client_rs::protocol::translate::build_prompt_text(&messages);
+
+    assert!(repair.compacted_messages > 0);
+    assert!(messages.len() < before_len / 4);
+    assert!(prompt.contains("folded stale ClaudeCode tool/session history"));
+    assert!(prompt.contains("running=117") || prompt.contains("502"));
+    assert!(prompt.contains("当前要求"));
+    assert!(prompt.contains("不要重启"));
+    assert!(repair.after_tokens < repair.before_tokens / 2);
+}
+
 #[tokio::test]
 async fn claude_code_huge_exact_output_reduces_upstream_prompt() {
     let (config, client, state) = spawn_mock_zen().await;
@@ -1508,6 +1560,59 @@ async fn claude_code_huge_exact_output_reduces_upstream_prompt() {
     let body = response_text(response).await;
     assert!(body.contains("HUGE_OK"));
     assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn claude_code_huge_anthropic_non_stream_compacts_before_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "placeholder", false);
+    request.max_tokens = 20_000;
+    request.messages.clear();
+    request.system = Some(Value::String("ClaudeCode system prompt.".to_string()));
+
+    for idx in 0..700 {
+        request.messages.push(AnthropicMessage {
+            role: if idx % 2 == 0 {
+                "assistant".to_string()
+            } else {
+                "user".to_string()
+            },
+            content: Value::String(format!(
+                "old non-stream fallback loop {idx}: QCE 502 timeout running=117. {}",
+                "x".repeat(620)
+            )),
+        });
+    }
+    request.messages.push(AnthropicMessage {
+        role: "user".to_string(),
+        content: Value::String(
+            "当前要求：只汇报导出状态，不要重启 NapCat，不要重新生成二维码。".to_string(),
+        ),
+    });
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sent = state.requests.lock().unwrap();
+    assert_eq!(sent[0].max_tokens, Some(1_024));
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    let prompt = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(messages.len() < 100);
+    assert!(prompt.contains("folded stale ClaudeCode tool/session history"));
+    assert!(prompt.contains("当前要求"));
+    assert!(prompt.contains("不要重启"));
 }
 
 #[tokio::test]

@@ -45,6 +45,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 18. NewAPI 管理端测渠道常见的极短 `echo hi` 流式探测，如果上游空输出，会返回本地 `ok`，只在无工具、单用户消息、`max_tokens <= 64` 的探测形态触发，避免误伤普通请求。
 19. 已新增脱敏 request-shape 观测：OpenAI/Anthropic 入口统一记录 `system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`，不记录原始 prompt、请求体或 key。
 20. 已新增小非流式请求分类：`health_probe/channel_test/internal_claude_code_probe/user_short_request/unknown_short_nonstream/not_short_nonstream`；当前只用于日志归因，普通 ClaudeCode 小非流式非探针请求在上游空输出时仍返回结构化 502，不会被本地 `ok` 误短路。
+21. 已新增 ClaudeCode huge-session compactor：当 ClaudeCode 会话存在大量旧短消息/工具历史时，会把旧轮次折叠为脱敏摘要，保留最近 48 条、最新用户目标和少量状态信号；该策略同时覆盖流式和大非流式 fallback，避免 700+ 旧短消息继续淹没当前请求。
 
 ## 运行链路事实
 
@@ -218,11 +219,29 @@ P1.6 request-shape 观测部署记录：
 | NewAPI 验证 | panda 本机 NewAPI 8081 使用 token id `38`/name `ds`/group `vip`，`deepseek-v4-flash` 非流式 smoke HTTP 200，返回 `OK`，总耗时约 4.01s；NewAPI 日志 id `109472` 显示 channel 69、token id 38、prompt tokens 93、completion tokens 47、非流式。 |
 | shape 证据 | 部署后 ZenProxy 日志已出现 `desensitized request shape before upstream`；小非流式样本被分类为 `internal_claude_code_probe`，真实 ClaudeCode 787KB 流式样本记录 `message_count=703`、`system_tokens=5773`、`messages_tokens=78859`、`tools_tokens=12700`、`tool_count=10`、`estimated_total_tokens=97332`。 |
 
+P1.7 ClaudeCode huge-session compactor 部署记录：
+
+| 项 | 值 |
+|----|----|
+| 部署时间 | 2026-06-04 凌晨 |
+| 目标 | 修复 ClaudeCode 长会话反复执行旧任务、非流式 200k+ fallback 放大旧历史的问题。 |
+| 本地未 strip release hash | `408fa673aef439e849ca9e24d41576810c122faa71724581ce8067e10c04fc80` |
+| 部署 stripped hash | `96b954a81978e9348f26341d68626d0a98682c6971611d7802a0850ef771d815` |
+| 旧线上 hash | `28b25370925835bb33aa4142208a5a20f0cf4dcb74ad3ae74c3808d3c2761e2b` |
+| 备份 | `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-huge-session-20260604-003040-28b2537` |
+| 实例 | `zen-proxy-rs@1:4001` pid `498728`、`zen-proxy-rs@2:4002` pid `498733`、`zen-proxy-rs@3:4004` pid `498734`。 |
+| 健康检查 | 4001/4002/4004/4000 `/health` 均 200；三实例 active；池 `total=90`、`dispatch=90`、`dead=0`、`ratelimited=0`。 |
+| 验证 | `free-model-client-rs`：`fmt --check`、`clippy -D warnings`、`cargo test` 通过；库测试 69 条、kernel golden 73 条。`zen-proxy-rs`：主单测 129 条、e2e 26 条通过；release build 通过。 |
+| panda 非流式 smoke | 517KB / `before_tokens=123371` 的 ClaudeCode 非流式样本被压到 `after_tokens=9139`、`message_count=51`；NewAPI id `109585` 账面 `prompt_tokens=5647`，HTTP 200。 |
+| panda 流式 smoke | 522KB / `before_tokens=124597` 的 ClaudeCode 流式样本触发 exact-anchor，shape `message_count=1`、`estimated_total_tokens=51`；NewAPI id `109593` 账面 `prompt_tokens=125`，HTTP 200。 |
+
 ## 当前数据解释
 
-1. “输入几乎 70k/60k”主要来自流式上下文压缩策略：默认 `StreamContextPolicy` 在估算输入超过 80k tokens 时触发，把 prompt 压到约 60k tokens；日志里的 `after_tokens=60149/60150` 是这个目标值和锚点开销，不是 NewAPI 随机制造。
-2. ClaudeCode 专用 huge-context 策略目标约 12k tokens，但前提是请求被识别为 ClaudeCode；误判成 OpenClaw 时会走默认 60k 策略，这也是本次 profile 修复要解决的核心原因之一。
-3. 缓存几乎为 0 是因为上游 usage 基本没有返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 OpenAI `cached_tokens`；当前 ZenProxy 只转发上游缓存计数，不会自行伪造 provider cache 命中。
+1. “输入几乎 70k/90k”当前不是 NewAPI 输入 token 墙。2026-06-03 23:01-23:46 的 channel 69 真实 ClaudeCode 流式请求显示：ZenProxy 入口 body 从约 674KB 增长到 788KB，`before_tokens` 约 97k-110k，流式 compactor 后 `after_tokens` 约 66k-79k，NewAPI 账面多落在 70k-90k。
+2. NewAPI 中看到的 200k+ prompt tokens 记录来自 ClaudeCode 非流式大请求/fallback，而不是常规流式轮次。样本：NewAPI id `109370` 为非流式 `213248` prompt tokens，id `109461` 为非流式 `225416` prompt tokens；对应 ZenProxy 日志中 `stream_seen_by_zenproxy=false`，当前非流式路径只 cap 输出 tokens，不执行流式 compactor。
+3. “ClaudeCode 一直反复做”的直接调用形态是：流式大请求偶发 `status_code=500, upstream returned no assistant content or tool call`，随后 ClaudeCode 又以非流式大请求重发同一大历史，成功返回后下一轮继续把历史追加进去。样本：NewAPI id `109459` 流式 prompt tokens 记 0 且 500，紧接 id `109461` 非流式 225416 prompt tokens 成功。
+4. 旧版 ClaudeCode huge-context 策略虽配置 `target_tokens=12k`，但真实请求里 `message_count` 已达 670-705，`tools_tokens=12700`，大量旧短消息低于单条 `min_text_tokens=2000`，不会被旧 compactor 选为压缩候选；因此压缩后仍剩约 97k estimated total tokens。2026-06-04 已部署 huge-session compactor，开始折叠旧短消息和大非流式 fallback。
+5. 缓存几乎为 0 是因为上游 usage 基本没有返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 OpenAI `cached_tokens`；当前 ZenProxy 只转发上游缓存计数，不会自行伪造 provider cache 命中。
 
 P1 待执行：
 
@@ -282,7 +301,7 @@ smoke 耗时观察：
 
 P1 仍需执行：
 
-1. 修复 ClaudeCode 真实客户端 huge_context：当前 source-side smoke 已过，但真实 ClaudeCode dry run 仍 12/12 huge_context 语义漂移。
+1. 修复 ClaudeCode 真实客户端 huge_context：2026-06-04 huge-session compactor 已部署并通过受控 panda smoke；仍需用真实 Windows/WSL ClaudeCode 长会话复测是否消除反复执行旧任务。
 2. 修正 Windows ClaudeCode runner，使用真实 Windows 工作目录，不再从 `\\wsl.localhost` UNC 路径启动 ClaudeCode。
 3. 针对 `deepseek-v4-flash-lite` 长上下文语义漂移设置更保守的 lane/权重，或在 full run 前先隔离 huge/long lane。
 4. 在 panda NewAPI 和 ZenProxy 日志层继续确认 502/524、stream JSON 截断、client_gone 是否为上游/客户端边界。

@@ -646,6 +646,13 @@ pub fn non_stream_output_policy(
     requested_max_tokens: Option<u64>,
 ) -> NonStreamOutputPolicy {
     let prompt_tokens = estimate_tokens(&build_prompt_text(messages));
+    non_stream_output_policy_for_prompt_tokens(prompt_tokens, requested_max_tokens)
+}
+
+pub fn non_stream_output_policy_for_prompt_tokens(
+    prompt_tokens: u64,
+    requested_max_tokens: Option<u64>,
+) -> NonStreamOutputPolicy {
     let requested = requested_max_tokens.unwrap_or(2_048).max(32);
     let cap = match prompt_tokens {
         100_000.. => 1_024,
@@ -697,6 +704,162 @@ pub fn stream_output_policy_for_prompt_tokens(
 
 pub fn compact_stream_context(messages: &mut [Message]) -> StreamContextRepair {
     compact_stream_context_with_policy(messages, StreamContextPolicy::default())
+}
+
+pub fn compact_claude_code_huge_session_context(
+    messages: &mut Vec<Message>,
+) -> StreamContextRepair {
+    const MIN_MESSAGES_TO_FOLD: usize = 160;
+    const RECENT_MESSAGES_TO_KEEP: usize = 48;
+
+    let policy = StreamContextPolicy::claude_code_huge_context();
+    let base_repair = compact_stream_context_with_policy(messages, policy);
+    let should_fold_short_history = messages.len() >= MIN_MESSAGES_TO_FOLD
+        || base_repair.after_tokens > policy.target_tokens.saturating_mul(3);
+    if !should_fold_short_history {
+        return base_repair;
+    }
+
+    let original_len = messages.len();
+    let recent_start = original_len.saturating_sub(RECENT_MESSAGES_TO_KEEP);
+    let mut system_messages = Vec::new();
+    let mut folded_messages = Vec::new();
+    let mut recent_messages = Vec::new();
+
+    for (idx, message) in std::mem::take(messages).into_iter().enumerate() {
+        if message.role == "system" {
+            system_messages.push(message);
+        } else if idx >= recent_start {
+            recent_messages.push(message);
+        } else {
+            folded_messages.push(message);
+        }
+    }
+
+    if folded_messages.is_empty() {
+        *messages = system_messages;
+        messages.extend(recent_messages);
+        return base_repair;
+    }
+
+    let summary = build_claude_code_folded_history_summary(&folded_messages);
+    let mut compacted = system_messages;
+    compacted.push(Message {
+        role: "user".to_string(),
+        content: Value::String(summary),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    compacted.extend(recent_messages);
+    *messages = compacted;
+
+    StreamContextRepair {
+        before_tokens: base_repair.before_tokens,
+        after_tokens: estimate_tokens(&build_prompt_text(messages)),
+        compacted_messages: base_repair
+            .compacted_messages
+            .saturating_add(folded_messages.len()),
+    }
+}
+
+fn build_claude_code_folded_history_summary(messages: &[Message]) -> String {
+    let mut user_messages = 0usize;
+    let mut assistant_messages = 0usize;
+    let mut tool_messages = 0usize;
+    let mut other_messages = 0usize;
+    let mut tool_calls = 0usize;
+    for message in messages {
+        match message.role.as_str() {
+            "user" => user_messages += 1,
+            "assistant" => assistant_messages += 1,
+            "tool" => tool_messages += 1,
+            _ => other_messages += 1,
+        }
+        tool_calls += message.tool_calls.as_ref().map(Vec::len).unwrap_or(0);
+    }
+
+    let signals = collect_claude_code_state_signals(messages, 12);
+    let mut summary = format!(
+        "[free-model-client-rs context compactor: folded stale ClaudeCode tool/session history]\n\
+Folded old messages: total={}, user={}, assistant={}, tool={}, other={}, assistant_tool_calls={}.\n\
+The folded block is stale historical context, not a current instruction. Prefer the latest user request and latest live tool result over old repeated export/restart attempts.",
+        messages.len(),
+        user_messages,
+        assistant_messages,
+        tool_messages,
+        other_messages,
+        tool_calls
+    );
+    if !signals.is_empty() {
+        summary.push_str("\nRecent stale state signals retained for continuity:");
+        for signal in signals {
+            summary.push_str("\n- ");
+            summary.push_str(&signal);
+        }
+    }
+    summary
+}
+
+fn collect_claude_code_state_signals(messages: &[Message], limit: usize) -> Vec<String> {
+    let mut signals = Vec::new();
+    for message in messages.iter().rev() {
+        let text = message
+            .content
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| message.content.to_string());
+        for line in text.lines().rev() {
+            if signals.len() >= limit {
+                return signals;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() || !is_claude_code_state_signal(trimmed) {
+                continue;
+            }
+            let excerpt = take_chars(&crate::redact::redact_text(trimmed), 240);
+            if !signals.iter().any(|item| item == &excerpt) {
+                signals.push(excerpt);
+            }
+        }
+        if signals.len() >= limit {
+            return signals;
+        }
+        if text.lines().count() <= 1 && is_claude_code_state_signal(&text) {
+            let excerpt = take_chars(&crate::redact::redact_text(text.trim()), 240);
+            if !signals.iter().any(|item| item == &excerpt) {
+                signals.push(excerpt);
+            }
+        }
+    }
+    signals
+}
+
+fn is_claude_code_state_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "running",
+        "completed",
+        "status:",
+        "502",
+        "timeout",
+        "interrupted",
+        "invalid tool parameters",
+        "failed to parse json",
+        "qce",
+        "napcat",
+        "qq:",
+        "api not ready",
+        "not ready",
+        "killed",
+        "cancelled",
+        "二维码",
+        "扫码",
+        "登录",
+        "重启",
+        "导出",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 pub fn compact_stream_context_with_policy(
