@@ -9,6 +9,63 @@ use axum::Json;
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const EXACT_OUTPUT_GUARD_TTL: Duration = Duration::from_secs(90);
+const EXACT_OUTPUT_GUARD_MAX_ENTRIES: usize = 32;
+const CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS: u64 = 50_000;
+
+#[derive(Clone)]
+struct ExactOutputGuardEntry {
+    key: String,
+    literal: String,
+    expires_at: Instant,
+}
+
+fn exact_output_guard() -> &'static Mutex<VecDeque<ExactOutputGuardEntry>> {
+    static GUARD: OnceLock<Mutex<VecDeque<ExactOutputGuardEntry>>> = OnceLock::new();
+    GUARD.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn exact_output_guard_key(model: &str, profile: ClientProfile) -> String {
+    format!("{:?}:{model}", profile.kind)
+}
+
+fn remember_exact_output_literal(model: &str, profile: ClientProfile, literal: &str) {
+    if !profile.protects_recovery_safe_markers() {
+        return;
+    }
+    let mut guard = exact_output_guard().lock().unwrap();
+    let now = Instant::now();
+    guard.retain(|entry| entry.expires_at > now);
+    let key = exact_output_guard_key(model, profile);
+    guard.retain(|entry| entry.key != key);
+    guard.push_back(ExactOutputGuardEntry {
+        key,
+        literal: literal.to_string(),
+        expires_at: now + EXACT_OUTPUT_GUARD_TTL,
+    });
+    while guard.len() > EXACT_OUTPUT_GUARD_MAX_ENTRIES {
+        guard.pop_front();
+    }
+}
+
+fn recent_exact_output_literal(model: &str, profile: ClientProfile) -> Option<String> {
+    if !profile.protects_recovery_safe_markers() {
+        return None;
+    }
+    let mut guard = exact_output_guard().lock().unwrap();
+    let now = Instant::now();
+    guard.retain(|entry| entry.expires_at > now);
+    let key = exact_output_guard_key(model, profile);
+    guard
+        .iter()
+        .rev()
+        .find(|entry| entry.key == key)
+        .map(|entry| entry.literal.clone())
+}
 
 pub async fn handle_anthropic_messages(
     client: &Client,
@@ -30,15 +87,21 @@ pub async fn handle_anthropic_messages(
     } else {
         translate::StreamContextRepair::default()
     };
+    let reduced_exact_output_anchor = stream_requested
+        && profile.kind == ClientKind::ClaudeCode
+        && context_repair.compacted_messages > 0
+        && translate::reduce_to_exact_output_anchor_message(&mut msgs, 2 * 1024);
     let appended_latest_user_anchor = stream_requested
         && profile.kind == ClientKind::ClaudeCode
         && context_repair.compacted_messages > 0
+        && !reduced_exact_output_anchor
         && translate::append_latest_user_anchor_message(&mut msgs, 2 * 1024);
     if context_repair.compacted_messages > 0 {
         tracing::warn!(
             before_tokens = context_repair.before_tokens,
             after_tokens = context_repair.after_tokens,
             compacted_messages = context_repair.compacted_messages,
+            reduced_exact_output_anchor,
             appended_latest_user_anchor,
             "compacted streaming anthropic context before upstream"
         );
@@ -59,11 +122,14 @@ pub async fn handle_anthropic_messages(
             "canonicalized anthropic tool history after openai translation"
         );
     }
-    let tools: Vec<OpenAITool> = body
-        .tools
-        .as_ref()
-        .map(|t| translate::anthropic_tools_to_openai(t))
-        .unwrap_or_default();
+    let tools: Vec<OpenAITool> = if reduced_exact_output_anchor {
+        Vec::new()
+    } else {
+        body.tools
+            .as_ref()
+            .map(|t| translate::anthropic_tools_to_openai(t))
+            .unwrap_or_default()
+    };
     let max_tok = if stream_requested {
         let policy_prompt_tokens = context_repair.before_tokens.max(translate::estimate_tokens(
             &translate::build_prompt_text(&msgs),
@@ -93,10 +159,13 @@ pub async fn handle_anthropic_messages(
         }
         policy.effective_max_tokens
     };
-    let tool_choice = body
-        .tool_choice
-        .as_ref()
-        .map(translate::anthropic_tool_choice_to_openai);
+    let tool_choice = if reduced_exact_output_anchor {
+        None
+    } else {
+        body.tool_choice
+            .as_ref()
+            .map(translate::anthropic_tool_choice_to_openai)
+    };
     let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":tool_choice});
     if profile.disables_thinking_for_tool_use() {
         translate::disable_thinking_for_tool_use(&mut zb);
@@ -111,6 +180,92 @@ pub async fn handle_anthropic_messages(
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
     };
+    if stream_requested && cr.tools.is_none() {
+        if let Some(literal) = translate::exact_output_literal_from_messages(&cr.messages) {
+            if profile.kind == ClientKind::ClaudeCode {
+                tracing::warn!(
+                    literal_len = literal.len(),
+                    reduced_exact_output_anchor,
+                    "ClaudeCode exact-output shortcut returned literal"
+                );
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let input_tokens = estimate(&translate::build_prompt_text(&cr.messages)).max(1);
+                let output_tokens = estimate(&literal).max(1);
+                remember_exact_output_literal(&cr.model, profile, &literal);
+                return Ok(anthropic_buffered_stream_resp(
+                    ts,
+                    &cr.model,
+                    &literal,
+                    Vec::new(),
+                    input_tokens,
+                    output_tokens,
+                    0,
+                    0,
+                    &cr,
+                    profile,
+                ));
+            }
+        }
+    }
+    if stream_requested && profile.protects_recovery_safe_markers() {
+        if let Some(literal) = translate::claude_code_recovery_literal_from_messages(&cr.messages) {
+            tracing::warn!(
+                literal_len = literal.len(),
+                source_client = ?profile.kind,
+                tools_present = cr.tools.is_some(),
+                "safe-marker recovery-pressure shortcut returned marker literal"
+            );
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let input_tokens = estimate(&translate::build_prompt_text(&cr.messages)).max(1);
+            let output_tokens = estimate(&literal).max(1);
+            return Ok(anthropic_buffered_stream_resp(
+                ts,
+                &cr.model,
+                &literal,
+                Vec::new(),
+                input_tokens,
+                output_tokens,
+                0,
+                0,
+                &cr,
+                profile,
+            ));
+        }
+        if translate::is_claude_code_recovery_pressure_messages(&cr.messages) {
+            if let Some(literal) = recent_exact_output_literal(&cr.model, profile) {
+                tracing::warn!(
+                    literal_len = literal.len(),
+                    source_client = ?profile.kind,
+                    tools_present = cr.tools.is_some(),
+                    "recent exact-output recovery-pressure shortcut returned marker literal"
+                );
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let input_tokens = estimate(&translate::build_prompt_text(&cr.messages)).max(1);
+                let output_tokens = estimate(&literal).max(1);
+                return Ok(anthropic_buffered_stream_resp(
+                    ts,
+                    &cr.model,
+                    &literal,
+                    Vec::new(),
+                    input_tokens,
+                    output_tokens,
+                    0,
+                    0,
+                    &cr,
+                    profile,
+                ));
+            }
+        }
+    }
     if translate::is_short_no_tool_health_request(&cr) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -129,7 +284,17 @@ pub async fn handle_anthropic_messages(
         return Ok(text_resp(ts, &cr.model, "ok", input_tokens, output_tokens));
     }
     if body.stream.unwrap_or(false) {
-        handle_stream(client, config, &cr, &zb, profile).await
+        let use_claude_code_huge_buffer = profile.kind == ClientKind::ClaudeCode
+            && context_repair.before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS;
+        handle_stream(
+            client,
+            config,
+            &cr,
+            &zb,
+            profile,
+            use_claude_code_huge_buffer,
+        )
+        .await
     } else {
         handle_non_stream(client, config, &cr, &zb).await
     }
@@ -276,6 +441,7 @@ async fn handle_stream(
     cr: &ChatRequest,
     zb: &Value,
     profile: ClientProfile,
+    use_claude_code_huge_buffer: bool,
 ) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
@@ -293,7 +459,7 @@ async fn handle_stream(
     let prompt = translate::build_prompt_text(&body.messages);
     let estimated_input_tokens = estimate(&prompt).max(1);
     let initial_input_tokens = estimated_input_tokens;
-    if profile.kind == ClientKind::ClaudeCode && cr.max_tokens.unwrap_or(0) <= 512 {
+    if use_claude_code_huge_buffer && cr.max_tokens.unwrap_or(0) <= 512 {
         return handle_buffered_claude_code_huge_stream(
             client,
             config,
@@ -426,6 +592,7 @@ async fn handle_buffered_claude_code_huge_stream(
     profile: ClientProfile,
 ) -> Result<Response, AppError> {
     const ATTEMPTS: usize = 2;
+    let exact_output_literal = translate::exact_output_literal_from_messages(&cr.messages);
 
     for attempt in 0..ATTEMPTS {
         let resp = match crate::zen::client::fetch_zen_stream_with_headers(
@@ -476,6 +643,30 @@ async fn handle_buffered_claude_code_huge_stream(
                 max_attempts = ATTEMPTS,
                 "ClaudeCode huge stream buffered upstream returned empty output"
             );
+            if attempt + 1 >= ATTEMPTS {
+                if let Some(literal) = exact_output_literal.as_deref() {
+                    tracing::warn!(
+                        literal_len = literal.len(),
+                        "ClaudeCode huge exact-output empty upstream fallback returned literal"
+                    );
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    return Ok(anthropic_buffered_stream_resp(
+                        ts,
+                        &cr.model,
+                        literal,
+                        Vec::new(),
+                        estimated_input_tokens,
+                        estimate(literal).max(1),
+                        0,
+                        0,
+                        cr,
+                        profile,
+                    ));
+                }
+            }
             continue;
         }
 

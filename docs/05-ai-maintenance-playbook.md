@@ -30,6 +30,9 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - base URL 使用 `http://100.69.228.93:8081`，除非用户更新。
 - API key 在报告中必须脱敏。
+- 不要把 token 名当作 API key；例如 NewAPI 日志里的 `token_name=ds` 不是可公开复用的明文 key。
+- channel 69 属于 `vip` 组；用 default 组或已删除 token 测出来的 401/403/`No available channel` 不能证明 ZenProxy 不可用。
+- `sk-dev` 已是历史失效 token，不再作为 panda channel 69 验收凭据。
 - 测试前清空或禁用代理环境变量，避免走错链路。
 - 报告必须列状态码、耗时、模型、协议类型、错误分类。
 - 不要用本机 `127.0.0.1:8081` 代替 panda。
@@ -86,6 +89,7 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - dry run 没通过前不启动 full run；2026-05-31 历史 dry run 曾暴露 huge_context、OpenClaw subagent 和上游 overload 红旗。
 - 2026-05-31 晚间 OpenClaw subagent 的 profile 误识别已修复，OpenClaw-only smoke 5/5、WSL 三客户端 smoke 15/15；但仍需重新跑 dry run 后才能进入 full run。
 - 2026-06-01 已在 panda 部署 ClaudeCode huge_context final-anchor 修复；panda 本机 `/v1/messages` 约 1.0MB source-side smoke 中 flash 3/3、lite 3/3 均返回 `HUGE_OK`，但这不是四客户端真实 dry run。
+- 2026-06-03 已在 panda 部署 channel 69 健康测试误判修复；空内容无工具探测应短路为 `ok`，小 `max_tokens` 请求不得进入 ClaudeCode huge buffered retry。
 - huge stream 日志里若出现 `ClaudeCode huge stream buffered upstream returned empty output`，先按 buffered retry 已兜底处理归类；只有最终裸透给客户端或耗尽重试才算失败。
 - 如果需要临时中止压测，保留已有 `raw-results.jsonl`，再生成 partial summary，不要补写伪造的完成数。
 

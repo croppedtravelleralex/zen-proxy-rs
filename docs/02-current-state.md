@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-06-01
+更新时间：2026-06-03
 分支：`codex/v46-quality-nonstream-gates`
 
 ## 代码已确认能力
@@ -18,7 +18,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - `fmt --check` 通过。
 - `clippy -D warnings` 通过。
-- `cargo test` 通过：库测试 60 条、kernel golden 46 条、doc tests 0 条。
+- `cargo test` 通过：库测试 61 条、kernel golden 62 条、doc tests 0 条。
 
 当前已实现并由测试覆盖的关键能力：
 
@@ -37,6 +37,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 13. Markdown fence 边界修复，降低流式代码块截断导致客户端显示异常的概率。
 14. `ParsedZenFrame::Event` 已装箱，`clippy::large_enum_variant` 已消除。
 15. 客户端 profile 已支持显式 `x-fmc-client`、header、UA 和 body/toolset 推断；OpenClaw 专属工具和 `OpenClaw` marker 优先于 ClaudeCode 共用工具名。
+16. 空内容、无工具的 OpenAI/Anthropic 健康探测会走本地短路 `ok`，不再误进上游或 huge buffered retry。
+17. ClaudeCode huge buffered stream 只在修复前估算输入 >= 50k tokens 时启用；小 `max_tokens` 健康探测不再触发 huge retry 路径。
 
 ## 运行链路事实
 
@@ -47,6 +49,15 @@ client -> panda NewAPI http://100.69.228.93:8081 -> configured upstream
 ```
 
 注意：本仓库文档目前不把 panda NewAPI 后面的真实渠道名写死。除非通过 NewAPI 管理端、日志或响应证据确认，否则后续报告只能写 “configured upstream”。
+
+2026-06-03 已确认的 channel 69 事实：
+
+- panda NewAPI channel 69 名称为 `Zenproxyrs4.3`，状态启用，分组为 `vip`。
+- channel 69 模型为 `deepseek-v4-flash,deepseek-v4-flash-lite`，base URL 为 `http://172.17.0.1:4000`。
+- `sk-dev` 已被删除且属于历史 default 组，不能用于判断 channel 69 是否可用。
+- NewAPI token 表中有效 `vip` 组 token 可通过 channel 69；文档和报告只记录 token id/name/group，不记录明文 key。
+- 2026-06-03 11:26 NewAPI 日志出现 channel 69 管理测试成功消费记录：`request_path=/v1/messages`、`stream_status=ok`、`frt=76ms`。
+- 2026-06-03 11:34 panda 本机 NewAPI 实测：`/v1/models` 200 且包含两个 deepseek 模型；OpenAI 非流式 `deepseek-v4-flash` 200，返回 `CHANNEL69_OPENAI_OK`；Anthropic 流式 `deepseek-v4-flash` 200，返回 `CHANNEL69_ANTHROPIC_OK`。
 
 历史探测事实：
 
@@ -144,6 +155,21 @@ P1.2 ClaudeCode huge_context final-anchor 修复部署记录：
 | huge stream smoke | panda 本机 `/v1/messages`，约 1.0MB 请求体，`source_client=claude-code`，触发 `appended_latest_user_anchor=true`；`deepseek-v4-flash` 3/3 返回 `HUGE_OK`，`deepseek-v4-flash-lite` 3/3 返回 `HUGE_OK`。 |
 | 耗时观察 | flash 三轮约 2.5s、2.7s、3.1s；lite 三轮约 3.2s、3.3s、14.8s。另有早期单轮 flash 3.9s 成功。 |
 | 残留观察 | 日志仍可见上游偶发空输出，buffered retry 已处理，未裸透给 smoke 客户端；这仍需在正式 dry run 中统计。 |
+
+P1.3 channel 69 健康测试/空输出误判修复部署记录：
+
+| 项 | 值 |
+|----|----|
+| 部署时间 | 2026-06-03 上午 |
+| 部署目标 | panda `/opt/zen-proxy-rs/zen-proxy-rs` |
+| 上一线上 hash | `66b883256e08d42dbc7e473e865dc9e05f5318260c290837530f5cacd62f912f` |
+| 实际部署 hash | `28b928472d2abc7be036cdc2796915865bd4a5b083ee2dd1dab46b1ddd0e2633` |
+| 备份 | `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-channel-test-fix-20260603-111524-66b8832` |
+| 实例 | `zen-proxy-rs@1:4001`、`zen-proxy-rs@2:4002`、`zen-proxy-rs@3:4004` |
+| 根因 | ClaudeCode 小 `max_tokens` 流式请求会误进 huge buffered retry；NewAPI channel test 的小/空探测因此被当作大上下文重试，最终出现 `upstream returned no assistant content or tool call`。 |
+| 修复 | 空内容无工具健康探测短路为本地 `ok`；ClaudeCode huge buffer 改为只按修复前输入 tokens >= 50k 触发。 |
+| 代码验证 | `free-model-client-rs` 的 `fmt --check`、`clippy -D warnings`、`cargo test` 通过。 |
+| panda 验证 | channel 69 管理测试日志成功；有效 `vip` 组 token 下 `/v1/models`、OpenAI 非流式、Anthropic 流式均 200。 |
 
 P1 待执行：
 

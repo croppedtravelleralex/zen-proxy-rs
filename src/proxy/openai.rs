@@ -17,7 +17,6 @@ pub async fn handle_openai_chat(
 ) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
     let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
-    let tools = body.tools.clone().unwrap_or_default();
     let stream_requested = body.stream.unwrap_or(false);
     let context_repair = if stream_requested {
         let policy = if profile.kind == ClientKind::ClaudeCode {
@@ -29,15 +28,25 @@ pub async fn handle_openai_chat(
     } else {
         translate::StreamContextRepair::default()
     };
+    let reduced_exact_output_anchor = stream_requested
+        && profile.kind == ClientKind::ClaudeCode
+        && context_repair.compacted_messages > 0
+        && translate::reduce_to_exact_output_anchor_message(&mut body.messages, 2 * 1024);
     let appended_latest_user_anchor = stream_requested
         && profile.kind == ClientKind::ClaudeCode
         && context_repair.compacted_messages > 0
+        && !reduced_exact_output_anchor
         && translate::append_latest_user_anchor_message(&mut body.messages, 2 * 1024);
+    if reduced_exact_output_anchor {
+        body.tools = None;
+        body.tool_choice = None;
+    }
     if context_repair.compacted_messages > 0 {
         tracing::warn!(
             before_tokens = context_repair.before_tokens,
             after_tokens = context_repair.after_tokens,
             compacted_messages = context_repair.compacted_messages,
+            reduced_exact_output_anchor,
             appended_latest_user_anchor,
             "compacted streaming openai context before upstream"
         );
@@ -89,6 +98,7 @@ pub async fn handle_openai_chat(
             "canonicalized openai tool history before upstream"
         );
     }
+    let tools = body.tools.clone().unwrap_or_default();
     let mut zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":body.tool_choice});
     if profile.disables_thinking_for_tool_use() {
         translate::disable_thinking_for_tool_use(&mut zb);

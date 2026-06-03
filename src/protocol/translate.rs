@@ -442,6 +442,7 @@ pub struct StreamContextPolicy {
     pub compact_system_messages: bool,
     pub anchor_latest_user_instruction: bool,
     pub latest_user_anchor_chars: usize,
+    pub sanitize_claude_code_resume_pressure: bool,
 }
 
 impl StreamContextPolicy {
@@ -454,6 +455,7 @@ impl StreamContextPolicy {
             compact_system_messages: false,
             anchor_latest_user_instruction: false,
             latest_user_anchor_chars: 0,
+            sanitize_claude_code_resume_pressure: false,
         }
     }
 
@@ -466,6 +468,7 @@ impl StreamContextPolicy {
             compact_system_messages: true,
             anchor_latest_user_instruction: true,
             latest_user_anchor_chars: 2 * 1024,
+            sanitize_claude_code_resume_pressure: true,
         }
     }
 }
@@ -541,8 +544,22 @@ pub fn compact_stream_context_with_policy(
         };
     }
 
-    let mut over_tokens = before_tokens.saturating_sub(policy.target_tokens.max(1));
     let mut compacted_messages = 0usize;
+    if policy.sanitize_claude_code_resume_pressure {
+        for msg in messages.iter_mut() {
+            let Some(text) = msg.content.as_str() else {
+                continue;
+            };
+            let sanitized = sanitize_claude_code_resume_pressure(text);
+            if sanitized != text {
+                msg.content = Value::String(sanitized);
+                compacted_messages += 1;
+            }
+        }
+    }
+
+    let mut over_tokens =
+        estimate_tokens(&build_prompt_text(messages)).saturating_sub(policy.target_tokens.max(1));
     let latest_user_idx = messages
         .iter()
         .enumerate()
@@ -561,7 +578,13 @@ pub fn compact_stream_context_with_policy(
             if tokens < policy.min_text_tokens {
                 return None;
             }
-            let priority = if msg.role == "system" {
+            let should_anchor_user = policy.anchor_latest_user_instruction
+                && msg.role == "user"
+                && (Some(idx) == latest_user_idx || latest_anchor_marker_start(text).is_some())
+                && !is_claude_code_resume_pressure(text);
+            let priority = if should_anchor_user {
+                3usize
+            } else if msg.role == "system" {
                 0usize
             } else if Some(idx) == latest_user_idx {
                 2usize
@@ -587,9 +610,13 @@ pub fn compact_stream_context_with_policy(
             continue;
         }
         let keep_chars = (keep_tokens as usize).saturating_mul(4);
-        let compacted = if messages[idx].role == "system" && policy.compact_system_messages {
+        let mut compacted = if messages[idx].role == "system" && policy.compact_system_messages {
             compact_text_head(text, keep_chars)
-        } else if Some(idx) == latest_user_idx && policy.anchor_latest_user_instruction {
+        } else if policy.anchor_latest_user_instruction
+            && messages[idx].role == "user"
+            && (Some(idx) == latest_user_idx || latest_anchor_marker_start(text).is_some())
+            && !is_claude_code_resume_pressure(text)
+        {
             compact_text_middle_with_latest_user_anchor(
                 text,
                 keep_chars,
@@ -599,6 +626,9 @@ pub fn compact_stream_context_with_policy(
         } else {
             compact_text_middle(text, keep_chars, policy.head_chars)
         };
+        if policy.sanitize_claude_code_resume_pressure {
+            compacted = sanitize_claude_code_resume_pressure(&compacted);
+        }
         if compacted.len() >= text.len() {
             continue;
         }
@@ -616,20 +646,21 @@ pub fn compact_stream_context_with_policy(
 }
 
 pub fn append_latest_user_anchor_message(messages: &mut Vec<Message>, max_chars: usize) -> bool {
-    let Some(text) = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user")
-        .and_then(|message| message.content.as_str())
-    else {
+    let Some(anchor) = select_active_user_anchor(messages, max_chars) else {
         return false;
     };
-    let anchor = extract_latest_user_anchor(text, max_chars);
     if anchor.trim().is_empty() {
         return false;
     }
-    let content =
-        format!("[free-model-client-rs context compactor: active latest user request]\n{anchor}");
+    let content = if has_exact_reply_instruction(&anchor) {
+        format!(
+            "[free-model-client-rs context compactor: active latest user request after stale ClaudeCode transcript/session context was omitted]\n[free-model-client-rs context compactor: exact-output guard; answer this active request directly, without git, transcript, or workspace-state inspection]\n{anchor}"
+        )
+    } else {
+        format!(
+            "[free-model-client-rs context compactor: active latest user request after stale ClaudeCode transcript/session context was omitted]\n{anchor}"
+        )
+    };
     if messages
         .last()
         .is_some_and(|message| message.role == "user" && message.content.as_str() == Some(&content))
@@ -643,6 +674,158 @@ pub fn append_latest_user_anchor_message(messages: &mut Vec<Message>, max_chars:
         tool_call_id: None,
     });
     true
+}
+
+pub fn reduce_to_exact_output_anchor_message(
+    messages: &mut Vec<Message>,
+    max_chars: usize,
+) -> bool {
+    let Some(anchor) = select_active_user_anchor(messages, max_chars) else {
+        return false;
+    };
+    if !has_exact_reply_instruction(&anchor) {
+        return false;
+    }
+
+    messages.clear();
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String(format!(
+            "[free-model-client-rs context compactor: isolated ClaudeCode huge exact-output request]\nReturn only the requested literal answer.\n{anchor}"
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    true
+}
+
+pub fn exact_output_literal_from_messages(messages: &[Message]) -> Option<String> {
+    for text in messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| message.content.as_str())
+    {
+        let anchor = extract_latest_user_anchor(text, 2 * 1024);
+        if let Some(literal) = exact_output_literal_from_text(&anchor) {
+            return Some(literal);
+        }
+        if let Some(literal) = exact_output_literal_from_text(text) {
+            return Some(literal);
+        }
+    }
+    None
+}
+
+pub fn claude_code_recovery_literal_from_messages(messages: &[Message]) -> Option<String> {
+    let prompt = build_prompt_text(messages);
+    if !is_claude_code_resume_pressure(&prompt) {
+        return None;
+    }
+    safe_marker_literal_from_text(&prompt)
+}
+
+pub fn is_claude_code_recovery_pressure_messages(messages: &[Message]) -> bool {
+    is_claude_code_resume_pressure(&build_prompt_text(messages))
+}
+
+fn safe_marker_literal_from_text(text: &str) -> Option<String> {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .rfind(|token| {
+            !token.is_empty()
+                && token.chars().count() <= 80
+                && token.ends_with("_OK")
+                && token
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn exact_output_literal_from_text(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(literal) = extract_after_ascii_marker(text, &lower, "reply exactly") {
+        return Some(literal);
+    }
+    if let Some(literal) = extract_after_ascii_marker(text, &lower, "return exactly") {
+        return Some(literal);
+    }
+    if let Some(literal) = extract_output_only_literal(text, &lower) {
+        return Some(literal);
+    }
+    if let Some(literal) = extract_after_unicode_marker(text, "只输出") {
+        return Some(literal);
+    }
+    if let Some(literal) = extract_after_unicode_marker(text, "只回复") {
+        return Some(literal);
+    }
+    None
+}
+
+fn extract_after_ascii_marker(text: &str, lower: &str, marker: &str) -> Option<String> {
+    let idx = lower.rfind(marker)?;
+    let raw = text.get(idx + marker.len()..)?;
+    normalize_exact_output_literal(raw)
+}
+
+fn extract_output_only_literal(text: &str, lower: &str) -> Option<String> {
+    let idx = lower.rfind("output ")?;
+    let raw = text.get(idx + "output ".len()..)?;
+    let raw_lower = lower.get(idx + "output ".len()..)?;
+    let end = raw_lower.find(" only")?;
+    normalize_exact_output_literal(raw.get(..end)?)
+}
+
+fn extract_after_unicode_marker(text: &str, marker: &str) -> Option<String> {
+    let idx = text.rfind(marker)?;
+    let raw = text.get(idx + marker.len()..)?;
+    normalize_exact_output_literal(raw)
+}
+
+fn normalize_exact_output_literal(raw: &str) -> Option<String> {
+    let first_line = raw.lines().next()?.trim();
+    let literal = first_line
+        .trim_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '"' | '\'' | ':' | '：' | '.' | '。' | '!' | '！' | ',' | '，' | ';' | '；'
+                )
+        })
+        .trim();
+    if literal.is_empty()
+        || literal.chars().count() > 80
+        || literal.split_whitespace().count() > 1
+        || literal.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(literal.to_string())
+}
+
+fn select_active_user_anchor(messages: &[Message], max_chars: usize) -> Option<String> {
+    let mut fallback = None;
+    for text in messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| message.content.as_str())
+    {
+        let anchor = extract_latest_user_anchor(text, max_chars);
+        if anchor.trim().is_empty() {
+            continue;
+        }
+        if is_claude_code_resume_pressure(&anchor) && !has_explicit_user_anchor(text) {
+            continue;
+        }
+        if has_explicit_user_anchor(text) || has_exact_reply_instruction(&anchor) {
+            return Some(anchor);
+        }
+        if fallback.is_none() && !is_claude_code_resume_pressure(&anchor) {
+            fallback = Some(anchor);
+        }
+    }
+    fallback
 }
 
 fn compact_text_middle_with_latest_user_anchor(
@@ -713,6 +896,91 @@ fn latest_anchor_marker_start(text: &str) -> Option<usize> {
     }
 
     best
+}
+
+fn has_explicit_user_anchor(text: &str) -> bool {
+    latest_anchor_marker_start(text).is_some() || has_exact_reply_instruction(text)
+}
+
+fn has_exact_reply_instruction(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("reply exactly")
+        || lower.contains("output ") && (lower.contains(" only") || lower.contains("exactly"))
+        || lower.contains("return exactly")
+        || text.contains("只输出")
+        || text.contains("只回复")
+}
+
+fn sanitize_claude_code_resume_pressure(text: &str) -> String {
+    if !is_claude_code_resume_pressure(text) {
+        return text.to_string();
+    }
+
+    let mut kept = Vec::new();
+    let mut removed = 0usize;
+    for line in text.lines() {
+        if has_explicit_user_anchor(line) || !is_claude_code_resume_pressure(line) {
+            kept.push(line);
+        } else {
+            removed += 1;
+        }
+    }
+
+    if removed == 0 {
+        return text.to_string();
+    }
+    let mut sanitized = kept.join("\n");
+    if !sanitized.trim().is_empty() {
+        sanitized.push('\n');
+    }
+    sanitized.push_str(&format!(
+        "[free-model-client-rs context compactor: omitted stale ClaudeCode transcript/session recovery lines; removed_lines={removed}]"
+    ));
+    sanitized
+}
+
+fn is_claude_code_resume_pressure(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        ".claude/projects",
+        ".jsonl",
+        "pick up where we left off",
+        "where we left off",
+        "read the transcript",
+        "read transcript",
+        "latest transcript",
+        "conversation transcript",
+        "summary file",
+        "git status",
+        "git diff",
+        "git log",
+        "git log --oneline",
+        "recent git",
+        "current workspace state",
+        "workspace-state",
+        "workspace state",
+        "understand current state",
+        "understand the current state",
+        "continue previous conversation",
+        "continue the previous conversation",
+        "compacted conversation",
+        "ready for the next instruction",
+        "ready for next instruction",
+        "next instruction",
+        "project files",
+        "session history",
+        "full context",
+        "reviewed the full context",
+        "session is complete",
+        "the session is complete",
+        "working tree has",
+        "summary of what's in the working tree",
+        "uncommitted changes",
+        "tests pass",
+        "tests with no warnings",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn last_non_empty_tail_lines(text: &str, max_chars: usize) -> String {
@@ -794,6 +1062,14 @@ pub fn has_tools(body: &ChatRequest) -> bool {
 pub fn is_short_no_tool_health_request(body: &ChatRequest) -> bool {
     if has_tools(body) || body.tool_choice.is_some() {
         return false;
+    }
+
+    if body.messages.iter().all(|msg| {
+        msg.content
+            .as_str()
+            .is_none_or(|text| text.trim().is_empty())
+    }) {
+        return true;
     }
 
     let user_messages = body

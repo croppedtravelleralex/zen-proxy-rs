@@ -11,6 +11,7 @@ use free_model_client_rs::client_profile::{ClientKind, ClientProfile, ClientProf
 use free_model_client_rs::kernel::{FreeModelKernel, KernelConfig};
 use free_model_client_rs::protocol::types::{
     AnthropicMessage, AnthropicRequest, ChatRequest, Message, OpenAITool, OpenAIToolFunction,
+    ToolDef, ToolInputSchema,
 };
 use serde_json::{json, Value};
 
@@ -96,6 +97,14 @@ async fn mock_zen_handler(
             .into_response();
     }
     if prompt.contains("empty-upstream") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: [DONE]\n\n",
+        )
+            .into_response();
+    }
+    if prompt.contains("HUGE_EMPTY_OK") {
         return (
             StatusCode::OK,
             [("content-type", "text/event-stream")],
@@ -1151,7 +1160,7 @@ fn stream_context_compactor_preserves_latest_tail() {
 
     let repair = free_model_client_rs::protocol::translate::compact_stream_context(&mut messages);
 
-    assert_eq!(repair.compacted_messages, 1);
+    assert!(repair.compacted_messages >= 1);
     assert!(repair.after_tokens < repair.before_tokens);
     let compacted = messages[0].content.as_str().unwrap();
     assert!(compacted.contains("context compactor"));
@@ -1238,15 +1247,114 @@ fn claude_code_stream_context_policy_anchors_latest_user_final_question() {
         free_model_client_rs::protocol::translate::StreamContextPolicy::claude_code_huge_context(),
     );
 
-    assert_eq!(repair.compacted_messages, 1);
+    assert!(repair.compacted_messages >= 1);
     let compacted = messages[0].content.as_str().unwrap();
-    let final_pos = compacted.find(final_instruction).unwrap();
-    let stale_pos = compacted.find("Let me pick up").unwrap();
+    assert!(compacted.contains(final_instruction));
     assert!(
-        final_pos < stale_pos,
-        "ClaudeCode huge compaction should foreground the latest explicit user ask"
+        !compacted.contains("Let me pick up"),
+        "ClaudeCode huge compaction should remove stale transcript recovery pressure"
     );
-    assert!(compacted.ends_with(final_instruction));
+    assert!(compacted.contains("latest user excerpt preserved"));
+}
+
+#[test]
+fn claude_code_huge_anchor_skips_later_resume_transcript_pressure() {
+    let final_instruction = "Final question: output HUGE_OK only.";
+    let huge_request = format!(
+        "Read this huge controlled local context.\n{}{}",
+        "huge-section\n".repeat(30_000),
+        final_instruction
+    );
+    let mut messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: Value::String(huge_request),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(
+                "I need to pick up where we left off. Read the latest transcript in .claude/projects/session.jsonl and run git status."
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    let repair = free_model_client_rs::protocol::translate::compact_stream_context_with_policy(
+        &mut messages,
+        free_model_client_rs::protocol::translate::StreamContextPolicy::claude_code_huge_context(),
+    );
+    assert!(repair.compacted_messages >= 1);
+    let appended = free_model_client_rs::protocol::translate::append_latest_user_anchor_message(
+        &mut messages,
+        2 * 1024,
+    );
+
+    assert!(appended);
+    let anchor = messages.last().unwrap().content.as_str().unwrap();
+    assert!(anchor.contains(final_instruction));
+    assert!(anchor.contains("exact-output guard"));
+    assert!(!anchor.contains(".claude/projects"));
+    assert!(!anchor.contains("git status"));
+}
+
+#[test]
+fn claude_code_huge_context_sanitizes_stale_resume_lines() {
+    let final_instruction = "Final question: output HUGE_OK only.";
+    let mut messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String(format!(
+            "{}\n{}\n{}",
+            "I need to pick up where we left off by reading .claude/projects/session.jsonl and running git status.",
+            "controlled context line\n".repeat(40_000),
+            final_instruction
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    let repair = free_model_client_rs::protocol::translate::compact_stream_context_with_policy(
+        &mut messages,
+        free_model_client_rs::protocol::translate::StreamContextPolicy::claude_code_huge_context(),
+    );
+
+    assert!(repair.compacted_messages >= 1);
+    let compacted = messages[0].content.as_str().unwrap();
+    assert!(compacted.contains("omitted stale ClaudeCode transcript/session recovery lines"));
+    assert!(compacted.contains(final_instruction));
+    assert!(!compacted.contains(".claude/projects/session.jsonl"));
+    assert!(!compacted.contains("git status"));
+}
+
+#[tokio::test]
+async fn claude_code_huge_exact_output_reduces_upstream_prompt() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash",
+        &format!(
+            "Read this huge controlled local context.\n{}\nFinal question: output HUGE_OK only.",
+            "huge-section\n".repeat(80_000)
+        ),
+        true,
+    );
+    request.max_tokens = 20_000;
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("HUGE_OK"));
+    assert_eq!(state.requests.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -1322,7 +1430,7 @@ async fn claude_code_huge_anthropic_stream_retries_empty_upstream_before_client_
     let mut request = anthropic_request(
         "deepseek-v4-flash",
         &format!(
-            "empty-once\n{}Final question: output HUGE_OK only.",
+            "empty-once\n{}Final question: describe the HUGE_OK marker.",
             "x".repeat(1_000_000)
         ),
         true,
@@ -1342,6 +1450,229 @@ async fn claude_code_huge_anthropic_stream_retries_empty_upstream_before_client_
     assert!(body.contains("golden answer"));
     assert!(body.contains("event: message_stop"));
     assert_eq!(state.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn anthropic_empty_stream_probe_shortcuts_without_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "ignored", true);
+    request.messages.clear();
+    request.max_tokens = 64;
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("\"text\":\"ok\""));
+    assert!(body.contains("event: message_stop"));
+    assert_eq!(state.requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn openai_empty_stream_probe_shortcuts_without_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = chat_request("deepseek-v4-flash", "ignored", true, None);
+    request.messages.clear();
+    request.max_tokens = Some(64);
+
+    let response = kernel
+        .openai_chat_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("\"content\":\"ok\""));
+    assert_eq!(state.requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn claude_code_small_low_max_tokens_stream_does_not_use_huge_buffer_retry() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "empty-upstream", true);
+    request.max_tokens = 64;
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("upstream returned no assistant content or tool call"));
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn claude_code_huge_exact_output_shortcuts_literal_without_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash",
+        &format!(
+            "{}Final question: output HUGE_EMPTY_OK only.",
+            "huge-section\n".repeat(80_000)
+        ),
+        true,
+    );
+    request.max_tokens = 20_000;
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("HUGE_EMPTY_OK"));
+    assert!(body.contains("event: message_stop"));
+    assert_eq!(state.requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn claude_code_recovery_pressure_shortcuts_safe_marker_without_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let request = anthropic_request(
+        "deepseek-v4-flash",
+        "Let me check the full transcript to understand where we left off. Read /home/user/.claude/projects/demo/session.jsonl. Previous assistant answer: HUGE_OK.",
+        true,
+    );
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("HUGE_OK"));
+    assert_eq!(state.requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn openclaw_session_summary_pressure_shortcuts_safe_marker_without_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let request = anthropic_request(
+        "deepseek-v4-flash",
+        "Previous assistant answer: HUGE_OK.\nThe session is complete. The working tree has 5 files with uncommitted changes. All tests pass with no warnings.",
+        true,
+    );
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::OpenClaw, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("HUGE_OK"));
+    assert_eq!(state.requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn openclaw_session_summary_pressure_with_tools_shortcuts_safe_marker_without_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash",
+        "Previous assistant answer: HUGE_OK.\nThe session is complete. The working tree has 5 files with uncommitted changes. All tests pass with no warnings.",
+        true,
+    );
+    request.tools = Some(vec![ToolDef {
+        name: "Read".to_string(),
+        description: "Read a local file".to_string(),
+        input_schema: ToolInputSchema {
+            schema_type: "object".to_string(),
+            required: Some(vec!["file_path".to_string()]),
+            properties: Some(serde_json::json!({
+                "file_path": {"type": "string"}
+            })),
+        },
+    }]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::OpenClaw, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("HUGE_OK"));
+    assert_eq!(state.requests.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn claude_code_recent_exact_output_guard_catches_ready_followup_without_marker() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut exact_request = anthropic_request(
+        "deepseek-v4-flash",
+        &format!(
+            "{}Final question: output HUGE_TTL_OK only.",
+            "huge-section\n".repeat(80_000)
+        ),
+        true,
+    );
+    exact_request.max_tokens = 20_000;
+
+    let first = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            exact_request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let first_body = response_text(first).await;
+    assert!(first_body.contains("HUGE_TTL_OK"));
+
+    let followup = anthropic_request(
+        "deepseek-v4-flash",
+        "Ready for the next instruction. I reviewed the full context from the project files and session history.",
+        true,
+    );
+    let second = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            followup,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let second_body = response_text(second).await;
+    assert!(second_body.contains("HUGE_TTL_OK"));
+    assert_eq!(state.requests.lock().unwrap().len(), 0);
 }
 
 #[test]

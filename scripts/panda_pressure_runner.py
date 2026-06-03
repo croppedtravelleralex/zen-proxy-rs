@@ -23,9 +23,10 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib import error, request
 from urllib.parse import urlparse
@@ -38,6 +39,8 @@ KEY_ENV_NAMES = ("PANDA_NEWAPI_KEY", "NEWAPI_API_KEY", "OPENAI_API_KEY")
 RESULT_PREFIX_LIMIT = 300
 STDERR_PREFIX_LIMIT = 1200
 SUBAGENT_CAPABLE_CLIENTS = {"windows-claudecode", "wsl-claudecode", "wsl-openclaw"}
+_WINDOWS_WORKSPACE_CACHE: dict[str, tuple[Path, Path | PureWindowsPath]] = {}
+_WINDOWS_WORKSPACE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -237,10 +240,15 @@ def prepare_workspace(run_dir: Path) -> Path:
     return workspace
 
 
-def build_prompt(case: CaseSpec, workspace: Path) -> str:
-    sample = workspace / "sample.txt"
-    numbers = workspace / "numbers.csv"
-    config = workspace / "nested" / "config.json"
+def build_prompt(
+    case: CaseSpec,
+    workspace: Path,
+    prompt_workspace: Path | PureWindowsPath | None = None,
+) -> str:
+    prompt_workspace = prompt_workspace or workspace
+    sample = prompt_workspace / "sample.txt"
+    numbers = prompt_workspace / "numbers.csv"
+    config = prompt_workspace / "nested" / "config.json"
     if case.case_type in {"short", "short_stream", "short_nonstream"}:
         return "Reply exactly OK. Do not add any other text."
     if case.case_type == "json":
@@ -437,6 +445,36 @@ def classify_process_error(rec: dict[str, Any]) -> str:
     return "unknown_error"
 
 
+def classify_api_error_text(text: str, status_code: int | None = None) -> str | None:
+    lower = (text or "").lower()
+    if not lower.strip() and status_code in {401, 403}:
+        return "auth_error"
+    if status_code in {401, 403}:
+        return "auth_error"
+    if (
+        "invalid token" in lower
+        or "invalid api key" in lower
+        or "invalid proxy api key" in lower
+        or "unauthorized" in lower
+    ):
+        return "auth_error"
+    if "no available channel" in lower or ("channel" in lower and "disabled" in lower):
+        return "channel_unavailable"
+    if "model_not_found" in lower or "model not found" in lower or "unknown model" in lower:
+        return "model_error"
+    if "system cpu overloaded" in lower or ("503" in lower and "overloaded" in lower):
+        return "upstream_overloaded"
+    if "failed to parse json" in lower or ("json" in lower and "parse" in lower):
+        return "stream_decode_error"
+    if "upstream returned no assistant content" in lower or "no assistant content" in lower:
+        return "empty_upstream"
+    if status_code and status_code >= 500:
+        return "server_error"
+    if status_code == 0:
+        return "network_error"
+    return None
+
+
 def classify_embedded_failure(result: str, rec: dict[str, Any]) -> str | None:
     """Some CLIs return 0 while printing provider/runtime failures as content."""
     text = f"{result or ''}\n{rec.get('stderr') or ''}\n{rec.get('stdout') or ''}".lower()
@@ -459,6 +497,8 @@ def classify_embedded_failure(result: str, rec: dict[str, Any]) -> str | None:
         return "tool_protocol_error"
     if "invalid api key" in text or "invalid proxy api key" in text or "unauthorized" in text:
         return "auth_error"
+    if "no available channel" in text or ("channel" in text and "disabled" in text):
+        return "channel_unavailable"
     if "model_not_found" in text or "model not found" in text or "unknown model" in text:
         return "model_error"
     return None
@@ -592,15 +632,12 @@ def claude_command(
     model: str,
     base_url: str,
     windows: bool = False,
+    include_settings: bool = True,
 ) -> list[str]:
     base = [
         "claude" if windows else "/home/lenovo/.local/bin/claude",
         "-p",
         "--bare",
-        "--setting-sources",
-        "",
-        "--settings",
-        claude_settings_json(base_url, model),
         "--model",
         model,
         "--output-format",
@@ -610,6 +647,13 @@ def claude_command(
         "--no-session-persistence",
         "--dangerously-skip-permissions",
     ]
+    if include_settings:
+        base[3:3] = [
+            "--setting-sources",
+            "",
+            "--settings",
+            claude_settings_json(base_url, model),
+        ]
     if case.tools:
         base.extend(
             [
@@ -619,8 +663,6 @@ def claude_command(
                 "Read,Task,Bash(cat:*),Bash(awk:*),Bash(python3:*)",
             ]
         )
-    else:
-        base.extend(["--tools", ""])
     return base
 
 
@@ -663,6 +705,10 @@ def powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def powershell_env_assignments(env: dict[str, str]) -> str:
+    return "; ".join(f"$env:{key} = {powershell_quote(value)}" for key, value in env.items())
+
+
 def wsl_to_windows_path(path: Path) -> str:
     try:
         proc = subprocess.run(
@@ -675,6 +721,89 @@ def wsl_to_windows_path(path: Path) -> str:
         return proc.stdout.strip()
     except Exception:
         return str(path)
+
+
+def windows_temp_dir_pair() -> tuple[Path, PureWindowsPath]:
+    if os.name == "nt":
+        temp = Path(os.environ.get("TEMP") or tempfile.gettempdir())
+        return temp, PureWindowsPath(str(temp))
+
+    win_temp = ""
+    for cmd in (
+        ["cmd.exe", "/c", "echo %TEMP%"],
+        ["powershell.exe", "-NoProfile", "-Command", "[System.IO.Path]::GetTempPath()"],
+    ):
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            win_temp = proc.stdout.decode("utf-8", errors="ignore").strip()
+            if win_temp:
+                break
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    if not win_temp:
+        win_temp = r"C:\Users\Lenovo\AppData\Local\Temp"
+    try:
+        wsl_proc = subprocess.run(
+            ["wslpath", "-u", win_temp],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        wsl_temp = Path(wsl_proc.stdout.strip())
+    except (OSError, subprocess.CalledProcessError):
+        wsl_temp = Path("/mnt/c/Users/Lenovo/AppData/Local/Temp")
+    return wsl_temp, PureWindowsPath(win_temp)
+
+
+def copy_workspace_for_windows(
+    workspace: Path,
+    run_dir: Path,
+) -> tuple[Path, Path | PureWindowsPath]:
+    """Return a Windows-local workspace and prompt path root for ClaudeCode.
+
+    ClaudeCode on Windows cannot reliably run from a ``\\wsl.localhost`` cwd.
+    Keep the runner output under the repo, but run Windows ClaudeCode from a
+    local TEMP workspace with Windows paths in the prompt.
+    """
+
+    key = f"{workspace.resolve()}::{run_dir.name}"
+    with _WINDOWS_WORKSPACE_LOCK:
+        cached = _WINDOWS_WORKSPACE_CACHE.get(key)
+        if cached:
+            return cached
+        temp_root, prompt_root = windows_temp_dir_pair()
+        local_root = temp_root / "zenproxy-panda-pressure" / run_dir.name
+        local_workspace = local_root / "workspace"
+        try:
+            if local_workspace.exists():
+                shutil.rmtree(local_workspace)
+            copy_tree_contents(workspace, local_workspace)
+            prompt_workspace = prompt_root / "zenproxy-panda-pressure" / run_dir.name / "workspace"
+        except OSError:
+            local_workspace = workspace
+            prompt_workspace = workspace
+        cached = (local_workspace, prompt_workspace)
+        _WINDOWS_WORKSPACE_CACHE[key] = cached
+        return cached
+
+
+def copy_tree_contents(src: Path, dst: Path) -> None:
+    """Copy file bytes only; drvfs can reject metadata preservation."""
+
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        target = dst / item.name
+        if item.is_dir():
+            copy_tree_contents(item, target)
+        elif item.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(item, target)
 
 
 def windows_claude_available() -> bool:
@@ -728,7 +857,7 @@ def run_windows_claudecode(
                 "error_class": "config_error",
                 "config_mode": "windows-native",
             }
-        cmd = claude_command(case, model, base_url, windows=True)
+        cmd = claude_command(case, model, base_url, windows=True, include_settings=False)
         cmd[0] = claude
         rec = run_process(cmd, workspace, env, timeout_ms, prompt_text)
         result, usage, tool_count, first_content_offset = extract_claude_stream(rec.get("stdout", ""))
@@ -765,14 +894,14 @@ def run_windows_claudecode(
     prompt_path = workspace / f"prompt-{uuid.uuid4().hex}.txt"
     prompt_path.write_text(prompt_text, encoding="utf-8")
     win_prompt = wsl_to_windows_path(prompt_path)
-    args = claude_command(case, model, base_url, windows=True)
+    args = claude_command(case, model, base_url, windows=True, include_settings=False)
     ps_args = " ".join(powershell_quote(arg) for arg in args[1:])
     ps = (
-        "$p = Get-Content -Raw -LiteralPath "
+        powershell_env_assignments(env)
+        + "; Get-Content -Raw -LiteralPath "
         + powershell_quote(win_prompt)
-        + "; claude "
+        + " | claude "
         + ps_args
-        + " $p"
     )
     rec = run_process(
         [
@@ -993,7 +1122,11 @@ def run_case(
     models: list[str],
 ) -> dict[str, Any]:
     request_id = f"{client}-{idx:04d}-{uuid.uuid4().hex[:8]}"
-    prompt_text = build_prompt(case, workspace)
+    case_workspace = workspace
+    prompt_workspace: Path | PureWindowsPath | None = None
+    if client == "windows-claudecode":
+        case_workspace, prompt_workspace = copy_workspace_for_windows(workspace, run_dir)
+    prompt_text = build_prompt(case, case_workspace, prompt_workspace)
     prompt_bytes = len(prompt_text.encode("utf-8"))
     prompt_tokens = estimate_tokens(prompt_text)
     started = time.time()
@@ -1035,13 +1168,13 @@ def run_case(
     }
     try:
         if client == "wsl-claudecode":
-            rec = run_wsl_claudecode(case, model, prompt_text, workspace, base_url, key, timeout_ms)
+            rec = run_wsl_claudecode(case, model, prompt_text, case_workspace, base_url, key, timeout_ms)
         elif client == "windows-claudecode":
-            rec = run_windows_claudecode(case, model, prompt_text, workspace, base_url, key, timeout_ms)
+            rec = run_windows_claudecode(case, model, prompt_text, case_workspace, base_url, key, timeout_ms)
         elif client == "wsl-hermes":
-            rec = run_hermes(case, model, prompt_text, workspace, base_url, key, timeout_ms, run_dir)
+            rec = run_hermes(case, model, prompt_text, case_workspace, base_url, key, timeout_ms, run_dir)
         elif client == "wsl-openclaw":
-            rec = run_openclaw(case, model, prompt_text, workspace, base_url, key, timeout_ms, run_dir, models)
+            rec = run_openclaw(case, model, prompt_text, case_workspace, base_url, key, timeout_ms, run_dir, models)
         else:
             rec = {
                 "ok": False,
@@ -1209,6 +1342,27 @@ def preflight(base_url: str, key: str, models: list[str], timeout_s: int) -> dic
             content = str(chat_parsed["choices"][0]["message"].get("content") or "")
         except Exception:
             content = ""
+    models_error_class = classify_api_error_text(raw, status)
+    chat_error_class = classify_api_error_text(chat_raw, chat_status)
+    error_class = models_error_class or chat_error_class
+    if status == 200 and missing and not error_class:
+        error_class = "model_error"
+    chat_ok = chat_status == 200 and "ok" in content.lower()
+    ok = status == 200 and not missing and chat_ok
+    if not ok and not error_class:
+        error_class = "preflight_failed"
+    blocker = None
+    if not ok:
+        if error_class == "auth_error":
+            blocker = "invalid_or_missing_newapi_token"
+        elif error_class == "channel_unavailable":
+            blocker = "newapi_channel_unavailable"
+        elif missing:
+            blocker = "target_models_missing_from_newapi"
+        elif chat_status != 200:
+            blocker = "minimal_chat_failed"
+        else:
+            blocker = "minimal_chat_semantic_failed"
     return {
         "models_status": status,
         "models_total_ms": total_ms,
@@ -1220,7 +1374,9 @@ def preflight(base_url: str, key: str, models: list[str], timeout_s: int) -> dic
         "chat_total_ms": chat_total,
         "chat_first_byte_ms": chat_first,
         "chat_content_prefix": content[:RESULT_PREFIX_LIMIT] or chat_raw[:RESULT_PREFIX_LIMIT],
-        "ok": status == 200 and not missing and chat_status == 200 and "ok" in content.lower(),
+        "error_class": error_class,
+        "blocker": blocker,
+        "ok": ok,
         "redaction_ok": key not in raw and key not in chat_raw,
     }
 
@@ -1263,7 +1419,12 @@ def run_matrix(args: argparse.Namespace) -> int:
     if not pf.get("ok") and not args.force:
         print(
             json.dumps(
-                {"event": "blocked", "reason": "preflight failed; pass --force to continue"},
+                {
+                    "event": "blocked",
+                    "reason": "preflight failed; pass --force to continue",
+                    "error_class": pf.get("error_class"),
+                    "blocker": pf.get("blocker"),
+                },
                 ensure_ascii=False,
             ),
             flush=True,

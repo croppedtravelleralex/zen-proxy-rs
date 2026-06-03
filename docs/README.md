@@ -61,14 +61,18 @@ P0 已完成但待文档收尾：
 
 1. 90 分客户端识别和 policy 隔离已落地并部署到 panda。
 2. 无密钥 panda 压测执行器已落地到 `scripts/panda_pressure_runner.py`。
-3. preflight/smoke 已通过。
-4. OpenClaw body/profile 识别修复已部署到 panda，OpenClaw-only smoke 5/5 通过，WSL 三客户端 smoke 15/15 通过。
-5. dry run 仍未重新通过：huge_context、`deepseek-v4-flash-lite` 长上下文语义漂移、Hermes 慢路径和上游 overload/502/524 仍需处理。
+3. 2026-06-02 exact-output TTL guard 已部署到 panda，ZenProxy 4000/4001/4002/4004 直连健康。
+4. 2026-06-03 channel 69 空输出/健康测试误判已从源头修复并部署到 panda；`Zenproxyrs4.3` channel 69 当前启用，`vip` 组，指向 `http://172.17.0.1:4000`。
+5. `sk-dev` 已不是有效压测 token，且属于历史 default 组；测试 channel 69 必须使用 NewAPI 中有效的 `vip` 组 token，报告中不得打印明文 key。
+6. preflight 已补充 `auth_error`、`channel_unavailable`、`blocker` 分类；无有效 NewAPI token 或目标渠道不可用时会阻断，不进入 smoke/dry/full。
+7. OpenClaw body/profile 识别修复已部署到 panda，OpenClaw-only smoke 5/5 通过，WSL 三客户端 smoke 15/15 通过。
+8. dry run 仍未重新通过：huge_context、`deepseek-v4-flash-lite` 长上下文语义漂移、Hermes 慢路径和上游 overload/502/524 仍需处理。
 
 仍需执行：
 
 1. 清理或归类 `.codex_tmp/`、`configured`、`panda`、异常字符文件等未跟踪项。
-2. 先处理/复测 dry-run 红旗，不直接启动 4 客户端 x 500 full run。
-3. 针对 huge_context lane、lite 长上下文策略和 Hermes 慢路径做修复或降级，再重新跑 dry run。
-4. 跑 full run 前再次确认不会污染 Hermes/OpenClaw/ClaudeCode 用户默认配置。
-5. 提交前复跑必要验证，并确认 README 与维护文档无旧状态残留。
+2. 用有效 `vip` 组 token 复跑 panda-only smoke/dry；不要再用 `sk-dev` 判断 channel 69 状态。
+3. 先处理/复测 dry-run 红旗，不直接启动 4 客户端 x 500 full run。
+4. 针对 huge_context lane、lite 长上下文策略和 Hermes 慢路径做修复或降级，再重新跑 dry run。
+5. 跑 full run 前再次确认不会污染 Hermes/OpenClaw/ClaudeCode 用户默认配置。
+6. 提交前复跑必要验证，并确认 README 与维护文档无旧状态残留。
