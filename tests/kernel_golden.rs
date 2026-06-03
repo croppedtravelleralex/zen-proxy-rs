@@ -705,6 +705,38 @@ async fn anthropic_empty_stream_with_tools_reports_empty_output_without_syntheti
 }
 
 #[tokio::test]
+async fn openai_non_stream_channel_probe_empty_upstream_returns_local_ok() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "echo hi", false, None),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("\"content\":\"ok\""));
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn anthropic_non_stream_channel_probe_empty_upstream_returns_local_ok() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "echo hi", false),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("\"text\":\"ok\""));
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn openai_role_only_stream_is_rejected_as_empty_upstream() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);

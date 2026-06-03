@@ -176,9 +176,9 @@ pub async fn handle_anthropic_messages(
     if body.stream.unwrap_or(false) {
         let use_claude_code_huge_buffer = profile.kind == ClientKind::ClaudeCode
             && (context_repair.before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS
-                || cr
-                    .max_tokens
-                    .is_some_and(|max_tokens| max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS));
+                || cr.max_tokens.is_some_and(|max_tokens| {
+                    max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS
+                }));
         handle_stream(
             client,
             config,
@@ -231,6 +231,18 @@ async fn handle_non_stream(
         }
         if let Some(output) = output {
             output
+        } else if last_empty && translate::is_short_no_tool_channel_test_probe(cr) {
+            tracing::warn!(
+                model = cr.model,
+                source_client = ?profile.kind,
+                "short non-stream channel-test probe received empty upstream; returning local ok"
+            );
+            let prompt = translate::build_prompt_text(&cr.messages);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            return Ok(text_resp(ts, &cr.model, "ok", estimate(&prompt), 1));
         } else if last_empty {
             return Err(AppError::empty_upstream());
         } else {

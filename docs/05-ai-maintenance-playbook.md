@@ -46,7 +46,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 - Hermes/OpenClaw 默认策略：保留协议兼容修复，但任何补齐或降级都必须记录 profile 和 repair count。
 - unknown 默认策略：不禁 thinking，只做最小协议修复。
 - 新增或调整客户端 profile 时，必须补 profile 维度测试，至少覆盖 thinking、stream whitespace、tool history 三类策略。
-- 当前 OpenClaw 自动识别必须优先看 body marker 和 OpenClaw 专属工具集，再看 ClaudeCode 共用工具名；`read/write/edit` 这类共用工具不能把 OpenClaw 误识别成 ClaudeCode。
+- 当前 OpenClaw 自动识别必须优先看强 body marker 和 OpenClaw 专属工具集，再看 ClaudeCode 共用工具名；`read/write/edit` 这类共用工具不能把 OpenClaw 误识别成 ClaudeCode，`web_fetch`/`web_search` 也不能单独把 ClaudeCode 误识别成 OpenClaw。
+- 普通用户正文里提到 OpenClaw/Hermes 不是客户端身份信号；只有 `running inside openclaw/hermes`、`openclaw cli/agent`、`hermes cli/agent` 等强 marker 才能作为 body marker。
 
 ## Hermes/OpenClaw 测试纪律
 
@@ -91,8 +92,18 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - 2026-06-01 已在 panda 部署 ClaudeCode huge_context final-anchor 修复；panda 本机 `/v1/messages` 约 1.0MB source-side smoke 中 flash 3/3、lite 3/3 均返回 `HUGE_OK`，但这不是四客户端真实 dry run。
 - 2026-06-03 已在 panda 部署 channel 69 健康测试误判修复；空内容无工具探测应短路为 `ok`，小 `max_tokens` 请求不得进入 ClaudeCode huge buffered retry。
 - 2026-06-03 已补管理端测渠道第二层兜底：`echo hi`/`hi`/`hello`/`test` 类极短流式无工具探测，只有在上游空输出时才降级为本地 `ok`；普通请求不应提前短路。
+- 2026-06-03 晚间已部署源码层非流式第二层兜底：同类极短非流式无工具探测在上游连续空输出后返回本地 `ok`；普通请求仍返回结构化空输出错误。
+- 2026-06-03 晚间已部署 ClaudeCode 格式误伤修复：`web_fetch`/`web_search` 和普通 OpenClaw/Hermes 文本引用不再把请求判为 OpenClaw；受控 `Task + web_fetch` `/v1/messages` 新 pid 日志为 `source_client=claude-code`。
+- panda 当前没有 Rust 工具链；上线源码补丁时优先在本机/WSL 构建 Linux release，再上传 strip 后二进制，不要在生产机上临时高负载编译。
+- Windows `ssh panda` 使用 `C:\Users\Lenovo\.ssh\config` 中的 `root@100.69.228.93`；WSL 默认 `ssh panda` 可能没有该配置。WSL 需要显式使用 `/mnt/c/Users/Lenovo/.ssh/id_ed25519`。
 - huge stream 日志里若出现 `ClaudeCode huge stream buffered upstream returned empty output`，先按 buffered retry 已兜底处理归类；只有最终裸透给客户端或耗尽重试才算失败。
 - 如果需要临时中止压测，保留已有 `raw-results.jsonl`，再生成 partial summary，不要补写伪造的完成数。
+
+## 常见现象解释
+
+- prompt tokens 稳定在约 60k：默认流式 compactor 在超过 80k 后压到约 60k；如果 ClaudeCode 被误判为 OpenClaw，就不会走 ClaudeCode huge-context 约 12k 目标。
+- NewAPI cache tokens 几乎为 0：当前链路只转发上游 usage 里的缓存字段；上游不返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 `cached_tokens` 时，ZenProxy 不自行制造缓存计数。
+- ClaudeCode CLI Markdown/表格/代码块/列表显示异常：先抓 raw SSE 和 `source_client`。若新 pid 仍不是 `claude-code`，优先查 profile 识别；若 raw SSE 正确但终端显示错，再归类为 CLI 渲染问题。
 
 必须记录：
 

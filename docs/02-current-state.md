@@ -5,20 +5,21 @@
 
 ## 代码已确认能力
 
-已通过本轮 WSL 原生路径验证：
+最新源码验证使用 WSL 原生路径和临时 target，避免 UNC target 增量锁问题：
 
 ```bash
 cd /home/lenovo/free-model-client-rs
 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo fmt -- --check
-CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo clippy --all-targets -- -D warnings
 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 ```
 
 结果：
 
 - `fmt --check` 通过。
-- `clippy -D warnings` 通过。
-- `cargo test` 通过：库测试 61 条、kernel golden 64 条、doc tests 0 条。
+- `cargo test` 通过：库测试 64 条、kernel golden 70 条、doc tests 0 条。
+- 同轮 `zen-proxy-rs` 验证通过：主单元测试 129 条、e2e 26 条。
+
+注意：上一轮部署记录中的 `clippy -D warnings` 属于历史验证事实；本次 profile/格式误伤修复未重新跑 clippy。
 
 当前已实现并由测试覆盖的关键能力：
 
@@ -36,7 +37,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 12. 429 上游错误保留 `Retry-After` 等关键响应头信息。
 13. Markdown fence 边界修复，降低流式代码块截断导致客户端显示异常的概率。
 14. `ParsedZenFrame::Event` 已装箱，`clippy::large_enum_variant` 已消除。
-15. 客户端 profile 已支持显式 `x-fmc-client`、header、UA 和 body/toolset 推断；OpenClaw 专属工具和 `OpenClaw` marker 优先于 ClaudeCode 共用工具名。
+15. 客户端 profile 已支持显式 `x-fmc-client`、header、UA 和 body/toolset 推断；只有强 OpenClaw/Hermes marker 或 OpenClaw 专属工具集才覆盖 ClaudeCode，普通正文提到 OpenClaw/Hermes、或只带 `web_fetch`/`web_search` 不再误判为 OpenClaw。
 16. 空内容、无工具的 OpenAI/Anthropic 健康探测会走本地短路 `ok`，不再误进上游或 huge buffered retry。
 17. ClaudeCode huge buffered stream 只在修复前估算输入 >= 50k tokens 时启用；小 `max_tokens` 健康探测不再触发 huge retry 路径。
 18. NewAPI 管理端测渠道常见的极短 `echo hi` 流式探测，如果上游空输出，会返回本地 `ok`，只在无工具、单用户消息、`max_tokens <= 64` 的探测形态触发，避免误伤普通请求。
@@ -173,6 +174,35 @@ P1.3 channel 69 健康测试/空输出误判修复部署记录：
 | 代码验证 | `free-model-client-rs` 的 `fmt --check`、`clippy -D warnings`、`cargo test` 通过；kernel golden 64 条。 |
 | panda 验证 | channel 69 管理测试日志成功；有效 `vip` 组 token 下 `/v1/models`、OpenAI 非流式、Anthropic 流式均 200。 |
 | 第二层验收 | panda NewAPI 有效 `vip` 组 token 下，`echo hi`/`max_tokens=16`/stream 探测 10/10 返回 200，`empty_error=0`；ZenProxy 日志确认上游空流被本地 `ok` 兜底。 |
+
+P1.4 非流式渠道探针兜底源码记录：
+
+| 项 | 值 |
+|----|----|
+| 修改时间 | 2026-06-03 晚间 |
+| 状态 | 已随 2026-06-03 晚间 profile/格式误伤修复一并部署到 panda。 |
+| 修复 | `echo hi`/`hi`/`hello`/`test` 类极短非流式无工具探针，在上游连续空输出后返回本地 `ok`；普通请求仍返回结构化空输出错误。 |
+| 代码范围 | `src/protocol/translate.rs`、`src/proxy/anthropic.rs`、`src/proxy/openai.rs`、`tests/kernel_golden.rs`。 |
+| 验证 | WSL 临时 target：`cargo fmt --check`、`cargo test`；结果为库测试 64 条、kernel golden 70 条、doc tests 0 条全部通过。 |
+| panda 部署 | 线上 hash 已更新为 `e47e2c89d7c0c497daa2cd49a9d135a8b695928e951f81a22630b206a0e2ab51`；备份为 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-profile-format-20260603-202631-cdafae8`。 |
+
+P1.5 ClaudeCode 格式误伤修复部署记录：
+
+| 项 | 值 |
+|----|----|
+| 部署时间 | 2026-06-03 晚间 |
+| 根因 | `free-model-client-rs` 内核和 `zen-proxy-rs` 外层都曾把正文里普通出现的 `OpenClaw/Hermes`、以及 `web_fetch`/`web_search` 工具名当成 OpenClaw 强信号，导致 ClaudeCode 请求可能走 OpenClaw/Hermes 兼容策略，不再逐字保留 Markdown/空白。 |
+| 修复 | 收窄 body marker，只接受 `running inside openclaw/hermes`、`openclaw cli/agent`、`hermes cli/agent` 等强 marker；`web_fetch`/`web_search` 不再单独触发 OpenClaw；OpenClaw 仍由 `subagents`、`sessions_*`、`memory_*`、`openclaw*` 等专属工具识别。 |
+| 代码范围 | `src/client_profile.rs`；`zen-proxy-rs/src/v4/provider.rs`。 |
+| 测试 | 新增 ClaudeCode + Web 工具、普通 OpenClaw/Hermes 文本引用、Web-only 工具三类回归；free-model 库测试 64/64、kernel golden 70/70；ZenProxy 单元 129/129、e2e 26/26。 |
+| panda 验证 | 新 pid `365354/365378/365392` 全部健康；`/v1/models` 200 且只暴露 `deepseek-v4-flash`、`deepseek-v4-flash-lite`；受控 `Task + web_fetch` `/v1/messages` 日志显示 `source_client=claude-code`。 |
+| 运行观察 | 旧 pid `350170/350205/350216` 日志中大量 `source_client=openclaw` 属于部署前误伤；部署后新 pid 日志里的受控样本已转为 `claude-code`。 |
+
+## 当前数据解释
+
+1. “输入几乎 70k/60k”主要来自流式上下文压缩策略：默认 `StreamContextPolicy` 在估算输入超过 80k tokens 时触发，把 prompt 压到约 60k tokens；日志里的 `after_tokens=60149/60150` 是这个目标值和锚点开销，不是 NewAPI 随机制造。
+2. ClaudeCode 专用 huge-context 策略目标约 12k tokens，但前提是请求被识别为 ClaudeCode；误判成 OpenClaw 时会走默认 60k 策略，这也是本次 profile 修复要解决的核心原因之一。
+3. 缓存几乎为 0 是因为上游 usage 基本没有返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 OpenAI `cached_tokens`；当前 ZenProxy 只转发上游缓存计数，不会自行伪造 provider cache 命中。
 
 P1 待执行：
 

@@ -168,13 +168,13 @@ fn infer_from_message_values<'a>(
 ) -> Option<ClientProfile> {
     for value in values {
         let text = value_to_text(value);
-        if infer_client_kind_from_text(&text) == Some(ClientKind::OpenClaw) {
+        if infer_client_kind_from_body_text(&text) == Some(ClientKind::OpenClaw) {
             return Some(ClientProfile::new(
                 ClientKind::OpenClaw,
                 ClientProfileSource::Body,
             ));
         }
-        if infer_client_kind_from_text(&text) == Some(ClientKind::Hermes) {
+        if infer_client_kind_from_body_text(&text) == Some(ClientKind::Hermes) {
             return Some(ClientProfile::new(
                 ClientKind::Hermes,
                 ClientProfileSource::Body,
@@ -203,23 +203,7 @@ fn value_to_text(value: &serde_json::Value) -> String {
 
 fn infer_from_tool_names<'a>(tool_names: impl Iterator<Item = &'a str>) -> Option<ClientProfile> {
     let names = tool_names.map(normalize).collect::<Vec<_>>();
-    if names.iter().any(|name| {
-        matches!(
-            name.as_str(),
-            "subagents"
-                | "sessionsspawn"
-                | "sessionssend"
-                | "sessionsyield"
-                | "sessionstatus"
-                | "sessionsstatus"
-                | "sessionshistory"
-                | "sessionslist"
-                | "memoryget"
-                | "memorysearch"
-                | "webfetch"
-                | "websearch"
-        ) || name.contains("openclaw")
-    }) {
+    if names.iter().any(|name| is_openclaw_strong_tool_name(name)) {
         return Some(ClientProfile::new(
             ClientKind::OpenClaw,
             ClientProfileSource::Body,
@@ -254,6 +238,49 @@ fn infer_from_tool_names<'a>(tool_names: impl Iterator<Item = &'a str>) -> Optio
     None
 }
 
+fn infer_client_kind_from_body_text(value: &str) -> Option<ClientKind> {
+    let lower = value.to_ascii_lowercase();
+    if contains_strong_openclaw_marker(&lower) {
+        return Some(ClientKind::OpenClaw);
+    }
+    if contains_strong_hermes_marker(&lower) {
+        return Some(ClientKind::Hermes);
+    }
+    None
+}
+
+fn contains_strong_openclaw_marker(lower: &str) -> bool {
+    lower.contains("running inside openclaw")
+        || lower.contains("openclaw cli")
+        || lower.contains("openclaw agent")
+        || lower.contains("openclaw_config")
+        || lower.contains("openclaw-config")
+}
+
+fn contains_strong_hermes_marker(lower: &str) -> bool {
+    lower.contains("running inside hermes")
+        || lower.contains("hermes cli")
+        || lower.contains("hermes agent")
+        || lower.contains("hermes_config")
+        || lower.contains("hermes-config")
+}
+
+fn is_openclaw_strong_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "subagents"
+            | "sessionsspawn"
+            | "sessionssend"
+            | "sessionsyield"
+            | "sessionstatus"
+            | "sessionsstatus"
+            | "sessionshistory"
+            | "sessionslist"
+            | "memoryget"
+            | "memorysearch"
+    ) || name.contains("openclaw")
+}
+
 fn normalize(value: &str) -> String {
     value
         .chars()
@@ -271,6 +298,17 @@ mod tests {
     };
     use serde_json::Value;
 
+    fn openai_tool(name: &str) -> OpenAITool {
+        OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: name.to_string(),
+                description: None,
+                parameters: None,
+            },
+        }
+    }
+
     fn openai_request_with_tool(name: &str) -> ChatRequest {
         ChatRequest {
             model: "deepseek-v4-flash".to_string(),
@@ -284,14 +322,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             top_p: None,
-            tools: Some(vec![OpenAITool {
-                tool_type: "function".to_string(),
-                function: OpenAIToolFunction {
-                    name: name.to_string(),
-                    description: None,
-                    parameters: None,
-                },
-            }]),
+            tools: Some(vec![openai_tool(name)]),
             tool_choice: None,
         }
     }
@@ -318,36 +349,55 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_web_tools_do_not_infer_openclaw() {
+        let mut request = openai_request_with_tool("Task");
+        request.tools = Some(vec![
+            openai_tool("Task"),
+            openai_tool("TodoWrite"),
+            openai_tool("web_fetch"),
+            openai_tool("web_search"),
+        ]);
+
+        let profile = ClientProfile::from_openai(&HeaderMap::new(), &request);
+
+        assert_eq!(profile.kind, ClientKind::ClaudeCode);
+        assert_eq!(profile.source, ClientProfileSource::Body);
+    }
+
+    #[test]
+    fn ordinary_openclaw_reference_does_not_override_claude_tools() {
+        let mut request = openai_request_with_tool("Task");
+        request.messages[0].content = Value::String(
+            "Compare OpenClaw and Hermes behavior, then use Task if needed.".to_string(),
+        );
+
+        let profile = ClientProfile::from_openai(&HeaderMap::new(), &request);
+
+        assert_eq!(profile.kind, ClientKind::ClaudeCode);
+        assert_eq!(profile.source, ClientProfileSource::Body);
+    }
+
+    #[test]
+    fn web_tools_alone_are_not_openclaw_heuristic() {
+        let mut request = openai_request_with_tool("web_search");
+        request.tools = Some(vec![openai_tool("web_fetch"), openai_tool("web_search")]);
+
+        let profile = ClientProfile::from_openai(&HeaderMap::new(), &request);
+
+        assert_eq!(profile.kind, ClientKind::Unknown);
+        assert_eq!(profile.source, ClientProfileSource::Unknown);
+    }
+
+    #[test]
     fn openclaw_toolset_wins_over_claude_like_tool_names() {
         let mut request = openai_request_with_tool("read");
         request.messages[0].role = "system".to_string();
         request.messages[0].content =
             Value::String("You are a personal assistant running inside OpenClaw.".to_string());
         request.tools = Some(vec![
-            OpenAITool {
-                tool_type: "function".to_string(),
-                function: OpenAIToolFunction {
-                    name: "read".to_string(),
-                    description: None,
-                    parameters: None,
-                },
-            },
-            OpenAITool {
-                tool_type: "function".to_string(),
-                function: OpenAIToolFunction {
-                    name: "subagents".to_string(),
-                    description: None,
-                    parameters: None,
-                },
-            },
-            OpenAITool {
-                tool_type: "function".to_string(),
-                function: OpenAIToolFunction {
-                    name: "sessions_spawn".to_string(),
-                    description: None,
-                    parameters: None,
-                },
-            },
+            openai_tool("read"),
+            openai_tool("subagents"),
+            openai_tool("sessions_spawn"),
         ]);
 
         let profile = ClientProfile::from_openai(&HeaderMap::new(), &request);

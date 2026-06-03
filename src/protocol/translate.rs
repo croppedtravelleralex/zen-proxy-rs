@@ -1140,8 +1140,7 @@ pub fn is_short_no_tool_health_request(body: &ChatRequest) -> bool {
 }
 
 pub fn is_short_no_tool_channel_test_probe(body: &ChatRequest) -> bool {
-    if body.stream != Some(true)
-        || has_tools(body)
+    if has_tools(body)
         || body.tool_choice.is_some()
         || body.max_tokens.is_none_or(|max_tokens| max_tokens > 64)
     {

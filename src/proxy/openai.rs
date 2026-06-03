@@ -184,6 +184,27 @@ async fn handle_oa_non_stream(
         }
         if let Some(output) = output {
             output
+        } else if last_empty && translate::is_short_no_tool_channel_test_probe(cr) {
+            tracing::warn!(
+                model = cr.model,
+                source_client = ?profile.kind,
+                "short non-stream channel-test probe received empty upstream; returning local ok"
+            );
+            let prompt = translate::build_prompt_text(&cr.messages);
+            let prompt_tokens = estimate(&prompt);
+            let completion_tokens = 1;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            return Ok(oa_text_resp(
+                ts,
+                &cr.model,
+                "ok",
+                prompt_tokens,
+                completion_tokens,
+                prompt_tokens + completion_tokens,
+            ));
         } else if last_empty {
             return Err(AppError::empty_upstream());
         } else {
