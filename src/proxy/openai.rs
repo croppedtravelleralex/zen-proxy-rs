@@ -9,6 +9,8 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
 
+const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
+
 pub async fn handle_openai_chat(
     client: &Client,
     config: &KernelConfig,
@@ -140,7 +142,7 @@ pub async fn handle_openai_chat(
     if body.stream.unwrap_or(false) {
         handle_oa_stream(client, config, &cr, &zb, profile).await
     } else {
-        handle_oa_non_stream(client, config, &cr, &zb).await
+        handle_oa_non_stream(client, config, &cr, &zb, profile).await
     }
 }
 
@@ -149,28 +151,50 @@ async fn handle_oa_non_stream(
     config: &KernelConfig,
     cr: &ChatRequest,
     zb: &Value,
+    profile: ClientProfile,
 ) -> Result<Response, AppError> {
-    let resp = crate::zen::client::fetch_zen_stream_with_headers(
-        client,
-        &config.zen_chat_url,
-        &config.zen_api_key,
-        zb,
-        &config.extra_headers,
-    )
-    .await?;
-    let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
-    let collected = crate::zen::client::collect_stream_parts(resp).await?;
-    let content = crate::proxy::markdown::MarkdownFenceGuard::repair_text(
-        &crate::redact::redact_text(&collected.content),
-    );
+    let mut observed_exit_ip = None;
+    let (collected, content) = {
+        let mut last_empty = false;
+        let mut output = None;
+        for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
+            let resp = crate::zen::client::fetch_zen_stream_with_headers(
+                client,
+                &config.zen_chat_url,
+                &config.zen_api_key,
+                zb,
+                &config.extra_headers,
+            )
+            .await?;
+            observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
+            let collected = crate::zen::client::collect_stream_parts(resp).await?;
+            let content = response_text_for_profile(profile, &collected.content);
+            if content.trim().is_empty() && collected.tool_calls.is_empty() {
+                last_empty = true;
+                tracing::warn!(
+                    attempt,
+                    max_attempts = NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+                    source_client = ?profile.kind,
+                    "non-stream upstream returned empty output; retrying"
+                );
+                continue;
+            }
+            output = Some((collected, content));
+            break;
+        }
+        if let Some(output) = output {
+            output
+        } else if last_empty {
+            return Err(AppError::empty_upstream());
+        } else {
+            return Err(AppError::empty_upstream());
+        }
+    };
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    if content.trim().is_empty() && collected.tool_calls.is_empty() {
-        return Err(AppError::empty_upstream());
-    }
     if !collected.tool_calls.is_empty() {
         let tool_calls = collected
             .tool_calls
@@ -263,6 +287,14 @@ fn oa_text_resp(ts: u64, model: &str, text: &str, pt: u64, ct: u64, total: u64) 
     Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total}})).into_response()
 }
 
+fn response_text_for_profile(profile: ClientProfile, text: &str) -> String {
+    if profile.preserves_model_text_exactly() {
+        text.to_string()
+    } else {
+        crate::proxy::markdown::MarkdownFenceGuard::repair_text(&crate::redact::redact_text(text))
+    }
+}
+
 fn oa_ok_stream_resp(ts: u64, model: &str, pt: u64, ct: u64) -> Response {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
@@ -332,7 +364,11 @@ async fn handle_oa_stream(
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
         let mut text = String::new();
-        let mut markdown_guard = crate::proxy::markdown::MarkdownFenceGuard::new();
+        let mut markdown_guard = if profile.preserves_model_text_exactly() {
+            None
+        } else {
+            Some(crate::proxy::markdown::MarkdownFenceGuard::new())
+        };
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
         while let Some(event) = upstream.next().await {
@@ -351,8 +387,11 @@ async fn handle_oa_stream(
                 for choice in choices {
                     let Some(delta) = choice.delta else { continue; };
                     if let Some(content) = delta.content {
-                        let content = crate::redact::redact_text(&content);
-                        let content = markdown_guard.push(&content);
+                        let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
+                            markdown_guard.push(&crate::redact::redact_text(&content))
+                        } else {
+                            content
+                        };
                         let should_emit =
                             !content.trim().is_empty()
                                 || (profile.preserves_stream_whitespace() && !content.is_empty());
@@ -367,7 +406,10 @@ async fn handle_oa_stream(
                 }
             }
         }
-        let final_markdown = markdown_guard.finish();
+        let final_markdown = markdown_guard
+            .as_mut()
+            .map(crate::proxy::markdown::MarkdownFenceGuard::finish)
+            .unwrap_or_default();
         if !final_markdown.is_empty() {
             text.push_str(&final_markdown);
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":final_markdown},"finish_reason":null}]}).to_string()));

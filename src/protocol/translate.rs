@@ -744,6 +744,9 @@ fn safe_marker_literal_from_text(text: &str) -> Option<String> {
 
 fn exact_output_literal_from_text(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
+    if let Some(literal) = extract_multiline_literal(text) {
+        return Some(literal);
+    }
     if let Some(literal) = extract_after_ascii_marker(text, &lower, "reply exactly") {
         return Some(literal);
     }
@@ -760,6 +763,42 @@ fn exact_output_literal_from_text(text: &str) -> Option<String> {
         return Some(literal);
     }
     None
+}
+
+fn extract_multiline_literal(text: &str) -> Option<String> {
+    const MAX_LITERAL_CHARS: usize = 8 * 1024;
+    let markers = [
+        "只输出以下",
+        "只输出下面",
+        "只回复以下",
+        "只回复下面",
+        "原样输出以下",
+        "原样输出下面",
+        "output the following",
+        "return the following",
+        "reply with the following",
+    ];
+    let lower = text.to_ascii_lowercase();
+    let idx = markers
+        .iter()
+        .filter_map(|marker| {
+            if marker.is_ascii() {
+                lower.rfind(marker)
+            } else {
+                text.rfind(marker)
+            }
+        })
+        .max()?;
+    let tail = text.get(idx..)?;
+    let newline = tail.find('\n')?;
+    let literal = tail.get(newline + 1..)?.trim();
+    if literal.is_empty()
+        || literal.chars().count() > MAX_LITERAL_CHARS
+        || literal.chars().any(|ch| ch == '\0')
+    {
+        return None;
+    }
+    Some(literal.to_string())
 }
 
 fn extract_after_ascii_marker(text: &str, lower: &str, marker: &str) -> Option<String> {

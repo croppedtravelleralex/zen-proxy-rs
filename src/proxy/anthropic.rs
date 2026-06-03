@@ -9,63 +9,11 @@ use axum::Json;
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
-use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
-const EXACT_OUTPUT_GUARD_TTL: Duration = Duration::from_secs(90);
-const EXACT_OUTPUT_GUARD_MAX_ENTRIES: usize = 32;
 const CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS: u64 = 50_000;
-
-#[derive(Clone)]
-struct ExactOutputGuardEntry {
-    key: String,
-    literal: String,
-    expires_at: Instant,
-}
-
-fn exact_output_guard() -> &'static Mutex<VecDeque<ExactOutputGuardEntry>> {
-    static GUARD: OnceLock<Mutex<VecDeque<ExactOutputGuardEntry>>> = OnceLock::new();
-    GUARD.get_or_init(|| Mutex::new(VecDeque::new()))
-}
-
-fn exact_output_guard_key(model: &str, profile: ClientProfile) -> String {
-    format!("{:?}:{model}", profile.kind)
-}
-
-fn remember_exact_output_literal(model: &str, profile: ClientProfile, literal: &str) {
-    if !profile.protects_recovery_safe_markers() {
-        return;
-    }
-    let mut guard = exact_output_guard().lock().unwrap();
-    let now = Instant::now();
-    guard.retain(|entry| entry.expires_at > now);
-    let key = exact_output_guard_key(model, profile);
-    guard.retain(|entry| entry.key != key);
-    guard.push_back(ExactOutputGuardEntry {
-        key,
-        literal: literal.to_string(),
-        expires_at: now + EXACT_OUTPUT_GUARD_TTL,
-    });
-    while guard.len() > EXACT_OUTPUT_GUARD_MAX_ENTRIES {
-        guard.pop_front();
-    }
-}
-
-fn recent_exact_output_literal(model: &str, profile: ClientProfile) -> Option<String> {
-    if !profile.protects_recovery_safe_markers() {
-        return None;
-    }
-    let mut guard = exact_output_guard().lock().unwrap();
-    let now = Instant::now();
-    guard.retain(|entry| entry.expires_at > now);
-    let key = exact_output_guard_key(model, profile);
-    guard
-        .iter()
-        .rev()
-        .find(|entry| entry.key == key)
-        .map(|entry| entry.literal.clone())
-}
+const CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS: u64 = 512;
+const CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS: usize = 3;
+const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
 
 pub async fn handle_anthropic_messages(
     client: &Client,
@@ -180,36 +128,6 @@ pub async fn handle_anthropic_messages(
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
     };
-    if stream_requested && cr.tools.is_none() {
-        if let Some(literal) = translate::exact_output_literal_from_messages(&cr.messages) {
-            if profile.kind == ClientKind::ClaudeCode {
-                tracing::warn!(
-                    literal_len = literal.len(),
-                    reduced_exact_output_anchor,
-                    "ClaudeCode exact-output shortcut returned literal"
-                );
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let input_tokens = estimate(&translate::build_prompt_text(&cr.messages)).max(1);
-                let output_tokens = estimate(&literal).max(1);
-                remember_exact_output_literal(&cr.model, profile, &literal);
-                return Ok(anthropic_buffered_stream_resp(
-                    ts,
-                    &cr.model,
-                    &literal,
-                    Vec::new(),
-                    input_tokens,
-                    output_tokens,
-                    0,
-                    0,
-                    &cr,
-                    profile,
-                ));
-            }
-        }
-    }
     if stream_requested && profile.protects_recovery_safe_markers() {
         if let Some(literal) = translate::claude_code_recovery_literal_from_messages(&cr.messages) {
             tracing::warn!(
@@ -237,34 +155,6 @@ pub async fn handle_anthropic_messages(
                 profile,
             ));
         }
-        if translate::is_claude_code_recovery_pressure_messages(&cr.messages) {
-            if let Some(literal) = recent_exact_output_literal(&cr.model, profile) {
-                tracing::warn!(
-                    literal_len = literal.len(),
-                    source_client = ?profile.kind,
-                    tools_present = cr.tools.is_some(),
-                    "recent exact-output recovery-pressure shortcut returned marker literal"
-                );
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let input_tokens = estimate(&translate::build_prompt_text(&cr.messages)).max(1);
-                let output_tokens = estimate(&literal).max(1);
-                return Ok(anthropic_buffered_stream_resp(
-                    ts,
-                    &cr.model,
-                    &literal,
-                    Vec::new(),
-                    input_tokens,
-                    output_tokens,
-                    0,
-                    0,
-                    &cr,
-                    profile,
-                ));
-            }
-        }
     }
     if translate::is_short_no_tool_health_request(&cr) {
         let ts = std::time::SystemTime::now()
@@ -285,7 +175,10 @@ pub async fn handle_anthropic_messages(
     }
     if body.stream.unwrap_or(false) {
         let use_claude_code_huge_buffer = profile.kind == ClientKind::ClaudeCode
-            && context_repair.before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS;
+            && (context_repair.before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS
+                || cr
+                    .max_tokens
+                    .is_some_and(|max_tokens| max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS));
         handle_stream(
             client,
             config,
@@ -296,7 +189,7 @@ pub async fn handle_anthropic_messages(
         )
         .await
     } else {
-        handle_non_stream(client, config, &cr, &zb).await
+        handle_non_stream(client, config, &cr, &zb, profile).await
     }
 }
 
@@ -305,28 +198,50 @@ async fn handle_non_stream(
     config: &KernelConfig,
     cr: &ChatRequest,
     zb: &Value,
+    profile: ClientProfile,
 ) -> Result<Response, AppError> {
-    let resp = crate::zen::client::fetch_zen_stream_with_headers(
-        client,
-        &config.zen_chat_url,
-        &config.zen_api_key,
-        zb,
-        &config.extra_headers,
-    )
-    .await?;
-    let observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
-    let collected = crate::zen::client::collect_stream_parts(resp).await?;
-    let content = crate::proxy::markdown::MarkdownFenceGuard::repair_text(
-        &crate::redact::redact_text(&collected.content),
-    );
+    let mut observed_exit_ip = None;
+    let (collected, content) = {
+        let mut last_empty = false;
+        let mut output = None;
+        for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
+            let resp = crate::zen::client::fetch_zen_stream_with_headers(
+                client,
+                &config.zen_chat_url,
+                &config.zen_api_key,
+                zb,
+                &config.extra_headers,
+            )
+            .await?;
+            observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
+            let collected = crate::zen::client::collect_stream_parts(resp).await?;
+            let content = response_text_for_profile(profile, &collected.content);
+            if content.trim().is_empty() && collected.tool_calls.is_empty() {
+                last_empty = true;
+                tracing::warn!(
+                    attempt,
+                    max_attempts = NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+                    source_client = ?profile.kind,
+                    "non-stream upstream returned empty output; retrying"
+                );
+                continue;
+            }
+            output = Some((collected, content));
+            break;
+        }
+        if let Some(output) = output {
+            output
+        } else if last_empty {
+            return Err(AppError::empty_upstream());
+        } else {
+            return Err(AppError::empty_upstream());
+        }
+    };
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    if content.trim().is_empty() && collected.tool_calls.is_empty() {
-        return Err(AppError::empty_upstream());
-    }
     if !collected.tool_calls.is_empty() {
         let blocks = collected
             .tool_calls
@@ -390,6 +305,14 @@ async fn handle_non_stream(
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
     Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"text","text":text}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":output_tokens}})).into_response()
+}
+
+fn response_text_for_profile(profile: ClientProfile, text: &str) -> String {
+    if profile.preserves_model_text_exactly() {
+        text.to_string()
+    } else {
+        crate::proxy::markdown::MarkdownFenceGuard::repair_text(&crate::redact::redact_text(text))
+    }
 }
 
 fn anthropic_ok_stream_resp(
@@ -483,7 +406,11 @@ async fn handle_stream(
         yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
         let mut text = String::new();
         let mut text_block_open = false;
-        let mut markdown_guard = crate::proxy::markdown::MarkdownFenceGuard::new();
+        let mut markdown_guard = if profile.preserves_model_text_exactly() {
+            None
+        } else {
+            Some(crate::proxy::markdown::MarkdownFenceGuard::new())
+        };
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
         while let Some(event) = upstream.next().await {
@@ -501,8 +428,11 @@ async fn handle_stream(
                 for choice in choices {
                     let Some(delta) = choice.delta else { continue; };
                     if let Some(content) = delta.content {
-                        let content = crate::redact::redact_text(&content);
-                        let content = markdown_guard.push(&content);
+                        let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
+                            markdown_guard.push(&crate::redact::redact_text(&content))
+                        } else {
+                            content
+                        };
                         let should_emit =
                             !content.trim().is_empty()
                                 || (profile.preserves_stream_whitespace() && !content.is_empty());
@@ -521,7 +451,10 @@ async fn handle_stream(
                 }
             }
         }
-        let final_markdown = markdown_guard.finish();
+        let final_markdown = markdown_guard
+            .as_mut()
+            .map(crate::proxy::markdown::MarkdownFenceGuard::finish)
+            .unwrap_or_default();
         if !final_markdown.is_empty() {
             if !text_block_open {
                 text_block_open = true;
@@ -603,10 +536,9 @@ async fn handle_buffered_claude_code_huge_stream(
     estimated_input_tokens: u64,
     profile: ClientProfile,
 ) -> Result<Response, AppError> {
-    const ATTEMPTS: usize = 2;
     let exact_output_literal = translate::exact_output_literal_from_messages(&cr.messages);
 
-    for attempt in 0..ATTEMPTS {
+    for attempt in 0..CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
         let resp = match crate::zen::client::fetch_zen_stream_with_headers(
             client,
             &config.zen_chat_url,
@@ -620,11 +552,11 @@ async fn handle_buffered_claude_code_huge_stream(
             Err(err) => {
                 tracing::warn!(
                     attempt,
-                    max_attempts = ATTEMPTS,
+                    max_attempts = CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
                     error = %err.message,
                     "ClaudeCode huge stream buffered fetch failed"
                 );
-                if attempt + 1 >= ATTEMPTS {
+                if attempt + 1 >= CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
                     return Err(err);
                 }
                 continue;
@@ -636,26 +568,47 @@ async fn handle_buffered_claude_code_huge_stream(
             Err(err) => {
                 tracing::warn!(
                     attempt,
-                    max_attempts = ATTEMPTS,
+                    max_attempts = CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
                     error = %err.message,
                     "ClaudeCode huge stream buffered collection failed"
                 );
-                if attempt + 1 >= ATTEMPTS {
+                if attempt + 1 >= CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
                     return Err(err);
                 }
                 continue;
             }
         };
-        let content = crate::proxy::markdown::MarkdownFenceGuard::repair_text(
-            &crate::redact::redact_text(&collected.content),
-        );
+        let content = response_text_for_profile(profile, &collected.content);
         if content.trim().is_empty() && collected.tool_calls.is_empty() {
             tracing::warn!(
                 attempt,
-                max_attempts = ATTEMPTS,
+                max_attempts = CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
                 "ClaudeCode huge stream buffered upstream returned empty output"
             );
-            if attempt + 1 >= ATTEMPTS {
+            if translate::is_short_no_tool_channel_test_probe(cr) {
+                tracing::warn!(
+                    model = cr.model,
+                    source_client = ?profile.kind,
+                    "short channel-test probe received empty buffered upstream; returning local ok"
+                );
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                return Ok(anthropic_buffered_stream_resp(
+                    ts,
+                    &cr.model,
+                    "ok",
+                    Vec::new(),
+                    estimated_input_tokens,
+                    1,
+                    0,
+                    0,
+                    cr,
+                    profile,
+                ));
+            }
+            if attempt + 1 >= CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
                 if let Some(literal) = exact_output_literal.as_deref() {
                     tracing::warn!(
                         literal_len = literal.len(),

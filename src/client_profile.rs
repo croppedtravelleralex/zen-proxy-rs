@@ -56,15 +56,16 @@ impl ClientProfile {
         matches!(self.kind, ClientKind::ClaudeCode)
     }
 
+    pub fn preserves_model_text_exactly(self) -> bool {
+        matches!(self.kind, ClientKind::ClaudeCode)
+    }
+
     pub fn uses_compat_tool_history(self) -> bool {
         matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw)
     }
 
     pub fn protects_recovery_safe_markers(self) -> bool {
-        matches!(
-            self.kind,
-            ClientKind::ClaudeCode | ClientKind::Hermes | ClientKind::OpenClaw
-        )
+        matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw)
     }
 
     fn from_headers(headers: &HeaderMap) -> Option<Self> {
