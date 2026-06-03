@@ -554,10 +554,10 @@ fn infer_source_client(path: &str, headers: &HeaderMap, body: &Value) -> String 
 }
 
 fn infer_source_client_from_body(body: &Value) -> Option<&'static str> {
-    if body_contains_client_marker(body, "openclaw") {
+    if body_contains_strong_client_marker(body, "openclaw") {
         return Some("openclaw");
     }
-    if body_contains_client_marker(body, "hermes") {
+    if body_contains_strong_client_marker(body, "hermes") {
         return Some("hermes");
     }
 
@@ -570,23 +570,10 @@ fn infer_source_client_from_body(body: &Value) -> Option<&'static str> {
         .map(normalize_tool_name)
         .collect::<Vec<_>>();
 
-    if tool_names.iter().any(|name| {
-        matches!(
-            name.as_str(),
-            "subagents"
-                | "sessionsspawn"
-                | "sessionssend"
-                | "sessionsyield"
-                | "sessionstatus"
-                | "sessionsstatus"
-                | "sessionshistory"
-                | "sessionslist"
-                | "memoryget"
-                | "memorysearch"
-                | "webfetch"
-                | "websearch"
-        ) || name.contains("openclaw")
-    }) {
+    if tool_names
+        .iter()
+        .any(|name| is_openclaw_strong_tool_name(name))
+    {
         return Some("openclaw");
     }
 
@@ -630,17 +617,56 @@ fn normalize_tool_name(value: &str) -> String {
         .collect()
 }
 
-fn body_contains_client_marker(value: &Value, marker: &str) -> bool {
+fn body_contains_strong_client_marker(value: &Value, marker: &str) -> bool {
     match value {
-        Value::String(text) => text.to_ascii_lowercase().contains(marker),
+        Value::String(text) => {
+            let lower = text.to_ascii_lowercase();
+            match marker {
+                "openclaw" => contains_strong_openclaw_marker(&lower),
+                "hermes" => contains_strong_hermes_marker(&lower),
+                _ => false,
+            }
+        }
         Value::Array(items) => items
             .iter()
-            .any(|item| body_contains_client_marker(item, marker)),
+            .any(|item| body_contains_strong_client_marker(item, marker)),
         Value::Object(map) => map
             .values()
-            .any(|item| body_contains_client_marker(item, marker)),
+            .any(|item| body_contains_strong_client_marker(item, marker)),
         _ => false,
     }
+}
+
+fn contains_strong_openclaw_marker(lower: &str) -> bool {
+    lower.contains("running inside openclaw")
+        || lower.contains("openclaw cli")
+        || lower.contains("openclaw agent")
+        || lower.contains("openclaw_config")
+        || lower.contains("openclaw-config")
+}
+
+fn contains_strong_hermes_marker(lower: &str) -> bool {
+    lower.contains("running inside hermes")
+        || lower.contains("hermes cli")
+        || lower.contains("hermes agent")
+        || lower.contains("hermes_config")
+        || lower.contains("hermes-config")
+}
+
+fn is_openclaw_strong_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "subagents"
+            | "sessionsspawn"
+            | "sessionssend"
+            | "sessionsyield"
+            | "sessionstatus"
+            | "sessionsstatus"
+            | "sessionshistory"
+            | "sessionslist"
+            | "memoryget"
+            | "memorysearch"
+    ) || name.contains("openclaw")
 }
 
 fn normalize_source_client(value: &str) -> String {
@@ -2196,6 +2222,61 @@ mod tests {
         assert_eq!(
             infer_source_client("messages", &headers, &body),
             "claude-code"
+        );
+    }
+
+    #[test]
+    fn claude_code_web_tools_do_not_infer_openclaw() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "use Task and web search"}],
+            "tools": [
+                {"type": "function", "function": {"name": "Task"}},
+                {"type": "function", "function": {"name": "TodoWrite"}},
+                {"type": "function", "function": {"name": "web_fetch"}},
+                {"type": "function", "function": {"name": "web_search"}}
+            ]
+        });
+
+        assert_eq!(
+            infer_source_client("messages", &headers, &body),
+            "claude-code"
+        );
+    }
+
+    #[test]
+    fn ordinary_openclaw_reference_does_not_override_claude_tools() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "Compare OpenClaw and Hermes behavior, then use Task if needed."}],
+            "tools": [
+                {"type": "function", "function": {"name": "Task"}}
+            ]
+        });
+
+        assert_eq!(
+            infer_source_client("messages", &headers, &body),
+            "claude-code"
+        );
+    }
+
+    #[test]
+    fn web_tools_alone_do_not_infer_openclaw_for_chat_completions() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "search"}],
+            "tools": [
+                {"type": "function", "function": {"name": "web_fetch"}},
+                {"type": "function", "function": {"name": "web_search"}}
+            ]
+        });
+
+        assert_eq!(
+            infer_source_client("chat/completions", &headers, &body),
+            "unknown"
         );
     }
 
