@@ -255,7 +255,10 @@ async fn handle_non_stream(
         }
         if let Some(output) = output {
             output
-        } else if last_empty && translate::is_short_no_tool_channel_test_probe(cr) {
+        } else if let Some(fallback_text) = last_empty
+            .then(|| translate::short_no_tool_empty_fallback_text(cr))
+            .flatten()
+        {
             tracing::warn!(
                 model = cr.model,
                 source_client = ?profile.kind,
@@ -271,7 +274,13 @@ async fn handle_non_stream(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            return Ok(text_resp(ts, &cr.model, "ok", estimate(&prompt), 1));
+            return Ok(text_resp(
+                ts,
+                &cr.model,
+                fallback_text,
+                estimate(&prompt),
+                estimate(fallback_text).max(1),
+            ));
         } else {
             return Err(AppError::empty_upstream());
         }
@@ -503,16 +512,16 @@ async fn handle_stream(
             yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":final_markdown}}).to_string()));
         }
         if text.trim().is_empty() && tool_calls.is_empty() {
-            if translate::is_short_no_tool_channel_test_probe(&body) {
+            if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body) {
                 tracing::warn!(
                     model = body.model,
                     source_client = ?profile.kind,
                     "short channel-test probe received empty upstream; returning local ok"
                 );
                 text_block_open = true;
-                text.push_str("ok");
+                text.push_str(fallback_text);
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
-                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}).to_string()));
+                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":fallback_text}}).to_string()));
             } else {
                 yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":"upstream returned no assistant content or tool call"}}).to_string()));
                 return;
@@ -624,7 +633,7 @@ async fn handle_buffered_claude_code_huge_stream(
                 max_attempts = CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
                 "ClaudeCode huge stream buffered upstream returned empty output"
             );
-            if translate::is_short_no_tool_channel_test_probe(cr) {
+            if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(cr) {
                 tracing::warn!(
                     model = cr.model,
                     source_client = ?profile.kind,
@@ -637,10 +646,10 @@ async fn handle_buffered_claude_code_huge_stream(
                 return Ok(anthropic_buffered_stream_resp(
                     ts,
                     &cr.model,
-                    "ok",
+                    fallback_text,
                     Vec::new(),
                     estimated_input_tokens,
-                    1,
+                    estimate(fallback_text).max(1),
                     0,
                     0,
                     cr,

@@ -85,10 +85,12 @@
   2. 非流式空输出 retry 日志增加 `short_request_kind/prompt_hash/prompt_tokens/message_count/max_tokens/source_client`。
   3. `echo hi` 仍是 channel-test probe；普通短请求不是 channel-test。
   4. 新增 kernel golden：ClaudeCode 小非流式、非探针、上游空输出时仍返回 `upstream returned no assistant content or tool call`，不会被本地 `ok` 误短路。
+  5. 2026-06-04 新增显式 smoke 探针兜底：`strict smoke`、`reply PASS`、`answer OK` 等无工具短测在上游空输出后返回本地测试文本；普通 ClaudeCode 短输入仍不兜底。
 - 待办：
   1. 继续用真实小非流式样本确认分类是否稳定命中 `internal_claude_code_probe`，并记录最终是否 retry 成功。
   2. 只有确认是 ClaudeCode 内部探测后，才评估本地安全 fallback 或短冷却；当前源码没有新增普通请求短路。
   3. 如日志仍无法区分用途，再补不含原文的 `last_user_prefix_class`。
+  4. Windows ClaudeCode/cc-switch 若访问 panda Tailscale IP，需确认进程是否继承 `HTTP_PROXY=http://127.0.0.1:7897`；若继承，必须为 `100.69.228.93` 配置 no-proxy，否则 Windows HTTP 客户端可能走代理返回 502。
 
 ### 压测矩阵
 

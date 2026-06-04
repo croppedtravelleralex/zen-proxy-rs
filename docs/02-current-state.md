@@ -235,6 +235,18 @@ P1.7 ClaudeCode huge-session compactor 部署记录：
 | panda 非流式 smoke | 517KB / `before_tokens=123371` 的 ClaudeCode 非流式样本被压到 `after_tokens=9139`、`message_count=51`；NewAPI id `109585` 账面 `prompt_tokens=5647`，HTTP 200。 |
 | panda 流式 smoke | 522KB / `before_tokens=124597` 的 ClaudeCode 流式样本触发 exact-anchor，shape `message_count=1`、`estimated_total_tokens=51`；NewAPI id `109593` 账面 `prompt_tokens=125`，HTTP 200。 |
 
+P1.8 NewAPI 短 smoke 探针空输出兜底：
+
+| 项 | 值 |
+|----|----|
+| 触发 | 2026-06-04 严格验收时，panda NewAPI channel 69 的极短 non-stream smoke 经 NewAPI 转为 ClaudeCode/Anthropic 小请求，上游连续返回空输出，旧逻辑在 `internal_claude_code_probe` 分类下裸透 502。 |
+| 修复 | 新增 `short_no_tool_empty_fallback_text`，只对无工具、单用户消息、`max_tokens <= 64` 且显式 `echo hi`/`strict smoke`/`reply PASS`/`answer OK` 等测试探针触发本地兜底；普通 ClaudeCode 短输入仍不兜底。 |
+| 测试 | `free-model-client-rs`：`fmt --check`、`clippy -D warnings`、`cargo test` 通过；库测试 70 条、kernel golden 75 条。`zen-proxy-rs`：主单测 129 条、e2e 26 条通过；release build 通过。 |
+| 部署 | panda 三实例部署 stripped hash `0f1d7a36fdc7142e1acd9670301e7277ca6805e47899490958a2c390c619cea5`；旧 hash `96b954a81978e9348f26341d68626d0a98682c6971611d7802a0850ef771d815` 备份到 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-strict-smoke-20260604-105132-96b954a`。 |
+| 线上 smoke | panda 本机 NewAPI `/v1/models` 200，返回 8 个模型且包含 `deepseek-v4-flash`、`deepseek-v4-flash-lite`；两个 deepseek 模型的 OpenAI/Anthropic、stream/non-stream 共 8 条 smoke 全部 HTTP 200，内容摘要为 `PASS`。 |
+| 耗时 | non-stream 总耗时约 4.8-5.5s；stream 首内容约 2.0-2.3s。 |
+| 环境边界 | Windows 环境变量存在 `HTTP_PROXY=http://127.0.0.1:7897`；Windows `Invoke-RestMethod` 走代理访问 panda NewAPI 会 502，但 `curl --noproxy '*'` 直连 `100.69.228.93:8081/v1/models` 为 200。Windows ClaudeCode/cc-switch 若继承该代理，需要显式绕过 panda Tailscale IP。 |
+
 ## 当前数据解释
 
 1. “输入几乎 70k/90k”当前不是 NewAPI 输入 token 墙。2026-06-03 23:01-23:46 的 channel 69 真实 ClaudeCode 流式请求显示：ZenProxy 入口 body 从约 674KB 增长到 788KB，`before_tokens` 约 97k-110k，流式 compactor 后 `after_tokens` 约 66k-79k，NewAPI 账面多落在 70k-90k。

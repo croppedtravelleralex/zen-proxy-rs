@@ -1471,11 +1471,15 @@ pub fn is_short_no_tool_health_request(body: &ChatRequest) -> bool {
 }
 
 pub fn is_short_no_tool_channel_test_probe(body: &ChatRequest) -> bool {
+    short_no_tool_empty_fallback_text(body).is_some_and(|text| text == "ok")
+}
+
+pub fn short_no_tool_empty_fallback_text(body: &ChatRequest) -> Option<&'static str> {
     if has_tools(body)
         || body.tool_choice.is_some()
         || body.max_tokens.is_none_or(|max_tokens| max_tokens > 64)
     {
-        return false;
+        return None;
     }
 
     let user_messages = body
@@ -1493,18 +1497,39 @@ pub fn is_short_no_tool_channel_test_probe(body: &ChatRequest) -> bool {
                         .is_some_and(|text| !text.trim().is_empty()))
         })
     {
-        return false;
+        return None;
     }
 
-    let Some(text) = user_messages[0].content.as_str() else {
-        return false;
-    };
+    let text = user_messages[0].content.as_str()?;
     let trimmed = text.trim();
     let lower = trimmed.to_ascii_lowercase();
-    matches!(
+    if matches!(
         lower.as_str(),
         "hi" | "hello" | "test" | "echo hi" | "echo hello" | "echo test"
     ) || matches!(trimmed, "测试" | "測試")
+    {
+        return Some("ok");
+    }
+
+    if lower.contains("strict smoke")
+        || lower.contains("chain smoke")
+        || lower.contains("reply pass")
+        || lower.contains("answer pass")
+        || lower.contains("pass only")
+        || lower.contains("respond pass")
+    {
+        return Some("PASS");
+    }
+
+    if lower.contains("reply ok")
+        || lower.contains("answer ok")
+        || lower.contains("ok only")
+        || lower.contains("respond ok")
+    {
+        return Some("ok");
+    }
+
+    None
 }
 
 pub fn is_reasoning_only_error(msg: &str) -> bool {
@@ -1583,9 +1608,22 @@ mod tests {
         let body = request("echo hi", false, Some(64));
 
         assert!(is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(short_no_tool_empty_fallback_text(&body), Some("ok"));
         assert_eq!(
             classify_short_non_stream_request(&body, false),
             ShortNonStreamRequestKind::ChannelTest
+        );
+    }
+
+    #[test]
+    fn explicit_smoke_pass_gets_safe_empty_fallback() {
+        let body = request("strict smoke: reply PASS only", false, Some(16));
+
+        assert!(!is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(short_no_tool_empty_fallback_text(&body), Some("PASS"));
+        assert_eq!(
+            classify_short_non_stream_request(&body, true),
+            ShortNonStreamRequestKind::InternalClaudeCodeProbe
         );
     }
 
@@ -1594,6 +1632,7 @@ mod tests {
         let body = request("write a title", false, Some(256));
 
         assert!(!is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(short_no_tool_empty_fallback_text(&body), None);
         assert_eq!(
             classify_short_non_stream_request(&body, false),
             ShortNonStreamRequestKind::UserShortRequest
@@ -1605,6 +1644,7 @@ mod tests {
         let body = request("session title", false, Some(64));
 
         assert!(!is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(short_no_tool_empty_fallback_text(&body), None);
         assert_eq!(
             classify_short_non_stream_request(&body, true),
             ShortNonStreamRequestKind::InternalClaudeCodeProbe

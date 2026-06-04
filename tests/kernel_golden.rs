@@ -750,6 +750,32 @@ async fn openai_claude_code_tiny_non_probe_empty_upstream_stays_error() {
 }
 
 #[tokio::test]
+async fn openai_claude_code_explicit_smoke_empty_upstream_returns_pass() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = chat_request(
+        "deepseek-v4-flash-free",
+        "strict smoke: reply PASS only empty-upstream",
+        false,
+        None,
+    );
+    request.max_tokens = Some(16);
+
+    let response = kernel
+        .openai_chat_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("\"content\":\"PASS\""));
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn anthropic_non_stream_channel_probe_empty_upstream_returns_local_ok() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -762,6 +788,31 @@ async fn anthropic_non_stream_channel_probe_empty_upstream_returns_local_ok() {
         .unwrap();
     let body = response_text(response).await;
     assert!(body.contains("\"text\":\"ok\""));
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn anthropic_claude_code_explicit_smoke_empty_upstream_returns_pass() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash-free",
+        "strict smoke: reply PASS only empty-upstream",
+        false,
+    );
+    request.max_tokens = 16;
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("\"text\":\"PASS\""));
     assert_eq!(state.requests.lock().unwrap().len(), 3);
 }
 

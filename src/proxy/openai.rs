@@ -208,7 +208,10 @@ async fn handle_oa_non_stream(
         }
         if let Some(output) = output {
             output
-        } else if last_empty && translate::is_short_no_tool_channel_test_probe(cr) {
+        } else if let Some(fallback_text) = last_empty
+            .then(|| translate::short_no_tool_empty_fallback_text(cr))
+            .flatten()
+        {
             tracing::warn!(
                 model = cr.model,
                 source_client = ?profile.kind,
@@ -221,7 +224,7 @@ async fn handle_oa_non_stream(
             );
             let prompt = translate::build_prompt_text(&cr.messages);
             let prompt_tokens = estimate(&prompt);
-            let completion_tokens = 1;
+            let completion_tokens = estimate(fallback_text).max(1);
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -229,7 +232,7 @@ async fn handle_oa_non_stream(
             return Ok(oa_text_resp(
                 ts,
                 &cr.model,
-                "ok",
+                fallback_text,
                 prompt_tokens,
                 completion_tokens,
                 prompt_tokens + completion_tokens,
@@ -463,14 +466,14 @@ async fn handle_oa_stream(
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":final_markdown},"finish_reason":null}]}).to_string()));
         }
         if text.trim().is_empty() && tool_calls.is_empty() {
-            if translate::is_short_no_tool_channel_test_probe(&body) {
+            if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body) {
                 tracing::warn!(
                     model = body.model,
                     source_client = ?profile.kind,
                     "short channel-test probe received empty upstream; returning local ok"
                 );
-                text.push_str("ok");
-                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}).to_string()));
+                text.push_str(fallback_text);
+                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":fallback_text},"finish_reason":null}]}).to_string()));
             } else {
                 yield Ok(Event::default().data(serde_json::json!({"error":{"message":"upstream returned no assistant content or tool call"}}).to_string()));
                 yield Ok(Event::default().data("[DONE]"));
