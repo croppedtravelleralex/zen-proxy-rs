@@ -41,6 +41,13 @@ STDERR_PREFIX_LIMIT = 1200
 SUBAGENT_CAPABLE_CLIENTS = {"windows-claudecode", "wsl-claudecode", "wsl-openclaw"}
 _WINDOWS_WORKSPACE_CACHE: dict[str, tuple[Path, Path | PureWindowsPath]] = {}
 _WINDOWS_WORKSPACE_LOCK = threading.Lock()
+POLICY_MODES = {"policy-smoke", "policy-dry"}
+PROVIDER_HEADER_NAMES = (
+    "x-zen-observed-exit-ip",
+    "x-request-id",
+    "x-oneapi-request-id",
+    "x-requested-with",
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,22 @@ class CaseSpec:
     subagent_requested: bool = False
     stream: bool | None = None
     boundary: bool = False
+
+
+@dataclass(frozen=True)
+class PolicyCaseSpec:
+    case_type: str
+    protocol: str
+    model: str
+    stream: bool
+    client_header: str
+    max_tokens: int
+    prompt_target_tokens: int = 0
+    expected_min_output_tokens: int = 0
+    cache_attempted: bool = False
+    tools: bool = False
+    expected_source_client: str = "unknown"
+    expected_effective_client: str = "unknown"
 
 
 SMOKE_CASES = (
@@ -85,6 +108,42 @@ def sha256_text(value: str) -> str:
 def estimate_tokens(text: str) -> int:
     # A stable rough estimator is enough for bucketed pressure reports.
     return max(1, len(text.encode("utf-8")) // 4)
+
+
+def json_compact(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def stable_hash64_update(hash_value: int, data: bytes) -> int:
+    for byte in data:
+        hash_value ^= byte
+        hash_value = (hash_value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return hash_value
+
+
+def stable_request_shape_hash(
+    model: str,
+    messages: list[dict[str, Any]],
+    stream: bool,
+    tool_count: int,
+) -> str:
+    hash_value = 0xCBF29CE484222325
+    hash_value = stable_hash64_update(hash_value, model.encode("utf-8"))
+    hash_value = stable_hash64_update(hash_value, b"\x1f")
+    hash_value = stable_hash64_update(hash_value, b"stream" if stream else b"nonstream")
+    hash_value = stable_hash64_update(hash_value, b"\x1f")
+    hash_value = stable_hash64_update(hash_value, str(tool_count).encode("utf-8"))
+    for message in messages:
+        hash_value = stable_hash64_update(hash_value, b"\x1e")
+        hash_value = stable_hash64_update(hash_value, str(message.get("role", "")).encode("utf-8"))
+        hash_value = stable_hash64_update(hash_value, b"\x1f")
+        content = message.get("content")
+        if isinstance(content, str):
+            rendered = content
+        else:
+            rendered = json_compact(content)
+        hash_value = stable_hash64_update(hash_value, rendered.encode("utf-8"))
+    return f"{hash_value:016x}"
 
 
 def percentile(values: list[int], pct: int) -> int | None:
@@ -177,6 +236,68 @@ def http_json(
     except Exception as exc:  # noqa: BLE001 - report as classified network error.
         total = now_ms() - started
         return 0, None, f"{type(exc).__name__}: {exc}", total, total
+
+
+def http_exchange(
+    method: str,
+    url: str,
+    key: str,
+    payload: dict[str, Any],
+    timeout_s: int,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    started = now_ms()
+    req = request.Request(url=url, data=body, headers=headers, method=method)
+    opener = request.build_opener(request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout_s) as resp:
+            first_ms = now_ms() - started
+            raw = resp.read()
+            total_ms = now_ms() - started
+            text = raw.decode("utf-8", errors="replace")
+            return {
+                "status_code": resp.status,
+                "raw_text": text,
+                "total_ms": total_ms,
+                "protocol_first_byte_ms": first_ms,
+                "headers": allowlisted_headers(resp.headers),
+            }
+    except error.HTTPError as exc:
+        first_ms = now_ms() - started
+        raw = exc.read()
+        total_ms = now_ms() - started
+        return {
+            "status_code": exc.code,
+            "raw_text": raw.decode("utf-8", errors="replace"),
+            "total_ms": total_ms,
+            "protocol_first_byte_ms": first_ms,
+            "headers": allowlisted_headers(exc.headers),
+        }
+    except Exception as exc:  # noqa: BLE001 - report as classified network error.
+        total_ms = now_ms() - started
+        return {
+            "status_code": 0,
+            "raw_text": f"{type(exc).__name__}: {exc}",
+            "total_ms": total_ms,
+            "protocol_first_byte_ms": None,
+            "headers": {},
+        }
+
+
+def allowlisted_headers(headers: Any) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for name in PROVIDER_HEADER_NAMES:
+        value = headers.get(name) if headers else None
+        if value:
+            result[name.lower()] = str(value)[:200]
+    return result
 
 
 def safe_write_json(path: Path, data: Any) -> None:
@@ -345,6 +466,277 @@ def build_plan(mode: str, rounds: int | None) -> list[CaseSpec]:
             result.extend([spec] * count)
         return result
     raise ValueError(f"unsupported mode: {mode}")
+
+
+def select_policy_models(models: list[str]) -> tuple[str, str]:
+    flash = next((model for model in models if "flash" in model and "lite" not in model), DEFAULT_MODELS[0])
+    lite = next((model for model in models if "lite" in model), DEFAULT_MODELS[1])
+    return flash, lite
+
+
+def build_policy_plan(mode: str, models: list[str]) -> list[PolicyCaseSpec]:
+    flash, lite = select_policy_models(models)
+    if mode == "policy-smoke":
+        input_tokens = 8_000
+        output_tokens = 256
+    elif mode == "policy-dry":
+        input_tokens = 70_000
+        output_tokens = 1_200
+    else:
+        raise ValueError(f"unsupported policy mode: {mode}")
+
+    cases: list[PolicyCaseSpec] = []
+    for protocol in ("openai", "anthropic"):
+        cases.extend(
+            [
+                PolicyCaseSpec(
+                    case_type="flash_input_room",
+                    protocol=protocol,
+                    model=flash,
+                    stream=True,
+                    client_header="claude-code",
+                    max_tokens=512,
+                    prompt_target_tokens=input_tokens,
+                    expected_source_client="claude-code",
+                    expected_effective_client="claude-code",
+                ),
+                PolicyCaseSpec(
+                    case_type="flash_output_room",
+                    protocol=protocol,
+                    model=flash,
+                    stream=True,
+                    client_header="claude-code",
+                    max_tokens=4096,
+                    expected_min_output_tokens=output_tokens,
+                    expected_source_client="claude-code",
+                    expected_effective_client="claude-code",
+                ),
+                PolicyCaseSpec(
+                    case_type="lite_not_claudecode",
+                    protocol=protocol,
+                    model=lite,
+                    stream=True,
+                    client_header="claude-code",
+                    max_tokens=512,
+                    tools=True,
+                    expected_source_client="claude-code",
+                    expected_effective_client="unknown",
+                ),
+                PolicyCaseSpec(
+                    case_type="provider_usage_probe",
+                    protocol=protocol,
+                    model=flash,
+                    stream=False,
+                    client_header="openai-sdk" if protocol == "openai" else "anthropic-sdk",
+                    max_tokens=64,
+                    expected_source_client="openai-sdk" if protocol == "openai" else "anthropic-sdk",
+                    expected_effective_client="openai-sdk" if protocol == "openai" else "anthropic-sdk",
+                ),
+                PolicyCaseSpec(
+                    case_type="cache_probe",
+                    protocol=protocol,
+                    model=flash,
+                    stream=False,
+                    client_header="openai-sdk" if protocol == "openai" else "anthropic-sdk",
+                    max_tokens=256,
+                    prompt_target_tokens=4_000,
+                    cache_attempted=True,
+                    expected_source_client="openai-sdk" if protocol == "openai" else "anthropic-sdk",
+                    expected_effective_client="openai-sdk" if protocol == "openai" else "anthropic-sdk",
+                ),
+            ]
+        )
+    return cases
+
+
+def policy_context(prefix: str, target_tokens: int) -> str:
+    unit = (
+        f"{prefix} controlled policy harness line with stable marker, "
+        "local-only text, and no external target.\n"
+    )
+    count = max(1, (target_tokens * 4) // len(unit.encode("utf-8")) + 1)
+    return unit * count
+
+
+def build_policy_prompt(case: PolicyCaseSpec) -> str:
+    if case.case_type == "flash_input_room":
+        return (
+            "Read this controlled long local-only context and reply exactly FLASH_INPUT_OK.\n\n"
+            + policy_context("flash-input", case.prompt_target_tokens)
+            + "\nFinal answer: FLASH_INPUT_OK only."
+        )
+    if case.case_type == "flash_output_room":
+        repeats = max(64, case.expected_min_output_tokens // 4 + 32)
+        return (
+            f"Return FLASH_OUTPUT_OK exactly {repeats} times separated by spaces. "
+            "Do not number the items and do not add any other words."
+        )
+    if case.case_type == "lite_not_claudecode":
+        return (
+            "This request intentionally carries x-fmc-client=claude-code while using "
+            "the lite model. Reply exactly LITE_POLICY_OK."
+        )
+    if case.case_type == "provider_usage_probe":
+        return "Reply exactly USAGE_POLICY_OK. Do not add any other text."
+    if case.case_type == "cache_probe":
+        return (
+            "The following reusable prefix is a cache observation fixture.\n\n"
+            + policy_context("cache-prefix", case.prompt_target_tokens)
+            + "\nFinal answer: CACHE_POLICY_OK only."
+        )
+    return "Reply exactly POLICY_OK."
+
+
+def openai_policy_tools() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "Task",
+                "description": "Local policy harness subtask placeholder.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"prompt": {"type": "string"}},
+                    "required": ["prompt"],
+                },
+            },
+        }
+    ]
+
+
+def anthropic_policy_tools() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "Task",
+            "description": "Local policy harness subtask placeholder.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"prompt": {"type": "string"}},
+                "required": ["prompt"],
+            },
+        }
+    ]
+
+
+def cache_content_blocks(prompt: str) -> list[dict[str, Any]]:
+    split_at = max(1, len(prompt) - 64)
+    return [
+        {
+            "type": "text",
+            "text": prompt[:split_at],
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": prompt[split_at:]},
+    ]
+
+
+def build_policy_payload(
+    case: PolicyCaseSpec,
+    prompt: str,
+) -> tuple[str, dict[str, Any], list[dict[str, Any]], list[str]]:
+    tools: list[str] = []
+    if case.protocol == "openai":
+        content: Any = cache_content_blocks(prompt) if case.cache_attempted else prompt
+        messages = [{"role": "user", "content": content}]
+        payload: dict[str, Any] = {
+            "model": case.model,
+            "stream": case.stream,
+            "max_tokens": case.max_tokens,
+            "messages": messages,
+        }
+        if case.tools:
+            payload["tools"] = openai_policy_tools()
+            payload["tool_choice"] = "auto"
+            tools = ["Task"]
+        return "/v1/chat/completions", payload, messages, tools
+
+    content = cache_content_blocks(prompt) if case.cache_attempted else prompt
+    payload = {
+        "model": case.model,
+        "stream": case.stream,
+        "max_tokens": case.max_tokens,
+        "messages": [{"role": "user", "content": content}],
+    }
+    if case.tools:
+        payload["tools"] = anthropic_policy_tools()
+        tools = ["Task"]
+    shape_content = (
+        "\n".join(block.get("text", "") for block in content)
+        if isinstance(content, list)
+        else content
+    )
+    shape_messages = [{"role": "user", "content": shape_content}]
+    return "/v1/messages", payload, shape_messages, tools
+
+
+def tool_name_class(name: str) -> str:
+    normalized = name.strip().lower().replace("-", "_").replace(".", "_")
+    if normalized in {"web_search", "websearch", "web", "search"} or "web_search" in normalized:
+        return "web_search"
+    if normalized in {"web_fetch", "webfetch", "fetch", "fetch_url"} or "web_fetch" in normalized:
+        return "web_fetch"
+    if normalized in {"task", "subagent", "sub_agent"}:
+        return "task"
+    if normalized in {"bash", "shell", "exec", "execute", "run_command"}:
+        return "shell"
+    if normalized in {"read", "write", "edit", "multiedit", "read_file", "write_file", "edit_file"}:
+        return "file"
+    if normalized in {"todowrite", "todo_write", "todo"}:
+        return "todo"
+    if normalized in {"memorysearch", "memory_search", "memoryread", "memory_read"}:
+        return "memory"
+    if normalized.startswith("mcp__"):
+        return "mcp"
+    return "other"
+
+
+def value_shape_tokens(value: Any) -> int:
+    if isinstance(value, str):
+        return estimate_tokens(value)
+    if value is None:
+        return 0
+    return estimate_tokens(json_compact(value))
+
+
+def policy_shape_fields(
+    case: PolicyCaseSpec,
+    messages: list[dict[str, Any]],
+    tool_names: list[str],
+) -> dict[str, Any]:
+    system_tokens = 0
+    messages_tokens = 0
+    largest_message_tokens = 0
+    last_user_tokens = 0
+    for message in messages:
+        tokens = value_shape_tokens(message.get("content"))
+        largest_message_tokens = max(largest_message_tokens, tokens)
+        if message.get("role") == "system":
+            system_tokens += tokens
+        else:
+            messages_tokens += tokens
+        if message.get("role") == "user":
+            last_user_tokens = tokens
+    tool_classes = sorted(set(tool_name_class(name) for name in tool_names))
+    tools_tokens = estimate_tokens(json_compact(openai_policy_tools())) if tool_names else 0
+    return {
+        "request_shape_hash": stable_request_shape_hash(
+            case.model,
+            messages,
+            case.stream,
+            len(tool_names),
+        ),
+        "request_shape_stream": case.stream,
+        "request_shape_max_tokens": case.max_tokens,
+        "request_shape_message_count": len(messages),
+        "request_shape_system_tokens": system_tokens,
+        "request_shape_messages_tokens": messages_tokens,
+        "request_shape_tools_tokens": tools_tokens,
+        "request_shape_tool_count": len(tool_names),
+        "request_shape_tool_name_classes": tool_classes,
+        "request_shape_largest_message_tokens": largest_message_tokens,
+        "request_shape_last_user_tokens": last_user_tokens,
+        "request_shape_estimated_total_tokens": system_tokens + messages_tokens + tools_tokens,
+    }
 
 
 class TimedProcessResult(dict[str, Any]):
@@ -602,6 +994,196 @@ def extract_generic_result(stdout: str) -> tuple[str, dict[str, Any] | None, int
         if isinstance(first, dict):
             return str(first.get("text") or first.get("content") or "").strip(), usage, tool_count
     return text, usage, tool_count
+
+
+def merge_usage(current: dict[str, Any] | None, new_value: Any) -> dict[str, Any] | None:
+    if not isinstance(new_value, dict):
+        return current
+    merged = dict(current or {})
+    for key, value in new_value.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            nested = dict(merged[key])
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
+    return merged
+
+
+def parse_policy_response(
+    protocol: str,
+    stream: bool,
+    raw_text: str,
+) -> tuple[str, dict[str, Any] | None, int, str | None]:
+    result_parts: list[str] = []
+    usage: dict[str, Any] | None = None
+    tool_count = 0
+    finish_reason: str | None = None
+
+    if stream:
+        for line in raw_text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("data:"):
+                continue
+            data = stripped[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            usage = merge_usage(usage, event.get("usage"))
+            if protocol == "openai":
+                for choice in event.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        result_parts.append(str(delta["content"]))
+                    if delta.get("tool_calls"):
+                        tool_count += len(delta["tool_calls"])
+                    if choice.get("finish_reason"):
+                        finish_reason = str(choice["finish_reason"])
+            else:
+                event_type = event.get("type")
+                if event_type == "message_start":
+                    message = event.get("message") or {}
+                    usage = merge_usage(usage, message.get("usage"))
+                elif event_type == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    if delta.get("text"):
+                        result_parts.append(str(delta["text"]))
+                elif event_type == "content_block_start":
+                    block = event.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        tool_count += 1
+                elif event_type == "message_delta":
+                    usage = merge_usage(usage, event.get("usage"))
+                    delta = event.get("delta") or {}
+                    if delta.get("stop_reason"):
+                        finish_reason = str(delta["stop_reason"])
+        return "".join(result_parts).strip(), usage, tool_count, finish_reason
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return raw_text.strip(), None, 0, None
+    if not isinstance(parsed, dict):
+        return str(parsed), None, 0, None
+    if protocol == "openai":
+        usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
+        choices = parsed.get("choices") if isinstance(parsed.get("choices"), list) else []
+        for choice in choices:
+            message = choice.get("message") or {}
+            if message.get("content"):
+                result_parts.append(str(message["content"]))
+            if message.get("tool_calls"):
+                tool_count += len(message["tool_calls"])
+            if choice.get("finish_reason"):
+                finish_reason = str(choice["finish_reason"])
+    else:
+        usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None
+        for block in parsed.get("content") or []:
+            if block.get("type") == "text" and block.get("text"):
+                result_parts.append(str(block["text"]))
+            if block.get("type") == "tool_use":
+                tool_count += 1
+        if parsed.get("stop_reason"):
+            finish_reason = str(parsed["stop_reason"])
+    return "".join(result_parts).strip(), usage, tool_count, finish_reason
+
+
+def usage_number(usage: dict[str, Any] | None, *keys: str) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    for key in keys:
+        value: Any = usage
+        for part in key.split("."):
+            if not isinstance(value, dict) or part not in value:
+                value = None
+                break
+            value = value[part]
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def usage_numbers(protocol: str, usage: dict[str, Any] | None) -> dict[str, int | None]:
+    if protocol == "openai":
+        input_tokens = usage_number(usage, "prompt_tokens")
+        output_tokens = usage_number(usage, "completion_tokens")
+    else:
+        input_tokens = usage_number(usage, "input_tokens")
+        output_tokens = usage_number(usage, "output_tokens")
+    cached_tokens = usage_number(usage, "prompt_tokens_details.cached_tokens")
+    cache_read = usage_number(usage, "cache_read_input_tokens")
+    cache_creation = usage_number(usage, "cache_creation_input_tokens")
+    return {
+        "usage_input_tokens": input_tokens,
+        "usage_output_tokens": output_tokens,
+        "usage_cached_tokens": cached_tokens,
+        "usage_cache_read_tokens": cache_read,
+        "usage_cache_creation_tokens": cache_creation,
+    }
+
+
+def classify_cache_observation(
+    cache_attempted: bool,
+    status_code: int,
+    usage: dict[str, Any] | None,
+    raw_text: str,
+) -> str:
+    if not cache_attempted:
+        return "ignored"
+    numbers = usage_numbers("openai", usage)
+    cache_values = [
+        numbers.get("usage_cached_tokens"),
+        numbers.get("usage_cache_read_tokens"),
+        numbers.get("usage_cache_creation_tokens"),
+    ]
+    present_values = [value for value in cache_values if value is not None]
+    if any((value or 0) > 0 for value in present_values):
+        return "accepted"
+    lower = (raw_text or "").lower()
+    if status_code in {400, 422} or (
+        status_code >= 400 and ("cache" in lower or "prompt caching" in lower)
+    ):
+        return "rejected"
+    if present_values:
+        return "attempted"
+    return "ignored"
+
+
+def policy_error_class(status_code: int, raw_text: str) -> str:
+    classified = classify_api_error_text(raw_text, status_code)
+    if classified:
+        return classified
+    if 200 <= status_code < 300:
+        return "ok"
+    if status_code == 0:
+        return "network_error"
+    return "unknown_error"
+
+
+def policy_case_ok(case: PolicyCaseSpec, row: dict[str, Any]) -> bool:
+    if not row.get("redaction_ok"):
+        return False
+    if case.cache_attempted:
+        if row.get("error_class") in {"auth_error", "model_error", "network_error"}:
+            return False
+        return row.get("cache_observation") in {"attempted", "accepted", "rejected", "ignored"}
+    if not row.get("api_ok"):
+        return False
+    if case.case_type == "flash_input_room":
+        return row.get("input_wall_ok") is True and "FLASH_INPUT_OK" in row.get("result_prefix", "")
+    if case.case_type == "flash_output_room":
+        return row.get("output_wall_ok") is True and "FLASH_OUTPUT_OK" in row.get("result_prefix", "")
+    if case.case_type == "lite_not_claudecode":
+        return (
+            row.get("expected_effective_client") == "unknown"
+            and "LITE_POLICY_OK" in row.get("result_prefix", "")
+        )
+    if case.case_type == "provider_usage_probe":
+        return row.get("provider_body_usage_signal") is True and "USAGE_POLICY_OK" in row.get("result_prefix", "")
+    return True
 
 
 def model_for_index(models: list[str], idx: int) -> str:
@@ -1381,6 +1963,257 @@ def preflight(base_url: str, key: str, models: list[str], timeout_s: int) -> dic
     }
 
 
+def run_policy_case(
+    case: PolicyCaseSpec,
+    idx: int,
+    base_url: str,
+    key: str,
+    timeout_ms: int,
+    run_dir: Path,
+) -> dict[str, Any]:
+    request_id = f"policy-{case.protocol}-{idx:04d}-{uuid.uuid4().hex[:8]}"
+    prompt = build_policy_prompt(case)
+    path, payload, shape_messages, tool_names = build_policy_payload(case, prompt)
+    shape = policy_shape_fields(case, shape_messages, tool_names)
+    request_body_bytes = len(json_compact(payload).encode("utf-8"))
+    prompt_bytes = len(prompt.encode("utf-8"))
+    started = time.time()
+    headers = {"x-fmc-client": case.client_header}
+    exchange = http_exchange(
+        "POST",
+        url_join(base_url, path),
+        key,
+        payload,
+        timeout_s=max(1, timeout_ms // 1000),
+        extra_headers=headers,
+    )
+    raw_text = str(exchange.get("raw_text") or "")
+    status_code = int(exchange.get("status_code") or 0)
+    result, usage, tool_count, finish_reason = parse_policy_response(
+        case.protocol,
+        case.stream,
+        raw_text,
+    )
+    usage_values = usage_numbers(case.protocol, usage)
+    output_est_tokens = estimate_tokens(result) if result else 0
+    body_usage_signal = usage_values["usage_input_tokens"] is not None or usage_values["usage_output_tokens"] is not None
+    provider_header_names = sorted((exchange.get("headers") or {}).keys())
+    error_class = policy_error_class(status_code, raw_text)
+    api_ok = 200 <= status_code < 300 and error_class == "ok"
+    cache_observation = classify_cache_observation(
+        case.cache_attempted,
+        status_code,
+        usage,
+        raw_text,
+    )
+    input_wall_ok = None
+    output_wall_ok = None
+    if case.case_type == "flash_input_room":
+        input_wall_ok = (
+            api_ok
+            and status_code not in {400, 413, 422}
+            and prompt_bytes >= case.prompt_target_tokens * 3
+        )
+    if case.case_type == "flash_output_room":
+        output_wall_ok = (
+            api_ok
+            and output_est_tokens >= case.expected_min_output_tokens
+            and finish_reason not in {"length", "max_tokens"}
+        )
+    row: dict[str, Any] = {
+        "run_id": run_dir.name,
+        "request_id": request_id,
+        "timestamp": started,
+        "client": "direct-http",
+        "host": platform.node(),
+        "base_url_kind": base_url_kind(base_url),
+        "protocol": case.protocol,
+        "endpoint": path,
+        "model": case.model,
+        "stream": case.stream,
+        "case_type": case.case_type,
+        "x_fmc_client": case.client_header,
+        "expected_source_client": case.expected_source_client,
+        "expected_effective_client": case.expected_effective_client,
+        "profile_source_expected": "header",
+        "prompt_est_tokens": estimate_tokens(prompt),
+        "prompt_target_tokens": case.prompt_target_tokens or None,
+        "prompt_bytes": prompt_bytes,
+        "prompt_sha256": sha256_text(prompt),
+        "request_body_bytes": request_body_bytes,
+        "max_tokens": case.max_tokens,
+        "expected_min_output_tokens": case.expected_min_output_tokens or None,
+        "status": "ok" if api_ok else "error",
+        "api_ok": api_ok,
+        "status_code": status_code,
+        "error_class": error_class,
+        "retry_count": 0,
+        "timeout_ms": timeout_ms,
+        "protocol_first_byte_ms": exchange.get("protocol_first_byte_ms"),
+        "first_content_ms": exchange.get("protocol_first_byte_ms") if result else None,
+        "first_tool_call_ms": exchange.get("protocol_first_byte_ms") if tool_count else None,
+        "total_ms": exchange.get("total_ms"),
+        "tool_call_count": tool_count,
+        "tool_success": None,
+        "subagent_requested": False,
+        "subagent_supported": None,
+        "subagent_observed": None,
+        "config_mode": "direct-http-temp-headers",
+        "semantic_ok": None,
+        "output_est_tokens": output_est_tokens,
+        "response_bytes": len(result.encode("utf-8", errors="ignore")),
+        "finish_reason": finish_reason,
+        "provider_header_signal": bool(provider_header_names),
+        "provider_header_names": provider_header_names,
+        "provider_body_usage_signal": body_usage_signal,
+        "usage": usage,
+        "cache_attempted": case.cache_attempted,
+        "cache_observation": cache_observation,
+        "input_wall_ok": input_wall_ok,
+        "output_wall_ok": output_wall_ok,
+        "result_prefix": result[:RESULT_PREFIX_LIMIT],
+        "stderr_prefix": raw_text[:STDERR_PREFIX_LIMIT] if not api_ok else "",
+    }
+    row.update(shape)
+    row.update(usage_values)
+    serialized = json.dumps(row, ensure_ascii=False)
+    row["redaction_ok"] = key not in serialized and not any(
+        os.environ.get(name, "") and os.environ.get(name, "") in serialized for name in KEY_ENV_NAMES
+    )
+    row["policy_ok"] = policy_case_ok(case, row)
+    row["status"] = "ok" if row["policy_ok"] else row["status"]
+    return row
+
+
+def summarize_policy(rows: list[dict[str, Any]], require_provider_header: bool) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "total": len(rows),
+        "ok": sum(1 for row in rows if row.get("policy_ok")),
+        "policy_ok": sum(1 for row in rows if row.get("policy_ok")),
+        "api_ok": sum(1 for row in rows if row.get("api_ok")),
+        "redaction_ok": all(row.get("redaction_ok") for row in rows),
+        "provider_header_signal_rows": sum(1 for row in rows if row.get("provider_header_signal")),
+        "provider_body_usage_signal_rows": sum(1 for row in rows if row.get("provider_body_usage_signal")),
+        "require_provider_header": require_provider_header,
+        "by_protocol": {},
+        "by_case_type": {},
+        "by_cache_observation": {},
+        "by_error_class": {},
+        "wall_failures": [],
+        "failure_samples": [],
+    }
+    for row in rows:
+        for key, field in [
+            ("by_protocol", "protocol"),
+            ("by_case_type", "case_type"),
+            ("by_cache_observation", "cache_observation"),
+            ("by_error_class", "error_class"),
+        ]:
+            value = str(row.get(field) or "unknown")
+            target = summary[key]
+            target[value] = target.get(value, 0) + 1
+        if row.get("input_wall_ok") is False or row.get("output_wall_ok") is False:
+            summary["wall_failures"].append(
+                {
+                    "request_id": row.get("request_id"),
+                    "protocol": row.get("protocol"),
+                    "case_type": row.get("case_type"),
+                    "model": row.get("model"),
+                    "input_wall_ok": row.get("input_wall_ok"),
+                    "output_wall_ok": row.get("output_wall_ok"),
+                    "finish_reason": row.get("finish_reason"),
+                    "output_est_tokens": row.get("output_est_tokens"),
+                }
+            )
+    summary["provider_header_requirement_ok"] = (
+        not require_provider_header or summary["provider_header_signal_rows"] > 0
+    )
+    body_usage_protocols = {
+        str(row.get("protocol")) for row in rows if row.get("provider_body_usage_signal")
+    }
+    summary["provider_body_usage_protocols"] = sorted(body_usage_protocols)
+    summary["provider_body_usage_requirement_ok"] = body_usage_protocols >= {"openai", "anthropic"}
+    summary["protocol_requirement_ok"] = set(summary["by_protocol"]) >= {"openai", "anthropic"}
+    summary["cache_requirement_ok"] = any(row.get("cache_attempted") for row in rows) and set(
+        summary["by_cache_observation"]
+    ).issubset({"attempted", "accepted", "rejected", "ignored"})
+    summary["failure_samples"] = [
+        {
+            "request_id": row.get("request_id"),
+            "protocol": row.get("protocol"),
+            "case_type": row.get("case_type"),
+            "model": row.get("model"),
+            "status": row.get("status"),
+            "policy_ok": row.get("policy_ok"),
+            "error_class": row.get("error_class"),
+            "cache_observation": row.get("cache_observation"),
+            "provider_body_usage_signal": row.get("provider_body_usage_signal"),
+            "provider_header_signal": row.get("provider_header_signal"),
+            "result_prefix": row.get("result_prefix"),
+            "stderr_prefix": row.get("stderr_prefix"),
+        }
+        for row in rows
+        if not row.get("policy_ok")
+    ][:20]
+    return summary
+
+
+def run_policy_matrix(
+    args: argparse.Namespace,
+    base_url: str,
+    key: str,
+    models: list[str],
+    run_dir: Path,
+) -> int:
+    plan = build_policy_plan(args.mode, models)
+    rows: list[dict[str, Any]] = []
+    result_path = run_dir / "raw-results.jsonl"
+    print(
+        json.dumps({"event": "policy_start", "mode": args.mode, "cases": len(plan)}, ensure_ascii=False),
+        flush=True,
+    )
+    for idx, case in enumerate(plan):
+        row = run_policy_case(
+            case,
+            idx,
+            base_url,
+            key,
+            args.timeout_ms,
+            run_dir,
+        )
+        append_jsonl(result_path, row)
+        rows.append(row)
+        print(
+            json.dumps(
+                {
+                    "event": "policy_result",
+                    "idx": idx,
+                    "protocol": row.get("protocol"),
+                    "case_type": row.get("case_type"),
+                    "model": row.get("model"),
+                    "policy_ok": row.get("policy_ok"),
+                    "error_class": row.get("error_class"),
+                    "cache_observation": row.get("cache_observation"),
+                    "provider_body_usage_signal": row.get("provider_body_usage_signal"),
+                    "provider_header_signal": row.get("provider_header_signal"),
+                    "total_ms": row.get("total_ms"),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    summary = summarize_policy(rows, args.require_provider_header)
+    safe_write_json(run_dir / "summary.json", summary)
+    print(json.dumps({"event": "policy_done", "run_dir": str(run_dir), "summary": summary}, ensure_ascii=False), flush=True)
+    if not summary["redaction_ok"]:
+        return 3
+    if not summary["provider_header_requirement_ok"]:
+        return 1
+    if not summary["provider_body_usage_requirement_ok"]:
+        return 1
+    return 0 if summary["policy_ok"] == summary["total"] else 1
+
+
 def run_matrix(args: argparse.Namespace) -> int:
     key_name, key = env_key()
     base_url = normalize_base_url(args.base_url)
@@ -1430,6 +2263,8 @@ def run_matrix(args: argparse.Namespace) -> int:
             flush=True,
         )
         return 2
+    if args.mode in POLICY_MODES:
+        return run_policy_matrix(args, base_url, key, models, run_dir)
     plan = build_plan(args.mode, args.rounds_per_client)
     rows: list[dict[str, Any]] = []
     result_path = run_dir / "raw-results.jsonl"
@@ -1533,7 +2368,11 @@ def run_matrix(args: argparse.Namespace) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["preflight", "smoke", "dry", "full"], default="smoke")
+    parser.add_argument(
+        "--mode",
+        choices=["preflight", "smoke", "dry", "full", "policy-smoke", "policy-dry"],
+        default="smoke",
+    )
     parser.add_argument(
         "--clients",
         default="windows-claudecode,wsl-claudecode,wsl-hermes,wsl-openclaw",
@@ -1548,6 +2387,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout-ms", type=int, default=300000)
     parser.add_argument("--preflight-timeout-s", type=int, default=30)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--require-provider-header",
+        action="store_true",
+        help="Fail policy modes unless an allowlisted provider header is observed.",
+    )
     return parser.parse_args(argv)
 
 

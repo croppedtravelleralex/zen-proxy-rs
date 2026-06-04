@@ -7,7 +7,9 @@
 - 状态：已完成小矩阵。
 - 原因：代码层测试通过，但用户当前关注的是 panda NewAPI 实际可用性。
 - 验收结果：`/v1/models`、OpenAI `/v1/chat/completions`、Anthropic `/v1/messages` 均返回 200；响应摘要已写入 `docs/02-current-state.md`。
-- 残留：尚未做 4 客户端 x 500 次 panda-only 正式压测。
+- 2026-06-04 更新：最新 V4.6 部署后，`/v1/models` 200、OpenAI 非流式 200、Anthropic 流式 200；Anthropic 极短非流式探针仍可能因上游持续空输出返回 502，需要单独补探针兜底，不影响真实流式小请求链路。
+- 2026-06-04 最新残留：输出限制和 non-stream output guard 已取消，但真实 panda `policy-smoke/policy-dry` 尚未跑；不能把该策略写成生产已验证。
+- 残留：尚未做 policy-smoke/policy-dry，也尚未做 4 客户端 x 500 次 panda-only 正式压测。
 
 ### Hermes 接入 panda NewAPI
 
@@ -36,6 +38,8 @@
 - 目标：先用 `x-fmc-client` 和自动识别拆出 `claude-code`、`hermes`、`openclaw`、`unknown` 等 profile；按 profile 应用不同 thinking、空白保留、工具历史修复策略。
 - 90 分验收：ClaudeCode tools 请求不再默认禁用 thinking；流式空格/换行/缩进不丢；Hermes/OpenClaw 小矩阵不回退；profile 维度测试通过。
 - 已完成：`src/client_profile.rs`、`x-fmc-client`、OpenAI/Anthropic chat profile 传递、per-client thinking/whitespace/tool-history policy、kernel golden 回归测试。
+- 2026-06-04 追加：已补模型维度有效策略，真实 `source_client` 继续进日志，但行为策略按模型收窄：`deepseek-v4-flash/deepseek-v4-flash-free` 只保留 ClaudeCode 深度适配，取消 Hermes/OpenClaw 适配并取消输入 token 墙；`deepseek-v4-flash-lite/big-pickle` 只保留 Hermes/OpenClaw 适配，取消 ClaudeCode 适配。
+- 2026-06-04 外层同步：`zen-proxy-rs` V4 context compactor 也已按模型分流，flash/free 大输入只记录 `warn/pass`，不 compact、不按 token target reject；lite 仍作为 compactor 保护路径。
 - 已验证：2026-06-04 Windows ClaudeCode 显式 panda NewAPI 5/5，Hermes 5/5；OpenClaw API 5/5 但语义 0/5，固定 `HEARTBEAT_OK`。
 - 待完成：dry-run 级别 profile 维度运行数据、Hermes 慢路径拆解、OpenClaw local gateway/harness 修复、WSL ClaudeCode CLI 修复。
 - 99+ 后续：拿真实数据后做动态 profile、per-client 指标、灰度和回滚。
@@ -46,6 +50,66 @@
 - 当前不足：代码层有错误结构化，但缺少完整阶段耗时暴露。
 - 建议指标：请求入站、认证、解析、协议修复、上游连接、上游首包、first content、first tool call、stream decode、响应结束。
 
+### 输出限制取消后的 panda 压测闸口
+
+- 状态：源码/ZenProxy 侧策略已调整，真实 panda policy-smoke/policy-dry 未跑。
+- 当前事实：
+  - 缺省 `max_tokens` 不再补 1024/2048。
+  - 显式 `max_tokens` 原样透传。
+  - OpenAI/Anthropic 只有客户端显式传值时才向上游写 `max_tokens`。
+  - ZenProxy 侧 non-stream output guard 已取消。
+  - ZenProxy 侧 context compactor 对 `deepseek-v4-flash/deepseek-v4-flash-free` 已改为只观测/告警，不再压缩或按 token target 拒绝；`deepseek-v4-flash-lite/big-pickle` 仍保留压缩保护。
+- 风险：
+  - 上游 413、provider timeout、空输出、长尾延迟和成本风险不再由本仓库输出 cap 吸收。
+  - flash/free 大输入现在可能真实打到 upstream；如果 upstream 无法承受，需要靠 panda policy 数据决定 lane/pool 隔离，而不是偷偷恢复输入墙。
+  - 风险会回到 upstream、NewAPI、ZenProxy lane/pool 调度和客户端超时边界。
+- 待办：
+  1. 先跑 `policy-smoke`，确认 input/output wall、provider usage/header/body 信号和 cache 四态都有记录。
+  2. 再跑 `policy-dry`，重点看大输出、无显式 `max_tokens`、长输入和 cache probe 是否出现 413/超时/空输出，并确认 flash/free 日志没有 `context_action=compact`。
+  3. policy 失败时先做 lane/pool 或 case 隔离，不直接回滚成无证据的全局输出墙。
+  4. policy 通过前，不启动四客户端 full run。
+
+### ClaudeCode 输出被截断的责任层
+
+- 状态：旧截断/finish_reason 问题已定位并修复；最新输出限制已完全取消，待真实 panda policy 和 ClaudeCode 长会话复验体感。
+- 当前事实：
+  - ClaudeCode 看到的 `… +N lines (ctrl+o to expand)` 是客户端对长工具输出的折叠展示，但它不能解释用户描述的“3 段只出 1.5 段”。
+  - 近期 panda 样本显示，工程请求不全是 `>=50k` 大上下文；很多是 26k-40k prompt tokens，却只有 100-700 completion tokens。
+  - 同窗口存在 `prompt=11906/completion=6985` 的长输出成功样本，证明链路和模型并非整体不能长输出。
+  - 源码之前会吞掉上游 `finish_reason`，即使上游是 `length`，OpenAI 也会被写成 `stop`，Anthropic/ClaudeCode 也会被写成 `end_turn`。
+  - 多条 ClaudeCode 工程请求的 `last_user_tokens=3`，同时存在 26k 级旧工具输出，说明当前任务指令被旧工具历史淹没；这类中等上下文没达到旧 compactor 的 80k 阈值。
+  - 历史版本存在 `>=50k/100k/200k` 的流式输出 cap，会把显式大输出请求降到 1024/768/512；最新策略已经完全取消输出限制，缺省不补 `max_tokens`，显式值原样透传。
+- 已完成：
+  1. 透传上游 `finish_reason`，Anthropic 将 `length` 映射为 `max_tokens`。
+  2. 增加 ClaudeCode 中等工具历史压缩，覆盖 `last_user_tokens` 很短、旧工具输出很大的场景。
+  3. 新增 5 条回归：OpenAI/Anthropic stream/non-stream 的 `length` 透传，以及中等工具历史折叠。
+  4. 完全取消输出限制：缺省 `max_tokens` 不自动补值，显式值不改写。
+  5. 收窄 ClaudeCode Anthropic buffered stream：短输出和 exact-output 仍可 retry/fallback，20k/32k 长输出直接流式返回，降低首字和内存压力。
+- 风险：
+  - 用户会感知为回答短、收尾早、工具后总结不完整。
+  - 输出限制取消后，空输出、上游 413、长尾延迟和成本风险需要靠 upstream 质量、lane/pool 调度和真实 panda 压测兜住。
+- 待办：
+  1. 用同一类 ClaudeCode 工程会话复验 completion tokens、stop_reason 和终端体感。
+  2. 若仍短，再查真实上游是否稳定返回 `length/max_tokens`，并确认是上游截断、客户端展示截断还是模型自主停笔。
+  3. 同时补脱敏观测：记录 `requested_max_tokens/effective_max_tokens/prompt_tokens_bucket/source_client/upstream_finish_reason`，避免继续把该问题误判为 NewAPI/CLI 渲染 bug。
+
+### NewAPI cache 可见性
+
+- 状态：cache usage 透传已在源码和 15:33 panda release 中落地；四态 cache 观测和 provider usage 信号已在 harness/观测侧补齐，待真实 panda policy-smoke/policy-dry 生成样本。
+- 当前事实：
+  - 2026-06-04 前，OpenAI 非流式正文/工具调用响应没有透传 `cache_*`；Anthropic 非流式正文/工具调用响应把 `cache_creation_input_tokens/cache_read_input_tokens` 固定写成 `0`。
+  - 因此即使上游 usage 里有 cache 字段，NewAPI 也可能在非流式请求上完全看不到。
+- 已完成：
+  1. 非流式 OpenAI 正文/工具调用响应保留 `prompt_tokens_details.cached_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens`。
+  2. 非流式 Anthropic 正文/工具调用响应保留真实 `cache_*`。
+  3. 新增 kernel golden 回归覆盖 OpenAI/Anthropic 非流式正文和工具调用四种路径。
+  4. cache 观测分类为 `attempted`、`accepted`、`rejected`、`ignored`，不伪造 cache 命中。
+  5. policy harness 记录 provider response/header/body usage 信号，用来拆分上游返回、header 透传和 body usage 展示。
+- 待办：
+  1. 用真实 panda `policy-smoke/policy-dry` 调用记录确认 cache 四态分布。
+  2. 若 body usage 有值但 NewAPI 展示仍不显示，再排查 NewAPI 自身对 OpenAI/Anthropic usage 字段的解析/展示层。
+  3. 若 header usage 有值但 provider header 在 NewAPI 后消失，报告中必须写成“中间层剥离/未透传”，不能写成上游无 cache。
+
 ### ClaudeCode 大流式空 assistant 500
 
 - 状态：已修复并部署，仍需线上观察。
@@ -54,11 +118,11 @@
   - 错误字符串来自 `free-model-client-rs` 的空上游保护，不是 NewAPI 自造错误。
   - 2026-06-04 近 4 小时内 `deepseek-v4-flash` 成功消费 133 条，该错误实际事件 4 次，发生在 10:43、10:58、11:03、11:04。
   - 失败样本主要是 ClaudeCode Anthropic `/v1/messages` 流式请求，`source_client=ClaudeCode`，`stream=true`，大上下文加工具 schema，`tools_tokens` 约 12.7k-12.9k。
-  - 上游请求前会把 `max_tokens=32000` cap 到 768 或 1024；旧版 ClaudeCode huge buffered retry 只覆盖 `max_tokens <= 512`，所以这些请求绕过 buffered retry，普通流式分支在收到空正文/空工具调用后直接向客户端发 error。
+  - 历史失败样本里，上游请求前会把 `max_tokens=32000` cap 到 768 或 1024；旧版 ClaudeCode huge buffered retry 只覆盖 `max_tokens <= 512`，所以这些请求绕过 buffered retry，普通流式分支在收到空正文/空工具调用后直接向客户端发 error。
   - 同一回合后续 NewAPI/客户端常发非流式 fallback，并有成功样本：约 48k-52k prompt tokens，905-1789 completion tokens。
 - 已完成：
   1. 移除 `handle_stream` 内部多余的 `max_tokens <= 512` 二次门槛。
-  2. 新增 1024 cap 桶回归：大 ClaudeCode 流式请求第一次上游空输出，第二次 buffered retry 成功。
+  2. 新增历史 1024 cap 桶回归：大 ClaudeCode 流式请求第一次上游空输出，第二次 buffered retry 成功；最新输出限制已完全取消，该回归主要防止旧路径回归。
   3. 2026-06-04 已部署到 panda stripped hash `7a8f4e5dc99e8ccf1aaf6562519d8353dc4ba5205e5e55f521c265b0760ed66e`。
 - 风险：
   - 单次流式请求失败会被用户感知为无回复、卡顿或重试。
@@ -101,20 +165,20 @@
 - 已确认事实：
   - ZenProxy `body_size` 是 HTTP JSON 字节数，不是 tokens。
   - 21:44 的 ClaudeCode 请求 `body_size=472161/474175`，`context_action=pass`，未触发 ZenProxy 外层大体积 compactor。
-  - free-model-client-rs 对这两条只做了流式输出 cap：`prompt_tokens=72826/73017`，`max_tokens=32000 -> 1024`。
+  - 历史版本里，free-model-client-rs 对这两条只做了流式输出 cap：`prompt_tokens=72826/73017`，`max_tokens=32000 -> 1024`；最新策略已取消输出限制，不能把该句当作当前行为。
   - Windows ClaudeCode 当前 `ANTHROPIC_BASE_URL=http://127.0.0.1:15721`，实际先走 cc-switch；Windows 设置启用 `CLAUDE_CODE_EFFORT_LEVEL=max`、agent teams、tool search 和多个插件。
   - cc-switch 最近 Claude 日志的 provider 为 `closedeepseek -> https://sub2api.closeapi.top`，不是 `LocalNewapi -> http://127.0.0.1:4000/v1`；因此 Windows ClaudeCode 最近使用记录和 panda NewAPI channel 69 记录不能直接混为同一条链路。
   - 2026-06-03 23:01-23:46 panda channel 69 真实 ClaudeCode 请求中，流式 body 从约 674KB 增长到 788KB，`message_count` 从 600 多增长到 705，`last_user_tokens` 多数只有 36-96。
   - 同一窗口 NewAPI channel 69 共 61 条：57 条流式、4 条非流式；53 条 prompt tokens 落在 70k-90k，2 条非流式超过 200k，2 条流式 prompt tokens 记 0 且内容为 `upstream returned no assistant content or tool call`。
-  - `prompt_tokens>=200k` 的两条是非流式大请求/fallback：id `109370` 为 213248 prompt tokens，id `109461` 为 225416 prompt tokens。对应 ZenProxy 非流式路径只做输出 cap，未做输入 compactor。
+  - `prompt_tokens>=200k` 的两条是非流式大请求/fallback：id `109370` 为 213248 prompt tokens，id `109461` 为 225416 prompt tokens。对应当时 ZenProxy 非流式路径只做输出 cap，未做输入 compactor；最新策略已改为输出不设墙、flash 输入只观测不压缩。
   - ClaudeCode huge-context 流式 compactor 的 `target_tokens=12k` 没在真实会话达到，根因不是 profile 误识别，而是 700+ 旧短消息和工具 schema 残留；当前 compactor 主要处理单条大文本，短轮次历史不进候选。
 - 已完成：
   1. `src/protocol/translate.rs` 新增 `RequestShape`，只记录 token/数量/hash，不保存原始 prompt、请求体或 key。
   2. OpenAI/Anthropic 入口统一输出脱敏字段：`system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`。
   3. shape 单元测试覆盖“不泄露原文”和“工具 schema 计入 tools_tokens”。
   4. 新增 ClaudeCode huge-session compactor：折叠旧短轮次历史，保留系统消息、最近 48 条消息、最新用户目标和少量脱敏状态信号。
-  5. Anthropic/OpenAI 两个入口均接入 ClaudeCode huge-session compactor；大非流式 fallback 不再只 cap 输出，也会先压输入。
-  6. 非流式输出 cap 使用压缩前原始 prompt token 口径，避免 200k fallback 被压缩后误放宽输出上限。
+  5. 历史上 Anthropic/OpenAI 两个入口曾接入 ClaudeCode huge-session compactor，用于避免大非流式 fallback 只 cap 输出；最新 flash 策略已取消输入墙，只观测不压缩。
+  6. 非流式输出 cap 的压缩前口径属于历史保护逻辑；最新输出限制已完全取消，后续用 policy harness 观察真实上游风险。
 - 待办：
   1. 记录并统计 `stream empty -> non-stream fallback` 链路，避免上游一次空流导致 ClaudeCode 把同一大历史重发并继续膨胀。
   2. 继续观察真实 ClaudeCode/Hermes/OpenClaw 请求，确认 shape 字段在长时间运行中可被稳定采集。
@@ -154,9 +218,9 @@
 
 ### README 同步
 
-- 状态：已完成本轮同步。
-- 已改：根目录 README 已补 `FREE_MODEL_REQUEST_BODY_LIMIT_MB`、`ZEN_UPSTREAM_SESSION_TTL_SECS`、非流式输出保护、空上游错误行为、脱敏 request-shape 日志说明，并把测试数量更新为库测试 69 条、kernel golden 71 条。
-- 残留：后续代码继续变化时，需要同步 README 和维护文档。
+- 状态：历史同步已完成；本轮只改 `docs/`，根 README 尚未同步最新“输出限制完全取消”事实。
+- 已改历史：根目录 README 曾补 `FREE_MODEL_REQUEST_BODY_LIMIT_MB`、`ZEN_UPSTREAM_SESSION_TTL_SECS`、非流式输出保护、空上游错误行为、脱敏 request-shape 日志说明，并把测试数量更新到当时版本。
+- 残留：后续允许改 README 时，需要删除旧输出保护表述，改成“缺省 `max_tokens` 不自动补值、显式值原样透传、真实 panda policy-smoke/policy-dry 待跑”。
 
 ### 临时产物归类
 
@@ -176,4 +240,4 @@
 ### 长上下文质量保护
 
 - 状态：待设计。
-- 注意：本仓库目前只有非流式输出 cap，不等于完整 compactor。若做 compactor，必须保护最后用户目标、最近错误、工具结果摘要、文件路径、subagent 指令和验收标准。
+- 注意：当前 `deepseek-v4-flash/deepseek-v4-flash-free` 已取消输入 token 墙，`free-model-client-rs` 侧只观测不压缩。若未来重新引入 compactor，必须先做语义保真设计，保护最后用户目标、最近错误、工具结果摘要、文件路径、subagent 指令和验收标准。

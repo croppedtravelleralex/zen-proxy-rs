@@ -28,6 +28,7 @@ struct ObservedRequest {
     messages: Option<Value>,
     tool_choice: Option<Value>,
     thinking: Option<Value>,
+    max_tokens_present: bool,
     max_tokens: Option<u64>,
 }
 
@@ -52,6 +53,7 @@ async fn mock_zen_handler(
         messages: body.get("messages").cloned(),
         tool_choice: body.get("tool_choice").cloned(),
         thinking: body.get("thinking").cloned(),
+        max_tokens_present: body.get("max_tokens").is_some(),
         max_tokens: body.get("max_tokens").and_then(Value::as_u64),
     };
     let request_count = {
@@ -176,6 +178,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("finish-length") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"},\"finish_reason\":\"length\"}]}\n\n",
+        )
+            .into_response();
+    }
 
     if prompt.contains("inline-fence-markdown") {
         return (
@@ -206,6 +216,26 @@ async fn mock_zen_handler(
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             "data: {\"choices\":[{\"delta\":{\"content\":\"API_KEY=abc123\\nsk-fake-do-not-leak\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":8,\"total_tokens\":11}}\n\ndata: [DONE]\n\n",
+        )
+            .into_response();
+    }
+
+    if prompt.contains("cache-usage-tool") {
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_cache_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":5,\"total_tokens\":35,\"prompt_tokens_details\":{\"cached_tokens\":22},\"cache_creation_input_tokens\":11,\"cache_read_input_tokens\":22}}\n\ndata: [DONE]\n\n";
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+
+    if prompt.contains("cache-usage") {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"golden answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":5,\"total_tokens\":35,\"prompt_tokens_details\":{\"cached_tokens\":22},\"cache_creation_input_tokens\":11,\"cache_read_input_tokens\":22}}\n\ndata: [DONE]\n\n";
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
         )
             .into_response();
     }
@@ -338,7 +368,7 @@ fn anthropic_request(model: &str, prompt: &str, stream: bool) -> AnthropicReques
             content: Value::String(prompt.to_string()),
         }],
         stream: Some(stream),
-        max_tokens: 64,
+        max_tokens: Some(64),
         temperature: None,
         system: None,
         tools: None,
@@ -388,6 +418,63 @@ async fn openai_non_stream_uses_caller_client_and_returns_golden_response() {
 }
 
 #[tokio::test]
+async fn openai_non_stream_preserves_cache_usage_metadata() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash", "cache-usage", false, None),
+        )
+        .await
+        .unwrap();
+
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["usage"]["prompt_tokens"], 30);
+    assert_eq!(body["usage"]["completion_tokens"], 5);
+    assert_eq!(body["usage"]["total_tokens"], 35);
+    assert_eq!(body["usage"]["cache_creation_input_tokens"], 11);
+    assert_eq!(body["usage"]["cache_read_input_tokens"], 22);
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 22);
+}
+
+#[tokio::test]
+async fn openai_non_stream_tool_response_preserves_cache_usage_metadata() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash", "cache-usage-tool", false, None),
+        )
+        .await
+        .unwrap();
+
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(body["usage"]["cache_creation_input_tokens"], 11);
+    assert_eq!(body["usage"]["cache_read_input_tokens"], 22);
+}
+
+#[tokio::test]
+async fn openai_stream_preserves_cache_usage_metadata() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash", "cache-usage", true, None),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("\"cache_creation_input_tokens\":11"));
+    assert!(body.contains("\"cache_read_input_tokens\":22"));
+    assert!(body.contains("\"prompt_tokens_details\":{\"cached_tokens\":22}"));
+}
+
+#[tokio::test]
 async fn openai_non_stream_preserves_short_user_prompt_upstream() {
     for prompt in ["1", "继续", "执行"] {
         let (config, client, state) = spawn_mock_zen().await;
@@ -412,7 +499,66 @@ async fn openai_non_stream_preserves_short_user_prompt_upstream() {
 }
 
 #[tokio::test]
-async fn openai_non_stream_caps_large_max_tokens_before_upstream() {
+async fn deepseek_flash_hermes_profile_does_not_apply_compat_thinking_policy() {
+    for model in ["deepseek-v4-flash", "deepseek-v4-flash-free"] {
+        for kind in [ClientKind::Hermes, ClientKind::OpenClaw] {
+            let (config, client, state) = spawn_mock_zen().await;
+            let kernel = FreeModelKernel::new(config);
+            let tools = vec![OpenAITool {
+                tool_type: "function".to_string(),
+                function: OpenAIToolFunction {
+                    name: "Read".to_string(),
+                    description: None,
+                    parameters: None,
+                },
+            }];
+
+            let response = kernel
+                .openai_chat_with_profile(
+                    &client,
+                    chat_request(model, "use tool", true, Some(tools)),
+                    ClientProfile::new(kind, ClientProfileSource::Header),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let observed = state.requests.lock().unwrap();
+            assert!(
+                observed[0].thinking.is_none(),
+                "{model} must not apply Hermes/OpenClaw compat thinking policy"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn deepseek_flash_lite_claude_code_profile_does_not_apply_claude_format_policy() {
+    for model in ["deepseek-v4-flash-lite", "big-pickle"] {
+        let (config, client, _) = spawn_mock_zen().await;
+        let kernel = FreeModelKernel::new(config);
+
+        let response = kernel
+            .openai_chat_with_profile(
+                &client,
+                chat_request(model, "whitespace-delta", true, None),
+                ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            )
+            .await
+            .unwrap();
+
+        let body = response_text(response).await;
+        assert!(body.contains("alpha"));
+        assert!(body.contains("beta"));
+        assert!(
+            !body.contains("\\n    "),
+            "{model} must not apply ClaudeCode exact text policy"
+        );
+    }
+}
+
+#[tokio::test]
+async fn openai_non_stream_preserves_large_max_tokens_before_upstream() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut req = chat_request("deepseek-v4-flash", "plain", false, None);
@@ -422,21 +568,53 @@ async fn openai_non_stream_caps_large_max_tokens_before_upstream() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let observed = state.requests.lock().unwrap();
-    assert_eq!(observed[0].max_tokens, Some(4_096));
+    assert!(observed[0].max_tokens_present);
+    assert_eq!(observed[0].max_tokens, Some(20_000));
 }
 
 #[tokio::test]
-async fn anthropic_non_stream_caps_large_max_tokens_before_upstream() {
+async fn anthropic_non_stream_preserves_large_max_tokens_before_upstream() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut req = anthropic_request("deepseek-v4-flash", "plain", false);
-    req.max_tokens = 20_000;
+    req.max_tokens = Some(20_000);
 
     let response = kernel.anthropic_messages(&client, req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let observed = state.requests.lock().unwrap();
-    assert_eq!(observed[0].max_tokens, Some(4_096));
+    assert!(observed[0].max_tokens_present);
+    assert_eq!(observed[0].max_tokens, Some(20_000));
+}
+
+#[tokio::test]
+async fn openai_non_stream_omits_missing_max_tokens_before_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = chat_request("deepseek-v4-flash", "plain", false, None);
+    req.max_tokens = None;
+
+    let response = kernel.openai_chat(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let observed = state.requests.lock().unwrap();
+    assert!(!observed[0].max_tokens_present);
+    assert_eq!(observed[0].max_tokens, None);
+}
+
+#[tokio::test]
+async fn openai_stream_omits_missing_max_tokens_before_upstream() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = chat_request("deepseek-v4-flash", "plain", true, None);
+    req.max_tokens = None;
+
+    let response = kernel.openai_chat(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let observed = state.requests.lock().unwrap();
+    assert!(!observed[0].max_tokens_present);
+    assert_eq!(observed[0].max_tokens, None);
 }
 
 #[tokio::test]
@@ -484,6 +662,38 @@ async fn openai_non_stream_accepts_finish_reason_without_done() {
         .unwrap();
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "golden answer");
+}
+
+#[tokio::test]
+async fn openai_non_stream_preserves_length_finish_reason() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "finish-length", false, None),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "partial answer");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+}
+
+#[tokio::test]
+async fn openai_stream_preserves_length_finish_reason() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "finish-length", true, None),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("partial answer"));
+    assert!(body.contains("\"finish_reason\":\"length\""));
 }
 
 #[tokio::test]
@@ -562,6 +772,92 @@ async fn anthropic_non_stream_returns_golden_message_response() {
     assert_eq!(body["stop_reason"], "end_turn");
     assert_eq!(body["usage"]["input_tokens"], 3);
     assert_eq!(body["usage"]["output_tokens"], 2);
+}
+
+#[tokio::test]
+async fn anthropic_non_stream_maps_length_finish_reason_to_max_tokens() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "finish-length", false),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["content"][0]["text"], "partial answer");
+    assert_eq!(body["stop_reason"], "max_tokens");
+}
+
+#[tokio::test]
+async fn anthropic_stream_maps_length_finish_reason_to_max_tokens() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "finish-length", true),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("partial answer"));
+    assert!(body.contains("\"stop_reason\":\"max_tokens\""));
+}
+
+#[tokio::test]
+async fn anthropic_non_stream_preserves_cache_usage_metadata() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "cache-usage", false),
+        )
+        .await
+        .unwrap();
+
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["usage"]["input_tokens"], 30);
+    assert_eq!(body["usage"]["output_tokens"], 5);
+    assert_eq!(body["usage"]["cache_creation_input_tokens"], 11);
+    assert_eq!(body["usage"]["cache_read_input_tokens"], 22);
+}
+
+#[tokio::test]
+async fn anthropic_non_stream_tool_response_preserves_cache_usage_metadata() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "cache-usage-tool", false),
+        )
+        .await
+        .unwrap();
+
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert_eq!(body["usage"]["cache_creation_input_tokens"], 11);
+    assert_eq!(body["usage"]["cache_read_input_tokens"], 22);
+}
+
+#[tokio::test]
+async fn anthropic_stream_preserves_cache_usage_metadata() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "cache-usage", true),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("\"cache_creation_input_tokens\":11"));
+    assert!(body.contains("\"cache_read_input_tokens\":22"));
 }
 
 #[tokio::test]
@@ -845,7 +1141,7 @@ async fn openai_claude_code_explicit_smoke_empty_upstream_returns_pass() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = chat_request(
-        "deepseek-v4-flash-free",
+        "deepseek-v4-flash-lite",
         "strict smoke: reply PASS only empty-upstream",
         false,
         None,
@@ -891,7 +1187,7 @@ async fn anthropic_claude_code_explicit_smoke_empty_upstream_returns_pass() {
         "strict smoke: reply PASS only empty-upstream",
         false,
     );
-    request.max_tokens = 16;
+    request.max_tokens = Some(16);
 
     let response = kernel
         .anthropic_messages_with_profile(
@@ -1143,7 +1439,7 @@ async fn claude_code_tools_do_not_disable_thinking() {
     let (config, client, observed) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let req = chat_request(
-        "deepseek-v4-flash-free",
+        "deepseek-v4-flash-lite",
         "use Task",
         false,
         Some(vec![OpenAITool {
@@ -1175,7 +1471,7 @@ async fn hermes_tools_keep_compat_thinking_policy() {
     let (config, client, observed) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let req = chat_request(
-        "deepseek-v4-flash-free",
+        "deepseek-v4-flash-lite",
         "use Task",
         false,
         Some(vec![OpenAITool {
@@ -1315,7 +1611,7 @@ async fn anthropic_tool_choice_is_translated_to_openai_function_choice() {
             },
         }]),
         tool_choice: Some(json!({"type":"tool","name":"Task"})),
-        ..anthropic_request("deepseek-v4-flash-free", "use Task", false)
+        ..anthropic_request("deepseek-v4-flash-lite", "use Task", false)
     };
     let _ = kernel
         .anthropic_messages_with_profile(
@@ -1376,7 +1672,7 @@ fn short_user_prompt_with_tools_is_not_rewritten() {
 }
 
 #[test]
-fn non_stream_output_policy_caps_by_prompt_size() {
+fn non_stream_output_policy_preserves_requested_max_tokens_by_prompt_size() {
     fn msg(chars: usize) -> Vec<Message> {
         vec![Message {
             role: "user".to_string(),
@@ -1388,31 +1684,38 @@ fn non_stream_output_policy_caps_by_prompt_size() {
 
     let missing =
         free_model_client_rs::protocol::translate::non_stream_output_policy(&msg(4), None);
-    assert_eq!(missing.effective_max_tokens, 2_048);
+    assert_eq!(missing.effective_max_tokens, None);
     assert!(!missing.capped);
 
     let small =
         free_model_client_rs::protocol::translate::non_stream_output_policy(&msg(4), Some(20_000));
-    assert_eq!(small.effective_max_tokens, 4_096);
-    assert!(small.capped);
+    assert_eq!(small.effective_max_tokens, Some(20_000));
+    assert!(!small.capped);
+
+    let tiny =
+        free_model_client_rs::protocol::translate::non_stream_output_policy(&msg(4), Some(1));
+    assert_eq!(tiny.effective_max_tokens, Some(1));
+    assert!(!tiny.capped);
 
     let fifty_k = free_model_client_rs::protocol::translate::non_stream_output_policy(
         &msg(200_000),
         Some(20_000),
     );
     assert_eq!(fifty_k.prompt_tokens, 50_000);
-    assert_eq!(fifty_k.effective_max_tokens, 2_048);
+    assert_eq!(fifty_k.effective_max_tokens, Some(20_000));
+    assert!(!fifty_k.capped);
 
     let hundred_k = free_model_client_rs::protocol::translate::non_stream_output_policy(
         &msg(400_000),
         Some(20_000),
     );
     assert_eq!(hundred_k.prompt_tokens, 100_000);
-    assert_eq!(hundred_k.effective_max_tokens, 1_024);
+    assert_eq!(hundred_k.effective_max_tokens, Some(20_000));
+    assert!(!hundred_k.capped);
 }
 
 #[test]
-fn stream_output_policy_caps_by_prompt_size() {
+fn stream_output_policy_preserves_explicit_max_tokens_by_prompt_size() {
     fn msg(chars: usize) -> Vec<Message> {
         vec![Message {
             role: "user".to_string(),
@@ -1424,23 +1727,33 @@ fn stream_output_policy_caps_by_prompt_size() {
 
     let small =
         free_model_client_rs::protocol::translate::stream_output_policy(&msg(4), Some(20_000));
-    assert_eq!(small.effective_max_tokens, 20_000);
+    assert_eq!(small.effective_max_tokens, Some(20_000));
     assert!(!small.capped);
+
+    let tiny = free_model_client_rs::protocol::translate::stream_output_policy(&msg(4), Some(1));
+    assert_eq!(tiny.effective_max_tokens, Some(1));
+    assert!(!tiny.capped);
 
     let fifty_k = free_model_client_rs::protocol::translate::stream_output_policy(
         &msg(200_000),
         Some(20_000),
     );
     assert_eq!(fifty_k.prompt_tokens, 50_000);
-    assert_eq!(fifty_k.effective_max_tokens, 1_024);
-    assert!(fifty_k.capped);
+    assert_eq!(fifty_k.effective_max_tokens, Some(20_000));
+    assert!(!fifty_k.capped);
 
     let hundred_k = free_model_client_rs::protocol::translate::stream_output_policy(
         &msg(400_000),
         Some(20_000),
     );
     assert_eq!(hundred_k.prompt_tokens, 100_000);
-    assert_eq!(hundred_k.effective_max_tokens, 768);
+    assert_eq!(hundred_k.effective_max_tokens, Some(20_000));
+    assert!(!hundred_k.capped);
+
+    let missing =
+        free_model_client_rs::protocol::translate::stream_output_policy(&msg(400_000), None);
+    assert_eq!(missing.effective_max_tokens, None);
+    assert!(!missing.capped);
 }
 
 #[test]
@@ -1676,8 +1989,63 @@ fn claude_code_huge_session_folds_old_short_tool_history() {
     assert!(repair.after_tokens < repair.before_tokens / 2);
 }
 
+#[test]
+fn claude_code_mid_sized_tool_history_folds_when_latest_user_is_tiny() {
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("ClaudeCode system prompt.".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    for idx in 0..86 {
+        messages.push(Message {
+            role: if idx % 2 == 0 {
+                "assistant".to_string()
+            } else {
+                "user".to_string()
+            },
+            content: Value::String(format!("old short session message {idx}")),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    messages.insert(
+        10,
+        Message {
+            role: "tool".to_string(),
+            content: Value::String(format!(
+                "OLD_TOOL_OUTPUT_START\n{}\nOLD_TOOL_OUTPUT_END",
+                "tool result line\n".repeat(7_000)
+            )),
+            tool_calls: None,
+            tool_call_id: Some("call_old_tool".to_string()),
+        },
+    );
+    messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String("继续".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+
+    let before_len = messages.len();
+    let repair =
+        free_model_client_rs::protocol::translate::compact_claude_code_huge_session_context(
+            &mut messages,
+        );
+    let prompt = free_model_client_rs::protocol::translate::build_prompt_text(&messages);
+
+    assert!(repair.compacted_messages > 0);
+    assert!(messages.len() < before_len);
+    assert!(prompt.contains("folded stale ClaudeCode tool/session history"));
+    assert!(prompt.contains("继续"));
+    assert!(!prompt.contains("OLD_TOOL_OUTPUT_START"));
+}
+
 #[tokio::test]
-async fn claude_code_huge_exact_output_reduces_upstream_prompt() {
+async fn deepseek_flash_claude_code_huge_exact_output_preserves_upstream_prompt_without_input_wall()
+{
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request(
@@ -1688,7 +2056,7 @@ async fn claude_code_huge_exact_output_reduces_upstream_prompt() {
         ),
         true,
     );
-    request.max_tokens = 20_000;
+    request.max_tokens = Some(20_000);
 
     let response = kernel
         .anthropic_messages_with_profile(
@@ -1701,15 +2069,25 @@ async fn claude_code_huge_exact_output_reduces_upstream_prompt() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_text(response).await;
     assert!(body.contains("HUGE_OK"));
-    assert_eq!(state.requests.lock().unwrap().len(), 1);
+    let sent = state.requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    let prompt = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!prompt.contains("context compactor"));
+    assert!(prompt.contains("huge-section"));
+    assert!(prompt.contains("Final question: output HUGE_OK only."));
 }
 
 #[tokio::test]
-async fn claude_code_huge_anthropic_non_stream_compacts_before_upstream() {
+async fn deepseek_flash_claude_code_anthropic_non_stream_preserves_large_input_before_upstream() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request("deepseek-v4-flash", "placeholder", false);
-    request.max_tokens = 20_000;
+    request.max_tokens = Some(20_000);
     request.messages.clear();
     request.system = Some(Value::String("ClaudeCode system prompt.".to_string()));
 
@@ -1744,21 +2122,22 @@ async fn claude_code_huge_anthropic_non_stream_compacts_before_upstream() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let sent = state.requests.lock().unwrap();
-    assert_eq!(sent[0].max_tokens, Some(1_024));
+    assert_eq!(sent[0].max_tokens, Some(20_000));
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
     let prompt = messages
         .iter()
         .filter_map(|message| message["content"].as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(messages.len() < 100);
-    assert!(prompt.contains("folded stale ClaudeCode tool/session history"));
+    assert!(messages.len() > 650);
+    assert!(!prompt.contains("folded stale ClaudeCode tool/session history"));
+    assert!(prompt.contains("old non-stream fallback loop 0"));
     assert!(prompt.contains("当前要求"));
     assert!(prompt.contains("不要重启"));
 }
 
 #[tokio::test]
-async fn openai_stream_caps_and_compacts_large_context_before_upstream() {
+async fn deepseek_flash_openai_stream_preserves_large_context_before_upstream() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = chat_request(
@@ -1779,15 +2158,16 @@ async fn openai_stream_caps_and_compacts_large_context_before_upstream() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let sent = state.requests.lock().unwrap();
-    assert_eq!(sent[0].max_tokens, Some(768));
+    assert_eq!(sent[0].max_tokens, Some(20_000));
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
     let content = messages[0]["content"].as_str().unwrap();
-    assert!(content.contains("context compactor"));
+    assert!(!content.contains("context compactor"));
+    assert!(content.len() > 420_000);
     assert!(content.ends_with("FINAL_MARKER"));
 }
 
 #[tokio::test]
-async fn claude_code_stream_uses_original_prompt_tokens_for_output_cap_after_compaction() {
+async fn deepseek_flash_claude_code_stream_preserves_large_context_without_output_cap() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = chat_request(
@@ -1808,23 +2188,17 @@ async fn claude_code_stream_uses_original_prompt_tokens_for_output_cap_after_com
     assert_eq!(response.status(), StatusCode::OK);
 
     let sent = state.requests.lock().unwrap();
-    assert_eq!(sent[0].max_tokens, Some(512));
+    assert_eq!(sent[0].max_tokens, Some(20_000));
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    assert_eq!(messages.len(), 1);
     let content = messages[0]["content"].as_str().unwrap();
-    assert!(content.contains("context compactor"));
+    assert!(!content.contains("context compactor"));
+    assert!(content.len() > 1_000_000);
     assert!(content.ends_with("FINAL_MARKER"));
-    assert_eq!(messages.len(), 2);
-    let final_anchor = messages[1]["content"].as_str().unwrap();
-    assert!(final_anchor.contains("active latest user request"));
-    assert!(final_anchor.contains("FINAL_MARKER"));
-    assert!(
-        free_model_client_rs::protocol::translate::estimate_tokens(content) <= 13_000,
-        "ClaudeCode huge context should compact below the safer target"
-    );
 }
 
 #[tokio::test]
-async fn claude_code_huge_anthropic_stream_compacts_before_client_stream() {
+async fn deepseek_flash_claude_code_anthropic_stream_preserves_large_context_before_upstream() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request(
@@ -1835,7 +2209,7 @@ async fn claude_code_huge_anthropic_stream_compacts_before_client_stream() {
         ),
         true,
     );
-    request.max_tokens = 20_000;
+    request.max_tokens = Some(20_000);
 
     let response = kernel
         .anthropic_messages_with_profile(
@@ -1849,7 +2223,17 @@ async fn claude_code_huge_anthropic_stream_compacts_before_client_stream() {
     let body = response_text(response).await;
     assert!(body.contains("HUGE_OK"));
     assert!(body.contains("event: message_stop"));
-    assert_eq!(state.requests.lock().unwrap().len(), 1);
+    let sent = state.requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].max_tokens, Some(20_000));
+    let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
+    let prompt = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!prompt.contains("context compactor"));
+    assert!(prompt.contains("Final question: describe the HUGE_OK marker."));
 }
 
 #[tokio::test]
@@ -1858,7 +2242,7 @@ async fn anthropic_empty_stream_probe_shortcuts_without_upstream() {
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request("deepseek-v4-flash", "ignored", true);
     request.messages.clear();
-    request.max_tokens = 64;
+    request.max_tokens = Some(64);
 
     let response = kernel
         .anthropic_messages_with_profile(
@@ -1904,7 +2288,7 @@ async fn claude_code_small_low_max_tokens_stream_uses_buffer_retry() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request("deepseek-v4-flash", "empty-once", true);
-    request.max_tokens = 64;
+    request.max_tokens = Some(64);
 
     let response = kernel
         .anthropic_messages_with_profile(
@@ -1922,7 +2306,7 @@ async fn claude_code_small_low_max_tokens_stream_uses_buffer_retry() {
 }
 
 #[tokio::test]
-async fn claude_code_huge_stream_uses_buffer_retry_after_1024_output_cap() {
+async fn claude_code_huge_stream_uses_buffer_retry_for_short_output_guard() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let huge_prompt = format!(
@@ -1930,7 +2314,7 @@ async fn claude_code_huge_stream_uses_buffer_retry_after_1024_output_cap() {
         "old tool output line\n".repeat(12_000)
     );
     let mut request = anthropic_request("deepseek-v4-flash", &huge_prompt, true);
-    request.max_tokens = 32_000;
+    request.max_tokens = Some(2_048);
 
     let response = kernel
         .anthropic_messages_with_profile(
@@ -1946,8 +2330,35 @@ async fn claude_code_huge_stream_uses_buffer_retry_after_1024_output_cap() {
     assert!(!body.contains("upstream returned no assistant content or tool call"));
     let requests = state.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].max_tokens, Some(1024));
-    assert_eq!(requests[1].max_tokens, Some(1024));
+    assert_eq!(requests[0].max_tokens, Some(2_048));
+    assert_eq!(requests[1].max_tokens, Some(2_048));
+}
+
+#[tokio::test]
+async fn claude_code_huge_stream_large_output_direct_streams_without_buffer() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let huge_prompt = format!(
+        "Read this long ClaudeCode session.\n{}\nLatest task: answer normally.",
+        "old tool output line\n".repeat(12_000)
+    );
+    let mut request = anthropic_request("deepseek-v4-flash", &huge_prompt, true);
+    request.max_tokens = Some(32_000);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer"));
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].max_tokens, Some(32_000));
 }
 
 #[tokio::test]
@@ -1955,7 +2366,7 @@ async fn anthropic_channel_test_probe_empty_upstream_falls_back_to_ok() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request("deepseek-v4-flash", "echo hi", true);
-    request.max_tokens = 16;
+    request.max_tokens = Some(16);
 
     let response = kernel
         .anthropic_messages_with_profile(
@@ -2009,7 +2420,7 @@ async fn claude_code_huge_exact_output_uses_upstream_before_literal_fallback() {
         ),
         true,
     );
-    request.max_tokens = 20_000;
+    request.max_tokens = Some(20_000);
 
     let response = kernel
         .anthropic_messages_with_profile(
@@ -2083,7 +2494,7 @@ async fn openclaw_session_summary_pressure_shortcuts_safe_marker_without_upstrea
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let request = anthropic_request(
-        "deepseek-v4-flash",
+        "deepseek-v4-flash-lite",
         "Previous assistant answer: HUGE_OK.\nThe session is complete. The working tree has 5 files with uncommitted changes. All tests pass with no warnings.",
         true,
     );
@@ -2107,7 +2518,7 @@ async fn openclaw_session_summary_pressure_with_tools_shortcuts_safe_marker_with
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request(
-        "deepseek-v4-flash",
+        "deepseek-v4-flash-lite",
         "Previous assistant answer: HUGE_OK.\nThe session is complete. The working tree has 5 files with uncommitted changes. All tests pass with no warnings.",
         true,
     );
@@ -2149,7 +2560,7 @@ async fn claude_code_ready_followup_does_not_reuse_recent_exact_output() {
         ),
         true,
     );
-    exact_request.max_tokens = 20_000;
+    exact_request.max_tokens = Some(20_000);
 
     let first = kernel
         .anthropic_messages_with_profile(

@@ -4,6 +4,7 @@ use crate::kernel::KernelConfig;
 use crate::protocol::translate::estimate_tokens as estimate;
 use crate::protocol::{translate, types::*};
 use crate::synthesis;
+use crate::zen::client::ProviderCacheSignals;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
@@ -11,7 +12,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 const CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS: u64 = 50_000;
-const CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS: u64 = 512;
+const CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS: u64 = 2_048;
 const CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS: usize = 3;
 const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
 
@@ -22,10 +23,22 @@ pub async fn handle_anthropic_messages(
     profile: ClientProfile,
 ) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
+    let observed_profile = profile;
+    let profile = observed_profile.effective_for_model(&model);
+    if profile != observed_profile {
+        tracing::info!(
+            model,
+            source_client = ?observed_profile.kind,
+            effective_client = ?profile.kind,
+            "client profile policy narrowed by model"
+        );
+    }
     let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
     let mut msgs = translate::anthropic_to_openai_messages(&body);
     let stream_requested = body.stream.unwrap_or(false);
-    let context_repair = if profile.kind == ClientKind::ClaudeCode {
+    let context_repair = if translate::model_disables_input_compaction(&model) {
+        translate::observe_context(&msgs)
+    } else if profile.kind == ClientKind::ClaudeCode {
         translate::compact_claude_code_huge_session_context(&mut msgs)
     } else if stream_requested {
         translate::compact_stream_context_with_policy(
@@ -93,7 +106,7 @@ pub async fn handle_anthropic_messages(
         ));
         let policy = translate::stream_output_policy_for_prompt_tokens(
             policy_prompt_tokens,
-            Some(body.max_tokens),
+            body.max_tokens,
         );
         if policy.capped {
             tracing::warn!(
@@ -110,7 +123,7 @@ pub async fn handle_anthropic_messages(
         ));
         let policy = translate::non_stream_output_policy_for_prompt_tokens(
             policy_prompt_tokens,
-            Some(body.max_tokens),
+            body.max_tokens,
         );
         if policy.capped {
             tracing::warn!(
@@ -129,7 +142,10 @@ pub async fn handle_anthropic_messages(
             .as_ref()
             .map(translate::anthropic_tool_choice_to_openai)
     };
-    let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":tool_choice});
+    let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":tool_choice});
+    if let Some(max_tok) = max_tok {
+        zb["max_tokens"] = serde_json::json!(max_tok);
+    }
     if profile.disables_thinking_for_tool_use() {
         translate::disable_thinking_for_tool_use(&mut zb);
     }
@@ -137,13 +153,13 @@ pub async fn handle_anthropic_messages(
         model: model.clone(),
         messages: msgs,
         stream: Some(stream_requested),
-        max_tokens: Some(max_tok),
+        max_tokens: max_tok,
         temperature: body.temperature,
         top_p: None,
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
     };
-    super::log_request_shape("anthropic", &cr, profile);
+    super::log_request_shape("anthropic", &cr, observed_profile, profile);
     if stream_requested && profile.protects_recovery_safe_markers() {
         if let Some(literal) = translate::claude_code_recovery_literal_from_messages(&cr.messages) {
             tracing::warn!(
@@ -158,6 +174,14 @@ pub async fn handle_anthropic_messages(
                 .as_millis();
             let input_tokens = estimate(&translate::build_prompt_text(&cr.messages)).max(1);
             let output_tokens = estimate(&literal).max(1);
+            super::log_provider_cache_observation(
+                "anthropic",
+                &cr,
+                profile,
+                &ProviderCacheSignals::ignored(),
+                0,
+                0,
+            );
             return Ok(anthropic_buffered_stream_resp(
                 ts,
                 &cr.model,
@@ -167,12 +191,21 @@ pub async fn handle_anthropic_messages(
                 output_tokens,
                 0,
                 0,
+                "end_turn".to_string(),
                 &cr,
                 profile,
             ));
         }
     }
     if translate::is_short_no_tool_health_request(&cr) {
+        super::log_provider_cache_observation(
+            "anthropic",
+            &cr,
+            profile,
+            &ProviderCacheSignals::ignored(),
+            0,
+            0,
+        );
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -190,11 +223,13 @@ pub async fn handle_anthropic_messages(
         return Ok(text_resp(ts, &cr.model, "ok", input_tokens, output_tokens));
     }
     if body.stream.unwrap_or(false) {
-        let use_claude_code_huge_buffer = profile.kind == ClientKind::ClaudeCode
-            && (context_repair.before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS
-                || cr.max_tokens.is_some_and(|max_tokens| {
-                    max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS
-                }));
+        let use_claude_code_huge_buffer = should_use_claude_code_buffered_stream(
+            profile,
+            context_repair.before_tokens,
+            cr.max_tokens,
+            reduced_exact_output_anchor
+                || translate::exact_output_literal_from_messages(&cr.messages).is_some(),
+        );
         handle_stream(
             client,
             config,
@@ -207,6 +242,26 @@ pub async fn handle_anthropic_messages(
     } else {
         handle_non_stream(client, config, &cr, &zb, profile).await
     }
+}
+
+fn should_use_claude_code_buffered_stream(
+    profile: ClientProfile,
+    before_tokens: u64,
+    effective_max_tokens: Option<u64>,
+    has_exact_output_literal: bool,
+) -> bool {
+    if profile.kind != ClientKind::ClaudeCode {
+        return false;
+    }
+    if has_exact_output_literal {
+        return true;
+    }
+    let Some(max_tokens) = effective_max_tokens else {
+        return false;
+    };
+    max_tokens <= 512
+        || (max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS
+            && before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS)
 }
 
 async fn handle_non_stream(
@@ -232,8 +287,18 @@ async fn handle_non_stream(
                 &config.extra_headers,
             )
             .await?;
+            let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
             observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
             let collected = crate::zen::client::collect_stream_parts(resp).await?;
+            let cache_signals = cache_signals.with_body_usage(collected.usage.as_ref());
+            super::log_provider_cache_observation(
+                "anthropic",
+                cr,
+                profile,
+                &cache_signals,
+                attempt + 1,
+                NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+            );
             let content = response_text_for_profile(profile, &collected.content);
             if content.trim().is_empty() && collected.tool_calls.is_empty() {
                 last_empty = true;
@@ -331,7 +396,14 @@ async fn handle_non_stream(
                     .max(1)
                 });
             return Ok(with_observed_exit_ip(
-                tool_resp(ts, &cr.model, blocks, input_tokens, output_tokens),
+                tool_resp_with_usage(
+                    ts,
+                    &cr.model,
+                    blocks,
+                    input_tokens,
+                    output_tokens,
+                    collected.usage.as_ref(),
+                ),
                 observed_exit_ip,
             ));
         }
@@ -347,13 +419,21 @@ async fn handle_non_stream(
         .and_then(|usage| usage.completion_tokens)
         .unwrap_or_else(|| estimate(&content));
     Ok(with_observed_exit_ip(
-        text_resp(ts, &cr.model, &content, input_tokens, output_tokens),
+        text_resp_with_usage(
+            ts,
+            &cr.model,
+            &content,
+            input_tokens,
+            output_tokens,
+            collected.usage.as_ref(),
+            collected.finish_reason.as_deref(),
+        ),
         observed_exit_ip,
     ))
 }
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
-    Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":[{"type":"text","text":text}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":output_tokens}})).into_response()
+    text_resp_with_usage(ts, model, text, input_tokens, output_tokens, None, None)
 }
 
 fn response_text_for_profile(profile: ClientProfile, text: &str) -> String {
@@ -385,14 +465,91 @@ fn anthropic_ok_stream_resp(
     Sse::new(stream).into_response()
 }
 
-fn tool_resp(
+fn text_resp_with_usage(
+    ts: u128,
+    model: &str,
+    text: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    usage: Option<&crate::zen::client::ZenUsage>,
+    upstream_finish_reason: Option<&str>,
+) -> Response {
+    let stop_reason = anthropic_stop_reason(upstream_finish_reason, false);
+    Json(serde_json::json!({
+        "id": format!("msg_{ts}"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type":"text","text":text}],
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "cache_creation_input_tokens": cache_creation_tokens(usage),
+            "cache_read_input_tokens": cache_read_tokens(usage),
+            "output_tokens": output_tokens
+        }
+    }))
+    .into_response()
+}
+
+fn tool_resp_with_usage(
     ts: u128,
     model: &str,
     blocks: Vec<AnthropicContentBlock>,
     input_tokens: u64,
     output_tokens: u64,
+    usage: Option<&crate::zen::client::ZenUsage>,
 ) -> Response {
-    Json(serde_json::json!({"id":format!("msg_{ts}"),"type":"message","role":"assistant","model":model,"content":blocks,"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":input_tokens,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":output_tokens}})).into_response()
+    Json(serde_json::json!({
+        "id": format!("msg_{ts}"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": blocks,
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "cache_creation_input_tokens": cache_creation_tokens(usage),
+            "cache_read_input_tokens": cache_read_tokens(usage),
+            "output_tokens": output_tokens
+        }
+    }))
+    .into_response()
+}
+
+fn cache_creation_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
+    usage
+        .and_then(|usage| usage.cache_creation_input_tokens)
+        .unwrap_or(0)
+}
+
+fn cache_read_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
+    usage
+        .and_then(|usage| usage.cache_read_input_tokens)
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(|value| value.as_u64())
+        })
+        .unwrap_or(0)
+}
+
+fn anthropic_stop_reason(
+    upstream_finish_reason: Option<&str>,
+    has_tool_calls: bool,
+) -> &'static str {
+    if has_tool_calls {
+        return "tool_use";
+    }
+    match upstream_finish_reason {
+        Some("length") => "max_tokens",
+        Some("stop") => "end_turn",
+        Some("content_filter") => "end_turn",
+        _ => "end_turn",
+    }
 }
 
 fn with_observed_exit_ip(
@@ -472,6 +629,7 @@ async fn handle_stream(
         &config.extra_headers,
     )
     .await?;
+    let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
     let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
@@ -484,6 +642,7 @@ async fn handle_stream(
         };
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
+        let mut upstream_finish_reason: Option<String> = None;
         while let Some(event) = upstream.next().await {
             let event = match event {
                 Ok(event) => event,
@@ -497,6 +656,9 @@ async fn handle_stream(
             }
             if let Some(choices) = event.choices {
                 for choice in choices {
+                    if let Some(reason) = choice.finish_reason.as_deref().filter(|reason| !reason.is_empty()) {
+                        upstream_finish_reason = Some(reason.to_string());
+                    }
                     let Some(delta) = choice.delta else { continue; };
                     if let Some(content) = delta.content {
                         let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
@@ -568,7 +730,7 @@ async fn handle_stream(
                 yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":tidx}).to_string()));
             }
         }
-        let stop_reason = if !tool_calls.is_empty() { "tool_use" } else { "end_turn" };
+        let stop_reason = anthropic_stop_reason(upstream_finish_reason.as_deref(), !tool_calls.is_empty());
         let output_tokens = usage
             .as_ref()
             .and_then(|usage| usage.completion_tokens)
@@ -594,6 +756,8 @@ async fn handle_stream(
                     .and_then(|value| value.as_u64())
             })
             .unwrap_or(0);
+        let cache_signals = cache_signals.with_body_usage(usage.as_ref());
+        super::log_provider_cache_observation("anthropic", &body, profile, &cache_signals, 1, 1);
         yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
@@ -635,6 +799,7 @@ async fn handle_buffered_claude_code_huge_stream(
             }
         };
 
+        let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
         let collected = match crate::zen::client::collect_stream_parts(resp).await {
             Ok(collected) => collected,
             Err(err) => {
@@ -650,6 +815,15 @@ async fn handle_buffered_claude_code_huge_stream(
                 continue;
             }
         };
+        let cache_signals = cache_signals.with_body_usage(collected.usage.as_ref());
+        super::log_provider_cache_observation(
+            "anthropic_buffered",
+            cr,
+            profile,
+            &cache_signals,
+            attempt + 1,
+            CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
+        );
         let content = response_text_for_profile(profile, &collected.content);
         if content.trim().is_empty() && collected.tool_calls.is_empty() {
             tracing::warn!(
@@ -676,6 +850,7 @@ async fn handle_buffered_claude_code_huge_stream(
                     estimate(fallback_text).max(1),
                     0,
                     0,
+                    "end_turn".to_string(),
                     cr,
                     profile,
                 ));
@@ -699,6 +874,7 @@ async fn handle_buffered_claude_code_huge_stream(
                         estimate(literal).max(1),
                         0,
                         0,
+                        "end_turn".to_string(),
                         cr,
                         profile,
                     ));
@@ -753,6 +929,7 @@ async fn handle_buffered_claude_code_huge_stream(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
+        let has_tool_calls = !collected.tool_calls.is_empty();
         return Ok(anthropic_buffered_stream_resp(
             ts,
             &cr.model,
@@ -762,6 +939,7 @@ async fn handle_buffered_claude_code_huge_stream(
             output_tokens,
             cache_creation,
             cache_read,
+            anthropic_stop_reason(collected.finish_reason.as_deref(), has_tool_calls).to_string(),
             cr,
             profile,
         ));
@@ -780,6 +958,7 @@ fn anthropic_buffered_stream_resp(
     output_tokens: u64,
     cache_creation: u64,
     cache_read: u64,
+    stop_reason: String,
     body: &ChatRequest,
     profile: ClientProfile,
 ) -> Response {
@@ -827,7 +1006,7 @@ fn anthropic_buffered_stream_resp(
                 yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":tidx}).to_string()));
             }
         }
-        let stop_reason = if tool_calls.is_empty() { "end_turn" } else { "tool_use" };
+        let stop_reason = if tool_calls.is_empty() { stop_reason } else { "tool_use".to_string() };
         yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };

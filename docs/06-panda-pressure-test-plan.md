@@ -1,6 +1,6 @@
 # panda-only 四客户端压测方案
 
-更新时间：2026-05-31
+更新时间：2026-06-04
 
 ## 目标
 
@@ -44,7 +44,7 @@ WSL OpenClaw: 500 次
 | 类型 | 次数 | 目的 |
 |------|------|------|
 | 短请求 stream | 120 | 测短请求首字、短指令服从、普通对话稳定性 |
-| 短请求 non-stream | 60 | 测非流式 cap、短输出、NewAPI 兼容性 |
+| 短请求 non-stream | 60 | 测无输出 cap 后的短输出、usage 透传、NewAPI 兼容性 |
 | 中上下文 1k-10k | 80 | 测常规工程上下文和工具 schema 压力 |
 | 长上下文 10k-50k | 70 | 测 first_content、总耗时、上下文保持 |
 | 超长上下文 50k-200k | 40 | 测长请求隔离、非流式保护、客户端超时边界 |
@@ -74,6 +74,91 @@ WSL OpenClaw: 500 次
    - 检查默认配置是否被污染。
    - 检查 `.codex_tmp/` 是否有密钥、完整请求体、完整响应体。
    - 只把脱敏摘要写入 `docs/`。
+
+## 策略 smoke/dry harness
+
+四客户端 CLI 压测之外，`scripts/panda_pressure_runner.py` 现在提供直接 HTTP policy harness，用来先验收本轮策略信号，不依赖本地 ClaudeCode/Hermes/OpenClaw CLI 状态。
+
+当前状态：harness 已落地，但真实 panda `policy-smoke` / `policy-dry` 尚未跑；不得把输出限制取消、ZenProxy non-stream output guard 取消写成生产已验证。
+
+运行方式：
+
+```bash
+cd /home/lenovo/free-model-client-rs
+PANDA_NEWAPI_KEY=sk-*** python3 scripts/panda_pressure_runner.py --mode policy-smoke
+PANDA_NEWAPI_KEY=sk-*** python3 scripts/panda_pressure_runner.py --mode policy-dry --timeout-ms 300000
+```
+
+如果要把 provider header 作为硬门槛：
+
+```bash
+PANDA_NEWAPI_KEY=sk-*** python3 scripts/panda_pressure_runner.py --mode policy-smoke --require-provider-header
+```
+
+policy harness 固定覆盖 OpenAI `/v1/chat/completions` 和 Anthropic `/v1/messages` 两类协议，每类协议各跑：
+
+| case_type | 目的 | 关键断言 |
+|-----------|------|----------|
+| `flash_input_room` | 验证 `deepseek-v4-flash` 没有输入墙 | 大 prompt 不返回 400/413/422，`input_wall_ok=true`。 |
+| `flash_output_room` | 验证 `deepseek-v4-flash` 没有输出墙 | 输出 token 达到门槛，`finish_reason` 不能是 `length/max_tokens`，`output_wall_ok=true`。 |
+| `lite_not_claudecode` | 验证 `deepseek-v4-flash-lite` 不走 ClaudeCode 适配 | 请求带 `x-fmc-client=claude-code` 和 `Task` 工具；结果字段预期 `expected_source_client=claude-code`、`expected_effective_client=unknown`，线上日志需按 `request_shape_hash` 对齐确认。 |
+| `provider_usage_probe` | 验证 provider body usage 信号 | 非流式简单请求必须返回 `provider_body_usage_signal=true` 和 usage token 字段。 |
+| `cache_probe` | 验证缓存观测分类 | 输出 `cache_observation=attempted/accepted/rejected/ignored`，不伪造 cache 命中。 |
+
+样本数据字段：
+
+```text
+request_id
+protocol
+endpoint
+model
+stream
+case_type
+x_fmc_client
+expected_source_client
+expected_effective_client
+request_shape_hash
+request_shape_estimated_total_tokens
+request_shape_tool_name_classes
+prompt_est_tokens
+request_body_bytes
+max_tokens
+status_code
+api_ok
+policy_ok
+provider_header_signal
+provider_header_names
+provider_body_usage_signal
+usage_input_tokens
+usage_output_tokens
+usage_cached_tokens
+usage_cache_read_tokens
+usage_cache_creation_tokens
+cache_attempted
+cache_observation
+input_wall_ok
+output_wall_ok
+finish_reason
+redaction_ok
+```
+
+其中 provider response usage 信号由 `usage` 原文及 `usage_input_tokens/usage_output_tokens/usage_cached_tokens/...` 派生；provider header/body usage 信号分别由 `provider_header_signal/provider_header_names` 和 `provider_body_usage_signal` 表示。
+
+验收标准：
+
+1. `policy-smoke` 至少产生 10 条记录，OpenAI/Anthropic 两协议均覆盖，`redaction_ok=true`。
+2. `flash_input_room` 全部 `api_ok=true` 且 `input_wall_ok=true`。
+3. `flash_output_room` 全部 `output_wall_ok=true`；dry 模式输出门槛高于历史 1024 token 桶，用来暴露旧输出墙回归。
+4. `lite_not_claudecode` 记录必须显示 `expected_source_client=claude-code`、`expected_effective_client=unknown`；同时用服务端 `desensitized request shape before upstream` 日志按 `request_shape_hash` 对齐，确认 `source_client=ClaudeCode`、`effective_client=Unknown`。
+5. `cache_probe` 必须给出 `cache_observation` 分类：`accepted` 表示 usage cache token > 0，`attempted` 表示 provider 返回 cache 字段但为 0，`rejected` 表示 provider 明确拒绝 cache 控制，`ignored` 表示未返回 cache 字段。
+6. 两协议都应有 provider response/body usage 信号；如果验证 provider header 透传，使用 `--require-provider-header`，否则报告必须说明 NewAPI 是否剥离了 `x-zen-observed-exit-ip` 等 header。
+7. 任何 `policy_ok=false`、`auth_error`、`model_error`、`network_error` 或 `redaction_ok=false` 都阻断后续四客户端 dry/full。
+
+补充本地验收边界：
+
+- `zen-proxy-rs` e2e 已覆盖 flash/free 外层输入放行：大旧工具结果请求在 `ZEN_COMPACTOR_MODE=enforce` 下返回 `x-zen-context-action=warn`、`x-zen-context-trimmed=false`，上游仍看到原始大 tool content。
+- `zen-proxy-rs` e2e 也覆盖 lite compactor 仍工作：同样的大旧工具结果请求改用 `deepseek-v4-flash-lite` 时返回 `x-zen-context-action=compact`，上游看到 `ZenProxy context compactor` 占位。
+- panda policy-smoke 不能只看 HTTP 200；必须按服务端日志确认 flash/free 没有 `context_action=compact`，lite 的 compactor 保护仍可触发。
 
 ## 必采集字段
 
@@ -143,7 +228,6 @@ subagent_not_triggered
 context_drift
 safety_classification_mismatch
 semantic_mismatch
-nonstream_guard
 rate_limited
 network_error
 config_error
@@ -215,11 +299,12 @@ OpenClaw profile 修复后的新增证据：
 
 继续 full run 前的硬条件：
 
-1. huge_context 不再让 ClaudeCode 进入 transcript/gist/git 状态续写；2026-06-01 source-side smoke 已通过，但真实 ClaudeCode dry run 仍未通过。
-2. OpenClaw subagent 已在 dry run 5/5 observed，但 `deepseek-v4-flash-lite` long_context 仍有 1 个 `context_drift`，需要复验或隔离。
-3. `deepseek-v4-flash-lite` 的长/超长上下文语义漂移有隔离策略，至少不能拖死短请求和工具请求。
-4. panda NewAPI / ZenProxy 日志确认没有持续 502/524、stream JSON 截断或 client_gone 高发。
-5. Hermes 慢路径需要拆分并设定保护阈值，避免长 agent 循环拖死短请求 lane。
+1. 最新输出限制取消必须先通过真实 panda `policy-smoke/policy-dry`：缺省 `max_tokens` 不补值、显式值原样透传、OpenAI/Anthropic 只有显式值才写上游；同时确认没有高发 413、超时、空输出或明显成本/延迟失控。
+2. huge_context 不再让 ClaudeCode 进入 transcript/gist/git 状态续写；2026-06-01 source-side smoke 已通过，但真实 ClaudeCode dry run 仍未通过。
+3. OpenClaw subagent 已在 dry run 5/5 observed，但 `deepseek-v4-flash-lite` long_context 仍有 1 个 `context_drift`，需要复验或隔离。
+4. `deepseek-v4-flash-lite` 的长/超长上下文语义漂移有隔离策略，至少不能拖死短请求和工具请求。
+5. panda NewAPI / ZenProxy 日志确认没有持续 502/524、stream JSON 截断或 client_gone 高发。
+6. Hermes 慢路径需要拆分并设定保护阈值，避免长 agent 循环拖死短请求 lane。
 
 ## 通过门槛
 
@@ -231,6 +316,8 @@ OpenClaw profile 修复后的新增证据：
 stream_decode_error = 0，或全部被明确重试/降级且不裸透
 empty_upstream = 0，或全部有清晰上游空输出分类
 非流式 300s 超时 = 0
+上游 413 = 0，或全部被明确归类并通过 lane/case 隔离
+输出限制取消后的异常成本/长尾延迟 = 0，或有明确调度降级方案
 短请求 P90 <= 4s
 <50k first_content P90 <= 8s
 工具调用成功率 >= 95%
@@ -343,7 +430,7 @@ not_supported：
 
 ## 当前未落地事项
 
-1. 需要把 `.codex_tmp/client-matrix/run_matrix.py` 提炼成无密钥执行器或新建 `tests/manual/panda-pressure/` 入口。
-2. 需要在 panda 上按本方案重新跑 smoke、dry run、full run。
+1. 无密钥执行器已在 `scripts/panda_pressure_runner.py`；本轮新增 `policy-smoke/policy-dry` 直接 HTTP 策略 harness。
+2. 仍需要在 panda 上按本方案重新跑 policy-smoke、policy-dry、四客户端 smoke、dry run、full run。
 3. 需要把真实结果以脱敏摘要形式写入 `docs/reports/`。
 4. 需要在报告后更新 `docs/02-current-state.md`、`docs/03-roadmap.md`、`docs/04-improvement-backlog.md`。

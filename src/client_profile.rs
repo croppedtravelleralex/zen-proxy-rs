@@ -68,6 +68,27 @@ impl ClientProfile {
         matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw)
     }
 
+    pub fn effective_for_model(self, model: &str) -> Self {
+        let normalized = normalize(model);
+        match normalized.as_str() {
+            "deepseekv4flash" | "deepseekv4flashfree" => {
+                if matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw) {
+                    Self::unknown()
+                } else {
+                    self
+                }
+            }
+            "deepseekv4flashlite" | "bigpickle" => {
+                if matches!(self.kind, ClientKind::ClaudeCode) {
+                    Self::unknown()
+                } else {
+                    self
+                }
+            }
+            _ => self,
+        }
+    }
+
     fn from_headers(headers: &HeaderMap) -> Option<Self> {
         if let Some(kind) = headers
             .get("x-fmc-client")
@@ -415,7 +436,7 @@ mod tests {
                 content: Value::String("use subagent".to_string()),
             }],
             stream: Some(true),
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             temperature: None,
             system: Some(Value::String(
                 "You are a personal assistant running inside OpenClaw.".to_string(),
@@ -447,5 +468,46 @@ mod tests {
 
         assert_eq!(profile.kind, ClientKind::OpenClaw);
         assert_eq!(profile.source, ClientProfileSource::Body);
+    }
+
+    #[test]
+    fn deepseek_flash_drops_hermes_openclaw_compat_policy() {
+        for kind in [ClientKind::Hermes, ClientKind::OpenClaw] {
+            let profile = ClientProfile::new(kind, ClientProfileSource::Header)
+                .effective_for_model("deepseek-v4-flash");
+
+            assert_eq!(profile.kind, ClientKind::Unknown);
+            assert!(!profile.disables_thinking_for_tool_use());
+            assert!(!profile.uses_compat_tool_history());
+        }
+    }
+
+    #[test]
+    fn deepseek_flash_keeps_claude_code_policy() {
+        let profile = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+            .effective_for_model("deepseek-v4-flash-free");
+
+        assert_eq!(profile.kind, ClientKind::ClaudeCode);
+        assert!(profile.preserves_model_text_exactly());
+    }
+
+    #[test]
+    fn deepseek_flash_lite_drops_claude_code_policy() {
+        let profile = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+            .effective_for_model("deepseek-v4-flash-lite");
+
+        assert_eq!(profile.kind, ClientKind::Unknown);
+        assert!(!profile.preserves_model_text_exactly());
+    }
+
+    #[test]
+    fn deepseek_flash_lite_keeps_hermes_openclaw_policy() {
+        for kind in [ClientKind::Hermes, ClientKind::OpenClaw] {
+            let profile = ClientProfile::new(kind, ClientProfileSource::Header)
+                .effective_for_model("big-pickle");
+
+            assert_eq!(profile.kind, kind);
+            assert!(profile.uses_compat_tool_history());
+        }
     }
 }

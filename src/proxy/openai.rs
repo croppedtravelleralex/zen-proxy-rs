@@ -4,6 +4,7 @@ use crate::kernel::KernelConfig;
 use crate::protocol::translate::estimate_tokens as estimate;
 use crate::protocol::{translate, types::*};
 use crate::synthesis;
+use crate::zen::client::ProviderCacheSignals;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
@@ -19,9 +20,21 @@ pub async fn handle_openai_chat(
     profile: ClientProfile,
 ) -> Result<Response, AppError> {
     let model = translate::normalize_model(&body.model);
+    let observed_profile = profile;
+    let profile = observed_profile.effective_for_model(&model);
+    if profile != observed_profile {
+        tracing::info!(
+            model,
+            source_client = ?observed_profile.kind,
+            effective_client = ?profile.kind,
+            "client profile policy narrowed by model"
+        );
+    }
     let upstream_model = translate::map_upstream_model(&model, &config.model_mappings);
     let stream_requested = body.stream.unwrap_or(false);
-    let context_repair = if profile.kind == ClientKind::ClaudeCode {
+    let context_repair = if translate::model_disables_input_compaction(&model) {
+        translate::observe_context(&body.messages)
+    } else if profile.kind == ClientKind::ClaudeCode {
         translate::compact_claude_code_huge_session_context(&mut body.messages)
     } else if stream_requested {
         translate::compact_stream_context_with_policy(
@@ -117,7 +130,10 @@ pub async fn handle_openai_chat(
         );
     }
     let tools = body.tools.clone().unwrap_or_default();
-    let mut zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"max_tokens":max_tok,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":body.tool_choice});
+    let mut zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":body.tool_choice});
+    if let Some(max_tok) = max_tok {
+        zb["max_tokens"] = serde_json::json!(max_tok);
+    }
     if profile.disables_thinking_for_tool_use() {
         translate::disable_thinking_for_tool_use(&mut zb);
     }
@@ -125,14 +141,22 @@ pub async fn handle_openai_chat(
         model: model.clone(),
         messages: body.messages.clone(),
         stream: Some(stream_requested),
-        max_tokens: Some(max_tok),
+        max_tokens: max_tok,
         temperature: body.temperature,
         top_p: body.top_p,
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice: body.tool_choice.clone(),
     };
-    super::log_request_shape("openai", &cr, profile);
+    super::log_request_shape("openai", &cr, observed_profile, profile);
     if translate::is_short_no_tool_health_request(&cr) {
+        super::log_provider_cache_observation(
+            "openai",
+            &cr,
+            profile,
+            &ProviderCacheSignals::ignored(),
+            0,
+            0,
+        );
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -186,8 +210,18 @@ async fn handle_oa_non_stream(
                 &config.extra_headers,
             )
             .await?;
+            let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
             observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
             let collected = crate::zen::client::collect_stream_parts(resp).await?;
+            let cache_signals = cache_signals.with_body_usage(collected.usage.as_ref());
+            super::log_provider_cache_observation(
+                "openai",
+                cr,
+                profile,
+                &cache_signals,
+                attempt + 1,
+                NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+            );
             let content = response_text_for_profile(profile, &collected.content);
             if content.trim().is_empty() && collected.tool_calls.is_empty() {
                 last_empty = true;
@@ -296,13 +330,14 @@ async fn handle_oa_non_stream(
                 .and_then(|usage| usage.total_tokens)
                 .unwrap_or(prompt_tokens + completion_tokens);
             return Ok(with_observed_exit_ip(
-                oa_tool_resp(
+                oa_tool_resp_with_usage(
                     ts,
                     &cr.model,
                     tool_calls,
                     prompt_tokens,
                     completion_tokens,
                     total_tokens,
+                    collected.usage.as_ref(),
                 ),
                 observed_exit_ip,
             ));
@@ -324,20 +359,22 @@ async fn handle_oa_non_stream(
         .and_then(|usage| usage.total_tokens)
         .unwrap_or(prompt_tokens + completion_tokens);
     Ok(with_observed_exit_ip(
-        oa_text_resp(
+        oa_text_resp_with_usage(
             ts,
             &cr.model,
             &content,
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            collected.usage.as_ref(),
+            collected.finish_reason.as_deref(),
         ),
         observed_exit_ip,
     ))
 }
 
 fn oa_text_resp(ts: u64, model: &str, text: &str, pt: u64, ct: u64, total: u64) -> Response {
-    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total}})).into_response()
+    oa_text_resp_with_usage(ts, model, text, pt, ct, total, None, None)
 }
 
 fn response_text_for_profile(profile: ClientProfile, text: &str) -> String {
@@ -362,15 +399,93 @@ fn oa_ok_stream_resp(ts: u64, model: &str, pt: u64, ct: u64) -> Response {
     Sse::new(stream).into_response()
 }
 
-fn oa_tool_resp(
+#[allow(clippy::too_many_arguments)]
+fn oa_text_resp_with_usage(
+    ts: u64,
+    model: &str,
+    text: &str,
+    pt: u64,
+    ct: u64,
+    total: u64,
+    usage: Option<&crate::zen::client::ZenUsage>,
+    upstream_finish_reason: Option<&str>,
+) -> Response {
+    let finish_reason = openai_finish_reason(upstream_finish_reason, false);
+    let mut body = serde_json::json!({
+        "id": format!("chatcmpl_{ts}"),
+        "object": "chat.completion",
+        "created": ts,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": total}
+    });
+    append_openai_usage_metadata(&mut body["usage"], usage);
+    Json(body).into_response()
+}
+
+fn oa_tool_resp_with_usage(
     ts: u64,
     model: &str,
     tool_calls: Vec<ToolCall>,
     pt: u64,
     ct: u64,
     total: u64,
+    usage: Option<&crate::zen::client::ZenUsage>,
 ) -> Response {
-    Json(serde_json::json!({"id":format!("chatcmpl_{ts}"),"object":"chat.completion","created":ts,"model":model,"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":tool_calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total}})).into_response()
+    let mut body = serde_json::json!({
+        "id": format!("chatcmpl_{ts}"),
+        "object": "chat.completion",
+        "created": ts,
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": tool_calls}, "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": total}
+    });
+    append_openai_usage_metadata(&mut body["usage"], usage);
+    Json(body).into_response()
+}
+
+fn openai_finish_reason(
+    upstream_finish_reason: Option<&str>,
+    has_tool_calls: bool,
+) -> &'static str {
+    if has_tool_calls {
+        return "tool_calls";
+    }
+    match upstream_finish_reason {
+        Some("length") => "length",
+        Some("content_filter") => "content_filter",
+        Some("stop") => "stop",
+        _ => "stop",
+    }
+}
+
+fn append_openai_usage_metadata(
+    usage_json: &mut Value,
+    usage: Option<&crate::zen::client::ZenUsage>,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+    if let Some(details) = usage.prompt_tokens_details.clone() {
+        usage_json["prompt_tokens_details"] = details;
+    }
+    if let Some(cache_read) = cache_read_tokens(Some(usage)) {
+        usage_json["cache_read_input_tokens"] = serde_json::json!(cache_read);
+    }
+    if let Some(cache_creation) = usage.cache_creation_input_tokens {
+        usage_json["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
+    }
+}
+
+fn cache_read_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> Option<u64> {
+    usage
+        .and_then(|usage| usage.cache_read_input_tokens)
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.prompt_tokens_details.as_ref())
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
 }
 
 fn with_observed_exit_ip(
@@ -413,6 +528,7 @@ async fn handle_oa_stream(
         &config.extra_headers,
     )
     .await?;
+    let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
     let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
@@ -424,6 +540,7 @@ async fn handle_oa_stream(
         };
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
+        let mut upstream_finish_reason: Option<String> = None;
         while let Some(event) = upstream.next().await {
             let event = match event {
                 Ok(event) => event,
@@ -438,6 +555,9 @@ async fn handle_oa_stream(
             }
             if let Some(choices) = event.choices {
                 for choice in choices {
+                    if let Some(reason) = choice.finish_reason.as_deref().filter(|reason| !reason.is_empty()) {
+                        upstream_finish_reason = Some(reason.to_string());
+                    }
                     let Some(delta) = choice.delta else { continue; };
                     if let Some(content) = delta.content {
                         let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
@@ -497,25 +617,29 @@ async fn handle_oa_stream(
             let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":tool.index,"id":tc.id,"type":"function","function":{"name":tc.function.name,"arguments":tc.function.arguments}}]},"finish_reason":null}]}).to_string()));
         }
-        let finish_reason = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
+        let finish_reason = openai_finish_reason(upstream_finish_reason.as_deref(), !tool_calls.is_empty());
         let mut final_chunk = serde_json::json!({
             "id": id, "object": "chat.completion.chunk", "created": created,
             "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
         });
         if let Some(usage) = usage {
+            let cache_signals = cache_signals.with_body_usage(Some(&usage));
+            super::log_provider_cache_observation("openai", &body, profile, &cache_signals, 1, 1);
             let pt = usage.prompt_tokens.unwrap_or_else(|| estimate(&prompt));
             let ct = usage.completion_tokens.unwrap_or_else(|| if !text.trim().is_empty() { estimate(&text) } else { estimate(&tool_calls.iter().map(|tool| format!("{} {}", tool.name, tool.arguments)).collect::<Vec<_>>().join("\n")).max(1) });
             let total = usage.total_tokens.unwrap_or(pt + ct);
             final_chunk["usage"] = serde_json::json!({"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total});
-            if let Some(details) = usage.prompt_tokens_details {
-                final_chunk["usage"]["prompt_tokens_details"] = details;
+            if let Some(ref details) = usage.prompt_tokens_details {
+                final_chunk["usage"]["prompt_tokens_details"] = details.clone();
             }
-            if let Some(cache_read) = usage.cache_read_input_tokens {
+            if let Some(cache_read) = cache_read_tokens(Some(&usage)) {
                 final_chunk["usage"]["cache_read_input_tokens"] = serde_json::json!(cache_read);
             }
             if let Some(cache_creation) = usage.cache_creation_input_tokens {
                 final_chunk["usage"]["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
             }
+        } else {
+            super::log_provider_cache_observation("openai", &body, profile, &cache_signals, 1, 1);
         }
         yield Ok(Event::default().data(final_chunk.to_string()));
         yield Ok(Event::default().data("[DONE]"));

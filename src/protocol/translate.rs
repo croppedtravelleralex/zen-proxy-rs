@@ -417,7 +417,7 @@ pub fn stabilize_short_user_prompt(_body: &mut Value) {
 pub struct NonStreamOutputPolicy {
     pub prompt_tokens: u64,
     pub requested_max_tokens: Option<u64>,
-    pub effective_max_tokens: u64,
+    pub effective_max_tokens: Option<u64>,
     pub capped: bool,
 }
 
@@ -425,7 +425,7 @@ pub struct NonStreamOutputPolicy {
 pub struct StreamOutputPolicy {
     pub prompt_tokens: u64,
     pub requested_max_tokens: Option<u64>,
-    pub effective_max_tokens: u64,
+    pub effective_max_tokens: Option<u64>,
     pub capped: bool,
 }
 
@@ -684,24 +684,16 @@ pub fn non_stream_output_policy_for_prompt_tokens(
     prompt_tokens: u64,
     requested_max_tokens: Option<u64>,
 ) -> NonStreamOutputPolicy {
-    let requested = requested_max_tokens.unwrap_or(2_048).max(32);
-    let cap = match prompt_tokens {
-        100_000.. => 1_024,
-        50_000.. => 2_048,
-        _ => 4_096,
-    };
-    let effective_max_tokens = requested.min(cap).max(32);
-
     NonStreamOutputPolicy {
         prompt_tokens,
         requested_max_tokens,
-        effective_max_tokens,
-        capped: requested != effective_max_tokens,
+        effective_max_tokens: requested_max_tokens,
+        capped: false,
     }
 }
 
-pub fn stream_output_max_tokens(requested_max_tokens: Option<u64>) -> u64 {
-    requested_max_tokens.unwrap_or(1_024).max(32)
+pub fn stream_output_max_tokens(requested_max_tokens: Option<u64>) -> Option<u64> {
+    requested_max_tokens
 }
 
 pub fn stream_output_policy(
@@ -716,21 +708,28 @@ pub fn stream_output_policy_for_prompt_tokens(
     prompt_tokens: u64,
     requested_max_tokens: Option<u64>,
 ) -> StreamOutputPolicy {
-    let requested = requested_max_tokens.unwrap_or(1_024).max(32);
-    let cap = match prompt_tokens {
-        200_000.. => 512,
-        100_000.. => 768,
-        50_000.. => 1_024,
-        _ => requested,
-    };
-    let effective_max_tokens = requested.min(cap).max(32);
-
     StreamOutputPolicy {
         prompt_tokens,
         requested_max_tokens,
-        effective_max_tokens,
-        capped: requested != effective_max_tokens,
+        effective_max_tokens: requested_max_tokens,
+        capped: false,
     }
+}
+
+pub fn observe_context(messages: &[Message]) -> StreamContextRepair {
+    let tokens = estimate_tokens(&build_prompt_text(messages));
+    StreamContextRepair {
+        before_tokens: tokens,
+        after_tokens: tokens,
+        compacted_messages: 0,
+    }
+}
+
+pub fn model_disables_input_compaction(model: &str) -> bool {
+    matches!(
+        normalize_model(model).as_str(),
+        "deepseek-v4-flash" | "deepseek-v4-flash-free"
+    )
 }
 
 pub fn compact_stream_context(messages: &mut [Message]) -> StreamContextRepair {
@@ -743,10 +742,17 @@ pub fn compact_claude_code_huge_session_context(
     const MIN_MESSAGES_TO_FOLD: usize = 160;
     const RECENT_MESSAGES_TO_KEEP: usize = 48;
 
-    let policy = StreamContextPolicy::claude_code_huge_context();
+    let mut policy = StreamContextPolicy::claude_code_huge_context();
+    let before_tokens = estimate_tokens(&build_prompt_text(messages));
+    let mid_sized_tool_history_pressure =
+        should_compact_mid_sized_claude_code_tool_history(messages, before_tokens);
+    if mid_sized_tool_history_pressure {
+        policy.compact_at_tokens = 24_000;
+    }
     let base_repair = compact_stream_context_with_policy(messages, policy);
     let should_fold_short_history = messages.len() >= MIN_MESSAGES_TO_FOLD
-        || base_repair.after_tokens > policy.target_tokens.saturating_mul(3);
+        || base_repair.after_tokens > policy.target_tokens.saturating_mul(3)
+        || (mid_sized_tool_history_pressure && messages.len() > RECENT_MESSAGES_TO_KEEP);
     if !should_fold_short_history {
         return base_repair;
     }
@@ -791,6 +797,36 @@ pub fn compact_claude_code_huge_session_context(
             .compacted_messages
             .saturating_add(folded_messages.len()),
     }
+}
+
+fn should_compact_mid_sized_claude_code_tool_history(
+    messages: &[Message],
+    before_tokens: u64,
+) -> bool {
+    const MIN_MESSAGES: usize = 40;
+    const MIN_TOTAL_TOKENS: u64 = 24_000;
+    const MIN_LARGEST_MESSAGE_TOKENS: u64 = 12_000;
+    const MAX_LATEST_USER_TOKENS: u64 = 1_024;
+
+    if messages.len() < MIN_MESSAGES || before_tokens < MIN_TOTAL_TOKENS {
+        return false;
+    }
+
+    let largest_message_tokens = messages
+        .iter()
+        .filter(|message| message.role != "system")
+        .map(|message| value_shape_tokens(&message.content))
+        .max()
+        .unwrap_or(0);
+    let latest_user_tokens = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| value_shape_tokens(&message.content))
+        .unwrap_or(0);
+
+    largest_message_tokens >= MIN_LARGEST_MESSAGE_TOKENS
+        && latest_user_tokens <= MAX_LATEST_USER_TOKENS
 }
 
 fn build_claude_code_folded_history_summary(messages: &[Message]) -> String {
@@ -1542,6 +1578,14 @@ pub fn short_no_tool_empty_fallback_text(body: &ChatRequest) -> Option<&'static 
         return Some("ok");
     }
 
+    if lower.contains("reply pong only")
+        || lower.contains("answer pong only")
+        || lower.contains("pong only")
+        || lower.contains("respond pong")
+    {
+        return Some("PONG");
+    }
+
     if lower.contains("strict smoke")
         || lower.contains("chain smoke")
         || lower.contains("reply pass")
@@ -1673,6 +1717,30 @@ mod tests {
 
         assert!(!is_short_no_tool_channel_test_probe(&body));
         assert_eq!(short_no_tool_empty_fallback_text(&body), Some("PASS"));
+        assert_eq!(
+            classify_short_non_stream_request(&body, true),
+            ShortNonStreamRequestKind::InternalClaudeCodeProbe
+        );
+    }
+
+    #[test]
+    fn explicit_smoke_pong_gets_safe_empty_fallback() {
+        let body = request("reply PONG only", false, Some(16));
+
+        assert!(!is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(short_no_tool_empty_fallback_text(&body), Some("PONG"));
+        assert_eq!(
+            classify_short_non_stream_request(&body, true),
+            ShortNonStreamRequestKind::InternalClaudeCodeProbe
+        );
+    }
+
+    #[test]
+    fn explicit_smoke_pong_does_not_fallback_when_too_large() {
+        let body = request("reply PONG only", false, Some(256));
+
+        assert!(!is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(short_no_tool_empty_fallback_text(&body), None);
         assert_eq!(
             classify_short_non_stream_request(&body, true),
             ShortNonStreamRequestKind::InternalClaudeCodeProbe

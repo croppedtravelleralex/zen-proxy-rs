@@ -2,6 +2,7 @@ use bytes::BytesMut;
 use futures::stream::StreamExt;
 use rand::Rng;
 
+use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::Deserialize;
 use std::hash::{Hash, Hasher};
@@ -56,6 +57,212 @@ pub struct ZenUsage {
     pub prompt_tokens_details: Option<serde_json::Value>,
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
+}
+
+impl ZenUsage {
+    pub fn prompt_cached_tokens(&self) -> Option<u64> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(serde_json::Value::as_u64)
+    }
+
+    pub fn cache_read_tokens(&self) -> Option<u64> {
+        self.cache_read_input_tokens
+            .or_else(|| self.prompt_cached_tokens())
+    }
+
+    pub fn has_body_cache_usage_signal(&self) -> bool {
+        self.cache_creation_input_tokens.is_some()
+            || self.cache_read_input_tokens.is_some()
+            || self.prompt_cached_tokens().is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCacheObservationStatus {
+    Ignored,
+    Attempted,
+    Accepted,
+    Rejected,
+}
+
+impl ProviderCacheObservationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignored => "ignored",
+            Self::Attempted => "attempted",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProviderCacheSignals {
+    pub response_seen: bool,
+    pub header_usage_signal: bool,
+    pub header_cache_hit: Option<bool>,
+    pub header_cache_read_input_tokens: Option<u64>,
+    pub header_cache_creation_input_tokens: Option<u64>,
+    pub header_cached_tokens: Option<u64>,
+    pub body_usage_signal: bool,
+    pub body_cache_read_input_tokens: Option<u64>,
+    pub body_cache_creation_input_tokens: Option<u64>,
+    pub body_cached_tokens: Option<u64>,
+}
+
+impl ProviderCacheSignals {
+    pub fn ignored() -> Self {
+        Self::default()
+    }
+
+    pub fn from_response_headers(headers: &HeaderMap) -> Self {
+        let header_cache_hit = parse_header_bool_any(
+            headers,
+            &[
+                "x-provider-cache-hit",
+                "x-prompt-cache-hit",
+                "x-litellm-cache-hit",
+                "x-cache-hit",
+                "x-cache",
+                "x-cache-status",
+                "cf-cache-status",
+            ],
+        );
+        let header_cache_read_input_tokens = parse_header_u64_any(
+            headers,
+            &[
+                "x-cache-read-input-tokens",
+                "x-prompt-cache-read-input-tokens",
+                "x-provider-cache-read-input-tokens",
+                "x-litellm-cache-read-input-tokens",
+            ],
+        );
+        let header_cache_creation_input_tokens = parse_header_u64_any(
+            headers,
+            &[
+                "x-cache-creation-input-tokens",
+                "x-prompt-cache-creation-input-tokens",
+                "x-provider-cache-creation-input-tokens",
+                "x-litellm-cache-creation-input-tokens",
+            ],
+        );
+        let header_cached_tokens = parse_header_u64_any(
+            headers,
+            &[
+                "x-cached-tokens",
+                "x-prompt-cached-tokens",
+                "x-provider-cached-tokens",
+                "x-litellm-cached-tokens",
+            ],
+        );
+        let header_usage_signal = header_cache_hit.is_some()
+            || header_cache_read_input_tokens.is_some()
+            || header_cache_creation_input_tokens.is_some()
+            || header_cached_tokens.is_some();
+
+        Self {
+            response_seen: true,
+            header_usage_signal,
+            header_cache_hit,
+            header_cache_read_input_tokens,
+            header_cache_creation_input_tokens,
+            header_cached_tokens,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_body_usage(mut self, usage: Option<&ZenUsage>) -> Self {
+        let Some(usage) = usage else {
+            return self;
+        };
+        self.body_usage_signal = true;
+        self.body_cache_read_input_tokens = usage.cache_read_input_tokens;
+        self.body_cache_creation_input_tokens = usage.cache_creation_input_tokens;
+        self.body_cached_tokens = usage.prompt_cached_tokens();
+        self
+    }
+
+    pub fn from_response(headers: &HeaderMap, usage: Option<&ZenUsage>) -> Self {
+        Self::from_response_headers(headers).with_body_usage(usage)
+    }
+
+    pub fn status(&self) -> ProviderCacheObservationStatus {
+        if !self.response_seen {
+            return ProviderCacheObservationStatus::Ignored;
+        }
+        if self.has_positive_cache_signal() {
+            return ProviderCacheObservationStatus::Accepted;
+        }
+        if self.has_explicit_negative_cache_signal() {
+            return ProviderCacheObservationStatus::Rejected;
+        }
+        ProviderCacheObservationStatus::Attempted
+    }
+
+    fn has_positive_cache_signal(&self) -> bool {
+        self.header_cache_hit == Some(true)
+            || is_positive(self.header_cache_read_input_tokens)
+            || is_positive(self.header_cache_creation_input_tokens)
+            || is_positive(self.header_cached_tokens)
+            || is_positive(self.body_cache_read_input_tokens)
+            || is_positive(self.body_cache_creation_input_tokens)
+            || is_positive(self.body_cached_tokens)
+    }
+
+    fn has_explicit_negative_cache_signal(&self) -> bool {
+        self.header_cache_hit == Some(false)
+            || self.header_usage_signal
+                && (is_zero(self.header_cache_read_input_tokens)
+                    || is_zero(self.header_cache_creation_input_tokens)
+                    || is_zero(self.header_cached_tokens))
+            || self.body_usage_signal
+                && (is_zero(self.body_cache_read_input_tokens)
+                    || is_zero(self.body_cache_creation_input_tokens)
+                    || is_zero(self.body_cached_tokens))
+    }
+}
+
+fn is_positive(value: Option<u64>) -> bool {
+    value.is_some_and(|value| value > 0)
+}
+
+fn is_zero(value: Option<u64>) -> bool {
+    value == Some(0)
+}
+
+fn parse_header_bool_any(headers: &HeaderMap, names: &[&str]) -> Option<bool> {
+    names
+        .iter()
+        .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+        .and_then(parse_cache_hit_value)
+}
+
+fn parse_cache_hit_value(value: &str) -> Option<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "hit" | "cache-hit" | "cached" => Some(true),
+        "0" | "false" | "no" | "miss" | "cache-miss" | "bypass" | "dynamic" | "expired"
+        | "stale" => Some(false),
+        value if value.contains("hit") && !value.contains("miss") => Some(true),
+        value
+            if value.contains("miss")
+                || value.contains("bypass")
+                || value.contains("dynamic")
+                || value.contains("expired") =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn parse_header_u64_any(headers: &HeaderMap, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 #[derive(Debug, Default)]
@@ -499,6 +706,97 @@ mod tests {
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.clone())
             .unwrap()
+    }
+
+    fn test_headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn provider_cache_signals_are_ignored_without_provider_response() {
+        let signals = ProviderCacheSignals::ignored();
+
+        assert_eq!(signals.status(), ProviderCacheObservationStatus::Ignored);
+        assert!(!signals.response_seen);
+    }
+
+    #[test]
+    fn provider_cache_signals_are_attempted_when_response_has_no_cache_signal() {
+        let usage = ZenUsage {
+            prompt_tokens: Some(30),
+            completion_tokens: Some(5),
+            total_tokens: Some(35),
+            prompt_tokens_details: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+
+        let signals = ProviderCacheSignals::from_response(&HeaderMap::new(), Some(&usage));
+
+        assert_eq!(signals.status(), ProviderCacheObservationStatus::Attempted);
+        assert!(signals.response_seen);
+        assert!(signals.body_usage_signal);
+        assert!(!signals.header_usage_signal);
+    }
+
+    #[test]
+    fn provider_cache_signals_accept_body_cached_tokens() {
+        let usage = ZenUsage {
+            prompt_tokens: Some(30),
+            completion_tokens: Some(5),
+            total_tokens: Some(35),
+            prompt_tokens_details: Some(json!({"cached_tokens": 22})),
+            cache_creation_input_tokens: Some(11),
+            cache_read_input_tokens: None,
+        };
+
+        let signals = ProviderCacheSignals::from_response(&HeaderMap::new(), Some(&usage));
+
+        assert_eq!(signals.status(), ProviderCacheObservationStatus::Accepted);
+        assert_eq!(signals.body_cache_creation_input_tokens, Some(11));
+        assert_eq!(signals.body_cached_tokens, Some(22));
+    }
+
+    #[test]
+    fn provider_cache_signals_accept_header_hit_without_body_usage() {
+        let headers = test_headers(&[
+            ("x-provider-cache-hit", "true"),
+            ("x-provider-cached-tokens", "22"),
+        ]);
+
+        let signals = ProviderCacheSignals::from_response(&headers, None);
+
+        assert_eq!(signals.status(), ProviderCacheObservationStatus::Accepted);
+        assert!(signals.header_usage_signal);
+        assert_eq!(signals.header_cache_hit, Some(true));
+        assert_eq!(signals.header_cached_tokens, Some(22));
+        assert!(!signals.body_usage_signal);
+    }
+
+    #[test]
+    fn provider_cache_signals_reject_explicit_miss_or_zero_tokens() {
+        let headers = test_headers(&[
+            ("x-provider-cache-hit", "miss"),
+            ("x-provider-cached-tokens", "0"),
+        ]);
+        let usage = ZenUsage {
+            prompt_tokens: Some(30),
+            completion_tokens: Some(5),
+            total_tokens: Some(35),
+            prompt_tokens_details: Some(json!({"cached_tokens": 0})),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+        };
+
+        let signals = ProviderCacheSignals::from_response(&headers, Some(&usage));
+
+        assert_eq!(signals.status(), ProviderCacheObservationStatus::Rejected);
+        assert_eq!(signals.header_cache_hit, Some(false));
+        assert_eq!(signals.body_cache_read_input_tokens, Some(0));
     }
 
     #[test]

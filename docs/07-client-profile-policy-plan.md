@@ -26,7 +26,13 @@ Hermes/OpenClaw 适配后，ClaudeCode 体感变差，主要风险来自共享�
 基于真实指标做动态 profile、per-client 质量/延迟/工具成功率优化、灰度和回滚。
 ```
 
-当前状态：90 分代码实现已落地；OpenClaw body/profile 修复已部署到 panda，OpenClaw-only smoke 5/5、WSL ClaudeCode/Hermes/OpenClaw smoke 15/15 已通过。下一步是重新跑 dry run，再决定 99+ 动态 profile 范围。
+当前状态：90 分代码实现已落地；OpenClaw body/profile 修复已部署到 panda，OpenClaw-only smoke 5/5、WSL ClaudeCode/Hermes/OpenClaw smoke 15/15 已通过。本轮已进一步按模型收窄 effective profile。下一步是先跑 policy-smoke/policy-dry，再重新跑 dry run，最后决定 99+ 动态 profile 范围。
+
+2026-06-04 追加：模型策略已经按模型族收窄。`deepseek-v4-flash/deepseek-v4-flash-free` 取消 Hermes/OpenClaw 适配，只保留 ClaudeCode 深度适配，并取消输入 token 墙，在 `free-model-client-rs` 侧只观测不压缩。`deepseek-v4-flash-lite/big-pickle` 只保留 Hermes/OpenClaw 适配，取消 ClaudeCode 适配。
+
+2026-06-04 外层追加：`zen-proxy-rs` V4 context compactor 也已按模型分流。flash/free 大输入只做 `warn/pass` 观测，不 compact、不按 token target reject；lite 仍可 compact。后续排查 ClaudeCode 上下文短视时，不要只看 `free-model-client-rs`，还要同时确认 ZenProxy 日志中的 `context_action`。
+
+2026-06-04 追加：`scripts/panda_pressure_runner.py --mode policy-smoke|policy-dry` 已补直接 HTTP 策略 harness。该 harness 会用 `deepseek-v4-flash-lite` + `x-fmc-client=claude-code` + `Task` 工具生成 `lite_not_claudecode` 探针，并输出 `expected_source_client=claude-code`、`expected_effective_client=unknown`、`request_shape_hash`，用于和服务端 `desensitized request shape before upstream` 日志对齐确认 lite 不再走 ClaudeCode 适配；真实 panda policy-smoke/policy-dry 尚未跑，不能写成生产已验证。
 
 ## 90 分版本范围
 
@@ -143,6 +149,7 @@ T5：小矩阵验收
 - Hermes：短回复、文件/终端工具、web 用例。
 - OpenClaw：models、infer、agent 文件工具、web_fetch。
 - 状态：panda smoke 已通过；OpenClaw subagent 已从历史 328s timeout 修复为约 20.1s 成功。Hermes 慢路径仍需在 dry run 拆分。
+- 策略 harness：先跑 `policy-smoke` 验证 flash 无输入/输出墙、ZenProxy 外层 `context_action`、lite effective profile、cache usage 四态和 provider response/header/body usage 信号；再跑四客户端 smoke/dry。lite effective profile 必须用 `request_shape_hash` 对齐服务端日志闭环，不能只看响应文本。
 
 ## 99+ 后续范围
 

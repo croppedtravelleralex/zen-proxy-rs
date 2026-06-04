@@ -1,7 +1,7 @@
 # 当前状态
 
-更新时间：2026-06-03
-分支：`codex/v46-quality-nonstream-gates`
+更新时间：2026-06-04
+分支：`codex/v47-client-split-cache-harness`
 
 ## 代码已确认能力
 
@@ -18,18 +18,18 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - `fmt --check` 通过。
 - `clippy --all-targets -- -D warnings` 通过。
-- `cargo test` 通过：库测试 69 条、kernel golden 71 条、doc tests 0 条。
-- `zen-proxy-rs` 本轮未改；最近一次相关验证通过：主单元测试 129 条、e2e 26 条。
+- `cargo test` 通过：库测试 82 条、kernel golden 94 条、doc tests 0 条。
+- `zen-proxy-rs` 本轮已改外层 V4 context compactor 和 e2e harness；当前已验证 `clippy -D warnings`、bin 单元测试 132 条、context 相关单元测试 12 条、e2e 27 条、shell e2e 9/9 通过。
 
-注意：上述验证覆盖本仓库当前源码；本轮 request-shape 观测改动已随 `zen-proxy-rs` release 部署到 panda。
+注意：上述验证覆盖本仓库当前源码。15:33 前一批 `finish_reason`、cache usage 和中等工具历史压缩改动已随 `zen-proxy-rs` release 部署到 panda；本轮后续输出限制取消、模型策略收窄、ZenProxy 外层 flash 输入放行和 policy harness 仍需真实 panda `policy-smoke/policy-dry` 验证，不能当作生产压测结论。
 
 当前已实现并由测试覆盖的关键能力：
 
 1. `Authorization` 和 `x-api-key` 两种认证头识别。
 2. 请求体上限由 `FREE_MODEL_REQUEST_BODY_LIMIT_MB` 控制，默认 64MB。
 3. OpenAI/Anthropic 两套入口共享协议内核。
-4. 非流式输出保护：缺省 `max_tokens` 为 2048；小 prompt 最大 4096；估算 prompt >= 50k tokens 最大 2048；估算 prompt >= 100k tokens 最大 1024。
-5. 流式请求不套非流式 cap，缺省输出上限 1024，显式值最低 32。
+4. 输出限制已完全取消：缺省 `max_tokens` 不再补 1024/2048；显式 `max_tokens` 原样透传；OpenAI/Anthropic 上游请求只有在客户端显式传值时才写 `max_tokens`。
+5. `deepseek-v4-flash/deepseek-v4-flash-free` 已取消 Hermes/OpenClaw 适配，只保留 ClaudeCode 深度适配；该模型族不再设置输入 token 墙，`free-model-client-rs` 侧只做脱敏 request-shape 观测，不压缩输入。
 6. 保留短指令原意，不再把 `1`、`继续`、`执行` 等短输入改写成 `ok`。
 7. 不默认禁用 thinking；仅保留参数规范化位置。
 8. OpenAI 工具历史规范化：缺 id、缺 `tool_call_id`、孤儿 tool result、交错 user 消息等有修复/降级。
@@ -45,7 +45,14 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 18. NewAPI 管理端测渠道常见的极短 `echo hi` 流式探测，如果上游空输出，会返回本地 `ok`，只在无工具、单用户消息、`max_tokens <= 64` 的探测形态触发，避免误伤普通请求。
 19. 已新增脱敏 request-shape 观测：OpenAI/Anthropic 入口统一记录 `system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`，不记录原始 prompt、请求体或 key。
 20. 已新增小非流式请求分类：`health_probe/channel_test/internal_claude_code_probe/user_short_request/unknown_short_nonstream/not_short_nonstream`；当前只用于日志归因，普通 ClaudeCode 小非流式非探针请求在上游空输出时仍返回结构化 502，不会被本地 `ok` 误短路。
-21. 已新增 ClaudeCode huge-session compactor：当 ClaudeCode 会话存在大量旧短消息/工具历史时，会把旧轮次折叠为脱敏摘要，保留最近 48 条、最新用户目标和少量状态信号；该策略同时覆盖流式和大非流式 fallback，避免 700+ 旧短消息继续淹没当前请求。
+21. ClaudeCode huge-session compactor 属于历史修复背景；当前 `deepseek-v4-flash/deepseek-v4-flash-free` 路径已经取消输入墙和输入压缩，只保留脱敏观测，避免在本仓库侧裁剪用户上下文。
+22. 源码已补非流式 cache usage 透传：OpenAI 非流式正文/工具调用响应会保留 `prompt_tokens_details.cached_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens`；Anthropic 非流式正文/工具调用响应也会保留真实 `cache_*`，不再统一写死为 `0`。
+23. 源码已补上游 `finish_reason` 透传：OpenAI 非流式/流式会保留 `length/content_filter/stop`；Anthropic 非流式/流式/buffered 流式会把上游 `length` 映射为 `max_tokens`，不再把提前到达长度上限伪装成正常 `end_turn`。
+24. 源码已补 ClaudeCode 中等工具历史压缩：当消息很多、总上下文约 24k+、单条旧工具输出 12k+、最新用户指令很短时，会折叠旧工具/会话历史并保留最新用户目标，覆盖线上 `last_user_tokens=3`、旧工具输出 26k、总输入不到 50k 的截断感场景。
+25. 源码已补模型维度的有效 profile 策略：日志仍记录真实 `source_client`，但 `deepseek-v4-flash/deepseek-v4-flash-free` 不再应用 Hermes/OpenClaw 兼容策略，只保留 ClaudeCode 深度适配；`deepseek-v4-flash-lite/big-pickle` 不再应用 ClaudeCode 适配，只保留 Hermes/OpenClaw 适配。
+26. cache 观测新增四态：`attempted`、`accepted`、`rejected`、`ignored`；同时采集 provider response/header/body usage 信号，用来区分“上游未给 usage/cache”、“NewAPI/中间层剥离 header”和“真实 cache 命中”。
+27. 显式 `reply PONG only` 等短 smoke 在无工具、`max_tokens <= 64` 且上游连续空输出后允许返回本地 `PONG`；普通短请求仍不会伪造答案。
+28. `zen-proxy-rs` 外层 V4 context compactor 已按模型分流：`deepseek-v4-flash/deepseek-v4-flash-free` 只记录 `warn/pass`，不 compact、不因 token target reject；`deepseek-v4-flash-lite/big-pickle` 仍保留 compactor 能力，避免把全局大上下文保护误关。
 
 ## 运行链路事实
 
@@ -115,8 +122,9 @@ P1 当前状态：
 1. 90 分客户端识别和策略隔离已落地，避免 Hermes/OpenClaw 兼容策略继续误伤 ClaudeCode。
 2. 已实现 `ClientProfile`、`x-fmc-client`、OpenAI/Anthropic chat 路径 profile 传递、per-client thinking/whitespace/tool-history policy。
 3. 已验证 kernel golden：ClaudeCode tools 不默认禁用 thinking，ClaudeCode 流式空白 delta 保留，Hermes compat thinking 策略保留，显式 `x-fmc-client` 优先。
-4. 已构建并部署到 panda 生产 `zen-proxy-rs` 三实例；panda 运行链路为 `NewAPI 8081 -> zen-proxy-rs 4001/4002/4004 -> free-model-client-rs kernel -> upstream`。
-5. 部署后 panda 本机 NewAPI 小请求已通过：`/v1/models` 返回 200，包含 `deepseek-v4-flash`、`deepseek-v4-flash-lite`；`deepseek-v4-flash` 非流式小请求返回 `OK`，HTTP 200，耗时约 2.37s。
+4. 2026-06-04 15:33 已将包含 `finish_reason` 透传、non-stream cache usage 透传和 ClaudeCode 中等工具历史压缩的 `zen-proxy-rs` release 部署到 panda 三实例；panda 运行链路为 `NewAPI 8081 -> zen-proxy-rs 4001/4002/4004 -> free-model-client-rs kernel -> upstream`。
+5. 本轮部署后 smoke：`/v1/models` 返回 200，包含 `deepseek-v4-flash`、`deepseek-v4-flash-lite`；`deepseek-v4-flash` OpenAI 非流式返回 `PONG`，HTTP 200；Anthropic 流式返回 `PONG`，HTTP 200；Anthropic 极短非流式探针仍可能在上游持续空输出时返回 502。
+6. 最新源码/脚本状态：输出限制已完全取消，ZenProxy 侧 non-stream output guard 已取消；ZenProxy 外层 context compactor 对 flash/free 已放行、对 lite 仍生效；`policy-smoke/policy-dry` harness 已存在并记录 input/output wall、provider header/body usage、cache 四态。真实 panda `policy-smoke/policy-dry` 尚未跑，不能写成生产已验证。
 
 P1 panda 部署记录：
 
@@ -258,7 +266,58 @@ P1.9 ClaudeCode 大流式 768/1024 cap 桶 buffered retry 修复：
 | 本地验证 | `free-model-client-rs`：`fmt --check`、`clippy -D warnings`、`cargo test` 通过；库测试 71 条、kernel golden 76 条。`zen-proxy-rs`：主单测 129 条、e2e 26 条、release build 通过。 |
 | 部署 | panda 三实例部署 stripped hash `7a8f4e5dc99e8ccf1aaf6562519d8353dc4ba5205e5e55f521c265b0760ed66e`；旧 hash `117b3cbfaf058fbbeb258f98542afc09a097e763359f34d174414b47dfd11aff` 已备份到 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-buffered-1024-*`。 |
 | 线上健康 | `zen-proxy-rs@1/@2/@3` active；`http://127.0.0.1:4000/health` 返回 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`、`upstream.backoff=false`。 |
-| NewAPI preflight | `http://100.69.228.93:8081/v1/models` 200，模型数 8；`deepseek-v4-flash` 最小 OpenAI chat 200，返回 `OK`，约 2.6-3.1s。 |
+
+P1.10 non-stream cache usage 透传源码修复：
+
+| 项 | 值 |
+|----|----|
+| 修改时间 | 2026-06-04 |
+| 根因 | NewAPI 看不到/不显示 cache，不只是上游不返回；源码里 OpenAI 非流式响应根本没带 `cache_*` 字段，Anthropic 非流式正文/工具调用响应长期把 `cache_creation_input_tokens/cache_read_input_tokens` 写死为 `0`。 |
+| 修复 | `src/proxy/openai.rs`、`src/proxy/anthropic.rs` 已改为在非流式正文和工具调用两条分支透传真实 usage：`prompt_tokens_details.cached_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens`。 |
+| 验证 | WSL `lenovo` 用户下执行 `cargo fmt -- --check`、`cargo test -q`、`cargo clippy --all-targets -- -D warnings` 通过；库测试 71 条、kernel golden 87 条。 |
+| 部署状态 | 已随 2026-06-04 15:33 panda release 部署；实际部署 stripped hash `694036f6a130e8211b998a5b58eff36105fb48fb866ec57ebbb2c03ccfb5f3d7`，备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-v46-20260604-153327-0f6cdf6e5cd2`。 |
+| 线上观察 | 部署后 OpenAI 非流式 smoke usage 已正常透出 `prompt_tokens=87`、`completion_tokens=27`。该样本 `cached_tokens=0`，说明这次调用本身没有上游 cache 命中，不代表透传无效。 |
+
+P1.11 ClaudeCode 半截输出根因修复源码记录：
+
+| 项 | 值 |
+|----|----|
+| 修改时间 | 2026-06-04 |
+| 根因 | 近期 panda 样本显示，小 prompt 可长输出，但 ClaudeCode 工程请求大量为中等上下文 + 工具历史形态：`last_user_tokens` 经常只有 3，旧工具输出可达 26k；同时源码把上游 `finish_reason=length` 固定改成正常 `stop/end_turn`，导致提前停止不可见。 |
+| 修复 1 | OpenAI/Anthropic 响应保留上游 `finish_reason`；Anthropic 将 `length` 映射为 `max_tokens`。 |
+| 修复 2 | ClaudeCode 中等工具历史压力下提前折叠旧历史：消息数 >=40、消息 token >=24k、最大非系统消息 >=12k、最新 user <=1024 tokens。 |
+| 验证 | 新增 `finish_reason=length` 四路径回归、ClaudeCode 中等工具历史折叠回归；`cargo fmt -- --check`、`cargo test -q`、`cargo clippy --all-targets -- -D warnings` 通过。 |
+| 部署状态 | 已随 2026-06-04 15:33 panda release 部署；实际部署 stripped hash `694036f6a130e8211b998a5b58eff36105fb48fb866ec57ebbb2c03ccfb5f3d7`。 |
+| NewAPI 验收 | `curl --noproxy '*' http://100.69.228.93:8081/v1/models` 200，模型数 8；OpenAI 非流式 `deepseek-v4-flash` 200，返回 `PONG`，usage `prompt_tokens=87`、`completion_tokens=27`；Anthropic 流式 `deepseek-v4-flash` 200，返回 `PONG`，usage `input_tokens=87`、`output_tokens=27`。 |
+| 残留 | Anthropic 极短非流式探针 `reply PONG only` 仍可能被识别为 `internal_claude_code_probe`，在上游连续空输出时经 11 次 provider retry 后返回 502：`upstream retry budget exhausted ... last_error=empty_output`。该残留目前不影响真实流式小请求验收，但仍需继续补 non-stream probe 兜底。 |
+
+P1.12 2026-06-04 V4.6 panda 部署记录：
+
+| 项 | 值 |
+|----|----|
+| 部署时间 | 2026-06-04 15:33 |
+| 部署目标 | `/opt/zen-proxy-rs/zen-proxy-rs` |
+| 旧二进制 hash | `0f6cdf6e5cd2dd1946a69707c97591cca865b47178ff63846f04bbdf283f2314` |
+| 本地未 strip release hash | `9b68db105aaad2c1014899d00122accf3a21109a26054f68ce0d612f152b5839` |
+| 实际部署 stripped hash | `694036f6a130e8211b998a5b58eff36105fb48fb866ec57ebbb2c03ccfb5f3d7` |
+| 备份 | `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-v46-20260604-153327-0f6cdf6e5cd2` |
+| 实例 | `zen-proxy-rs@1:4001`、`zen-proxy-rs@2:4002`、`zen-proxy-rs@3:4004` |
+| 健康检查 | 三实例 `active`；4000/4001/4002/4004 `/health` 均返回 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`、`upstream.backoff=false`。 |
+| /metrics | smoke 后 `zen_proxy_requests_total{status="200"} 2`、`{status="5xx"} 1`、`stream=2`、`non_stream=1`、`model=\"deepseek-v4-flash\"=3`。 |
+| NewAPI smoke | `curl --noproxy '*'` 直连 panda `8081` 时：`/v1/models` 200 且包含两个 deepseek 模型；OpenAI 非流式 `PONG` 200；Anthropic 流式 `PONG` 200。 |
+| 环境边界 | WSL 若继承代理环境变量，直连 `http://100.69.228.93:8081` 可能先返回代理层 502 空响应；验收时需显式使用 `curl --noproxy '*'` 或配置 `NO_PROXY=100.69.228.93`。 |
+
+P1.13 输出限制取消与 policy harness 当前状态：
+
+| 项 | 值 |
+|----|----|
+| 状态 | 当前源码已完全取消输出限制；ZenProxy 侧 non-stream output guard 已取消；真实 panda `policy-smoke/policy-dry` 尚未跑，不能写成生产已验证。 |
+| max_tokens 行为 | 缺省 `max_tokens` 不再自动补 1024/2048；显式 `max_tokens` 原样透传；OpenAI/Anthropic 只有显式值才写上游。 |
+| flash 策略 | `deepseek-v4-flash/deepseek-v4-flash-free` 取消 Hermes/OpenClaw 适配，只保留 ClaudeCode 深度适配；取消输入 token 墙，`free-model-client-rs` 侧只观测不压缩。 |
+| lite 策略 | `deepseek-v4-flash-lite/big-pickle` 只保留 Hermes/OpenClaw 适配，取消 ClaudeCode 适配。 |
+| cache/usage 观测 | cache 记录 `attempted/accepted/rejected/ignored` 四态，并记录 provider response/header/body usage 信号。 |
+| harness | `scripts/panda_pressure_runner.py --mode policy-smoke|policy-dry` 记录 input/output wall、provider header/body usage、cache 四态和 lite effective profile。 |
+| 风险 | 输出限制取消后，上游 413/超时/空输出/延迟/成本风险回到 upstream 与 lane/pool 调度，需要真实 panda 压测确认。 |
 
 P1.10 2026-06-04 三客户端 smoke 和 web/search 边界：
 
@@ -274,25 +333,26 @@ P1.10 2026-06-04 三客户端 smoke 和 web/search 边界：
 
 ## 当前数据解释
 
-1. “输入几乎 70k/90k”当前不是 NewAPI 输入 token 墙。2026-06-03 23:01-23:46 的 channel 69 真实 ClaudeCode 流式请求显示：ZenProxy 入口 body 从约 674KB 增长到 788KB，`before_tokens` 约 97k-110k，流式 compactor 后 `after_tokens` 约 66k-79k，NewAPI 账面多落在 70k-90k。
-2. NewAPI 中看到的 200k+ prompt tokens 记录来自 ClaudeCode 非流式大请求/fallback，而不是常规流式轮次。样本：NewAPI id `109370` 为非流式 `213248` prompt tokens，id `109461` 为非流式 `225416` prompt tokens；对应 ZenProxy 日志中 `stream_seen_by_zenproxy=false`，当前非流式路径只 cap 输出 tokens，不执行流式 compactor。
+1. “输入几乎 70k/90k”当前不是 NewAPI 输入 token 墙。2026-06-03 23:01-23:46 的 channel 69 历史 ClaudeCode 流式请求显示：ZenProxy 入口 body 从约 674KB 增长到 788KB，`before_tokens` 约 97k-110k，当时压缩后 NewAPI 账面多落在 70k-90k；最新 `deepseek-v4-flash/deepseek-v4-flash-free` 策略已经取消输入 token 墙，`free-model-client-rs` 侧只观测 request shape，不再压缩输入，`zen-proxy-rs` 外层也只 warn/pass 不 compact/reject。
+2. NewAPI 中看到的 200k+ prompt tokens 记录来自 ClaudeCode 非流式大请求/fallback，而不是常规流式轮次。样本：NewAPI id `109370` 为非流式 `213248` prompt tokens，id `109461` 为非流式 `225416` prompt tokens；这是历史输出/输入保护改动前的归因样本，不能用来证明当前仍存在输出 cap。
 3. “ClaudeCode 一直反复做”的直接调用形态是：流式大请求偶发 `status_code=500, upstream returned no assistant content or tool call`，随后 ClaudeCode 又以非流式大请求重发同一大历史，成功返回后下一轮继续把历史追加进去。样本：NewAPI id `109459` 流式 prompt tokens 记 0 且 500，紧接 id `109461` 非流式 225416 prompt tokens 成功。
-4. 旧版 ClaudeCode huge-context 策略虽配置 `target_tokens=12k`，但真实请求里 `message_count` 已达 670-705，`tools_tokens=12700`，大量旧短消息低于单条 `min_text_tokens=2000`，不会被旧 compactor 选为压缩候选；因此压缩后仍剩约 97k estimated total tokens。2026-06-04 已部署 huge-session compactor，开始折叠旧短消息和大非流式 fallback。
-5. 缓存几乎为 0 是因为上游 usage 基本没有返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 OpenAI `cached_tokens`；当前 ZenProxy 只转发上游缓存计数，不会自行伪造 provider cache 命中。
-6. 2026-06-04 中午已修复 768/1024 cap 桶绕过 buffered retry 的源头 bug；后续若 NewAPI 再出现同样错误，先查是否为新 hash 之后的真实事件，以及是否所有 buffered retry 都为空。
+4. 旧版 ClaudeCode huge-context 策略虽配置 `target_tokens=12k`，但真实请求里 `message_count` 已达 670-705，`tools_tokens=12700`，大量旧短消息低于单条 `min_text_tokens=2000`，不会被旧 compactor 选为压缩候选；这是历史 context_drift 归因。当前 flash 路径改为只观测不压缩，后续质量风险要由真实 panda policy/dry 压测确认。
+5. 缓存几乎为 0 不能再直接写成“上游没有 cache”。当前观测会分为 `attempted/accepted/rejected/ignored` 四态，并分别记录 provider header/body usage 信号；只有真实 panda policy 样本能判断是上游没给、被中间层剥离、cache 被拒绝，还是确实命中。
+6. 2026-06-04 中午已修复 768/1024 cap 桶绕过 buffered retry 的历史 bug；最新策略已经完全取消输出限制，后续若 NewAPI 再出现空输出、413、超时或高延迟，应优先归因到上游、客户端断流、lane/pool 调度和成本/长尾风险，而不是本仓库的输出墙。
 7. Web/search 不是模型原生联网。当前源头已经证明：只要客户端提供 tool schema，ZenProxy 可以让模型返回 tool call；官方 ClaudeCode + 官方 Claude 能执行 `WebSearch/WebFetch`。ZenProxy 路径失败时优先检查工具定义是否进入请求、上游是否返回 tool call、返回工具名是否被 canonicalize 回客户端注册名，而不是再把问题归结为 ClaudeCode 没工具。
 
 P1 待执行：
 
 1. 正式无密钥 panda 压测执行器已落地到 `scripts/panda_pressure_runner.py`。
 2. 执行器只从 `PANDA_NEWAPI_KEY`、`NEWAPI_API_KEY`、`OPENAI_API_KEY` 读取 key，默认 base URL 为 `http://100.69.228.93:8081`，默认拒绝 localhost。
-3. 执行器已支持 Windows ClaudeCode、WSL ClaudeCode、WSL Hermes、WSL OpenClaw，且对 Hermes/OpenClaw 大 prompt 使用文件背书，避免 Linux `Argument list too long`。
-4. Smoke / preflight 已证明 panda `/v1/models` 和最小聊天可用，模型包含 `deepseek-v4-flash`、`deepseek-v4-flash-lite`。
-5. dry run 暴露红旗，当前不能直接进入 4 客户端 x 500 full run。
-6. 2026-06-01 panda 本机 huge stream source-side smoke 已通过，但它不是 ClaudeCode/Hermes/OpenClaw 真实客户端验收；下一步仍要重新跑 panda-only dry run。
-7. WSL ClaudeCode 必须先换成真实 ClaudeCode CLI 或修复当前 clawgod launcher，否则不能纳入四客户端正式压测。
-8. OpenClaw 必须先修 local secrets gateway / agent harness 的 `HEARTBEAT_OK` 问题，否则只能统计 API 可达，不能统计语义、工具和 subagent 成功率。
-9. ClaudeCode WebSearch 若要真实执行，必须让 ClaudeCode 收到和其已注册工具同名的 `tool_use`，例如 `WebSearch`/`WebFetch`。ZenProxy 不会也不应自行替客户端执行公网搜索；但必须保真转发并回填工具名大小写/别名。
+3. 执行器已新增 `policy-smoke` / `policy-dry`，直接 HTTP 验证输出/输入墙取消、provider header/body usage、cache 四态和 lite effective profile，不依赖本地 CLI 状态。
+4. 执行器已支持 Windows ClaudeCode、WSL ClaudeCode、WSL Hermes、WSL OpenClaw，且对 Hermes/OpenClaw 大 prompt 使用文件背书，避免 Linux `Argument list too long`。
+5. Smoke / preflight 已证明 panda `/v1/models` 和最小聊天可用，模型包含 `deepseek-v4-flash`、`deepseek-v4-flash-lite`；但最新输出限制取消后的真实 panda `policy-smoke/policy-dry` 尚未跑。
+6. dry run 暴露红旗，当前不能直接进入 4 客户端 x 500 full run。
+7. 2026-06-01 panda 本机 huge stream source-side smoke 已通过，但它不是 ClaudeCode/Hermes/OpenClaw 真实客户端验收；下一步仍要重新跑 panda-only policy-smoke/policy-dry，再跑四客户端 dry run。
+8. WSL ClaudeCode 必须先换成真实 ClaudeCode CLI 或修复当前 clawgod launcher，否则不能纳入四客户端正式压测。
+9. OpenClaw 必须先修 local secrets gateway / agent harness 的 `HEARTBEAT_OK` 问题，否则只能统计 API 可达，不能统计语义、工具和 subagent 成功率。
+10. ClaudeCode WebSearch 若要真实执行，必须让 ClaudeCode 收到和其已注册工具同名的 `tool_use`，例如 `WebSearch`/`WebFetch`。ZenProxy 不会也不应自行替客户端执行公网搜索；但必须保真转发并回填工具名大小写/别名。
 
 P1 dry-run 结果：
 
@@ -366,10 +426,11 @@ P1 仍需执行：
 ## 当前风险
 
 1. 小矩阵通过不等于 4 客户端 x 500 次压测通过；当前 dry run 已阻断 full run，不能直接开 2000 次压测。
-2. Hermes/OpenClaw 当前测试使用临时环境变量或临时配置，不能误当成用户默认配置已经切换。
-3. OpenClaw 系统 Node 仍是 `v20.20.2`，只有显式使用隔离 Node 22 路径才满足运行要求。
-4. `.codex_tmp/` 里有大量历史测试输出，可能包含敏感信息，默认不提交。
-5. 仓库根目录存在 `configured`、`panda`、`""`、异常字符文件等未跟踪项，提交前必须逐个确认用途，不要盲目删除。
-6. 客户端策略隔离和 final-anchor 修复已在代码层落地，panda 本机 source-side huge stream smoke 通过；但真实 ClaudeCode dry run 仍显示 huge_context 语义漂移，不能进入 full run。
-7. panda ZenProxy 三实例健康且池指标正常，但 NewAPI/docker 日志里出现过上游 Cloudflare 502/524、stream JSON 截断和 client_gone，需要在正式报告中和 ZenProxy 指标分开归因。
-8. Windows ClaudeCode 不能从当前 WSL 非交互环境稳定启动时，应归类为测试执行环境问题；不要把它误判成 panda/ZenProxy 链路失败。
+2. 输出限制和 flash 输入墙完全取消后，上游 413、超时、空输出、延迟和成本风险回到 upstream 与 lane/pool 调度层；必须用真实 panda `policy-smoke/policy-dry` 和后续 dry run 压测确认，不能凭源码测试判定生产安全。
+3. Hermes/OpenClaw 当前测试使用临时环境变量或临时配置，不能误当成用户默认配置已经切换。
+4. OpenClaw 系统 Node 仍是 `v20.20.2`，只有显式使用隔离 Node 22 路径才满足运行要求。
+5. `.codex_tmp/` 里有大量历史测试输出，可能包含敏感信息，默认不提交。
+6. 仓库根目录存在 `configured`、`panda`、`""`、异常字符文件等未跟踪项，提交前必须逐个确认用途，不要盲目删除。
+7. 客户端策略隔离和 final-anchor 修复已在代码层落地，panda 本机 source-side huge stream smoke 通过；但真实 ClaudeCode dry run 仍显示 huge_context 语义漂移，不能进入 full run。
+8. panda ZenProxy 三实例健康且池指标正常，但 NewAPI/docker 日志里出现过上游 Cloudflare 502/524、stream JSON 截断和 client_gone，需要在正式报告中和 ZenProxy 指标分开归因。
+9. Windows ClaudeCode 不能从当前 WSL 非交互环境稳定启动时，应归类为测试执行环境问题；不要把它误判成 panda/ZenProxy 链路失败。
