@@ -2,12 +2,13 @@
 
 ## Now
 
-1. 先跑真实 panda `policy-smoke` / `policy-dry`，确认输出限制取消、flash 输入只观测不压缩、provider usage/header/body 信号和 cache 四态在生产链路上闭环。
-2. policy harness 通过后再跑修复后的四客户端 smoke/dry，确认 OpenClaw、Hermes、Windows ClaudeCode、WSL ClaudeCode 的真实客户端状态。
-3. 针对 huge_context、`deepseek-v4-flash-lite` 长上下文语义漂移、Hermes 慢路径和输出限制取消后的 413/超时/空输出/成本风险做 lane/case 降级或隔离。
-4. 清理或归类未跟踪文件，避免把 `.codex_tmp/`、密钥、测试输出混进提交。
-5. 对压测前配置做安全确认：不污染 Hermes/OpenClaw/ClaudeCode 用户默认配置，不使用本机 `127.0.0.1:8081` 代替 panda。
-6. 提交前复查 README、维护文档和 git 状态。
+1. 部署并验收 V4.98 cache-friendly session：确认长会话不再因尾部增长导致上游 session 每轮变化，并用 `prefix_4k/32k/128k/256k` 与 cache tokens 对齐判断是否提升命中。
+2. 继续跑真实 panda `policy-smoke` / `policy-dry`，确认输出限制取消、flash 输入只观测不压缩、provider usage/header/body 信号和 cache 四态在生产链路上闭环。
+3. policy harness 通过后再跑修复后的四客户端 smoke/dry，确认 OpenClaw、Hermes、Windows ClaudeCode、WSL ClaudeCode 的真实客户端状态。
+4. 针对 huge_context、`deepseek-v4-flash-lite` 长上下文语义漂移、Hermes 慢路径和输出限制取消后的 413/超时/空输出/成本风险做 lane/case 降级或隔离。
+5. 清理或归类未跟踪文件，避免把 `.codex_tmp/`、密钥、测试输出混进提交。
+6. 对压测前配置做安全确认：不污染 Hermes/OpenClaw/ClaudeCode 用户默认配置，不使用本机 `127.0.0.1:8081` 代替 panda。
+7. 提交前复查 README、维护文档和 git 状态。
 
 ## Done This Phase
 
@@ -24,6 +25,7 @@
 11. 输出限制已在当前源码/ZenProxy 侧完全取消：缺省 `max_tokens` 不再自动补值，显式值原样透传；真实 panda policy-smoke/policy-dry 尚未跑，不能写成生产已验证。
 12. `policy-smoke` / `policy-dry` harness 已落地，可记录 input/output wall、provider header/body usage 和 cache `attempted/accepted/rejected/ignored` 四态。
 13. `zen-proxy-rs` 外层 V4 context compactor 已完成模型分流：flash/free 只 warn/pass 不 compact/reject，lite 仍保留 compact 能力；本地 e2e 已覆盖。
+14. V4.98 cache-friendly session 源码已落地：大请求 session 按稳定前缀而不是完整 messages hash 分组，并补 `prefix_4k/32k/128k/256k` 脱敏观测；真实 panda A/B 尚未跑。
 
 ## Next
 

@@ -444,6 +444,11 @@ pub struct RequestShape {
     pub max_tokens: Option<u64>,
     pub tool_choice_present: bool,
     pub prompt_hash: u64,
+    pub prefix_4k_hash: u64,
+    pub prefix_32k_hash: u64,
+    pub prefix_128k_hash: u64,
+    pub prefix_256k_hash: u64,
+    pub cache_material_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,6 +511,12 @@ pub fn request_shape(body: &ChatRequest) -> RequestShape {
         .saturating_add(messages_tokens)
         .saturating_add(tools_tokens);
     let prompt_hash = request_prompt_hash(body, tool_count);
+    let cache_material = request_cache_material(body);
+    let cache_material_bytes = cache_material.len();
+    let prefix_4k_hash = request_cache_prefix_hash(&cache_material, 4 * 1024);
+    let prefix_32k_hash = request_cache_prefix_hash(&cache_material, 32 * 1024);
+    let prefix_128k_hash = request_cache_prefix_hash(&cache_material, 128 * 1024);
+    let prefix_256k_hash = request_cache_prefix_hash(&cache_material, 256 * 1024);
 
     RequestShape {
         system_tokens,
@@ -521,6 +532,11 @@ pub fn request_shape(body: &ChatRequest) -> RequestShape {
         max_tokens: body.max_tokens,
         tool_choice_present: body.tool_choice.is_some(),
         prompt_hash,
+        prefix_4k_hash,
+        prefix_32k_hash,
+        prefix_128k_hash,
+        prefix_256k_hash,
+        cache_material_bytes,
     }
 }
 
@@ -623,6 +639,28 @@ fn request_prompt_hash(body: &ChatRequest, tool_count: usize) -> u64 {
     }
 
     hash
+}
+
+fn request_cache_material(body: &ChatRequest) -> String {
+    let mut material = String::new();
+    material.push_str("model=");
+    material.push_str(&body.model);
+    material.push('\n');
+    material.push_str("messages=");
+    material.push_str(&serde_json::to_string(&body.messages).unwrap_or_default());
+    material.push('\n');
+    material.push_str("tools=");
+    material.push_str(&serde_json::to_string(&body.tools).unwrap_or_default());
+    material.push('\n');
+    material.push_str("tool_choice=");
+    material.push_str(&serde_json::to_string(&body.tool_choice).unwrap_or_default());
+    material
+}
+
+fn request_cache_prefix_hash(material: &str, prefix_bytes: usize) -> u64 {
+    let bytes = material.as_bytes();
+    let len = bytes.len().min(prefix_bytes);
+    stable_hash64_update(0xcbf29ce484222325u64, &bytes[..len])
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

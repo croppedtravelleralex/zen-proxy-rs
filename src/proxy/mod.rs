@@ -39,6 +39,11 @@ pub(crate) fn log_request_shape(
         tool_choice_present = shape.tool_choice_present,
         short_request_kind = short_request_kind.as_str(),
         prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
+        prefix_4k_hash = %format_args!("{:016x}", shape.prefix_4k_hash),
+        prefix_32k_hash = %format_args!("{:016x}", shape.prefix_32k_hash),
+        prefix_128k_hash = %format_args!("{:016x}", shape.prefix_128k_hash),
+        prefix_256k_hash = %format_args!("{:016x}", shape.prefix_256k_hash),
+        cache_material_bytes = shape.cache_material_bytes,
         "desensitized request shape before upstream"
     );
 }
@@ -70,6 +75,11 @@ pub(crate) fn log_provider_cache_observation(
         provider_body_cache_creation_input_tokens = ?signals.body_cache_creation_input_tokens,
         provider_body_cached_tokens = ?signals.body_cached_tokens,
         prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
+        prefix_4k_hash = %format_args!("{:016x}", shape.prefix_4k_hash),
+        prefix_32k_hash = %format_args!("{:016x}", shape.prefix_32k_hash),
+        prefix_128k_hash = %format_args!("{:016x}", shape.prefix_128k_hash),
+        prefix_256k_hash = %format_args!("{:016x}", shape.prefix_256k_hash),
+        cache_material_bytes = shape.cache_material_bytes,
         estimated_total_tokens = shape.estimated_total_tokens,
         "provider cache usage observation"
     );

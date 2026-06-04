@@ -5,10 +5,12 @@ use rand::Rng;
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::Deserialize;
-use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const UA: &str = "opencode/1.15.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+const DEFAULT_STABLE_SESSION_PREFIX_BYTES: usize = 256 * 1024;
+const MIN_STABLE_SESSION_PREFIX_BYTES: usize = 4 * 1024;
+const MAX_STABLE_SESSION_PREFIX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct ZenSseEvent {
@@ -304,9 +306,20 @@ fn make_id(prefix: &str) -> String {
 }
 
 fn short_hash(input: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    short_hash_bytes(input.as_bytes())
+}
+
+fn short_hash_bytes(input: &[u8]) -> String {
+    format!("{:016x}", stable_hash64(input))
+}
+
+fn stable_hash64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn stable_session_id(api_key: &str, body: &serde_json::Value) -> String {
@@ -347,13 +360,49 @@ fn stable_project_id(body: &serde_json::Value) -> String {
 }
 
 fn session_scope(body: &serde_json::Value) -> String {
-    let material = serde_json::to_string(&body.get("messages")).unwrap_or_default();
+    let material = session_material(body);
     let estimated_tokens = material.len() / 4;
     let compacted = material.contains("free-model-client-rs context compactor");
     if compacted || estimated_tokens >= 10_000 {
-        return format!("large:{}", short_hash(&material));
+        let prefix_bytes = stable_session_prefix_bytes();
+        let prefix_len = material.len().min(prefix_bytes);
+        let prefix_hash = short_hash_bytes(&material.as_bytes()[..prefix_len]);
+        let tools_hash = component_hash(body.get("tools"));
+        let tool_choice_hash = component_hash(body.get("tool_choice"));
+        return format!(
+            "large_prefix_v498:p{}:{}:tools{}:choice{}",
+            prefix_bytes, prefix_hash, tools_hash, tool_choice_hash
+        );
     }
     "normal".to_string()
+}
+
+fn stable_session_prefix_bytes() -> usize {
+    std::env::var("ZEN_UPSTREAM_SESSION_PREFIX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_STABLE_SESSION_PREFIX_BYTES)
+        .clamp(
+            MIN_STABLE_SESSION_PREFIX_BYTES,
+            MAX_STABLE_SESSION_PREFIX_BYTES,
+        )
+}
+
+fn session_material(body: &serde_json::Value) -> String {
+    let mut material = String::new();
+    material.push_str("messages=");
+    material.push_str(&component_string(body.get("messages")));
+    material
+}
+
+fn component_hash(value: Option<&serde_json::Value>) -> String {
+    short_hash(&component_string(value))
+}
+
+fn component_string(value: Option<&serde_json::Value>) -> String {
+    value
+        .map(|value| serde_json::to_string(value).unwrap_or_default())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 pub fn zen_headers(api_key: &str, body: &serde_json::Value) -> Vec<(String, String)> {
@@ -850,6 +899,24 @@ mod tests {
             header_value(&third, "x-opencode-session")
         );
         assert_ne!(header_value(&first, "x-opencode-project"), "global");
+    }
+
+    #[test]
+    fn opencode_session_keeps_large_stable_prefix_when_tail_grows() {
+        let prefix = "a".repeat(1_200_000);
+        let first = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":prefix}]}),
+        );
+        let second = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":prefix},{"role":"assistant","content":"done"},{"role":"user","content":"continue"}]}),
+        );
+
+        assert_eq!(
+            header_value(&first, "x-opencode-session"),
+            header_value(&second, "x-opencode-session")
+        );
     }
 
     #[test]

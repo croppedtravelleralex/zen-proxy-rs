@@ -1757,6 +1757,52 @@ fn stream_output_policy_preserves_explicit_max_tokens_by_prompt_size() {
 }
 
 #[test]
+fn request_shape_prefix_hashes_stay_stable_when_large_tail_grows() {
+    let prefix = "a".repeat(1_200_000);
+    let mut first = ChatRequest {
+        model: "deepseek-v4-flash-free".to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: Value::String(prefix.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        stream: Some(true),
+        max_tokens: Some(32_000),
+        temperature: None,
+        top_p: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let mut second = first.clone();
+    second.messages.push(Message {
+        role: "assistant".to_string(),
+        content: Value::String("done".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    second.messages.push(Message {
+        role: "user".to_string(),
+        content: Value::String("continue".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+
+    let first_shape = free_model_client_rs::protocol::translate::request_shape(&first);
+    let second_shape = free_model_client_rs::protocol::translate::request_shape(&second);
+
+    assert_ne!(first_shape.prompt_hash, second_shape.prompt_hash);
+    assert_eq!(first_shape.prefix_4k_hash, second_shape.prefix_4k_hash);
+    assert_eq!(first_shape.prefix_32k_hash, second_shape.prefix_32k_hash);
+    assert_eq!(first_shape.prefix_128k_hash, second_shape.prefix_128k_hash);
+    assert_eq!(first_shape.prefix_256k_hash, second_shape.prefix_256k_hash);
+
+    first.messages[0].content = Value::String(format!("b{prefix}"));
+    let changed_prefix = free_model_client_rs::protocol::translate::request_shape(&first);
+    assert_ne!(first_shape.prefix_4k_hash, changed_prefix.prefix_4k_hash);
+}
+
+#[test]
 fn stream_context_compactor_preserves_latest_tail() {
     let tail = "FINAL_MARKER";
     let mut messages = vec![Message {

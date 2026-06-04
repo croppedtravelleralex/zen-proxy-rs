@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-06-04
+更新时间：2026-06-05
 分支：`codex/v47-client-split-cache-harness`
 
 ## 代码已确认能力
@@ -18,7 +18,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - `fmt --check` 通过。
 - `clippy --all-targets -- -D warnings` 通过。
-- `cargo test` 通过：库测试 82 条、kernel golden 94 条、doc tests 0 条。
+- `cargo test` 通过：库测试 83 条、kernel golden 95 条、doc tests 0 条。
 - `zen-proxy-rs` 本轮已改外层 V4 context compactor 和 e2e harness；当前已验证 `clippy -D warnings`、bin 单元测试 132 条、context 相关单元测试 12 条、e2e 27 条、shell e2e 9/9 通过。
 
 注意：上述验证覆盖本仓库当前源码。2026-06-04 18:54 已将输出限制取消、模型策略收窄、flash/free 输入放行和 cache 四态观测构建进 `zen-proxy-rs` release 并部署到 panda；部署后已通过 NewAPI models、短请求和手工大上下文不折叠 smoke。真实 panda `policy-smoke/policy-dry` 和四客户端压测仍未跑，不能当作生产压测结论。
@@ -53,6 +53,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 26. cache 观测新增四态：`attempted`、`accepted`、`rejected`、`ignored`；同时采集 provider response/header/body usage 信号，用来区分“上游未给 usage/cache”、“NewAPI/中间层剥离 header”和“真实 cache 命中”。
 27. 显式 `reply PONG only` 等短 smoke 在无工具、`max_tokens <= 64` 且上游连续空输出后允许返回本地 `PONG`；普通短请求仍不会伪造答案。
 28. `zen-proxy-rs` 外层 V4 context compactor 已按模型分流：`deepseek-v4-flash/deepseek-v4-flash-free` 只记录 `warn/pass`，不 compact、不因 token target reject；`deepseek-v4-flash-lite/big-pickle` 仍保留 compactor 能力，避免把全局大上下文保护误关。
+29. V4.98 cache-friendly session 已在本仓库源码落地：大请求上游 `x-opencode-session` 不再按完整 `messages` hash 每轮变化，而是按稳定前缀 hash、tools hash、tool_choice hash、模型、api key hash 和时间桶分组；请求正文、消息顺序、`max_tokens` 均不改写。
+30. V4.98 新增脱敏 prefix 观测：request-shape 和 cache observation 日志记录 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes`，用于判断长会话前缀是否稳定；仍不记录原始 prompt、请求体或 key。
 
 ## 运行链路事实
 
@@ -427,6 +429,19 @@ P1 仍需执行：
 4. 在 panda NewAPI 和 ZenProxy 日志层继续确认 502/524、stream JSON 截断、client_gone 是否为上游/客户端边界。
 5. Hermes 慢路径需要拆分客户端启动、工具 schema、上游响应和 agent 循环耗时；当前 50/50 功能通过但 P90 约 69.5s，不能直接进入 full 2000。
 6. 提交前复查 README、维护文档、脚本和 `.codex_tmp/` 临时产物一致性。
+
+P1.15 2026-06-05 V4.98 cache-friendly session 源码记录：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户在真实 ClaudeCode 长会话中观察到 NewAPI prompt tokens 稳定约 330k 且耗时爆红；panda 最近 70 分钟 `/v1/messages` 77/77 流式、prompt P50 约 326k、P90 约 331k、cache hits 0。 |
+| 判断 | 330k 不是输入 token 墙。部署后的 ZenProxy 日志为 `context_action=pass`、`effective_body_size=body_size`，free-model-client-rs `messages_tokens` 持续增长；问题主要是大输入每轮未命中 provider cache。 |
+| 线上证据 | 8 小时窗口内 cache 并非完全不可用：存在 `prompt_tokens=286975/cache_tokens=462592`、`prompt_tokens=439847/cache_tokens=439808` 等命中；其中一个大命中来自三次完全相同 `prompt_hash` 的重试后成功。 |
+| 根因候选 | 旧上游 session 策略对大请求使用完整 `messages` hash；长会话每轮追加尾部消息都会改变 session，不利于 provider 对重复前缀复用。 |
+| 修复 | 大请求 session scope 改为 `large_prefix_v498`：稳定前缀 hash + tools hash + tool_choice hash；保留模型、api key hash、时间桶隔离。 |
+| 观测 | 新增 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes` 到 request-shape 与 cache observation 日志，后续能区分“前缀不稳”和“前缀稳定但 provider 仍未命中”。 |
+| 非目标 | 不裁剪 330k 上下文，不做摘要替换，不重排消息，不注入提示词，不伪造 cache 命中。 |
+| 待验收 | 尚未部署 panda。部署后必须用同一 ClaudeCode 长会话 A/B 观察 cache hit rate、`frt`、总耗时、空输出/工具错误和回答质量。 |
 
 ## 临时产物归类
 

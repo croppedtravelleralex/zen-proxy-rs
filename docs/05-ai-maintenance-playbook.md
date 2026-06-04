@@ -109,7 +109,9 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 ## 常见现象解释
 
 - prompt tokens 稳定在约 60k：先确认时间点和模型。历史版本曾有流式 compactor/输出 cap；最新 `deepseek-v4-flash/deepseek-v4-flash-free` 已取消输入 token 墙，`free-model-client-rs` 和 `zen-proxy-rs` 外层都只观测/告警不压缩，不能再默认按旧 compactor 解释。
+- prompt tokens 稳定在约 330k：不要先判定输入墙，也不要先裁剪。先对齐 ZenProxy `context_action/effective_body_size`、free-model-client-rs `messages_tokens`、NewAPI `prompt_tokens`；如果 flash/free 是 `pass` 且 tokens 持续增长，说明在吃完整长上下文。
 - NewAPI cache tokens 几乎为 0：先看 `cache_observation=attempted/accepted/rejected/ignored`，再看 provider header/body usage 信号。`ignored` 代表没有可用 cache 字段，`attempted` 代表 provider 返回了 cache 字段但值为 0，`accepted` 才是 cache token > 0，`rejected` 代表 provider 明确拒绝 cache 控制。
+- V4.98 cache 排查顺序：先比较 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash` 是否稳定；若 prefix 稳定但 cache 仍为 0，再查上游 session、代理节点、账号和 provider cache 行为；若 prefix 本身不稳，先定位 ClaudeCode 是否把易变内容放在前缀，而不是直接缩上下文。
 - ClaudeCode CLI Markdown/表格/代码块/列表显示异常：先抓 raw SSE 和 `source_client`。若新 pid 仍不是 `claude-code`，优先查 profile 识别；若 raw SSE 正确但终端显示错，再归类为 CLI 渲染问题。
 - NewAPI 偶发 `status_code=500, upstream returned no assistant content or tool call`：先按空上游保护排查，不要先改 NewAPI。历史样本曾因流式 `max_tokens` 被 768/1024 cap 后绕过 buffered retry；最新策略已经完全取消输出限制，后续应重点看真实上游空输出、客户端断流、lane/pool 调度或非流式 fallback。
 - Web search 用不了：先分清“模型原生联网搜索”和“客户端工具搜索”。本仓库不自带搜索引擎，只转发 tools/tool_calls/tool results。排查顺序是：请求是否带 `WebSearch/WebFetch` 或 `web_search/web_fetch` 工具定义、模型是否发出 tool call、ZenProxy 是否把上游工具名 canonicalize 回客户端注册名、客户端/工具执行器是否执行联网、工具结果是否回到模型上下文。Hermes/OpenClaw/ClaudeCode 要分开验收。2026-06-04 已确认直连 panda NewAPI 带 `web_search` tool 能返回 tool call；用户截图也证明 Windows ClaudeCode 官方 Claude 路径可真实执行 `WebSearch/WebFetch`。不要再把“某次 ZenProxy 样本没有执行 web 工具”写成 ClaudeCode 不支持 web 工具。
@@ -128,6 +130,7 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - 工具调用、subagent/Task 调用成功率。
 - 失败状态码、错误分类、重试结果。
 - provider header/body usage 信号和 cache `attempted/accepted/rejected/ignored` 四态。
+- V4.98 prefix hash：`prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes`。
 - 输出限制取消后的 input/output wall 结果，尤其是 413、超时、空输出、长尾延迟和成本风险。
 - 是否污染用户默认配置。
 

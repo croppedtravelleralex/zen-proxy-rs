@@ -241,3 +241,23 @@
 
 - 状态：待设计。
 - 注意：当前 `deepseek-v4-flash/deepseek-v4-flash-free` 已取消输入 token 墙，`free-model-client-rs` 侧只观测不压缩。若未来重新引入 compactor，必须先做语义保真设计，保护最后用户目标、最近错误、工具结果摘要、文件路径、subagent 指令和验收标准。
+
+### V4.98 cache 命中优化
+
+- 状态：源码已落地，panda 部署和 A/B 待执行。
+- 背景：真实 ClaudeCode 长会话已达到约 330k prompt tokens，NewAPI 总耗时爆红；部署后日志显示 flash/free 没有输入墙或 compactor，当前瓶颈更像是长输入每轮未命中 provider cache。
+- 线上事实：
+  - 最近 70 分钟同一长会话 `/v1/messages` 77/77 流式，cache hits 0，prompt P50 约 326k、P90 约 331k。
+  - 8 小时窗口内仍存在大 cache 命中样本，说明 provider/NewAPI 并非完全不记录 cache。
+  - 完全相同 `prompt_hash` 的重试样本能命中 cache；尾部不断增长的长会话基本不命中。
+- 已做：
+  1. 大请求上游 session 从完整 `messages` hash 改为稳定前缀 hash + tools hash + tool_choice hash。
+  2. 新增 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes` 脱敏观测。
+  3. 增加回归：大前缀稳定、只追加尾部时，session 和 prefix hash 保持稳定；前缀变化时 prefix hash 必须变化。
+- 非目标：
+  - 不降低 330k 输入，不做摘要替换，不裁剪工具历史，不改用户消息顺序。
+  - 不注入隐藏提示词，不伪造 `cache_tokens`，不把 NewAPI 显示问题误写成真实 cache 命中。
+- 待验收：
+  1. 部署 panda 后用同一 ClaudeCode 长会话做 A/B：V47/V4.98 或部署前后窗口比较。
+  2. 观察 `cache_tokens/cache_observation/frt/use_time/client_gone/empty output/tool errors`。
+  3. 如果 prefix hash 稳定但 cache 仍为 0，再检查上游是否按 session、代理节点、账号或 body prefix 粒度隔离 cache。
