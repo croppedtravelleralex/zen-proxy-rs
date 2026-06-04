@@ -28,6 +28,7 @@ pub(crate) fn log_request_shape(
         messages_tokens = shape.messages_tokens,
         tools_tokens = shape.tools_tokens,
         tool_count = shape.tool_count,
+        tool_name_classes = ?shape.tool_name_classes,
         largest_message_tokens = shape.largest_message_tokens,
         last_user_tokens = shape.last_user_tokens,
         estimated_total_tokens = shape.estimated_total_tokens,

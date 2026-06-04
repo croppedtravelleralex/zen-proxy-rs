@@ -430,7 +430,7 @@ async fn handle_stream(
     let prompt = translate::build_prompt_text(&body.messages);
     let estimated_input_tokens = estimate(&prompt).max(1);
     let initial_input_tokens = estimated_input_tokens;
-    if use_claude_code_huge_buffer && cr.max_tokens.unwrap_or(0) <= 512 {
+    if use_claude_code_huge_buffer {
         return handle_buffered_claude_code_huge_stream(
             client,
             config,

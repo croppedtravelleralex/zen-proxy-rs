@@ -435,6 +435,7 @@ pub struct RequestShape {
     pub messages_tokens: u64,
     pub tools_tokens: u64,
     pub tool_count: usize,
+    pub tool_name_classes: Vec<&'static str>,
     pub message_count: usize,
     pub largest_message_tokens: u64,
     pub last_user_tokens: u64,
@@ -487,14 +488,20 @@ pub fn request_shape(body: &ChatRequest) -> RequestShape {
         }
     }
 
-    let (tool_count, tools_tokens) = body
+    let (tool_count, tools_tokens, tool_name_classes) = body
         .tools
         .as_ref()
         .map(|tools| {
             let rendered = serde_json::to_string(tools).unwrap_or_default();
-            (tools.len(), estimate_tokens(&rendered))
+            let mut classes = tools
+                .iter()
+                .map(|tool| tool_name_class(&tool.function.name))
+                .collect::<Vec<_>>();
+            classes.sort_unstable();
+            classes.dedup();
+            (tools.len(), estimate_tokens(&rendered), classes)
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0, Vec::new()));
     let estimated_total_tokens = system_tokens
         .saturating_add(messages_tokens)
         .saturating_add(tools_tokens);
@@ -505,6 +512,7 @@ pub fn request_shape(body: &ChatRequest) -> RequestShape {
         messages_tokens,
         tools_tokens,
         tool_count,
+        tool_name_classes,
         message_count: body.messages.len(),
         largest_message_tokens,
         last_user_tokens,
@@ -513,6 +521,29 @@ pub fn request_shape(body: &ChatRequest) -> RequestShape {
         max_tokens: body.max_tokens,
         tool_choice_present: body.tool_choice.is_some(),
         prompt_hash,
+    }
+}
+
+pub fn tool_name_class(name: &str) -> &'static str {
+    let normalized = name.trim().to_ascii_lowercase().replace(['-', '.'], "_");
+    match normalized.as_str() {
+        "web_search" | "websearch" | "web" | "search" => "web_search",
+        "web_fetch" | "webfetch" | "fetch" | "fetch_url" => "web_fetch",
+        "task" | "subagent" | "sub_agent" => "task",
+        "bash" | "shell" | "exec" | "execute" | "run_command" => "shell",
+        "read" | "write" | "edit" | "multiedit" | "read_file" | "write_file" | "edit_file" => {
+            "file"
+        }
+        "todowrite" | "todo_write" | "todo" => "todo",
+        "memorysearch" | "memory_search" | "memoryread" | "memory_read" => "memory",
+        "mcp__cherryhub__list"
+        | "mcp__cherryhub__inspect"
+        | "mcp__cherryhub__invoke"
+        | "mcp__cherryhub__exec" => "mcp",
+        _ if normalized.starts_with("mcp__") => "mcp",
+        _ if normalized.contains("web_search") => "web_search",
+        _ if normalized.contains("web_fetch") => "web_fetch",
+        _ => "other",
     }
 }
 
@@ -1591,6 +1622,7 @@ mod tests {
 
         assert_eq!(shape.message_count, 2);
         assert_eq!(shape.tool_count, 1);
+        assert_eq!(shape.tool_name_classes, vec!["file"]);
         assert!(shape.system_tokens > 0);
         assert!(shape.messages_tokens > 0);
         assert!(shape.tools_tokens > 0);
@@ -1601,6 +1633,26 @@ mod tests {
         assert!(!rendered.contains("SECRET_SYSTEM_TEXT"));
         assert!(!rendered.contains("SECRET_USER_TEXT"));
         assert!(!rendered.contains("SECRET_TOOL_DESCRIPTION"));
+    }
+
+    #[test]
+    fn request_shape_classifies_web_tools_without_exposing_unknown_tool_names() {
+        let mut body = request("use the web tool", true, Some(1024));
+        body.tools = Some(vec![
+            tool("web_fetch"),
+            tool("web_search"),
+            tool("Task"),
+            tool("SECRET_CUSTOM_TOOL"),
+        ]);
+
+        let shape = request_shape(&body);
+        let rendered = format!("{shape:?}");
+
+        assert_eq!(
+            shape.tool_name_classes,
+            vec!["other", "task", "web_fetch", "web_search"]
+        );
+        assert!(!rendered.contains("SECRET_CUSTOM_TOOL"));
     }
 
     #[test]

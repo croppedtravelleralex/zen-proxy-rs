@@ -1831,6 +1831,35 @@ async fn claude_code_small_low_max_tokens_stream_uses_buffer_retry() {
 }
 
 #[tokio::test]
+async fn claude_code_huge_stream_uses_buffer_retry_after_1024_output_cap() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let huge_prompt = format!(
+        "Read this long ClaudeCode session.\n{}\nLatest task: trigger empty-once retry and then answer normally.",
+        "old tool output line\n".repeat(12_000)
+    );
+    let mut request = anthropic_request("deepseek-v4-flash", &huge_prompt, true);
+    request.max_tokens = 32_000;
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer"));
+    assert!(!body.contains("upstream returned no assistant content or tool call"));
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].max_tokens, Some(1024));
+    assert_eq!(requests[1].max_tokens, Some(1024));
+}
+
+#[tokio::test]
 async fn anthropic_channel_test_probe_empty_upstream_falls_back_to_ok() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);

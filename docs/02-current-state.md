@@ -247,6 +247,31 @@ P1.8 NewAPI 短 smoke 探针空输出兜底：
 | 耗时 | non-stream 总耗时约 4.8-5.5s；stream 首内容约 2.0-2.3s。 |
 | 环境边界 | Windows 环境变量存在 `HTTP_PROXY=http://127.0.0.1:7897`；Windows `Invoke-RestMethod` 走代理访问 panda NewAPI 会 502，但 `curl --noproxy '*'` 直连 `100.69.228.93:8081/v1/models` 为 200。Windows ClaudeCode/cc-switch 若继承该代理，需要显式绕过 panda Tailscale IP。 |
 
+P1.9 ClaudeCode 大流式 768/1024 cap 桶 buffered retry 修复：
+
+| 项 | 值 |
+|----|----|
+| 修复时间 | 2026-06-04 中午 |
+| 根因 | 外层已判断 ClaudeCode 大上下文或低输出 cap 应进入 huge buffered retry，但 `handle_stream` 内部又二次限制 `max_tokens <= 512`，导致 `max_tokens=32000` 被 cap 到 768/1024 的真实大流式请求绕过 retry，遇到上游空输出时裸透 `upstream returned no assistant content or tool call`。 |
+| 修复 | 移除 `handle_stream` 内部多余的 512 门槛；只要外层 `use_claude_code_huge_buffer=true` 就进入 buffered retry。 |
+| 回归 | 新增 `claude_code_huge_stream_uses_buffer_retry_after_1024_output_cap`：约 50k+ 输入、`max_tokens=32000 -> 1024`、上游第一次空输出、第二次正常输出，断言 upstream 请求 2 次且不再返回空 assistant 错误。 |
+| 本地验证 | `free-model-client-rs`：`fmt --check`、`clippy -D warnings`、`cargo test` 通过；库测试 71 条、kernel golden 76 条。`zen-proxy-rs`：主单测 129 条、e2e 26 条、release build 通过。 |
+| 部署 | panda 三实例部署 stripped hash `7a8f4e5dc99e8ccf1aaf6562519d8353dc4ba5205e5e55f521c265b0760ed66e`；旧 hash `117b3cbfaf058fbbeb258f98542afc09a097e763359f34d174414b47dfd11aff` 已备份到 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-buffered-1024-*`。 |
+| 线上健康 | `zen-proxy-rs@1/@2/@3` active；`http://127.0.0.1:4000/health` 返回 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`、`upstream.backoff=false`。 |
+| NewAPI preflight | `http://100.69.228.93:8081/v1/models` 200，模型数 8；`deepseek-v4-flash` 最小 OpenAI chat 200，返回 `OK`，约 2.6-3.1s。 |
+
+P1.10 2026-06-04 三客户端 smoke 和 web/search 边界：
+
+| 项 | 结果 |
+|----|------|
+| Windows ClaudeCode | 显式 base/key 指向 panda NewAPI，5/5 通过；P50 约 4.3s，P90 约 7.8s；tool 2/2 语义通过；subagent 用例语义通过但 runner 未观察到真实 Task tool call。 |
+| WSL ClaudeCode | 当前不可作为有效样本；`/home/lenovo/.local/bin/claude` 和 `claude-deepseek-free` 都指向 clawgod launcher，实际启动 `/root/.bun/bin/bun /root/.clawgod/cli.cjs`，会挂住，不是 Anthropic ClaudeCode CLI。 |
+| WSL Hermes | 5/5 通过；P50 约 34.7s，P90 约 38.9s；tool 2/2 通过；Hermes subagent 当前 runner 标记为不支持。慢路径属于 Hermes 本地 agent/启动/工具链耗时，不能直接等同 ZenProxy TTFT。 |
+| WSL OpenClaw | API 5/5 通，但 semantic 0/5；输出固定 `HEARTBEAT_OK`，stderr 有 local secrets gateway `1006 abnormal closure`。这是 OpenClaw 本地 agent/gateway/harness 问题，不是 NewAPI/ZenProxy HTTP 链路断。 |
+| 直连 web tools | 清空 WSL proxy env 后，Anthropic `/v1/messages` 和 OpenAI `/v1/chat/completions` 带 `web_search` tool 均 200，返回真实 `web_search` tool call；说明模型和 ZenProxy 可以转发/产生工具调用。 |
+| Windows ClaudeCode WebSearch | `--tools WebSearch,WebFetch` 下 `system init` 的 `tools_seen=[]`；模型输出的是普通文本 `<function_calls><invoke name="WebSearch">...`，没有真实工具执行。`--tools default` 只注册 `Bash/Edit/PowerShell/Read`。 |
+| cc-switch 当前 provider | Windows cc-switch 当前 Claude provider 是 `closedeepseek -> https://sub2api.closeapi.top`；`LocalNewapi -> http://127.0.0.1:8081` 存在但不是 current。用户平时从 Windows ClaudeCode 测到的现象不能默认归因到 panda NewAPI/ZenProxy。 |
+
 ## 当前数据解释
 
 1. “输入几乎 70k/90k”当前不是 NewAPI 输入 token 墙。2026-06-03 23:01-23:46 的 channel 69 真实 ClaudeCode 流式请求显示：ZenProxy 入口 body 从约 674KB 增长到 788KB，`before_tokens` 约 97k-110k，流式 compactor 后 `after_tokens` 约 66k-79k，NewAPI 账面多落在 70k-90k。
@@ -254,6 +279,8 @@ P1.8 NewAPI 短 smoke 探针空输出兜底：
 3. “ClaudeCode 一直反复做”的直接调用形态是：流式大请求偶发 `status_code=500, upstream returned no assistant content or tool call`，随后 ClaudeCode 又以非流式大请求重发同一大历史，成功返回后下一轮继续把历史追加进去。样本：NewAPI id `109459` 流式 prompt tokens 记 0 且 500，紧接 id `109461` 非流式 225416 prompt tokens 成功。
 4. 旧版 ClaudeCode huge-context 策略虽配置 `target_tokens=12k`，但真实请求里 `message_count` 已达 670-705，`tools_tokens=12700`，大量旧短消息低于单条 `min_text_tokens=2000`，不会被旧 compactor 选为压缩候选；因此压缩后仍剩约 97k estimated total tokens。2026-06-04 已部署 huge-session compactor，开始折叠旧短消息和大非流式 fallback。
 5. 缓存几乎为 0 是因为上游 usage 基本没有返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 OpenAI `cached_tokens`；当前 ZenProxy 只转发上游缓存计数，不会自行伪造 provider cache 命中。
+6. 2026-06-04 中午已修复 768/1024 cap 桶绕过 buffered retry 的源头 bug；后续若 NewAPI 再出现同样错误，先查是否为新 hash 之后的真实事件，以及是否所有 buffered retry 都为空。
+7. Web/search 不是模型原生联网。当前源头已经证明：只要客户端提供 tool schema，ZenProxy 可以让模型返回 `web_search` tool call；ClaudeCode CLI 当前没有注册 WebSearch/WebFetch，所以它只能把伪函数调用当普通文本输出。
 
 P1 待执行：
 
@@ -263,6 +290,9 @@ P1 待执行：
 4. Smoke / preflight 已证明 panda `/v1/models` 和最小聊天可用，模型包含 `deepseek-v4-flash`、`deepseek-v4-flash-lite`。
 5. dry run 暴露红旗，当前不能直接进入 4 客户端 x 500 full run。
 6. 2026-06-01 panda 本机 huge stream source-side smoke 已通过，但它不是 ClaudeCode/Hermes/OpenClaw 真实客户端验收；下一步仍要重新跑 panda-only dry run。
+7. WSL ClaudeCode 必须先换成真实 ClaudeCode CLI 或修复当前 clawgod launcher，否则不能纳入四客户端正式压测。
+8. OpenClaw 必须先修 local secrets gateway / agent harness 的 `HEARTBEAT_OK` 问题，否则只能统计 API 可达，不能统计语义、工具和 subagent 成功率。
+9. ClaudeCode WebSearch 若要真实执行，需要接入 ClaudeCode 可用的 MCP/web 工具或用 Bash/PowerShell/curl 类工具实现搜索；ZenProxy 不会也不应自行替客户端执行公网搜索。
 
 P1 dry-run 结果：
 

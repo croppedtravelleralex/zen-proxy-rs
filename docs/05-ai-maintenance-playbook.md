@@ -98,12 +98,17 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - Windows `ssh panda` 使用 `C:\Users\Lenovo\.ssh\config` 中的 `root@100.69.228.93`；WSL 默认 `ssh panda` 可能没有该配置。WSL 需要显式使用 `/mnt/c/Users/Lenovo/.ssh/id_ed25519`。
 - huge stream 日志里若出现 `ClaudeCode huge stream buffered upstream returned empty output`，先按 buffered retry 已兜底处理归类；只有最终裸透给客户端或耗尽重试才算失败。
 - 如果需要临时中止压测，保留已有 `raw-results.jsonl`，再生成 partial summary，不要补写伪造的完成数。
+- WSL ClaudeCode 当前不能直接作为有效客户端样本：`/home/lenovo/.local/bin/claude` 和 `claude-deepseek-free` 是 clawgod launcher，实际启动 `/root/.clawgod/cli.cjs`，不是 Anthropic ClaudeCode CLI；正式四客户端压测前必须修复或替换。
+- Windows ClaudeCode 经过 cc-switch 时必须先确认 current provider。2026-06-04 发现 current Claude provider 是 `closedeepseek -> https://sub2api.closeapi.top`，不是 `LocalNewapi -> http://127.0.0.1:8081`；普通 Windows 使用记录不能直接归因到 panda NewAPI/ZenProxy。
+- OpenClaw 若输出固定 `HEARTBEAT_OK` 且 stderr 有 local secrets gateway `1006 abnormal closure`，先归类为 OpenClaw 本地 agent/gateway/harness 问题，不要先改 ZenProxy。
 
 ## 常见现象解释
 
 - prompt tokens 稳定在约 60k：默认流式 compactor 在超过 80k 后压到约 60k；如果 ClaudeCode 被误判为 OpenClaw，就不会走 ClaudeCode huge-context 约 12k 目标。
 - NewAPI cache tokens 几乎为 0：当前链路只转发上游 usage 里的缓存字段；上游不返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 `cached_tokens` 时，ZenProxy 不自行制造缓存计数。
 - ClaudeCode CLI Markdown/表格/代码块/列表显示异常：先抓 raw SSE 和 `source_client`。若新 pid 仍不是 `claude-code`，优先查 profile 识别；若 raw SSE 正确但终端显示错，再归类为 CLI 渲染问题。
+- NewAPI 偶发 `status_code=500, upstream returned no assistant content or tool call`：先按空上游保护排查，不要先改 NewAPI。若样本是 ClaudeCode 大流式请求且 `max_tokens` 被 cap 到 768/1024，重点检查是否绕过了 ClaudeCode huge buffered retry；对齐后再决定是否扩大 buffered retry 覆盖。
+- Web search 用不了：先分清“模型原生联网搜索”和“客户端工具搜索”。本仓库不自带搜索引擎，只转发 tools/tool_calls/tool results。排查顺序是：请求是否带 `web_search/web_fetch` 工具定义、模型是否发出 tool call、客户端/工具执行器是否执行联网、工具结果是否回到模型上下文。Hermes/OpenClaw/ClaudeCode 要分开验收。2026-06-04 已确认直连 panda NewAPI 带 `web_search` tool 能返回 tool call；Windows ClaudeCode `--tools WebSearch,WebFetch` 不会注册真实 WebSearch/WebFetch，`--tools default` 只有 `Bash/Edit/PowerShell/Read`。
 - NewAPI 看到 70k-90k input tokens：不要直接判定为 NewAPI 输入墙。先对齐三种口径：ZenProxy `body_size` 是 JSON 字节数；free-model-client-rs `prompt_tokens` 是估算/策略口径；NewAPI/cc-switch usage 是最终账单口径。若日志出现 `compacted streaming ... before_tokens=... after_tokens=...`，说明是内核消息压缩后的上游输入；若 `context_action=pass` 且只有 `capped streaming ... max_tokens`，说明输入未被外层裁剪，只限制了输出。
 - Windows ClaudeCode 当前可能先走 cc-switch：检查 `C:\Users\Lenovo\.claude\settings.json` 里的 `ANTHROPIC_BASE_URL`，再查 cc-switch provider。不要把 `ClaudeCode -> cc-switch -> closeapi` 的记录和 `panda NewAPI channel 69 -> ZenProxy` 的记录合并归因。
 - ClaudeCode 表面短 prompt 不等于短请求：ClaudeCode 会带系统提示、工具 schema、plugins/skills、agent 信息、历史上下文和模型别名。当前源码已增加并部署脱敏 request-shape 采样，字段包括 `system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`；禁止保存原始 prompt、请求体或密钥。

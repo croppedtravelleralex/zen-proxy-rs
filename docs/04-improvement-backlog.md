@@ -19,24 +19,25 @@
 
 ### OpenClaw Node 运行环境
 
-- 状态：已完成小矩阵。
+- 状态：Node 运行时已解决；OpenClaw agent/gateway 仍有阻塞。
 - 已知：OpenClaw package 要求 Node `>=22.19.0`，当前系统 WSL Node 仍为 `v20.20.2`。
 - 已执行：隔离安装 Node `v22.21.1` 到 `~/.local/opt/node-v22.21.1-linux-x64`，只在 OpenClaw 测试命令里 prepend PATH。
 - 验收结果：`openclaw --help`、临时 config validate、models list、infer PONG、agent PONG、agent 文件工具、agent web_fetch 均通过 panda NewAPI。
-- 残留：如果后续直接运行 `openclaw` 而不显式使用隔离 Node，仍会命中系统 Node 20 并失败。
+- 最新结果：2026-06-04 smoke 中 OpenClaw API 5/5 通，但语义 0/5，输出固定 `HEARTBEAT_OK`，stderr 有 local secrets gateway `1006 abnormal closure`。
+- 残留：如果后续直接运行 `openclaw` 而不显式使用隔离 Node，仍会命中系统 Node 20 并失败；即使 Node 22 正确，仍需修复 OpenClaw local gateway/agent harness，否则不能把 OpenClaw 纳入正式语义压测。
 
 ## P1：稳定性与观测
 
 ### 客户端识别与策略隔离
 
-- 状态：90 分方案和代码均已落地；OpenClaw body/profile 修复已部署到 panda，WSL 三客户端 smoke 已通过。
+- 状态：90 分方案和代码均已落地；ClaudeCode/Hermes 当前路径可用，OpenClaw 需要先修本地 agent/gateway。
 - 原因：Hermes/OpenClaw 适配目前通过共享路径生效，可能误伤 ClaudeCode 的 thinking、流式输出格式和工具历史语义。
 - 方案入口：`docs/07-client-profile-policy-plan.md`。
 - 目标：先用 `x-fmc-client` 和自动识别拆出 `claude-code`、`hermes`、`openclaw`、`unknown` 等 profile；按 profile 应用不同 thinking、空白保留、工具历史修复策略。
 - 90 分验收：ClaudeCode tools 请求不再默认禁用 thinking；流式空格/换行/缩进不丢；Hermes/OpenClaw 小矩阵不回退；profile 维度测试通过。
 - 已完成：`src/client_profile.rs`、`x-fmc-client`、OpenAI/Anthropic chat profile 传递、per-client thinking/whitespace/tool-history policy、kernel golden 回归测试。
-- 已验证：OpenClaw-only smoke 5/5；WSL ClaudeCode/Hermes/OpenClaw smoke 15/15；OpenClaw subagent 用例从历史 328s timeout 降到约 20.1s 成功。
-- 待完成：dry-run 级别 profile 维度运行数据、Hermes 慢路径拆解、Windows ClaudeCode 原生执行验证。
+- 已验证：2026-06-04 Windows ClaudeCode 显式 panda NewAPI 5/5，Hermes 5/5；OpenClaw API 5/5 但语义 0/5，固定 `HEARTBEAT_OK`。
+- 待完成：dry-run 级别 profile 维度运行数据、Hermes 慢路径拆解、OpenClaw local gateway/harness 修复、WSL ClaudeCode CLI 修复。
 - 99+ 后续：拿真实数据后做动态 profile、per-client 指标、灰度和回滚。
 
 ### 运行指标细分
@@ -44,6 +45,52 @@
 - 状态：待设计。
 - 当前不足：代码层有错误结构化，但缺少完整阶段耗时暴露。
 - 建议指标：请求入站、认证、解析、协议修复、上游连接、上游首包、first content、first tool call、stream decode、响应结束。
+
+### ClaudeCode 大流式空 assistant 500
+
+- 状态：已修复并部署，仍需线上观察。
+- 现象：panda NewAPI channel 69 偶发 `status_code=500, upstream returned no assistant content or tool call`。
+- 已确认事实：
+  - 错误字符串来自 `free-model-client-rs` 的空上游保护，不是 NewAPI 自造错误。
+  - 2026-06-04 近 4 小时内 `deepseek-v4-flash` 成功消费 133 条，该错误实际事件 4 次，发生在 10:43、10:58、11:03、11:04。
+  - 失败样本主要是 ClaudeCode Anthropic `/v1/messages` 流式请求，`source_client=ClaudeCode`，`stream=true`，大上下文加工具 schema，`tools_tokens` 约 12.7k-12.9k。
+  - 上游请求前会把 `max_tokens=32000` cap 到 768 或 1024；旧版 ClaudeCode huge buffered retry 只覆盖 `max_tokens <= 512`，所以这些请求绕过 buffered retry，普通流式分支在收到空正文/空工具调用后直接向客户端发 error。
+  - 同一回合后续 NewAPI/客户端常发非流式 fallback，并有成功样本：约 48k-52k prompt tokens，905-1789 completion tokens。
+- 已完成：
+  1. 移除 `handle_stream` 内部多余的 `max_tokens <= 512` 二次门槛。
+  2. 新增 1024 cap 桶回归：大 ClaudeCode 流式请求第一次上游空输出，第二次 buffered retry 成功。
+  3. 2026-06-04 已部署到 panda stripped hash `7a8f4e5dc99e8ccf1aaf6562519d8353dc4ba5205e5e55f521c265b0760ed66e`。
+- 风险：
+  - 单次流式请求失败会被用户感知为无回复、卡顿或重试。
+  - fallback 会拉长耗时，并可能继续放大长会话上下文。
+- 待办：
+  1. 观察新 hash 之后是否还出现同类空 assistant 500；如仍有，确认是否 buffered retry 三次都为空。
+  2. 普通流式空输出分支补结构化日志：`source_client/prompt_hash/prompt_tokens/message_count/max_tokens/tool_count/tools_tokens`。
+  3. 所有 buffered retry 为空时返回清晰分类；普通用户请求仍不得伪造答案。
+  4. 部署后用 panda NewAPI 验收：同类错误事件应归零，短请求 P90 不被大 buffered retry 拖慢。
+
+### Web search / web_fetch 能力边界
+
+- 状态：源头已拆分验证；客户端执行器仍需分别处理。
+- 当前事实：
+  - DeepSeek/OpenAI-compatible chat 模型可以通过 function/tool calling 请求工具，但搜索动作本身不是模型内置能力；真正联网搜索必须由 ClaudeCode/Hermes/OpenClaw/MCP 或后端工具执行。
+  - 本仓库只负责把工具定义、工具调用和工具结果在 OpenAI/Anthropic 协议间规范化转发，不自带搜索引擎、不自发访问公网。
+  - OpenClaw panda 小矩阵中 `web_fetch` 曾通过；Hermes web 用例命令成功但返回 `WEB_FAIL`，需要独立归因。
+  - `web_fetch/web_search` 不能作为 OpenClaw 强身份信号；该识别误伤已修复，避免 ClaudeCode 因带 web 工具而套用 OpenClaw/Hermes 策略。
+  - 2026-06-04 清空 WSL proxy env 后，直连 panda NewAPI 的 Anthropic `/v1/messages` 和 OpenAI `/v1/chat/completions` 均能返回 `web_search` tool call。
+  - Windows ClaudeCode `--tools WebSearch,WebFetch` 下 `system init` 的 `tools_seen=[]`，模型只输出普通文本形式的伪 function call；`--tools default` 只有 `Bash/Edit/PowerShell/Read`。
+  - OpenClaw 请求能带 `web_fetch/web_search` tool schema，但当前 OpenClaw agent 输出固定 `HEARTBEAT_OK`，不是 ZenProxy web 转发问题。
+- 可能原因：
+  1. 客户端没有把 web 工具定义传进请求，模型就无法调用。
+  2. 模型收到工具定义但没有选择 tool call，属于模型工具服从问题。
+  3. 模型发起 tool call，但客户端/工具执行器没有真正联网或返回失败。
+  4. 工具结果返回后被协议转换、compactor 或工具历史修复误处理，导致模型看不到搜索结果。
+- 待办：
+  1. ClaudeCode 若需要真实 WebSearch，接入可执行 WebSearch/WebFetch 的 MCP 或让 ClaudeCode 使用 Bash/PowerShell/curl 工具；不能指望 ZenProxy 自行执行搜索。
+  2. Hermes 的 `WEB_FAIL` 不再直接算链路失败，必须标注为“未触发工具 / 工具执行失败 / 工具结果未被使用 / 模型判断错误”之一。
+  3. OpenClaw 先修 local gateway/harness，再重新验证 `web_fetch/web_search` 工具执行。
+  4. 保持 ZenProxy 脱敏 `tool_name_classes` 观测，不记录原始查询内容。
+  5. 若用户需要“模型自带联网搜索”，不能只靠 `deepseek-v4-flash-free`；需要接入带搜索执行器的客户端/MCP 或在 ZenProxy 外侧增加受控搜索工具服务。
 
 ### ClaudeCode 请求体来源归因
 
