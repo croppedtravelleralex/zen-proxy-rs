@@ -1,6 +1,10 @@
+use std::net::TcpListener;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const SERVER_STARTUP_ATTEMPTS: usize = 8;
+const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn sha256_first8(input: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -8,11 +12,39 @@ fn sha256_first8(input: &str) -> String {
     hex::encode(&hash[..4])
 }
 
-fn start_server(port: u16) -> (Child, u16) {
-    start_server_with_env(port, &[])
+fn start_server(_preferred_port: u16) -> (Child, u16) {
+    start_server_with_env(_preferred_port, &[])
 }
 
-fn start_server_with_env(port: u16, envs: &[(&str, &str)]) -> (Child, u16) {
+fn start_server_with_env(_preferred_port: u16, envs: &[(&str, &str)]) -> (Child, u16) {
+    let mut last_error = String::new();
+    for _ in 0..SERVER_STARTUP_ATTEMPTS {
+        let port = pick_unused_port();
+        let mut child = spawn_server(port, envs);
+        match wait_for_server(&mut child, port) {
+            Ok(()) => return (child, port),
+            Err(err) => {
+                last_error = err;
+                child.kill().ok();
+                child.wait().ok();
+                let _ = std::fs::remove_file(node_db_path(port));
+            }
+        }
+    }
+
+    panic!("failed to start e2e server after {SERVER_STARTUP_ATTEMPTS} attempts: {last_error}");
+}
+
+fn pick_unused_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve e2e port");
+    listener.local_addr().expect("reserved e2e port").port()
+}
+
+fn node_db_path(port: u16) -> String {
+    format!("/tmp/zen-e2e-{port}.json")
+}
+
+fn spawn_server(port: u16, envs: &[(&str, &str)]) -> Child {
     let exe = option_env!("CARGO_BIN_EXE_zen-proxy-rs")
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| {
@@ -30,23 +62,54 @@ fn start_server_with_env(port: u16, envs: &[(&str, &str)]) -> (Child, u16) {
         .env("PROXY_TOKEN_MODE", "unlimited")
         .env("ADMIN_API_KEY", "test-key")
         .env("NODES_FILE", "/dev/null")
-        .env("NODE_DB_PATH", format!("/tmp/zen-e2e-{}.json", port));
+        .env("NODE_DB_PATH", node_db_path(port));
     for (key, value) in envs {
         command.env(key, value);
     }
 
-    let child = command.spawn().expect("failed to start server");
-    std::thread::sleep(Duration::from_secs(4));
-    (child, port)
+    command.spawn().expect("failed to start server")
+}
+
+fn wait_for_server(child: &mut Child, port: u16) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+        .map_err(|err| format!("failed to build readiness client: {err}"))?;
+    let url = format!("http://127.0.0.1:{port}/health");
+    let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("failed to poll server process: {err}"))?
+        {
+            return Err(format!(
+                "server exited before readiness on port {port}: {status}"
+            ));
+        }
+
+        let last_error = match client.get(&url).send() {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => format!("readiness returned {}", resp.status()),
+            Err(err) => err.to_string(),
+        };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for server on port {port}; last readiness error: {last_error}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn stop_server(mut child: Child, port: u16) {
     child.kill().ok();
     child.wait().ok();
-    let _ = std::fs::remove_file(format!("/tmp/zen-e2e-{}.json", port));
+    let _ = std::fs::remove_file(node_db_path(port));
 }
 
 fn start_mock_zen() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    use axum::extract::DefaultBodyLimit;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -111,7 +174,8 @@ fn start_mock_zen() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
 
             let app = Router::new()
                 .route("/zen/v1/chat/completions", post(handler))
-                .with_state(state);
+                .with_state(state)
+                .layer(DefaultBodyLimit::max(8 * 1024 * 1024));
             let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
             axum::serve(listener, app).await.unwrap();
         });
@@ -244,6 +308,31 @@ mod e2e {
         ))
         .expect("missing model detail endpoint");
         assert_eq!(missing.status(), 404);
+
+        let client = reqwest::blocking::Client::new();
+        for (probe_name, header, value) in [
+            ("openai", "user-agent", "OpenAI/Python 1.0"),
+            ("anthropic", "anthropic-client", "anthropic-sdk-rust/0.1"),
+        ] {
+            let probe_resp = client
+                .get(format!("http://127.0.0.1:{}/v1/models", port))
+                .header(header, value)
+                .send()
+                .unwrap_or_else(|err| panic!("{probe_name} model probe failed: {err}"));
+            assert_eq!(probe_resp.status(), 200, "{probe_name} model probe");
+            let probe_body: serde_json::Value = probe_resp.json().unwrap();
+            let probe_ids: Vec<&str> = probe_body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|model| model["id"].as_str())
+                .collect();
+            assert_eq!(
+                probe_ids,
+                vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"],
+                "{probe_name} model probe ids"
+            );
+        }
         stop_server(child, port);
     }
 
@@ -282,7 +371,7 @@ mod e2e {
         let openai_resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-v4-flash-lite",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": false
             }))
@@ -318,10 +407,10 @@ mod e2e {
         assert_eq!(anthropic_health_resp.status(), 200);
 
         let seen = observed.lock().unwrap();
-        assert_eq!(seen[0]["body"]["model"], "deepseek-v4-flash-free");
+        assert_eq!(seen[0]["body"]["model"], "big-pickle");
         assert_eq!(seen[1]["body"]["model"], "big-pickle");
         assert_eq!(seen[2]["body"]["model"], "big-pickle");
-        assert_eq!(seen[2]["body"]["max_tokens"], 1024);
+        assert!(seen[2]["body"].get("max_tokens").is_none());
         assert_eq!(seen[0]["selected_node_id"], "direct");
         assert_eq!(seen[0]["selected_node_url"], "direct");
 
@@ -335,10 +424,10 @@ mod e2e {
         let items = requests_body["data"].as_array().unwrap();
         let openai_record = items
             .iter()
-            .find(|item| item["public_model"] == "deepseek-v4-flash")
+            .find(|item| item["public_model"] == "deepseek-v4-flash-lite")
             .unwrap();
         assert!(openai_record["rid"].as_str().is_some());
-        assert_eq!(openai_record["upstream_model"], "deepseek-v4-flash-free");
+        assert_eq!(openai_record["upstream_model"], "big-pickle");
         assert_eq!(openai_record["selected_node_id"], "direct");
         assert_eq!(openai_record["selected_node_url_redacted"], "direct");
         assert_eq!(openai_record["observed_exit_ip"], "direct");
@@ -433,7 +522,7 @@ mod e2e {
         let resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-v4-flash-lite",
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "old-tool", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]},
                     {"role": "tool", "content": "x".repeat(2 * 1024 * 1024), "tool_call_id": "old-tool"},
@@ -460,6 +549,7 @@ mod e2e {
 
         let seen = observed.lock().unwrap();
         assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["model"], "big-pickle");
         let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
         assert_eq!(upstream_messages.last().unwrap()["content"], "latest user");
         let compacted_tool = upstream_messages
@@ -473,7 +563,75 @@ mod e2e {
     }
 
     #[test]
-    fn test_v4_nonstream_guard_caps_large_prompt_before_upstream() {
+    fn test_v4_flash_input_wall_passes_large_old_tool_result_before_upstream() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19807,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+                ("ZEN_COMPACTOR_MODE", "enforce"),
+                ("ZEN_ARTIFACT_CACHE_MODE", "off"),
+                ("CONTEXT_COMPACT_BODY_MB", "1"),
+                ("CONTEXT_TARGET_BODY_MB", "1"),
+                ("CONTEXT_LARGE_CHUNK_BYTES", "1024"),
+                ("CONTEXT_PRESERVE_RECENT_MESSAGES", "8"),
+                ("CONTEXT_TOKEN_COMPACT", "100"),
+                ("CONTEXT_TOKEN_TARGET", "100"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "old-tool", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]},
+                    {"role": "tool", "content": "x".repeat(2 * 1024 * 1024), "tool_call_id": "old-tool"},
+                    {"role": "assistant", "content": "recent assistant"},
+                    {"role": "user", "content": "y".repeat(2 * 1024)}
+                ],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 flash pass-through openai request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-context-trimmed")
+                .and_then(|value| value.to_str().ok()),
+            Some("false")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-context-action")
+                .and_then(|value| value.to_str().ok()),
+            Some("warn")
+        );
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["model"], "deepseek-v4-flash-free");
+        let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
+        assert_eq!(
+            upstream_messages.last().unwrap()["content"],
+            "y".repeat(2 * 1024)
+        );
+        let tool_content = upstream_messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("paired tool result should remain protocol-shaped");
+        assert!(!tool_content.contains("ZenProxy context compactor"));
+        assert_eq!(tool_content.len(), 2 * 1024 * 1024);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_nonstream_guard_preserves_large_prompt_output_before_upstream() {
         let (upstream_base, observed) = start_mock_zen();
         let (child, port) = start_server_with_env(
             19805,
@@ -501,17 +659,17 @@ mod e2e {
             resp.headers()
                 .get("x-zen-nonstream-guard-action")
                 .and_then(|value| value.to_str().ok()),
-            Some("cap_long_prompt_2048")
+            Some("pass")
         );
 
         let seen = observed.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0]["body"]["max_tokens"], 2048);
+        assert_eq!(seen[0]["body"]["max_tokens"], 4096);
         stop_server(child, port);
     }
 
     #[test]
-    fn test_v4_nonstream_guard_rejects_huge_prompt_long_output() {
+    fn test_v4_nonstream_guard_preserves_huge_prompt_long_output() {
         let (upstream_base, observed) = start_mock_zen();
         let (child, port) = start_server_with_env(
             19806,
@@ -533,10 +691,11 @@ mod e2e {
                 "stream": false
             }))
             .send()
-            .expect("v4 nonstream rejected request");
-        assert_eq!(resp.status(), 422);
-        assert!(resp.text().unwrap().contains("use stream=true"));
-        assert!(observed.lock().unwrap().is_empty());
+            .expect("v4 nonstream preserved request");
+        assert_eq!(resp.status(), 200);
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["max_tokens"], 20_000);
         stop_server(child, port);
     }
 
@@ -600,7 +759,7 @@ mod e2e {
     }
 
     #[test]
-    fn test_v4_free_model_kernel_propagates_client_profile() {
+    fn test_v4_free_model_kernel_propagates_source_client_and_model_profile_policy() {
         let (upstream_base, observed) = start_mock_zen();
         let (child, port) = start_server_with_env(
             19811,
@@ -616,7 +775,20 @@ mod e2e {
             {"type":"function","function":{"name":"Task","parameters":{"type":"object","properties":{}}}}
         ]);
 
-        let openclaw_resp = client
+        let source_client_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-zen-source-client", "openclaw")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash-lite",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools.clone(),
+                "stream": false
+            }))
+            .send()
+            .expect("source_client profile request");
+        assert_eq!(source_client_resp.status(), 200);
+
+        let flash_resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .header("x-fmc-client", "openclaw")
             .json(&serde_json::json!({
@@ -626,31 +798,33 @@ mod e2e {
                 "stream": false
             }))
             .send()
-            .expect("openclaw profile request");
-        assert_eq!(openclaw_resp.status(), 200);
+            .expect("flash model profile request");
+        assert_eq!(flash_resp.status(), 200);
 
-        let claude_resp = client
+        let lite_claude_resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .header("x-fmc-client", "claude-code")
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-v4-flash-lite",
                 "messages": [{"role":"user","content":"use tool"}],
                 "tools": tools.clone(),
                 "stream": false
             }))
             .send()
-            .expect("claude profile request");
-        assert_eq!(claude_resp.status(), 200);
+            .expect("lite claude profile request");
+        assert_eq!(lite_claude_resp.status(), 200);
 
         let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0]["body"]["model"], "big-pickle");
         assert_eq!(
             seen[0]["body"]["thinking"],
             serde_json::json!({"type":"disabled"})
         );
-        assert_ne!(
-            seen[1]["body"]["thinking"],
-            serde_json::json!({"type":"disabled"})
-        );
+        assert_eq!(seen[1]["body"]["model"], "deepseek-v4-flash-free");
+        assert!(seen[1]["body"]["thinking"].is_null());
+        assert_eq!(seen[2]["body"]["model"], "big-pickle");
+        assert!(seen[2]["body"]["thinking"].is_null());
         stop_server(child, port);
     }
 

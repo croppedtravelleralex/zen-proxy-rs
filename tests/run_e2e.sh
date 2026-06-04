@@ -2,27 +2,52 @@
 # tests/run_e2e.sh - E2E integration tests
 set -e
 
-PORT=19995
-BIND_ADDRESS=127.0.0.1
-ADMIN_API_KEY=test-key-123
+PORT="${PORT:-$(python3 - <<'PY'
+import socket
+
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)}"
+BIND_ADDRESS="${BIND_ADDRESS:-127.0.0.1}"
+ADMIN_API_KEY="${ADMIN_API_KEY:-test-key-123}"
+NODE_DB_PATH="${NODE_DB_PATH:-/tmp/zen-e2e-shell-${PORT}.json}"
 
 export PORT="${PORT}"
 export BIND_ADDRESS="${BIND_ADDRESS}"
 export PROXY_TOKEN_MODE=unlimited
 export ADMIN_API_KEY="${ADMIN_API_KEY}"
 export NODES_FILE=/dev/null
-
-# Kill any stale server
-pkill -f "zen-proxy-rs" 2>/dev/null || true
-sleep 0.5
+export NODE_DB_PATH
 
 # Build
-cargo +nightly build -q 2>/dev/null
+if [ -n "${CARGO_TOOLCHAIN:-}" ]; then
+    cargo +"${CARGO_TOOLCHAIN}" build -q
+else
+    cargo build -q
+fi
 
 # Start server in background
 ./target/debug/zen-proxy-rs &
 SERVER_PID=$!
-sleep 0.5
+
+for _ in {1..100}; do
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+        wait "${SERVER_PID}" 2>/dev/null || true
+        echo "FAIL: server exited before readiness on ${BIND_ADDRESS}:${PORT}"
+        exit 1
+    fi
+    if curl -fs "http://${BIND_ADDRESS}:${PORT}/health" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.1
+done
+
+if ! curl -fs "http://${BIND_ADDRESS}:${PORT}/health" >/dev/null 2>&1; then
+    echo "FAIL: server did not become ready on ${BIND_ADDRESS}:${PORT}"
+    exit 1
+fi
 
 PASS=0
 FAIL=0
@@ -44,7 +69,8 @@ check() {
 cleanup() {
     kill $SERVER_PID 2>/dev/null || true
     wait $SERVER_PID 2>/dev/null || true
-    unset PORT BIND_ADDRESS PROXY_TOKEN_MODE ADMIN_API_KEY NODES_FILE
+    rm -f "${NODE_DB_PATH}" 2>/dev/null || true
+    unset PORT BIND_ADDRESS PROXY_TOKEN_MODE ADMIN_API_KEY NODES_FILE NODE_DB_PATH
 }
 trap cleanup EXIT
 
@@ -73,7 +99,7 @@ check "admin auth accepts valid key" '200' "$code"
 
 # Test 6: admin stats with key
 resp=$(curl -s -H "x-api-key: ${ADMIN_API_KEY}" http://${BIND_ADDRESS}:${PORT}/admin/stats)
-check "admin stats" '"requests"' "$resp"
+check "admin stats" '"total_requests"' "$resp"
 
 echo "---"
 echo "PASS: $PASS, FAIL: $FAIL"

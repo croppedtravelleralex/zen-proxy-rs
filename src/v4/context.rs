@@ -112,6 +112,7 @@ pub fn govern_request(
     let mode = conf.zen_compactor_mode;
     let needs_compact = should_compact(conf, &before);
     let needs_warn = should_warn(conf, &before);
+    let input_compaction_disabled = model_disables_input_compaction(&body);
 
     push_trace(
         &mut trace,
@@ -154,6 +155,22 @@ pub fn govern_request(
             before,
             mode,
             action,
+            cache,
+            trace,
+        });
+    }
+
+    if input_compaction_disabled {
+        push_trace(
+            &mut trace,
+            "model disables ZenProxy input compaction/token wall; body left unchanged",
+        );
+        return Ok(ContextPlan {
+            body,
+            after: before.clone(),
+            before,
+            mode,
+            action: ContextAction::Warn,
             cache,
             trace,
         });
@@ -293,6 +310,13 @@ fn should_warn(conf: &Config, profile: &ContextProfile) -> bool {
 fn should_compact(conf: &Config, profile: &ContextProfile) -> bool {
     profile.body_bytes >= mb_to_bytes(conf.context_compact_body_mb) as u64
         || profile.estimated_prompt_tokens >= conf.context_token_compact
+}
+
+fn model_disables_input_compaction(body: &Value) -> bool {
+    matches!(
+        body.get("model").and_then(Value::as_str),
+        Some("deepseek-v4-flash" | "deepseek-v4-flash-free")
+    )
 }
 
 fn target_body_bytes(conf: &Config) -> u64 {
@@ -972,7 +996,7 @@ mod tests {
         let cfg = test_config(CompactorMode::Observe);
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4-flash-lite",
             "messages": [
                 {"role": "tool", "content": big},
                 {"role": "user", "content": "latest"}
@@ -986,11 +1010,45 @@ mod tests {
     }
 
     #[test]
+    fn enforce_mode_observes_flash_free_models_without_compaction_or_token_reject() {
+        for model in ["deepseek-v4-flash", "deepseek-v4-flash-free"] {
+            let mut cfg = test_config(CompactorMode::Enforce);
+            cfg.context_preserve_recent_messages = 8;
+            cfg.context_token_target = 100;
+            cfg.context_token_compact = 100;
+            let body = json!({
+                "model": model,
+                "messages": [
+                    {"role": "tool", "content": "x".repeat(2 * MIB), "tool_call_id": "old-tool"},
+                    {"role": "assistant", "content": "recent assistant"},
+                    {"role": "user", "content": "x".repeat(2 * 1024)}
+                ]
+            });
+            let original_body = body.clone();
+            let original = serialized_len(&body);
+
+            let plan = govern_request(&cfg, "chat/completions", body, original).unwrap();
+
+            assert_eq!(plan.action, ContextAction::Warn, "{model}");
+            assert!(plan.before.estimated_prompt_tokens > cfg.context_token_target);
+            assert_eq!(plan.before.body_bytes, plan.after.body_bytes, "{model}");
+            assert_eq!(plan.body, original_body, "{model}");
+            assert!(!plan.telemetry().trimmed, "{model}");
+            assert!(
+                plan.trace
+                    .iter()
+                    .any(|item| item.contains("input compaction/token wall")),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
     fn enforce_mode_trims_old_tool_output_and_keeps_latest_message() {
         let cfg = test_config(CompactorMode::Enforce);
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4-flash-lite",
             "messages": [
                 {"role": "tool", "content": big},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1018,7 +1076,7 @@ mod tests {
         cfg.context_preserve_recent_messages = 8;
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4-flash-lite",
             "messages": [
                 {"role": "tool", "content": big, "tool_call_id": "old-tool"},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1045,7 +1103,7 @@ mod tests {
             "x".repeat(2 * MIB)
         );
         let body = json!({
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4-flash-lite",
             "messages": [
                 {"role": "tool", "content": big, "tool_call_id": "old-tool"},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1068,7 +1126,7 @@ mod tests {
         cfg.context_token_target = 100;
         cfg.context_token_compact = 100;
         let body = json!({
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4-flash-lite",
             "messages": [
                 {"role": "user", "content": "x".repeat(2 * 1024)}
             ]
@@ -1086,7 +1144,7 @@ mod tests {
         cfg.context_token_target = 1_000;
         cfg.context_token_compact = 100;
         let body = json!({
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4-flash-lite",
             "messages": [
                 {"role": "user", "content": "x".repeat(2 * MIB)},
                 {"role": "assistant", "content": "old assistant"},
@@ -1102,6 +1160,52 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("ZenProxy context compactor"));
+    }
+
+    #[test]
+    fn flash_enforce_mode_keeps_large_input_unchanged() {
+        let mut cfg = test_config(CompactorMode::Enforce);
+        cfg.context_preserve_recent_messages = 8;
+        let big = "x".repeat(2 * MIB);
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "tool", "content": big, "tool_call_id": "old-tool"},
+                {"role": "assistant", "content": "recent assistant"},
+                {"role": "user", "content": "latest user"}
+            ]
+        });
+        let original = serialized_len(&body);
+        let plan = govern_request(&cfg, "chat/completions", body, original).unwrap();
+        assert_eq!(plan.action, ContextAction::Warn);
+        assert_eq!(plan.before.body_bytes, plan.after.body_bytes);
+        assert!(!plan.telemetry().trimmed);
+        let content = plan.body["messages"][0]["content"].as_str().unwrap();
+        assert!(!content.contains("ZenProxy context compactor"));
+    }
+
+    #[test]
+    fn flash_enforce_mode_does_not_reject_uncompressible_latest_message_over_token_target() {
+        let mut cfg = test_config(CompactorMode::Enforce);
+        cfg.context_token_target = 100;
+        cfg.context_token_compact = 100;
+        let body = json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "user", "content": "x".repeat(2 * 1024)}
+            ]
+        });
+        let original = serialized_len(&body);
+        let plan = govern_request(&cfg, "chat/completions", body, original).unwrap();
+        assert_eq!(plan.action, ContextAction::Warn);
+        assert_eq!(
+            plan.before.estimated_prompt_tokens,
+            plan.after.estimated_prompt_tokens
+        );
+        assert_eq!(
+            plan.body["messages"][0]["content"].as_str().unwrap().len(),
+            2 * 1024
+        );
     }
 
     #[test]
