@@ -97,7 +97,7 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - 2026-06-03 已补管理端测渠道第二层兜底：`echo hi`/`hi`/`hello`/`test` 类极短流式无工具探测，只有在上游空输出时才降级为本地 `ok`；普通请求不应提前短路。
 - 2026-06-03 晚间已部署源码层非流式第二层兜底：同类极短非流式无工具探测在上游连续空输出后返回本地 `ok`；普通请求仍返回结构化空输出错误。
 - 2026-06-03 晚间已部署 ClaudeCode 格式误伤修复：`web_fetch`/`web_search` 和普通 OpenClaw/Hermes 文本引用不再把请求判为 OpenClaw；受控 `Task + web_fetch` `/v1/messages` 新 pid 日志为 `source_client=claude-code`。
-- 2026-06-04 最新策略：输出限制已完全取消，缺省 `max_tokens` 不再补 1024/2048，显式 `max_tokens` 原样透传；OpenAI/Anthropic 只有显式值才写上游。ZenProxy 外层 context compactor 对 flash/free 只 warn/pass，对 lite 仍可 compact。真实 panda `policy-smoke/policy-dry` 尚未跑，不能把该策略写成生产已验证。
+- 2026-06-04 18:54 已部署最新策略到 panda：输出限制已完全取消，缺省 `max_tokens` 不再补 1024/2048，显式 `max_tokens` 原样透传；OpenAI/Anthropic 只有显式值才写上游。ZenProxy 外层 context compactor 对 flash/free 只 warn/pass，对 lite 仍可 compact。已通过手工 NewAPI smoke 和大上下文不折叠 smoke；真实 panda `policy-smoke/policy-dry` 尚未跑，不能把该策略写成生产压测已验证。
 - panda 当前没有 Rust 工具链；上线源码补丁时优先在本机/WSL 构建 Linux release，再上传 strip 后二进制，不要在生产机上临时高负载编译。
 - Windows `ssh panda` 使用 `C:\Users\Lenovo\.ssh\config` 中的 `root@100.69.228.93`；WSL 默认 `ssh panda` 可能没有该配置。WSL 需要显式使用 `/mnt/c/Users/Lenovo/.ssh/id_ed25519`。
 - huge stream 日志里若出现 `ClaudeCode huge stream buffered upstream returned empty output`，先按 buffered retry 已兜底处理归类；只有最终裸透给客户端或耗尽重试才算失败。最新输出策略不再通过 `max_tokens` cap 控制长输出，20k/32k 等显式长输出应原样透传给上游。

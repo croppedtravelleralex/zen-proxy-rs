@@ -79,7 +79,7 @@ WSL OpenClaw: 500 次
 
 四客户端 CLI 压测之外，`scripts/panda_pressure_runner.py` 现在提供直接 HTTP policy harness，用来先验收本轮策略信号，不依赖本地 ClaudeCode/Hermes/OpenClaw CLI 状态。
 
-当前状态：harness 已落地，但真实 panda `policy-smoke` / `policy-dry` 尚未跑；不得把输出限制取消、ZenProxy non-stream output guard 取消写成生产已验证。
+当前状态：harness 已落地；2026-06-04 18:54 已将输出限制取消、flash/free 输入放行和 cache 四态观测部署到 panda，并完成手工 NewAPI smoke 与大上下文不折叠 smoke。真实 panda `policy-smoke` / `policy-dry` 尚未跑；不得把手工 smoke 写成生产压测已验证。
 
 运行方式：
 

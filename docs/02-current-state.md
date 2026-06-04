@@ -21,7 +21,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 - `cargo test` 通过：库测试 82 条、kernel golden 94 条、doc tests 0 条。
 - `zen-proxy-rs` 本轮已改外层 V4 context compactor 和 e2e harness；当前已验证 `clippy -D warnings`、bin 单元测试 132 条、context 相关单元测试 12 条、e2e 27 条、shell e2e 9/9 通过。
 
-注意：上述验证覆盖本仓库当前源码。15:33 前一批 `finish_reason`、cache usage 和中等工具历史压缩改动已随 `zen-proxy-rs` release 部署到 panda；本轮后续输出限制取消、模型策略收窄、ZenProxy 外层 flash 输入放行和 policy harness 仍需真实 panda `policy-smoke/policy-dry` 验证，不能当作生产压测结论。
+注意：上述验证覆盖本仓库当前源码。2026-06-04 18:54 已将输出限制取消、模型策略收窄、flash/free 输入放行和 cache 四态观测构建进 `zen-proxy-rs` release 并部署到 panda；部署后已通过 NewAPI models、短请求和手工大上下文不折叠 smoke。真实 panda `policy-smoke/policy-dry` 和四客户端压测仍未跑，不能当作生产压测结论。
 
 当前已实现并由测试覆盖的关键能力：
 
@@ -311,13 +311,31 @@ P1.13 输出限制取消与 policy harness 当前状态：
 
 | 项 | 值 |
 |----|----|
-| 状态 | 当前源码已完全取消输出限制；ZenProxy 侧 non-stream output guard 已取消；真实 panda `policy-smoke/policy-dry` 尚未跑，不能写成生产已验证。 |
+| 状态 | 当前源码已完全取消输出限制；ZenProxy 侧 non-stream output guard 已取消；2026-06-04 18:54 已部署到 panda，并通过手工 NewAPI smoke 验证。真实 panda `policy-smoke/policy-dry` 尚未跑，不能写成生产压测已验证。 |
 | max_tokens 行为 | 缺省 `max_tokens` 不再自动补 1024/2048；显式 `max_tokens` 原样透传；OpenAI/Anthropic 只有显式值才写上游。 |
 | flash 策略 | `deepseek-v4-flash/deepseek-v4-flash-free` 取消 Hermes/OpenClaw 适配，只保留 ClaudeCode 深度适配；取消输入 token 墙，`free-model-client-rs` 侧只观测不压缩。 |
 | lite 策略 | `deepseek-v4-flash-lite/big-pickle` 只保留 Hermes/OpenClaw 适配，取消 ClaudeCode 适配。 |
 | cache/usage 观测 | cache 记录 `attempted/accepted/rejected/ignored` 四态，并记录 provider response/header/body usage 信号。 |
 | harness | `scripts/panda_pressure_runner.py --mode policy-smoke|policy-dry` 记录 input/output wall、provider header/body usage、cache 四态和 lite effective profile。 |
 | 风险 | 输出限制取消后，上游 413/超时/空输出/延迟/成本风险回到 upstream 与 lane/pool 调度，需要真实 panda 压测确认。 |
+
+P1.14 2026-06-04 V47 panda 部署记录：
+
+| 项 | 值 |
+|----|----|
+| 部署时间 | 2026-06-04 18:54 |
+| 部署目标 | `/opt/zen-proxy-rs/zen-proxy-rs` |
+| 旧二进制 hash | `694036f6a130e8211b998a5b58eff36105fb48fb866ec57ebbb2c03ccfb5f3d7` |
+| 本地未 strip release hash | `aeecc8d5acbea86e36dee3f1224858b2f371d64d0ebfc2508313e33e7b09b1c0` |
+| 实际部署 stripped hash | `99424602ce7c076671579abf48ca0d27367ac126e514efe4403d902d5caecd78` |
+| 备份 | `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-v47-20260604-185423-694036f` |
+| 实例 | `zen-proxy-rs@1:4001`、`zen-proxy-rs@2:4002`、`zen-proxy-rs@3:4004` |
+| 健康检查 | 三实例 `active`；新 pid 为 `1093754/1093766/1093777`；三实例 `/health` 均返回 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`、`upstream.backoff=false`。 |
+| 根因确认 | 部署前线上 18:19-18:21 日志仍有 `compacted streaming anthropic context before upstream` 和 `capped streaming anthropic max_tokens ... effective_max_tokens=512`，模型为 `deepseek-v4-flash-free`，说明用户看到的“我被压缩过了”来自旧线上自动 compactor，不是用户手动 compact。 |
+| NewAPI smoke | panda 本机 `http://127.0.0.1:8081/v1/models` 200，包含 `deepseek-v4-flash` 和 `deepseek-v4-flash-lite`；OpenAI 非流式 `deepseek-v4-flash` 返回 `V47_SHORT_OK`，HTTP 200，约 3.9s。 |
+| 大上下文 smoke | OpenAI 非流式 `deepseek-v4-flash`，361 条消息、请求体约 560KB、`max_tokens=32000`，返回 `V47_NO_COMPACTOR_OK`，HTTP 200，约 7.0s，NewAPI usage 约 `prompt_tokens=97836`。 |
+| 日志验收 | 部署后日志 grep `compacted .*context|capped .*max_tokens|context compactor|effective_max_tokens` 无命中；大请求日志显示 `context_action=pass`、`effective_body_size=560709`、`max_tokens=Some(32000)`，没有输入折叠或输出 cap。 |
+| cache 观察 | 大请求日志记录 `cache_observation="rejected"`、`provider_response_signal=true`、`provider_body_usage_signal=true`、`provider_body_cached_tokens=Some(0)`；这说明 provider 返回了 usage/cache 信号但本轮未命中缓存，不是 NewAPI 完全没记录。 |
 
 P1.10 2026-06-04 三客户端 smoke 和 web/search 边界：
 
