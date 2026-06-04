@@ -224,6 +224,32 @@ async fn mock_zen_handler(
                 }
             }]
         })
+    } else if prompt.contains("web-tool-delta") {
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_web_1",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{\"query\":\"today weather\"}"}
+                    }]
+                }
+            }]
+        })
+    } else if prompt.contains("task-lower-delta") {
+        json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_task_1",
+                        "type": "function",
+                        "function": {"name": "task", "arguments": "{\"description\":\"check\",\"prompt\":\"check\",\"subagent_type\":\"general-purpose\"}"}
+                    }]
+                }
+            }]
+        })
     } else if prompt.contains("tool-delta") {
         json!({
             "choices": [{
@@ -317,6 +343,18 @@ fn anthropic_request(model: &str, prompt: &str, stream: bool) -> AnthropicReques
         system: None,
         tools: None,
         tool_choice: None,
+    }
+}
+
+fn anthropic_tool(name: &str, properties: Value, required: &[&str]) -> ToolDef {
+    ToolDef {
+        name: name.to_string(),
+        description: format!("{name} tool"),
+        input_schema: ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: Some(properties),
+            required: Some(required.iter().map(|item| item.to_string()).collect()),
+        },
     }
 }
 
@@ -656,6 +694,59 @@ async fn tool_delta_is_preserved_in_non_streaming_anthropic_response() {
     assert!(body.contains("README.md"));
     assert!(body.contains("tool_use"));
     assert!(body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_canonicalizes_web_tool_name() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash-free", "web-tool-delta", true);
+    request.tools = Some(vec![
+        anthropic_tool("WebSearch", json!({"query":{"type":"string"}}), &["query"]),
+        anthropic_tool("WebFetch", json!({"url":{"type":"string"}}), &["url"]),
+    ]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("\"name\":\"WebSearch\""));
+    assert!(!body.contains("\"name\":\"web_search\""));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_nonstream_canonicalizes_task_tool_name() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash-free", "task-lower-delta", false);
+    request.tools = Some(vec![anthropic_tool(
+        "Task",
+        json!({
+            "description":{"type":"string"},
+            "prompt":{"type":"string"},
+            "subagent_type":{"type":"string"}
+        }),
+        &["description", "prompt", "subagent_type"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("\"name\":\"Task\""));
+    assert!(!body.contains("\"name\":\"task\""));
 }
 
 #[tokio::test]

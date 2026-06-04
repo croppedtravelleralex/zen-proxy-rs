@@ -78,15 +78,17 @@
   - OpenClaw panda 小矩阵中 `web_fetch` 曾通过；Hermes web 用例命令成功但返回 `WEB_FAIL`，需要独立归因。
   - `web_fetch/web_search` 不能作为 OpenClaw 强身份信号；该识别误伤已修复，避免 ClaudeCode 因带 web 工具而套用 OpenClaw/Hermes 策略。
   - 2026-06-04 清空 WSL proxy env 后，直连 panda NewAPI 的 Anthropic `/v1/messages` 和 OpenAI `/v1/chat/completions` 均能返回 `web_search` tool call。
-  - Windows ClaudeCode `--tools WebSearch,WebFetch` 下 `system init` 的 `tools_seen=[]`，模型只输出普通文本形式的伪 function call；`--tools default` 只有 `Bash/Edit/PowerShell/Read`。
+  - 用户后续截图证明：Windows ClaudeCode 在官方 Claude 模型路径下可以真实执行 `WebSearch/WebFetch`。此前受控样本只能说明当时 ZenProxy 路径没有形成可执行 tool_use，不能说明 ClaudeCode 本身不支持 web 工具。
+  - 2026-06-04 源码修复：free-model-client-rs 会把上游返回的 `web_search/task` 等工具名按原始请求工具表 canonicalize 回 `WebSearch/Task`，避免 ClaudeCode 因名称不匹配而不执行工具或 subagent。
   - OpenClaw 请求能带 `web_fetch/web_search` tool schema，但当前 OpenClaw agent 输出固定 `HEARTBEAT_OK`，不是 ZenProxy web 转发问题。
 - 可能原因：
   1. 客户端没有把 web 工具定义传进请求，模型就无法调用。
   2. 模型收到工具定义但没有选择 tool call，属于模型工具服从问题。
-  3. 模型发起 tool call，但客户端/工具执行器没有真正联网或返回失败。
-  4. 工具结果返回后被协议转换、compactor 或工具历史修复误处理，导致模型看不到搜索结果。
+  3. 模型发起 tool call，但工具名大小写/别名与客户端注册名不一致，例如 `web_search` vs `WebSearch`、`task` vs `Task`。
+  4. 模型发起 tool call，但客户端/工具执行器没有真正联网或返回失败。
+  5. 工具结果返回后被协议转换、compactor 或工具历史修复误处理，导致模型看不到搜索结果。
 - 待办：
-  1. ClaudeCode 若需要真实 WebSearch，接入可执行 WebSearch/WebFetch 的 MCP 或让 ClaudeCode 使用 Bash/PowerShell/curl 工具；不能指望 ZenProxy 自行执行搜索。
+  1. ClaudeCode 若需要真实 WebSearch，先确认请求里存在 `WebSearch/WebFetch` 工具定义，再确认响应里返回的是同名 `tool_use`；不能指望 ZenProxy 自行执行搜索。
   2. Hermes 的 `WEB_FAIL` 不再直接算链路失败，必须标注为“未触发工具 / 工具执行失败 / 工具结果未被使用 / 模型判断错误”之一。
   3. OpenClaw 先修 local gateway/harness，再重新验证 `web_fetch/web_search` 工具执行。
   4. 保持 ZenProxy 脱敏 `tool_name_classes` 观测，不记录原始查询内容。

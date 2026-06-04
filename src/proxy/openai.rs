@@ -3,6 +3,7 @@ use crate::error::AppError;
 use crate::kernel::KernelConfig;
 use crate::protocol::translate::estimate_tokens as estimate;
 use crate::protocol::{translate, types::*};
+use crate::synthesis;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
@@ -265,6 +266,7 @@ async fn handle_oa_non_stream(
                 },
                 index: Some(tool.index),
             })
+            .map(|tool| synthesis::tool::canonicalize_tool_call_name(&tool, cr))
             .collect::<Vec<_>>();
         if !tool_calls.is_empty() {
             let prompt_tokens = collected
@@ -483,7 +485,17 @@ async fn handle_oa_stream(
         for tool in tool_calls.iter() {
             let clean_id = tool.id.clone().unwrap_or_else(|| format!("call_{}", tool.index));
             let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
-            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":tool.index,"id":clean_id,"type":"function","function":{"name":tool.name,"arguments":tool.arguments}}]},"finish_reason":null}]}).to_string()));
+            let tc = ToolCall {
+                id: Some(clean_id),
+                call_type: "function".into(),
+                function: ToolFunction {
+                    name: tool.name.clone(),
+                    arguments: tool.arguments.clone(),
+                },
+                index: Some(tool.index),
+            };
+            let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
+            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":tool.index,"id":tc.id,"type":"function","function":{"name":tc.function.name,"arguments":tc.function.arguments}}]},"finish_reason":null}]}).to_string()));
         }
         let finish_reason = if !tool_calls.is_empty() { "tool_calls" } else { "stop" };
         let mut final_chunk = serde_json::json!({

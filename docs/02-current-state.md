@@ -269,7 +269,7 @@ P1.10 2026-06-04 三客户端 smoke 和 web/search 边界：
 | WSL Hermes | 5/5 通过；P50 约 34.7s，P90 约 38.9s；tool 2/2 通过；Hermes subagent 当前 runner 标记为不支持。慢路径属于 Hermes 本地 agent/启动/工具链耗时，不能直接等同 ZenProxy TTFT。 |
 | WSL OpenClaw | API 5/5 通，但 semantic 0/5；输出固定 `HEARTBEAT_OK`，stderr 有 local secrets gateway `1006 abnormal closure`。这是 OpenClaw 本地 agent/gateway/harness 问题，不是 NewAPI/ZenProxy HTTP 链路断。 |
 | 直连 web tools | 清空 WSL proxy env 后，Anthropic `/v1/messages` 和 OpenAI `/v1/chat/completions` 带 `web_search` tool 均 200，返回真实 `web_search` tool call；说明模型和 ZenProxy 可以转发/产生工具调用。 |
-| Windows ClaudeCode WebSearch | `--tools WebSearch,WebFetch` 下 `system init` 的 `tools_seen=[]`；模型输出的是普通文本 `<function_calls><invoke name="WebSearch">...`，没有真实工具执行。`--tools default` 只注册 `Bash/Edit/PowerShell/Read`。 |
+| Windows ClaudeCode WebSearch | 用户截图已证明官方 ClaudeCode + 官方 Claude 模型可以真实执行 `WebSearch/WebFetch`；此前“ClaudeCode 没注册 WebSearch/WebFetch”的结论只能描述当时那次 ZenProxy 受控样本，不是 ClaudeCode 能力边界。ZenProxy 路径的核心差异是上游可能返回 `web_search/task` 等小写或下划线工具名，旧内核原样吐回，ClaudeCode 只认已注册的 `WebSearch/Task`。2026-06-04 已在源码修复工具名 canonicalization，本地测试通过；panda 部署需单独确认。 |
 | cc-switch 当前 provider | Windows cc-switch 当前 Claude provider 是 `closedeepseek -> https://sub2api.closeapi.top`；`LocalNewapi -> http://127.0.0.1:8081` 存在但不是 current。用户平时从 Windows ClaudeCode 测到的现象不能默认归因到 panda NewAPI/ZenProxy。 |
 
 ## 当前数据解释
@@ -280,7 +280,7 @@ P1.10 2026-06-04 三客户端 smoke 和 web/search 边界：
 4. 旧版 ClaudeCode huge-context 策略虽配置 `target_tokens=12k`，但真实请求里 `message_count` 已达 670-705，`tools_tokens=12700`，大量旧短消息低于单条 `min_text_tokens=2000`，不会被旧 compactor 选为压缩候选；因此压缩后仍剩约 97k estimated total tokens。2026-06-04 已部署 huge-session compactor，开始折叠旧短消息和大非流式 fallback。
 5. 缓存几乎为 0 是因为上游 usage 基本没有返回 `cache_creation_input_tokens`、`cache_read_input_tokens` 或 OpenAI `cached_tokens`；当前 ZenProxy 只转发上游缓存计数，不会自行伪造 provider cache 命中。
 6. 2026-06-04 中午已修复 768/1024 cap 桶绕过 buffered retry 的源头 bug；后续若 NewAPI 再出现同样错误，先查是否为新 hash 之后的真实事件，以及是否所有 buffered retry 都为空。
-7. Web/search 不是模型原生联网。当前源头已经证明：只要客户端提供 tool schema，ZenProxy 可以让模型返回 `web_search` tool call；ClaudeCode CLI 当前没有注册 WebSearch/WebFetch，所以它只能把伪函数调用当普通文本输出。
+7. Web/search 不是模型原生联网。当前源头已经证明：只要客户端提供 tool schema，ZenProxy 可以让模型返回 tool call；官方 ClaudeCode + 官方 Claude 能执行 `WebSearch/WebFetch`。ZenProxy 路径失败时优先检查工具定义是否进入请求、上游是否返回 tool call、返回工具名是否被 canonicalize 回客户端注册名，而不是再把问题归结为 ClaudeCode 没工具。
 
 P1 待执行：
 
@@ -292,7 +292,7 @@ P1 待执行：
 6. 2026-06-01 panda 本机 huge stream source-side smoke 已通过，但它不是 ClaudeCode/Hermes/OpenClaw 真实客户端验收；下一步仍要重新跑 panda-only dry run。
 7. WSL ClaudeCode 必须先换成真实 ClaudeCode CLI 或修复当前 clawgod launcher，否则不能纳入四客户端正式压测。
 8. OpenClaw 必须先修 local secrets gateway / agent harness 的 `HEARTBEAT_OK` 问题，否则只能统计 API 可达，不能统计语义、工具和 subagent 成功率。
-9. ClaudeCode WebSearch 若要真实执行，需要接入 ClaudeCode 可用的 MCP/web 工具或用 Bash/PowerShell/curl 类工具实现搜索；ZenProxy 不会也不应自行替客户端执行公网搜索。
+9. ClaudeCode WebSearch 若要真实执行，必须让 ClaudeCode 收到和其已注册工具同名的 `tool_use`，例如 `WebSearch`/`WebFetch`。ZenProxy 不会也不应自行替客户端执行公网搜索；但必须保真转发并回填工具名大小写/别名。
 
 P1 dry-run 结果：
 

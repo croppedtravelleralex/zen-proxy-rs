@@ -295,17 +295,18 @@ async fn handle_non_stream(
             .tool_calls
             .iter()
             .filter(|tool| !tool.name.is_empty())
-            .map(|tool| AnthropicContentBlock {
-                block_type: "tool_use".to_string(),
-                text: None,
-                id: Some(
-                    tool.id
-                        .clone()
-                        .filter(|id| !id.is_empty())
-                        .unwrap_or_else(|| format!("call_{}", tool.index)),
-                ),
-                name: Some(tool.name.clone()),
-                input: Some(serde_json::from_str(&tool.arguments).unwrap_or(Value::Null)),
+            .map(|tool| {
+                let tc = collected_tool_call_to_tool_call(tool);
+                let ct = synthesis::tool::canonicalize_tool_call_name(&tc, cr);
+                AnthropicContentBlock {
+                    block_type: "tool_use".to_string(),
+                    text: None,
+                    id: ct.id,
+                    name: Some(ct.function.name),
+                    input: Some(
+                        serde_json::from_str(&ct.function.arguments).unwrap_or(Value::Null),
+                    ),
+                }
             })
             .collect::<Vec<_>>();
         if !blocks.is_empty() {
@@ -404,6 +405,28 @@ fn with_observed_exit_ip(
             .insert("x-zen-observed-exit-ip", value);
     }
     response
+}
+
+fn collected_tool_call_to_tool_call(tool: &crate::zen::client::CollectedToolCall) -> ToolCall {
+    let clean_id = tool
+        .id
+        .clone()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| format!("call_{}", tool.index));
+    let clean_id = if let Some(pos) = clean_id.find('{') {
+        clean_id[..pos].to_string()
+    } else {
+        clean_id
+    };
+    ToolCall {
+        id: Some(clean_id),
+        call_type: "function".into(),
+        function: ToolFunction {
+            name: tool.name.clone(),
+            arguments: tool.arguments.clone(),
+        },
+        index: Some(tool.index),
+    }
 }
 
 async fn handle_stream(
@@ -536,6 +559,7 @@ async fn handle_stream(
                 let clean_id = tool.id.clone().unwrap_or_else(||format!("call_{}", tool.index));
                 let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
                 let tc=ToolCall{id:Some(clean_id),call_type:"function".into(),function:ToolFunction{name:tool.name.clone(),arguments:tool.arguments.clone()},index:Some(tool.index)};
+                let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
                 let ct=if profile.uses_compat_tool_history() { synthesis::tool::complete_tool_call(&tc,&body) } else { tc };
                 let input:Value=serde_json::from_str(&ct.function.arguments).unwrap_or_default();
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));
@@ -788,6 +812,7 @@ fn anthropic_buffered_stream_resp(
                     },
                     index: Some(tool.index),
                 };
+                let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
                 let ct = if profile.uses_compat_tool_history() {
                     synthesis::tool::complete_tool_call(&tc, &body)
                 } else {

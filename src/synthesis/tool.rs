@@ -64,6 +64,7 @@ pub fn synthesize_tool_call(body: &ChatRequest) -> Option<ToolCall> {
 }
 
 pub fn complete_tool_call(call: &ToolCall, body: &ChatRequest) -> ToolCall {
+    let call = canonicalize_tool_call_name(call, body);
     let prompt = get_user_prompt(body).unwrap_or_default();
     let tools = body.tools.as_ref();
 
@@ -107,6 +108,14 @@ pub fn complete_tool_call(call: &ToolCall, body: &ChatRequest) -> ToolCall {
     }
 }
 
+pub fn canonicalize_tool_call_name(call: &ToolCall, body: &ChatRequest) -> ToolCall {
+    let mut canonical = call.clone();
+    if let Some(name) = canonical_tool_name(body.tools.as_deref(), &call.function.name) {
+        canonical.function.name = name.to_string();
+    }
+    canonical
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -129,6 +138,21 @@ fn tool_schema_for_call(tools: &[OpenAITool], name: &str) -> Value {
         }
     }
     default_schema_for_name(&name_lower)
+}
+
+fn canonical_tool_name<'a>(tools: Option<&'a [OpenAITool]>, name: &str) -> Option<&'a str> {
+    let target = normalize_tool_name(name);
+    tools?
+        .iter()
+        .find(|tool| normalize_tool_name(&tool.function.name) == target)
+        .map(|tool| tool.function.name.as_str())
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn default_schema_for_name(name: &str) -> Value {
