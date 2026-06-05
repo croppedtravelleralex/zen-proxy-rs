@@ -52,7 +52,7 @@
 
 ### NewAPI 使用日志导出 sidecar
 
-- 状态：SQLite/Postgres 第一版已落地，本地验证和 panda Postgres 直连验收通过；部署化待做。
+- 状态：SQLite/Postgres 第一版已落地，本地验证、panda Postgres 直连验收、systemd 部署和一句话 helper 验收通过。
 - 位置：`tools/newapi-usage-exporter/`，详细文档见 `docs/08-newapi-usage-exporter.md`。
 - 当前能力：SQLite/Postgres 只读导出，按 `user_id + time range` 生成脱敏 zip；HTTP API 和 CLI 均可用；单次最大 31 天；导出文件默认 30 天清理。
 - 当前边界：不修改 NewAPI，不读 ZenProxy 数据，不导出 prompt/response/key/IP 明文，不做套餐推荐，不凭 token 形态猜用户用途。
@@ -60,7 +60,7 @@
   1. 为 panda 创建专用只读 DB 用户，不直接复用 NewAPI 主连接权限。
   2. 增加 NewAPI `type` 数字到错误类别的精确映射。
   3. 增加日趋势、小时热力、模型/渠道成本占比、错误 Top N 等统计。
-  4. 补 systemd 或容器部署文件，固定管理网访问和 30 天清理策略。
+  4. 增加导出审计日志，记录谁在什么时候导出哪个 user_id 和时间范围。
   5. 如需要 MySQL，另补 MySQL adapter。
 
 ### 输出限制取消后的 panda 压测闸口

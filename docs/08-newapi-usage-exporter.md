@@ -63,6 +63,7 @@ HTTP API：
 ```text
 GET    /health
 POST   /v1/usage-export
+POST   /v1/usage-export/instruction
 GET    /v1/usage-export/{id}
 GET    /v1/usage-export/{id}/download
 DELETE /v1/usage-export/{id}
@@ -74,6 +75,21 @@ CLI：
 serve
 export
 cleanup
+```
+
+一句话导出示例：
+
+```bash
+newapi-usage-export '导出用户1从2026年6月5日~2026年6月5日的数据并做简要分析'
+```
+
+或：
+
+```bash
+curl -sS http://127.0.0.1:8098/v1/usage-export/instruction \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer <token>' \
+  -d '{"instruction":"导出用户1从2026年6月5日~2026年6月5日的数据并做简要分析"}'
 ```
 
 ## 配置
@@ -190,6 +206,19 @@ panda 真实 Postgres 验收：
 - HTTP `create/get/download/delete` 直连 Postgres smoke 通过。
 - 超过 31 天范围拒绝测试通过。
 - 未授权 HTTP 401 测试通过。
+
+panda 部署状态：
+
+- 服务：`newapi-usage-exporter.service`，已 enabled 并 active。
+- 二进制：`/opt/newapi-usage-exporter/newapi-usage-exporter`。
+- helper：`/usr/local/bin/newapi-usage-export`。
+- runner：`/usr/local/bin/newapi-usage-exporter-run`。
+- 导出目录：`/var/lib/newapi-usage-exporter/exports`。
+- 本地 API：`http://127.0.0.1:8098`。
+- 认证 token 存在 `/etc/newapi-usage-exporter.env`，不要在报告中打印。
+- runner 会动态读取 NewAPI 容器 `SQL_DSN` 并替换为当前 Postgres 容器 IP，因此 Postgres 容器 IP 变化后不需要手动改配置。
+- 一句话 helper 验收通过：`导出用户1从2026年6月5日~2026年6月5日的数据并做简要分析` 可生成 zip。
+- HTTP `/v1/usage-export/instruction` 验收通过。
 
 ## 未实现
 

@@ -72,14 +72,16 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 接口：
 
 - CLI：`serve`、`export`、`cleanup`。
-- HTTP：`GET /health`、`POST /v1/usage-export`、`GET /v1/usage-export/{id}`、`GET /v1/usage-export/{id}/download`、`DELETE /v1/usage-export/{id}`。
+- HTTP：`GET /health`、`POST /v1/usage-export`、`POST /v1/usage-export/instruction`、`GET /v1/usage-export/{id}`、`GET /v1/usage-export/{id}/download`、`DELETE /v1/usage-export/{id}`。
+- panda helper：`newapi-usage-export '导出用户1从2026年6月5日~2026年6月5日的数据并做简要分析'`。
 
 验证：
 
 - `cargo fmt --manifest-path tools/newapi-usage-exporter/Cargo.toml -- --check` 通过。
 - `cargo clippy --manifest-path tools/newapi-usage-exporter/Cargo.toml --all-targets -- -D warnings` 通过。
-- `cargo test --manifest-path tools/newapi-usage-exporter/Cargo.toml` 通过：4 条测试。
+- `cargo test --manifest-path tools/newapi-usage-exporter/Cargo.toml` 通过：6 条测试。
 - panda 真实 Postgres 直连验收通过：用户 1 当天 865 行导出 0.05 秒；用户 2 31 天 97,438 行导出 1.17 秒；HTTP create/get/download/delete 通过。
+- panda 已部署 `newapi-usage-exporter.service`，本地 API `http://127.0.0.1:8098` active；一句话 helper 和 `/v1/usage-export/instruction` 验收通过。
 
 详细说明见 `docs/08-newapi-usage-exporter.md`。
 

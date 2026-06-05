@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use postgres::{Client as PgClient, NoTls, Row as PgRow};
+use regex::Regex;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
@@ -1080,6 +1081,84 @@ pub fn parse_time(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(&normalized)?.with_timezone(&Utc))
 }
 
+pub fn export_request_from_instruction(instruction: &str) -> Result<ExportRequest> {
+    let user_id = parse_instruction_user_id(instruction)?;
+    let dates = parse_instruction_dates(instruction)?;
+    let include_brief_analysis = !instruction.contains("不要简要分析")
+        && !instruction.contains("不做简要分析")
+        && !instruction.contains("no brief");
+    Ok(ExportRequest {
+        user_id,
+        from: date_start_utc(dates[0])?,
+        to: date_start_utc(
+            dates[1]
+                .succ_opt()
+                .ok_or_else(|| anyhow!("invalid instruction end date"))?,
+        )?,
+        include_brief_analysis,
+        limit: DEFAULT_LIMIT,
+    })
+}
+
+fn parse_instruction_user_id(instruction: &str) -> Result<String> {
+    let re = Regex::new(r"(?i)(?:用户|user(?:_id)?|uid)\s*[:：#]?\s*([A-Za-z0-9_-]+)")?;
+    let user_id = re
+        .captures(instruction)
+        .and_then(|captures| captures.get(1))
+        .map(|value| value.as_str().trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("cannot parse user id from instruction"))?;
+    Ok(user_id)
+}
+
+fn parse_instruction_dates(instruction: &str) -> Result<Vec<NaiveDate>> {
+    let re = Regex::new(
+        r"(?x)
+        (?:
+            (?P<cy>\d{4})\s*年\s*(?P<cm>\d{1,2})\s*月\s*(?P<cd>\d{1,2})\s*(?:日|号)?
+        )
+        |
+        (?:
+            (?P<iy>\d{4})[-/](?P<im>\d{1,2})[-/](?P<id>\d{1,2})
+        )",
+    )?;
+    let mut dates = Vec::new();
+    for captures in re.captures_iter(instruction) {
+        let parsed = if let (Some(year), Some(month), Some(day)) = (
+            captures.name("cy"),
+            captures.name("cm"),
+            captures.name("cd"),
+        ) {
+            parse_naive_date(year.as_str(), month.as_str(), day.as_str())?
+        } else if let (Some(year), Some(month), Some(day)) = (
+            captures.name("iy"),
+            captures.name("im"),
+            captures.name("id"),
+        ) {
+            parse_naive_date(year.as_str(), month.as_str(), day.as_str())?
+        } else {
+            continue;
+        };
+        dates.push(parsed);
+    }
+    if dates.len() < 2 {
+        bail!("cannot parse date range from instruction");
+    }
+    if dates[1] < dates[0] {
+        bail!("instruction end date must be after start date");
+    }
+    Ok(dates.into_iter().take(2).collect())
+}
+
+fn parse_naive_date(year: &str, month: &str, day: &str) -> Result<NaiveDate> {
+    NaiveDate::from_ymd_opt(year.parse()?, month.parse()?, day.parse()?)
+        .ok_or_else(|| anyhow!("invalid instruction date"))
+}
+
+fn date_start_utc(date: NaiveDate) -> Result<DateTime<Utc>> {
+    parse_time(&format!("{}T00:00:00+08:00", date.format("%Y-%m-%d")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,5 +1310,35 @@ mod tests {
         let removed = cleanup_exports(export_dir.path(), DEFAULT_RETENTION_DAYS).unwrap();
         assert_eq!(removed, 1);
         assert!(!stale.exists());
+    }
+
+    #[test]
+    fn parses_chinese_instruction_export_request() {
+        let request = export_request_from_instruction(
+            "导出用户1从2026年6月5日~2026年6月5日的数据并做简要分析",
+        )
+        .unwrap();
+        assert_eq!(request.user_id, "1");
+        assert_eq!(
+            request.from,
+            parse_time("2026-06-05T00:00:00+08:00").unwrap()
+        );
+        assert_eq!(request.to, parse_time("2026-06-06T00:00:00+08:00").unwrap());
+        assert!(request.include_brief_analysis);
+    }
+
+    #[test]
+    fn parses_iso_instruction_without_brief() {
+        let request = export_request_from_instruction(
+            "export user_id:abc from 2026-06-01 to 2026-06-03 不做简要分析",
+        )
+        .unwrap();
+        assert_eq!(request.user_id, "abc");
+        assert_eq!(
+            request.from,
+            parse_time("2026-06-01T00:00:00+08:00").unwrap()
+        );
+        assert_eq!(request.to, parse_time("2026-06-04T00:00:00+08:00").unwrap());
+        assert!(!request.include_brief_analysis);
     }
 }

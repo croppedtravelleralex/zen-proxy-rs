@@ -49,6 +49,13 @@ cargo run --manifest-path tools/newapi-usage-exporter/Cargo.toml -- export \
   --to 2026-06-05
 ```
 
+一句话导出：
+
+```bash
+cargo run --manifest-path tools/newapi-usage-exporter/Cargo.toml -- export \
+  --instruction '导出用户123从2026年6月1日~2026年6月5日的数据并做简要分析'
+```
+
 清理过期导出：
 
 ```bash
@@ -68,6 +75,7 @@ cargo run --manifest-path tools/newapi-usage-exporter/Cargo.toml -- serve
 ```text
 GET    /health
 POST   /v1/usage-export
+POST   /v1/usage-export/instruction
 GET    /v1/usage-export/{id}
 GET    /v1/usage-export/{id}/download
 DELETE /v1/usage-export/{id}
@@ -85,6 +93,15 @@ curl -sS http://127.0.0.1:8098/v1/usage-export \
     "to": "2026-06-05T00:00:00+08:00",
     "include_brief_analysis": true
   }'
+```
+
+一句话导出：
+
+```bash
+curl -sS http://127.0.0.1:8098/v1/usage-export/instruction \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer change-me' \
+  -d '{"instruction":"导出用户123从2026年6月1日~2026年6月5日的数据并做简要分析"}'
 ```
 
 ## 数据边界

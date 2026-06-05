@@ -50,6 +50,9 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 - 当前覆盖 SQLite/Postgres；MySQL 未实现。
 - panda NewAPI 当前是 Postgres，真实连接来自 NewAPI 容器 `SQL_DSN`；报告中不得打印 DSN 密码。
 - 生产部署前应创建专用只读 DB 用户，不要长期复用 NewAPI 主连接权限。
+- panda 已部署 `newapi-usage-exporter.service`，本地 API 为 `http://127.0.0.1:8098`。
+- 优先用 helper 执行一句话导出：`newapi-usage-export '导出用户1从2026年6月5日~2026年6月5日的数据并做简要分析'`。
+- HTTP 指令入口为 `POST /v1/usage-export/instruction`；token 在 `/etc/newapi-usage-exporter.env`，不要打印明文。
 
 验证命令：
 

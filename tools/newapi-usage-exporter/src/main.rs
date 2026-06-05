@@ -7,8 +7,9 @@ use axum::{
     Json, Router,
 };
 use newapi_usage_exporter::{
-    cleanup_exports, create_export, export_zip_path, parse_time, DataSourceConfig, ExportConfig,
-    ExportRequest, ExportResult, DEFAULT_LIMIT, DEFAULT_RETENTION_DAYS,
+    cleanup_exports, create_export, export_request_from_instruction, export_zip_path, parse_time,
+    DataSourceConfig, ExportConfig, ExportRequest, ExportResult, DEFAULT_LIMIT,
+    DEFAULT_RETENTION_DAYS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,6 +38,12 @@ struct ApiExportRequest {
     from: String,
     to: String,
     include_brief_analysis: Option<bool>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiInstructionExportRequest {
+    instruction: String,
     limit: Option<u32>,
 }
 
@@ -120,6 +127,10 @@ async fn run_serve(options: CliOptions) -> Result<()> {
         .route("/health", get(health))
         .route("/v1/usage-export", post(create_export_handler))
         .route(
+            "/v1/usage-export/instruction",
+            post(create_instruction_export_handler),
+        )
+        .route(
             "/v1/usage-export/{id}",
             get(get_export_handler).delete(delete_export_handler),
         )
@@ -171,6 +182,25 @@ async fn create_export_handler(
     let result = tokio::task::spawn_blocking(move || create_export(&config, &request))
         .await
         .map_err(|err| internal_error(format!("export task failed: {err}")))?
+        .map_err(api_error_from_anyhow)?;
+    Ok(Json(result))
+}
+
+async fn create_instruction_export_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ApiInstructionExportRequest>,
+) -> Result<Json<ExportResult>, ApiErrorResponse> {
+    require_auth(&headers, &state)?;
+    let mut request =
+        export_request_from_instruction(&payload.instruction).map_err(api_error_from_anyhow)?;
+    if let Some(limit) = payload.limit {
+        request.limit = limit;
+    }
+    let config = (*state.config).clone();
+    let result = tokio::task::spawn_blocking(move || create_export(&config, &request))
+        .await
+        .map_err(|err| internal_error(format!("instruction export task failed: {err}")))?
         .map_err(api_error_from_anyhow)?;
     Ok(Json(result))
 }
@@ -374,6 +404,22 @@ fn config_from_options(options: &CliOptions) -> Result<ExportConfig> {
 }
 
 fn export_request_from_options(options: &CliOptions) -> Result<ExportRequest> {
+    if let Some(instruction) = options.values.get("instruction") {
+        let mut request = export_request_from_instruction(instruction)?;
+        if let Some(limit) = options
+            .values
+            .get("limit")
+            .map(|value| value.parse::<u32>().context("parse limit"))
+            .transpose()?
+        {
+            request.limit = limit;
+        }
+        if options.flags.contains("no_brief_analysis") {
+            request.include_brief_analysis = false;
+        }
+        return Ok(request);
+    }
+
     let user_id = required_option(options, "user_id")?;
     let from = parse_time(&required_option(options, "from")?).context("parse from")?;
     let to = parse_time(&required_option(options, "to")?).context("parse to")?;
@@ -479,6 +525,7 @@ Config:
   --bind HOST:PORT              or NEWAPI_USAGE_BIND, serve only
 
 Export:
+  --instruction 导出用户1从2026年6月5日~2026年6月5日的数据并做简要分析
   --user-id ID
   --from RFC3339_OR_YYYY-MM-DD
   --to RFC3339_OR_YYYY-MM-DD
@@ -488,6 +535,7 @@ Export:
 HTTP:
   GET    /health
   POST   /v1/usage-export
+  POST   /v1/usage-export/instruction
   GET    /v1/usage-export/{{id}}
   GET    /v1/usage-export/{{id}}/download
   DELETE /v1/usage-export/{{id}}
