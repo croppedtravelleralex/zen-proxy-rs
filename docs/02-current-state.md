@@ -457,7 +457,10 @@ P1.16 2026-06-05 V4.99 reasoning-aware output guard 源码记录：
 | buffered | ClaudeCode Anthropic buffered stream 不再仅因 `max_tokens<=512` 触发；现在需要 exact-output literal，或 `before_tokens>=50k && max_tokens<=2048`。小流式请求走直接流式 + 初始低预算策略。 |
 | 错误可观测 | 空输出错误现在可带 `class=empty_output/reasoning_only/reasoning_only_length/buffered_retry_exhausted`；日志记录 `reasoning_chars/content_chars/finish_reason/tool_call_count/short_request_kind`。 |
 | 验证 | 本地 `cargo fmt`、`CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings`、`CARGO_INCREMENTAL=0 cargo test` 已通过；golden 测试新增 OpenAI/Anthropic 非流式 reasoning-only-length disabled retry 和小流式低预算不走 buffered retry。 |
-| 部署 | 源码已落地；尚未部署 panda，不能写成生产已验证。 |
+| 部署 | 2026-06-05 10:47 已部署到 panda 三实例；线上 stripped SHA256 为 `8f8513c418c40704bd50c8ce73f27696fdc9fbb1aa75290f2829cedd9eb9e2f2`，旧 V4.98 hash `566e1c519056a4d2ee95697803d0e8bff9db40dc706c81ab753d70405edfb224` 已备份到 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-v499-20260605-104718-566e1c5`。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` 和 nginx 均 active；4001/4002/4004/4000 `/health` 均为 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`；4000 `/v1/models` 返回两个公开模型；panda NewAPI 8081 `/v1/models` 200。 |
+| 烟测结果 | panda NewAPI OpenAI 非流式短问答 200，约 2.03s，返回 `2+2 equals 4.`；panda NewAPI Anthropic 流式 exact prompt 返回 `STREAM_OK` 且无 error；非 exact 小流式返回正常 greeting 且日志显示 `protocol="anthropic"`，未因 `max_tokens=64` 进入 `anthropic_buffered`。 |
+| 线上观测 | 部署后日志已出现 V4.99 `applied upstream thinking policy`、`thinking_policy="low_budget_probe_disabled"`、`provider cache usage observation` 和 request shape 字段；部署后最小窗口内未见 `empty_output_class`、`upstream returned no assistant`、`stream error`、`retry budget`、`client_gone`。 |
 
 ## 临时产物归类
 
