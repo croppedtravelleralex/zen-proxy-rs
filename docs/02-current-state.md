@@ -56,6 +56,32 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 29. V4.98 cache-friendly session 已在本仓库源码落地：大请求上游 `x-opencode-session` 不再按完整 `messages` hash 每轮变化，而是按稳定前缀 hash、tools hash、tool_choice hash、模型、api key hash 和时间桶分组；请求正文、消息顺序、`max_tokens` 均不改写。
 30. V4.98 新增脱敏 prefix 观测：request-shape 和 cache observation 日志记录 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes`，用于判断长会话前缀是否稳定；仍不记录原始 prompt、请求体或 key。
 
+## 附属工具
+
+2026-06-05 新增独立 Rust sidecar：`tools/newapi-usage-exporter/`。
+
+边界：
+
+- 只读 NewAPI 使用日志数据库。
+- 不修改 NewAPI，不进入 ZenProxy/free-model-client-rs 主链路。
+- 按 `user_id + time range` 导出，单次最大 31 天。
+- 导出 zip 默认保留 30 天，过期清理。
+- 不导出 prompt 原文、完整响应、真实 API key 或 IP 明文。
+- 不做套餐推荐，不凭 tokens 猜用户真实用途。
+
+接口：
+
+- CLI：`serve`、`export`、`cleanup`。
+- HTTP：`GET /health`、`POST /v1/usage-export`、`GET /v1/usage-export/{id}`、`GET /v1/usage-export/{id}/download`、`DELETE /v1/usage-export/{id}`。
+
+验证：
+
+- `cargo fmt --manifest-path tools/newapi-usage-exporter/Cargo.toml -- --check` 通过。
+- `cargo clippy --manifest-path tools/newapi-usage-exporter/Cargo.toml --all-targets -- -D warnings` 通过。
+- `cargo test --manifest-path tools/newapi-usage-exporter/Cargo.toml` 通过：4 条测试。
+
+详细说明见 `docs/08-newapi-usage-exporter.md`。
+
 ## 运行链路事实
 
 已确认的最小事实：

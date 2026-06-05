@@ -50,6 +50,19 @@
 - 当前不足：代码层有错误结构化，但缺少完整阶段耗时暴露。
 - 建议指标：请求入站、认证、解析、协议修复、上游连接、上游首包、first content、first tool call、stream decode、响应结束。
 
+### NewAPI 使用日志导出 sidecar
+
+- 状态：第一版已落地，本地验证通过；生产接入待确认 NewAPI DB 类型和 schema。
+- 位置：`tools/newapi-usage-exporter/`，详细文档见 `docs/08-newapi-usage-exporter.md`。
+- 当前能力：SQLite 只读导出，按 `user_id + time range` 生成脱敏 zip；HTTP API 和 CLI 均可用；单次最大 31 天；导出文件默认 30 天清理。
+- 当前边界：不修改 NewAPI，不读 ZenProxy 数据，不导出 prompt/response/key/IP 明文，不做套餐推荐，不凭 token 形态猜用户用途。
+- 待办：
+  1. 确认 panda NewAPI 实际数据库类型、表名和字段名。
+  2. 用只读快照跑一次端到端导出验收。
+  3. 如生产是 MySQL/Postgres，补只读 adapter 和连接池。
+  4. 增加日趋势、小时热力、模型/渠道成本占比、错误 Top N 等统计。
+  5. 如对外开放 HTTP API，必须设置 `NEWAPI_USAGE_EXPORTER_ADMIN_TOKEN` 并只走内网/管理网。
+
 ### 输出限制取消后的 panda 压测闸口
 
 - 状态：源码/ZenProxy 侧策略已调整，真实 panda policy-smoke/policy-dry 未跑。

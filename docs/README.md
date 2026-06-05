@@ -10,7 +10,8 @@
 4. docs/05-ai-maintenance-playbook.md：后续 AI 接手和测试纪律。
 5. docs/06-panda-pressure-test-plan.md：panda-only 四客户端压测方案和报告模板。
 6. docs/07-client-profile-policy-plan.md：客户端识别、策略隔离和 ClaudeCode 误伤修复方案。
-7. docs/logs/YYYY/YYYY-MM.md：按时间追加的工作记录。
+7. docs/08-newapi-usage-exporter.md：独立 NewAPI 使用日志导出 sidecar。
+8. docs/logs/YYYY/YYYY-MM.md：按时间追加的工作记录。
 
 ## 真相来源优先级
 

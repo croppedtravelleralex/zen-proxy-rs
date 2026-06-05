@@ -37,6 +37,27 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 - 报告必须列状态码、耗时、模型、协议类型、错误分类。
 - 不要用本机 `127.0.0.1:8081` 代替 panda。
 
+## NewAPI 使用日志导出器纪律
+
+- 入口文档：`docs/08-newapi-usage-exporter.md`。
+- 代码目录：`tools/newapi-usage-exporter/`。
+- 它是独立 Rust sidecar，不是 ZenProxy/free-model-client-rs 主链路的一部分。
+- 只读 NewAPI 日志数据库；不得修改 NewAPI 源码或生产库数据。
+- 不得导出 prompt 原文、完整响应、真实 API key 或 IP 明文。
+- 单次导出范围最大 31 天，导出文件默认 30 天清理。
+- 简要分析只能写数据事实和待确认问题；不得凭 token 长度猜用户用途，不做套餐推荐。
+- HTTP API 若不只绑定 localhost，必须设置 `NEWAPI_USAGE_EXPORTER_ADMIN_TOKEN`，并走内网/管理网。
+- 生产接入前先确认 NewAPI 实际数据库类型和 schema；当前第一版只覆盖 SQLite，只能把 MySQL/Postgres 写成未实现。
+
+验证命令：
+
+```bash
+cd /home/lenovo/free-model-client-rs
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/newapi-usage-exporter-target cargo fmt --manifest-path tools/newapi-usage-exporter/Cargo.toml -- --check
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/newapi-usage-exporter-target cargo clippy --manifest-path tools/newapi-usage-exporter/Cargo.toml --all-targets -- -D warnings
+CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/newapi-usage-exporter-target cargo test --manifest-path tools/newapi-usage-exporter/Cargo.toml
+```
+
 ## 客户端策略纪律
 
 - ClaudeCode、Hermes、OpenClaw 不应再共享一套高侵入兼容策略。
