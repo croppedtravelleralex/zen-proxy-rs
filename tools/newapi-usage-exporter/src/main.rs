@@ -7,8 +7,8 @@ use axum::{
     Json, Router,
 };
 use newapi_usage_exporter::{
-    cleanup_exports, create_export, export_zip_path, parse_time, ExportConfig, ExportRequest,
-    ExportResult, DEFAULT_LIMIT, DEFAULT_RETENTION_DAYS,
+    cleanup_exports, create_export, export_zip_path, parse_time, DataSourceConfig, ExportConfig,
+    ExportRequest, ExportResult, DEFAULT_LIMIT, DEFAULT_RETENTION_DAYS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -70,8 +70,18 @@ async fn main() -> Result<()> {
     let (command, option_args) = split_command(&args);
     match command {
         "serve" => run_serve(parse_options(option_args)?).await,
-        "export" => run_export(parse_options(option_args)?),
-        "cleanup" => run_cleanup(parse_options(option_args)?),
+        "export" => {
+            let options = parse_options(option_args)?;
+            tokio::task::spawn_blocking(move || run_export(options))
+                .await
+                .context("export task failed")?
+        }
+        "cleanup" => {
+            let options = parse_options(option_args)?;
+            tokio::task::spawn_blocking(move || run_cleanup(options))
+                .await
+                .context("cleanup task failed")?
+        }
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -332,9 +342,21 @@ fn internal_error(message: impl Into<String>) -> ApiErrorResponse {
 }
 
 fn config_from_options(options: &CliOptions) -> Result<ExportConfig> {
-    let sqlite_path = option_or_env(options, "sqlite", "NEWAPI_USAGE_SQLITE_PATH")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("NEWAPI_USAGE_SQLITE_PATH or --sqlite is required"))?;
+    let data_source = if let Some(database_url) =
+        option_or_env(options, "database_url", "NEWAPI_USAGE_DATABASE_URL")
+            .or_else(|| option_or_env(options, "postgres_dsn", "NEWAPI_USAGE_POSTGRES_DSN"))
+    {
+        DataSourceConfig::Postgres(database_url)
+    } else {
+        let sqlite_path = option_or_env(options, "sqlite", "NEWAPI_USAGE_SQLITE_PATH")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "NEWAPI_USAGE_DATABASE_URL/--database-url or NEWAPI_USAGE_SQLITE_PATH/--sqlite is required"
+                    )
+                })?;
+        DataSourceConfig::Sqlite(sqlite_path)
+    };
     let export_dir = option_or_env(options, "export_dir", "NEWAPI_USAGE_EXPORT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| env::temp_dir().join("newapi-usage-exports"));
@@ -344,7 +366,7 @@ fn config_from_options(options: &CliOptions) -> Result<ExportConfig> {
         .unwrap_or(DEFAULT_RETENTION_DAYS);
     let log_table = option_or_env(options, "log_table", "NEWAPI_USAGE_LOG_TABLE");
     Ok(ExportConfig {
-        sqlite_path,
+        data_source,
         export_dir,
         retention_days,
         log_table,
@@ -450,6 +472,7 @@ Commands:
 
 Config:
   --sqlite PATH                 or NEWAPI_USAGE_SQLITE_PATH
+  --database-url URL_OR_DSN      or NEWAPI_USAGE_DATABASE_URL
   --export-dir PATH             or NEWAPI_USAGE_EXPORT_DIR
   --retention-days N            or NEWAPI_USAGE_RETENTION_DAYS, default 30
   --log-table NAME              or NEWAPI_USAGE_LOG_TABLE

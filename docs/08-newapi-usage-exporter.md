@@ -20,7 +20,7 @@
 - 不做套餐推荐；当前业务模式是按量充值，用多少充多少。
 - 导出文件只保留 30 天，过期后清理。
 
-当前第一版只实现 SQLite 只读适配。MySQL/Postgres 需要确认真实 NewAPI 数据库配置后再补 adapter。
+当前已实现 SQLite 和 Postgres 只读适配。MySQL adapter 尚未实现。
 
 ## 代码位置
 
@@ -79,7 +79,9 @@ cleanup
 ## 配置
 
 ```text
-NEWAPI_USAGE_SQLITE_PATH                 必填，NewAPI SQLite DB 路径
+NEWAPI_USAGE_SQLITE_PATH                 SQLite 路径，和 DATABASE_URL 二选一
+NEWAPI_USAGE_DATABASE_URL                Postgres URL/DSN，和 SQLITE_PATH 二选一
+NEWAPI_USAGE_POSTGRES_DSN                Postgres DSN 兼容别名
 NEWAPI_USAGE_EXPORT_DIR                  可选，默认系统临时目录 newapi-usage-exports
 NEWAPI_USAGE_RETENTION_DAYS              可选，默认 30
 NEWAPI_USAGE_LOG_TABLE                   可选，默认自动识别 logs/log/usage_logs/newapi_logs
@@ -112,6 +114,13 @@ duration_ms
 stream
 endpoint
 ```
+
+Postgres 适配说明：
+
+- panda NewAPI 实际 DB 为 Postgres，容器名 `new-api-postgres`，NewAPI 容器通过 `SQL_DSN` 连接。
+- 适配器只选择字段候选表中的安全字段。
+- `content`、`ip`、`other`、`request_id`、`upstream_request_id` 不会被导出。
+- NewAPI Postgres `type=2` 会被视为 `ok`；其他 `type` 目前只做粗分类，后续可结合 NewAPI type 语义做更细映射。
 
 错误只导出分类，不导出原始错误全文。当前分类包括：
 
@@ -172,12 +181,22 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/newapi-usage-exporter-target cargo tes
 - 可关闭 `brief_analysis.md`。
 - 过期导出目录会被清理。
 
+panda 真实 Postgres 验收：
+
+- 真实 DB 类型：Postgres。
+- `logs` 表当前字段包含 `content/ip/other/request_id` 等敏感字段，但导出器未选择这些字段。
+- 用户 1，2026-06-05 当天直连 Postgres 导出：865 行，0.05 秒，峰值 RSS 约 7MB。
+- 用户 2，2026-05-06 至 2026-06-06 直连 Postgres 导出：97,438 行，1.17 秒，峰值 RSS 约 150MB。
+- HTTP `create/get/download/delete` 直连 Postgres smoke 通过。
+- 超过 31 天范围拒绝测试通过。
+- 未授权 HTTP 401 测试通过。
+
 ## 未实现
 
 待真实生产配置确认后再做：
 
-- MySQL/Postgres 只读 adapter。
-- NewAPI 真实库 schema 对齐报告。
+- MySQL 只读 adapter。
+- NewAPI `type` 数字到错误类别的精确映射。
 - 按用户/时间的分页预览 API。
 - 更丰富的维度统计，例如日趋势、小时热力、模型成本占比、错误 Top N。
 - 独立部署单元、systemd 文件和反代安全策略。

@@ -6,7 +6,7 @@
 
 ## 当前能力
 
-- SQLite NewAPI 日志库只读导出。
+- SQLite / Postgres NewAPI 日志库只读导出。
 - 单次导出时间范围最大 31 天。
 - 导出文件默认保留 30 天，启动、导出和后台定时清理会删除过期导出。
 - 导出 zip 包包含：
@@ -25,6 +25,12 @@ export NEWAPI_USAGE_SQLITE_PATH=/path/to/newapi.db
 export NEWAPI_USAGE_EXPORT_DIR=/var/lib/newapi-usage-exports
 export NEWAPI_USAGE_RETENTION_DAYS=30
 export NEWAPI_USAGE_EXPORTER_ADMIN_TOKEN=change-me
+```
+
+Postgres：
+
+```bash
+export NEWAPI_USAGE_DATABASE_URL='postgresql://user:password@host:5432/new-api'
 ```
 
 可选：
@@ -83,6 +89,8 @@ curl -sS http://127.0.0.1:8098/v1/usage-export \
 
 ## 数据边界
 
-导出器只导出 NewAPI usage/log 表中已经存在的计量字段。当前 SQLite 适配会自动识别常见字段名，例如 `created_at/user_id/model_name/channel_id/prompt_tokens/completion_tokens/quota/status/error_message/use_time/stream`。
+导出器只导出 NewAPI usage/log 表中已经存在的计量字段。当前适配会自动识别常见字段名，例如 `created_at/user_id/model_name/channel_id/prompt_tokens/completion_tokens/quota/status/type/error_message/use_time/stream`。
 
-第一版不直接适配 MySQL/Postgres。若生产 NewAPI 使用 MySQL/Postgres，优先通过只读副本或安全导出快照给本 sidecar 使用；确认真实库配置后再补数据库 adapter。
+Postgres 路径只会选择字段候选表里的安全字段，不会选择 `content`、`ip`、`other`、`request_id` 等原始内容字段。
+
+MySQL adapter 尚未实现。若生产 NewAPI 使用 MySQL，优先通过只读副本或安全导出快照给本 sidecar 使用；确认真实库配置后再补 adapter。

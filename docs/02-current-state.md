@@ -62,7 +62,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 边界：
 
-- 只读 NewAPI 使用日志数据库。
+- 只读 NewAPI 使用日志数据库，支持 SQLite / Postgres。
 - 不修改 NewAPI，不进入 ZenProxy/free-model-client-rs 主链路。
 - 按 `user_id + time range` 导出，单次最大 31 天。
 - 导出 zip 默认保留 30 天，过期清理。
@@ -79,6 +79,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 - `cargo fmt --manifest-path tools/newapi-usage-exporter/Cargo.toml -- --check` 通过。
 - `cargo clippy --manifest-path tools/newapi-usage-exporter/Cargo.toml --all-targets -- -D warnings` 通过。
 - `cargo test --manifest-path tools/newapi-usage-exporter/Cargo.toml` 通过：4 条测试。
+- panda 真实 Postgres 直连验收通过：用户 1 当天 865 行导出 0.05 秒；用户 2 31 天 97,438 行导出 1.17 秒；HTTP create/get/download/delete 通过。
 
 详细说明见 `docs/08-newapi-usage-exporter.md`。
 

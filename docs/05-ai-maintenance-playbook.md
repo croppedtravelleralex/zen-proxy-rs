@@ -47,7 +47,9 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 - 单次导出范围最大 31 天，导出文件默认 30 天清理。
 - 简要分析只能写数据事实和待确认问题；不得凭 token 长度猜用户用途，不做套餐推荐。
 - HTTP API 若不只绑定 localhost，必须设置 `NEWAPI_USAGE_EXPORTER_ADMIN_TOKEN`，并走内网/管理网。
-- 生产接入前先确认 NewAPI 实际数据库类型和 schema；当前第一版只覆盖 SQLite，只能把 MySQL/Postgres 写成未实现。
+- 当前覆盖 SQLite/Postgres；MySQL 未实现。
+- panda NewAPI 当前是 Postgres，真实连接来自 NewAPI 容器 `SQL_DSN`；报告中不得打印 DSN 密码。
+- 生产部署前应创建专用只读 DB 用户，不要长期复用 NewAPI 主连接权限。
 
 验证命令：
 

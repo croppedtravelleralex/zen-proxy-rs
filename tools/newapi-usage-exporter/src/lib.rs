@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
+use postgres::{Client as PgClient, NoTls, Row as PgRow};
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
@@ -41,10 +42,16 @@ const EXPORT_FIELDS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct ExportConfig {
-    pub sqlite_path: PathBuf,
+    pub data_source: DataSourceConfig,
     pub export_dir: PathBuf,
     pub retention_days: i64,
     pub log_table: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DataSourceConfig {
+    Sqlite(PathBuf),
+    Postgres(String),
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +146,7 @@ fn column_candidates() -> HashMap<&'static str, &'static [&'static str]> {
         ),
         ("total_tokens", &["total_tokens"][..]),
         ("quota_cost", &["quota", "quota_cost", "used_quota"][..]),
-        ("status", &["status", "status_code"][..]),
+        ("status", &["status", "status_code", "type"][..]),
         ("error_message", &["error_message", "error_msg"][..]),
         (
             "duration_ms",
@@ -154,9 +161,20 @@ pub fn create_export(config: &ExportConfig, request: &ExportRequest) -> Result<E
     validate_request(request)?;
     cleanup_exports(&config.export_dir, config.retention_days)?;
 
-    let conn = open_read_only_sqlite(&config.sqlite_path)?;
-    let schema = resolve_schema(&conn, config.log_table.as_deref())?;
-    let records = fetch_usage_records(&conn, &schema, request)?;
+    let (schema, records) = match &config.data_source {
+        DataSourceConfig::Sqlite(path) => {
+            let conn = open_read_only_sqlite(path)?;
+            let schema = resolve_schema(&conn, config.log_table.as_deref())?;
+            let records = fetch_usage_records(&conn, &schema, request)?;
+            (schema, records)
+        }
+        DataSourceConfig::Postgres(database_url) => {
+            let mut client = open_postgres(database_url)?;
+            let schema = resolve_postgres_schema(&mut client, config.log_table.as_deref())?;
+            let records = fetch_postgres_usage_records(&mut client, &schema, request)?;
+            (schema, records)
+        }
+    };
     let summary = summarize(&records);
 
     let now = Utc::now();
@@ -279,6 +297,17 @@ pub fn resolve_schema(conn: &Connection, requested_table: Option<&str>) -> Resul
     }
 
     let column_types = table_columns(conn, &table)?;
+    let columns = resolve_columns(&column_types)?;
+    Ok(ResolvedSchema {
+        table,
+        columns,
+        column_types,
+    })
+}
+
+fn resolve_columns(
+    column_types: &HashMap<String, String>,
+) -> Result<HashMap<&'static str, String>> {
     let lower_to_actual = column_types
         .keys()
         .map(|column| (column.to_ascii_lowercase(), column.clone()))
@@ -298,11 +327,7 @@ pub fn resolve_schema(conn: &Connection, requested_table: Option<&str>) -> Resul
             bail!("cannot resolve required NewAPI log column: {required}");
         }
     }
-    Ok(ResolvedSchema {
-        table,
-        columns,
-        column_types,
-    })
+    Ok(columns)
 }
 
 fn table_names(conn: &Connection) -> Result<Vec<String>> {
@@ -323,6 +348,58 @@ fn table_columns(conn: &Connection, table: &str) -> Result<HashMap<String, Strin
     })?;
     rows.collect::<rusqlite::Result<HashMap<_, _>>>()
         .map_err(Into::into)
+}
+
+fn open_postgres(database_url: &str) -> Result<PgClient> {
+    PgClient::connect(database_url, NoTls).context("open read-only postgres")
+}
+
+pub fn resolve_postgres_schema(
+    client: &mut PgClient,
+    requested_table: Option<&str>,
+) -> Result<ResolvedSchema> {
+    let tables = postgres_table_names(client)?;
+    let table = requested_table
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            LOG_TABLE_CANDIDATES
+                .iter()
+                .find(|candidate| tables.iter().any(|table| table == **candidate))
+                .map(|value| (*value).to_owned())
+        })
+        .ok_or_else(|| anyhow!("cannot find NewAPI log table"))?;
+    if !is_safe_identifier(&table) {
+        bail!("unsafe table name");
+    }
+    let column_types = postgres_table_columns(client, &table)?;
+    let columns = resolve_columns(&column_types)?;
+    Ok(ResolvedSchema {
+        table,
+        columns,
+        column_types,
+    })
+}
+
+fn postgres_table_names(client: &mut PgClient) -> Result<Vec<String>> {
+    let rows = client.query(
+        "select table_name from information_schema.tables where table_schema = 'public'",
+        &[],
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect())
+}
+
+fn postgres_table_columns(client: &mut PgClient, table: &str) -> Result<HashMap<String, String>> {
+    let rows = client.query(
+        "select column_name, data_type from information_schema.columns where table_schema = 'public' and table_name = $1",
+        &[&table],
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect())
 }
 
 fn fetch_usage_records(
@@ -361,6 +438,84 @@ fn fetch_usage_records(
     )?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn fetch_postgres_usage_records(
+    client: &mut PgClient,
+    schema: &ResolvedSchema,
+    request: &ExportRequest,
+) -> Result<Vec<UsageRecord>> {
+    let mut selected = schema
+        .columns
+        .iter()
+        .map(|(field, column)| {
+            Ok(format!(
+                "{} as {}",
+                quote_pg_identifier(column)?,
+                quote_pg_identifier(field)?
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    selected.sort();
+    let time_column = schema_column(schema, "created_at")?;
+    let user_column = schema_column(schema, "user_id")?;
+    let sql = format!(
+        "select {} from {} where {}::text = $1 and {} >= $2 and {} <= $3 order by {} asc limit $4",
+        selected.join(", "),
+        quote_pg_identifier(&schema.table)?,
+        quote_pg_identifier(user_column)?,
+        quote_pg_identifier(time_column)?,
+        quote_pg_identifier(time_column)?,
+        quote_pg_identifier(time_column)?,
+    );
+    let limit = i64::from(request.limit);
+    let rows = if postgres_time_is_integer(schema)? {
+        let from_value = request.from.timestamp();
+        let to_value = request.to.timestamp();
+        client.query(&sql, &[&request.user_id, &from_value, &to_value, &limit])?
+    } else {
+        let from_value = request.from.to_rfc3339();
+        let to_value = request.to.to_rfc3339();
+        client.query(&sql, &[&request.user_id, &from_value, &to_value, &limit])?
+    };
+    rows.iter()
+        .map(|row| usage_record_from_pg_row(row, schema))
+        .collect()
+}
+
+fn usage_record_from_pg_row(row: &PgRow, schema: &ResolvedSchema) -> Result<UsageRecord> {
+    let prompt_tokens = pg_optional_i64(row, "prompt_tokens");
+    let completion_tokens = pg_optional_i64(row, "completion_tokens");
+    let total_tokens = pg_optional_i64(row, "total_tokens").or_else(|| {
+        if prompt_tokens.is_some() || completion_tokens.is_some() {
+            Some(prompt_tokens.unwrap_or(0) + completion_tokens.unwrap_or(0))
+        } else {
+            None
+        }
+    });
+    let status = pg_optional_string(row, "status").unwrap_or_default();
+    let error = pg_optional_string(row, "error_message").unwrap_or_default();
+    Ok(UsageRecord {
+        log_id: pg_optional_string(row, "log_id").unwrap_or_default(),
+        time: format_pg_record_time(row, schema)?,
+        user_id: pg_optional_string(row, "user_id").unwrap_or_default(),
+        username: pg_optional_string(row, "username").unwrap_or_default(),
+        token_id: pg_optional_string(row, "token_id").unwrap_or_default(),
+        token_name: pg_optional_string(row, "token_name").unwrap_or_default(),
+        model: pg_optional_string(row, "model").unwrap_or_default(),
+        channel_id: pg_optional_string(row, "channel_id").unwrap_or_default(),
+        channel_name: pg_optional_string(row, "channel_name").unwrap_or_default(),
+        group: pg_optional_string(row, "group").unwrap_or_default(),
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        quota_cost: pg_optional_f64(row, "quota_cost"),
+        status: status.clone(),
+        error_message_class: classify_error(&status, &error),
+        duration_ms: pg_optional_i64(row, "duration_ms"),
+        stream: pg_optional_string(row, "stream").unwrap_or_default(),
+        endpoint: pg_optional_string(row, "endpoint").unwrap_or_default(),
+    })
 }
 
 fn usage_record_from_row(row: &Row<'_>, schema: &ResolvedSchema) -> rusqlite::Result<UsageRecord> {
@@ -428,6 +583,60 @@ fn optional_f64(row: &Row<'_>, name: &str) -> Option<f64> {
     }
 }
 
+fn pg_optional_string(row: &PgRow, name: &str) -> Option<String> {
+    if let Ok(value) = row.try_get::<_, Option<String>>(name) {
+        return value;
+    }
+    if let Ok(value) = row.try_get::<_, Option<i64>>(name) {
+        return value.map(|value| value.to_string());
+    }
+    if let Ok(value) = row.try_get::<_, Option<i32>>(name) {
+        return value.map(|value| value.to_string());
+    }
+    if let Ok(value) = row.try_get::<_, Option<f64>>(name) {
+        return value.map(|value| value.to_string());
+    }
+    if let Ok(value) = row.try_get::<_, Option<bool>>(name) {
+        return value.map(|value| value.to_string());
+    }
+    None
+}
+
+fn pg_optional_i64(row: &PgRow, name: &str) -> Option<i64> {
+    if let Ok(value) = row.try_get::<_, Option<i64>>(name) {
+        return value;
+    }
+    if let Ok(value) = row.try_get::<_, Option<i32>>(name) {
+        return value.map(i64::from);
+    }
+    if let Ok(value) = row.try_get::<_, Option<i16>>(name) {
+        return value.map(i64::from);
+    }
+    if let Ok(value) = row.try_get::<_, Option<f64>>(name) {
+        return value.map(|value| value.round() as i64);
+    }
+    if let Ok(value) = row.try_get::<_, Option<String>>(name) {
+        return value.and_then(|value| value.trim().parse().ok());
+    }
+    None
+}
+
+fn pg_optional_f64(row: &PgRow, name: &str) -> Option<f64> {
+    if let Ok(value) = row.try_get::<_, Option<f64>>(name) {
+        return value;
+    }
+    if let Ok(value) = row.try_get::<_, Option<i64>>(name) {
+        return value.map(|value| value as f64);
+    }
+    if let Ok(value) = row.try_get::<_, Option<i32>>(name) {
+        return value.map(f64::from);
+    }
+    if let Ok(value) = row.try_get::<_, Option<String>>(name) {
+        return value.and_then(|value| value.trim().parse().ok());
+    }
+    None
+}
+
 fn format_record_time(row: &Row<'_>, schema: &ResolvedSchema) -> rusqlite::Result<String> {
     let time_column = schema_column(schema, "created_at")
         .map_err(|err| rusqlite::Error::InvalidParameterName(err.to_string()))?;
@@ -465,6 +674,29 @@ fn db_time_range(schema: &ResolvedSchema, request: &ExportRequest) -> Result<(St
     }
 }
 
+fn postgres_time_is_integer(schema: &ResolvedSchema) -> Result<bool> {
+    let time_column = schema_column(schema, "created_at")?;
+    let column_type = schema
+        .column_types
+        .get(time_column)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    Ok(column_type.contains("int"))
+}
+
+fn format_pg_record_time(row: &PgRow, schema: &ResolvedSchema) -> Result<String> {
+    if postgres_time_is_integer(schema)? {
+        let timestamp = pg_optional_i64(row, "created_at").unwrap_or_default();
+        Ok(Utc
+            .timestamp_opt(timestamp, 0)
+            .single()
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339())
+    } else {
+        Ok(pg_optional_string(row, "created_at").unwrap_or_default())
+    }
+}
+
 fn schema_column<'a>(schema: &'a ResolvedSchema, field: &str) -> Result<&'a str> {
     schema
         .columns
@@ -478,6 +710,13 @@ fn quote_identifier(value: &str) -> Result<String> {
         bail!("unsafe SQL identifier: {value}");
     }
     Ok(format!("`{value}`"))
+}
+
+fn quote_pg_identifier(value: &str) -> Result<String> {
+    if !is_safe_identifier(value) {
+        bail!("unsafe SQL identifier: {value}");
+    }
+    Ok(format!("\"{value}\""))
 }
 
 fn is_safe_identifier(value: &str) -> bool {
@@ -564,7 +803,12 @@ fn round4(value: f64) -> f64 {
 
 fn classify_error(status: &str, error: &str) -> String {
     let text = format!("{status} {error}").to_ascii_lowercase();
-    if text.trim().is_empty() || matches!(text.trim(), "ok" | "success" | "200" | "200 ok") {
+    if text.trim().is_empty()
+        || matches!(
+            text.trim(),
+            "ok" | "success" | "200" | "200 ok" | "2" | "type_2"
+        )
+    {
         return "ok".to_owned();
     }
     if text.contains("429") || text.contains("rate") {
@@ -906,7 +1150,7 @@ mod tests {
         let (_tmp, db_path) = fixture_db();
         let export_dir = tempfile::tempdir().unwrap();
         let config = ExportConfig {
-            sqlite_path: db_path,
+            data_source: DataSourceConfig::Sqlite(db_path),
             export_dir: export_dir.path().to_path_buf(),
             retention_days: DEFAULT_RETENTION_DAYS,
             log_table: None,
@@ -944,7 +1188,7 @@ mod tests {
         let (_tmp, db_path) = fixture_db();
         let export_dir = tempfile::tempdir().unwrap();
         let config = ExportConfig {
-            sqlite_path: db_path,
+            data_source: DataSourceConfig::Sqlite(db_path),
             export_dir: export_dir.path().to_path_buf(),
             retention_days: DEFAULT_RETENTION_DAYS,
             log_table: None,

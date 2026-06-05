@@ -10,7 +10,7 @@
 6. 清理或归类未跟踪文件，避免把 `.codex_tmp/`、密钥、测试输出混进提交。
 7. 对压测前配置做安全确认：不污染 Hermes/OpenClaw/ClaudeCode 用户默认配置，不使用本机 `127.0.0.1:8081` 代替 panda。
 8. 提交前复查 README、维护文档和 git 状态。
-9. NewAPI 使用日志导出器若要上线，先确认 panda/NewAPI 实际数据库类型和只读连接方式；当前第一版只支持 SQLite。
+9. NewAPI 使用日志导出器若要上线，补 systemd/容器部署和管理网认证配置；panda Postgres 直连功能验收已通过。
 
 ## Done This Phase
 
@@ -29,7 +29,7 @@
 13. `zen-proxy-rs` 外层 V4 context compactor 已完成模型分流：flash/free 只 warn/pass 不 compact/reject，lite 仍保留 compact 能力；本地 e2e 已覆盖。
 14. V4.98 cache-friendly session 已落地并部署 panda：大请求 session 按稳定前缀而不是完整 messages hash 分组，并补 `prefix_4k/32k/128k/256k` 脱敏观测；真实 panda 长会话 A/B 尚未跑。
 15. V4.99 reasoning-aware output guard 已在源码落地并部署 panda：OpenAI/Anthropic 非流式 `reasoning_only_length` 只重试一次 `thinking: disabled`，小流式低预算不再仅因 `max_tokens<=512` 进入 ClaudeCode huge buffered，空输出错误带分类；本地 fmt/clippy/test 已通过，panda 三实例健康，NewAPI OpenAI 非流式和 Anthropic 流式 smoke 通过。
-16. 独立 `tools/newapi-usage-exporter` 已落地：Rust CLI/HTTP sidecar，可按 `user_id + time range` 从 NewAPI SQLite 日志只读导出脱敏分析包；本地 fmt/clippy/test 通过。
+16. 独立 `tools/newapi-usage-exporter` 已落地：Rust CLI/HTTP sidecar，可按 `user_id + time range` 从 NewAPI SQLite/Postgres 日志只读导出脱敏分析包；本地 fmt/clippy/test 和 panda Postgres 直连 smoke 均通过。
 
 ## Next
 
@@ -40,7 +40,7 @@
 5. 加入更细粒度运行指标采集：protocol first byte、first content、first tool call、upstream connect、upstream status、stream parse error、empty upstream。
 6. 补足 API 覆盖文档：OpenAI、Anthropic、Models、Health、错误响应、认证头、请求体限制。
 7. 如果代码继续变化，保持根 README 和维护文档同步。
-8. NewAPI 使用日志导出器下一步需要拿真实 NewAPI DB 类型和 schema 做只读快照验收；如果生产不是 SQLite，再补 MySQL/Postgres adapter。
+8. NewAPI 使用日志导出器下一步是部署形态设计：systemd/容器、只读 DB 用户、管理网认证、导出目录 30 天清理和审计日志。
 
 ## Later
 
