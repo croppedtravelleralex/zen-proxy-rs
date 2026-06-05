@@ -441,7 +441,10 @@ P1.15 2026-06-05 V4.98 cache-friendly session 源码记录：
 | 修复 | 大请求 session scope 改为 `large_prefix_v498`：稳定前缀 hash + tools hash + tool_choice hash；保留模型、api key hash、时间桶隔离。 |
 | 观测 | 新增 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes` 到 request-shape 与 cache observation 日志，后续能区分“前缀不稳”和“前缀稳定但 provider 仍未命中”。 |
 | 非目标 | 不裁剪 330k 上下文，不做摘要替换，不重排消息，不注入提示词，不伪造 cache 命中。 |
-| 待验收 | 尚未部署 panda。部署后必须用同一 ClaudeCode 长会话 A/B 观察 cache hit rate、`frt`、总耗时、空输出/工具错误和回答质量。 |
+| 部署 | 2026-06-05 09:18 已部署到 panda 三实例；线上 stripped SHA256 为 `566e1c519056a4d2ee95697803d0e8bff9db40dc706c81ab753d70405edfb224`，旧 V47 hash `99424602ce7c076671579abf48ca0d27367ac126e514efe4403d902d5caecd78` 已备份到 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-v498-20260605-091813-9942460`。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` 和 nginx 均 active；4001/4002/4004/4000 `/health` 为 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`；4000 `/v1/models` 只暴露 `deepseek-v4-flash` 与 `deepseek-v4-flash-lite`；panda NewAPI 8081 `/v1/models` 200 且包含两个模型。 |
+| 烟测结果 | NewAPI exact smoke `reply pong only` 返回 `PONG`；真实中文短问答返回 200；真实英文短问答出现 `upstream returned no assistant content or tool call`，用 V47 备份临时实例同 prompt 对照也 502，因此不是 V4.98 新增回归，而是既有上游空输出/节点质量问题。 |
+| 待验收 | 仍需用同一 ClaudeCode 长会话 A/B 观察 cache hit rate、`frt`、总耗时、空输出/工具错误和回答质量。 |
 
 ## 临时产物归类
 

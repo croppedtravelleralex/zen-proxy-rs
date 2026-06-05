@@ -244,7 +244,7 @@
 
 ### V4.98 cache 命中优化
 
-- 状态：源码已落地，panda 部署和 A/B 待执行。
+- 状态：源码已落地并部署 panda，长会话 cache A/B 待执行。
 - 背景：真实 ClaudeCode 长会话已达到约 330k prompt tokens，NewAPI 总耗时爆红；部署后日志显示 flash/free 没有输入墙或 compactor，当前瓶颈更像是长输入每轮未命中 provider cache。
 - 线上事实：
   - 最近 70 分钟同一长会话 `/v1/messages` 77/77 流式，cache hits 0，prompt P50 约 326k、P90 约 331k。
@@ -254,10 +254,12 @@
   1. 大请求上游 session 从完整 `messages` hash 改为稳定前缀 hash + tools hash + tool_choice hash。
   2. 新增 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes` 脱敏观测。
   3. 增加回归：大前缀稳定、只追加尾部时，session 和 prefix hash 保持稳定；前缀变化时 prefix hash 必须变化。
+  4. 2026-06-05 已部署 panda 三实例，线上 stripped SHA256 为 `566e1c519056a4d2ee95697803d0e8bff9db40dc706c81ab753d70405edfb224`，备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-v498-20260605-091813-9942460`。
 - 非目标：
   - 不降低 330k 输入，不做摘要替换，不裁剪工具历史，不改用户消息顺序。
   - 不注入隐藏提示词，不伪造 `cache_tokens`，不把 NewAPI 显示问题误写成真实 cache 命中。
 - 待验收：
-  1. 部署 panda 后用同一 ClaudeCode 长会话做 A/B：V47/V4.98 或部署前后窗口比较。
+  1. 用同一 ClaudeCode 长会话做 A/B：V47/V4.98 或部署前后窗口比较。
   2. 观察 `cache_tokens/cache_observation/frt/use_time/client_gone/empty output/tool errors`。
   3. 如果 prefix hash 稳定但 cache 仍为 0，再检查上游是否按 session、代理节点、账号或 body prefix 粒度隔离 cache。
+  4. NewAPI 真实短问答仍偶发/可复现 `upstream returned no assistant content or tool call`；V47 备份临时实例同 prompt 也失败，当前按既有上游空输出/节点质量问题继续排查，不作为 V4.98 回滚条件。
