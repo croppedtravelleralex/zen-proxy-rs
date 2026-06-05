@@ -57,6 +57,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 30. V4.98 新增脱敏 prefix 观测：request-shape 和 cache observation 日志记录 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes`，用于判断长会话前缀是否稳定；仍不记录原始 prompt、请求体或 key。
 31. 2026-06-05 已补并部署 ClaudeCode 低预算工具探针保护：仅当 `source_client=ClaudeCode`、非流式、`max_tokens<=32`、工具数 1-2、无显式 `tool_choice`、小上下文时，第一次上游请求前禁用 thinking，并把上游 `max_tokens` 最小抬到 64，避免 `/context` 等内部探针被 DeepSeek 消耗在 reasoning-only 后裸 502；普通工具调用、长上下文、Hermes/OpenClaw 不受影响。
 32. 2026-06-05 已补并部署 ClaudeCode Anthropic 流式 idle ping 保活：仅对 `source_client=ClaudeCode` 的 Anthropic SSE 流，在 15 秒内没有下游可转发事件时发送协议级 `event: ping` / `{"type":"ping"}`；不伪造内容、不计入 first content、不改写 prompt，用来降低 50k+ 流式请求在真实内容前被 NewAPI/客户端判为 `client_gone` 的概率。
+33. 2026-06-06 已补并部署 V4.99 ClaudeCode Anthropic Stream Guard：当 ClaudeCode Anthropic stream 在真实 text/tool 输出前遇到上游 `stream truncated before DONE or finish_reason` 或 60 秒无可转发内容时，最多 3 次原地重试；最后一次仅在工具请求场景启用 disabled thinking 兜底。正常请求不改 prompt、不裁剪输入、不限制输出、不默认禁用 thinking。
+34. 2026-06-06 已补 Anthropic 工具调用 `input_json_delta` 分片：普通流式和 buffered huge-stream 返回工具参数时按 4KB 安全切片发送，保证拼接后 JSON 字符完全一致，降低大 Write 参数导致客户端/中间层解析压力。ClaudeCode 显式 forced `tool_choice` 会首跳禁用 thinking，避免上游返回 `Thinking mode does not support this tool_choice`；`tool_choice=auto` 和普通 tools 请求仍保持默认 thinking。
 
 ## 附属工具
 
@@ -521,6 +523,23 @@ P1.18 2026-06-05 ClaudeCode Anthropic stream idle ping 部署记录：
 | 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`；线上二进制包含 `sent ClaudeCode stream idle ping while upstream produced no forwardable output` 和 `sent ClaudeCode stream idle ping while waiting for upstream event` 字符串。 |
 | NewAPI smoke | panda 本机 token id `38`/name `ds`/group `vip` 下，`/v1/models` 200 且包含 `deepseek-v4-flash`、`deepseek-v4-flash-lite`；Anthropic `/v1/messages?beta=true` + `x-fmc-client=claude-code` 流式 smoke HTTP 200，starttransfer 约 1.39s、total 约 1.92s，响应按 SSE 分片输出目标 marker，无 error。 |
 | 残留 | idle ping 只能解决“下游长时间无字节活动”的 client_gone；如果上游 60 秒后仍真实空输出，或客户端有“必须真实内容在 N 秒内出现”的硬超时，还需要 first-content watchdog / retry 降级另行设计。 |
+
+P1.19 2026-06-06 V4.99 ClaudeCode Anthropic Stream Guard 部署记录：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户反馈 ClaudeCode 仍偶发 `API Error: Failed to parse JSON` 和中断；复查 NewAPI/ZenProxy 发现对应服务端错误不是 30KB Write JSON 溢出，而是 Anthropic stream 的 `status_code=500, stream truncated before DONE or finish_reason`。 |
+| 证据 | 部署前 90 分钟 channel 69 为 400 次调用、398 成功、2 错误；2 条错误均为 `stream=true` 的 `stream truncated before DONE or finish_reason`。失败样本均为 ClaudeCode Anthropic `/v1/messages`，工具 schema 存在，`max_tokens=32000`，上游在真实 text/tool 输出前长时间只有 reasoning/空 delta 或直接截断。 |
+| 修复 | `src/proxy/anthropic.rs` 将 ClaudeCode Anthropic stream 改为 Stream Guard 状态机：`message_start` 只发一次；真实 text/tool 未输出前，上游 fetch/stream 截断可原地重试；60 秒无可转发内容触发重试；最后一次仅在工具请求场景启用 disabled thinking 兜底；半截 tool JSON 不会被伪成功交给客户端。 |
+| 工具参数 | Anthropic `input_json_delta` 普通流式和 buffered huge-stream 均改为 4KB 分片；分片只改变 SSE 传输颗粒度，拼接后 JSON 字符不变。 |
+| forced tool_choice | ClaudeCode 显式 forced `tool_choice` 首跳禁用 thinking，避免 DeepSeek 返回 `Thinking mode does not support this tool_choice`；`tool_choice=auto`、普通 tools auto 和 unknown client 不受影响。 |
+| 本地验证 | WSL 原生路径执行 `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 均通过；库测试 89 条、kernel golden 100 条全部通过。新增单元覆盖 Stream Guard retry 判定、tool JSON 分片无损、ClaudeCode forced tool_choice thinking 策略。 |
+| 构建 | `/home/lenovo/zen-proxy-rs` release 构建通过；最终部署前 strip 后 SHA256 为 `39dc0bb94092597a00518abf83e80f8c32a91e8c60682c169942bf16bf70017d`。 |
+| 部署 | 2026-06-06 00:54 已部署到 panda；旧 hash `9d64728e5511f2b414d16f4f4dac27395dabb1abe3ae64c2cf9404ee4f31ba0e` 备份到 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-v499-forced-tool-20260606-005416-9d64728`。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`。 |
+| NewAPI smoke | panda 本机有效 `vip` token 下，`/v1/models` HTTP 200；Anthropic stream PONG HTTP 200、`message_stop` 存在、`event:error=0`；Anthropic forced `tool_choice` 工具流 HTTP 200，`tool_use` 和 `input_json_delta` 存在，`Thinking mode does not support this tool_choice=0`。 |
+| 部署后观察 | 00:54:16 最终部署后 channel 69 采样 13/13 成功、0 错误。部署前仍有 3 条非流式 300s/504 旧记录，属于另一类长非流式超时，不计入 V4.99 Stream Guard 后验收。 |
+| 残留 | 仍需用户真实 ClaudeCode 长会话观察 1-2 小时，重点看 `stream guard retrying`、`refusing to emit possibly partial tool calls`、`stream truncated` 是否继续出现；非流式 300s/504 需另按 long non-stream 保护排查。 |
 
 ## 临时产物归类
 

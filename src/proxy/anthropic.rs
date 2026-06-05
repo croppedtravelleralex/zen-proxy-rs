@@ -15,6 +15,9 @@ const CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS: u64 = 50_000;
 const CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS: u64 = 2_048;
 const CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS: usize = 3;
 const CLAUDE_CODE_STREAM_IDLE_PING_SECS: u64 = 15;
+const CLAUDE_CODE_STREAM_GUARD_ATTEMPTS: usize = 3;
+const CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS: u64 = 60;
+const ANTHROPIC_TOOL_JSON_DELTA_CHUNK_BYTES: usize = 4 * 1024;
 const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
 
 pub async fn handle_anthropic_messages(
@@ -636,6 +639,56 @@ fn collected_tool_call_to_tool_call(tool: &crate::zen::client::CollectedToolCall
     }
 }
 
+fn should_retry_stream_without_forwardable_output(
+    profile: ClientProfile,
+    attempt: usize,
+    text: &str,
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+    elapsed: std::time::Duration,
+) -> bool {
+    profile.kind == ClientKind::ClaudeCode
+        && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+        && text.trim().is_empty()
+        && tool_calls.is_empty()
+        && elapsed.as_secs() >= CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS
+}
+
+fn should_retry_stream_error_before_output(
+    profile: ClientProfile,
+    attempt: usize,
+    text: &str,
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+) -> bool {
+    profile.kind == ClientKind::ClaudeCode
+        && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+        && text.trim().is_empty()
+        && tool_calls.is_empty()
+}
+
+fn anthropic_tool_json_delta_chunks(input: &str) -> Vec<&str> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < input.len() {
+        let mut end = (start + ANTHROPIC_TOOL_JSON_DELTA_CHUNK_BYTES).min(input.len());
+        while end > start && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = input[start..]
+                .chars()
+                .next()
+                .map(|ch| start + ch.len_utf8())
+                .unwrap_or(input.len());
+        }
+        chunks.push(&input[start..end]);
+        start = end;
+    }
+    chunks
+}
+
 async fn handle_stream(
     client: &Client,
     config: &KernelConfig,
@@ -673,22 +726,19 @@ async fn handle_stream(
         )
         .await;
     }
-    let resp = crate::zen::client::fetch_zen_stream_with_headers(
-        client,
-        &config.zen_chat_url,
-        &config.zen_api_key,
-        zb,
-        &config.extra_headers,
-    )
-    .await?;
-    let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
-    let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
+    let client = client.clone();
+    let zen_chat_url = config.zen_chat_url.clone();
+    let zen_api_key = config.zen_api_key.clone();
+    let extra_headers = config.extra_headers.clone();
+    let base_body = zb.clone();
     let send_idle_ping = profile.kind == ClientKind::ClaudeCode;
     let idle_ping_interval = Duration::from_secs(CLAUDE_CODE_STREAM_IDLE_PING_SECS);
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
         let mut last_downstream_event = Instant::now();
         let mut idle_ping_count = 0_u64;
+        let mut attempts_used = 0_usize;
+        let mut used_disabled_thinking_retry = false;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut text_block_open = false;
@@ -700,90 +750,266 @@ async fn handle_stream(
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
         let mut upstream_finish_reason: Option<String> = None;
-        loop {
-            let next_event = if send_idle_ping {
-                match tokio::time::timeout(idle_ping_interval, upstream.next()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        idle_ping_count += 1;
-                        tracing::info!(
+        let mut cache_signals = ProviderCacheSignals::ignored();
+        let mut final_stream_error: Option<String> = None;
+        let mut completed_upstream = false;
+        let mut attempt_body = base_body.clone();
+        for attempt in 0..CLAUDE_CODE_STREAM_GUARD_ATTEMPTS {
+            attempts_used = attempt + 1;
+            let attempt_started = Instant::now();
+            let mut upstream_event_count = 0_u64;
+            let resp = match crate::zen::client::fetch_zen_stream_with_headers(
+                &client,
+                &zen_chat_url,
+                &zen_api_key,
+                &attempt_body,
+                &extra_headers,
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        prompt_hash,
+                        attempt = attempts_used,
+                        max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                        error = %err.message,
+                        text_chars = text.len(),
+                        reasoning_chars = reasoning.len(),
+                        tool_call_count = tool_calls.len(),
+                        idle_ping_count,
+                        "ClaudeCode stream guard upstream fetch failed"
+                    );
+                    final_stream_error = Some(err.message);
+                    if should_retry_stream_error_before_output(profile, attempt, &text, &tool_calls) {
+                        continue;
+                    }
+                    break;
+                }
+            };
+            cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
+            let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
+            let mut retry_attempt = false;
+            loop {
+                let next_event = if send_idle_ping {
+                    match tokio::time::timeout(idle_ping_interval, upstream.next()).await {
+                        Ok(next) => next,
+                        Err(_) => {
+                            idle_ping_count += 1;
+                            tracing::info!(
+                                protocol = "anthropic",
+                                model = %body.model,
+                                source_client = ?profile.kind,
+                                prompt_hash,
+                                attempt = attempts_used,
+                                idle_ping_count,
+                                idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
+                                "sent ClaudeCode stream idle ping while waiting for upstream event"
+                            );
+                            yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
+                            last_downstream_event = Instant::now();
+                            if should_retry_stream_without_forwardable_output(
+                                profile,
+                                attempt,
+                                &text,
+                                &tool_calls,
+                                attempt_started.elapsed(),
+                            ) {
+                                tracing::warn!(
+                                    protocol = "anthropic",
+                                    model = %body.model,
+                                    source_client = ?profile.kind,
+                                    prompt_hash,
+                                    attempt = attempts_used,
+                                    max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                                    elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                                    idle_ping_count,
+                                    upstream_event_count,
+                                    text_chars = text.len(),
+                                    reasoning_chars = reasoning.len(),
+                                    tool_call_count = tool_calls.len(),
+                                    "ClaudeCode stream guard retrying after no forwardable upstream output"
+                                );
+                                retry_attempt = true;
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    upstream.next().await
+                };
+                let Some(event) = next_event else {
+                    completed_upstream = true;
+                    break;
+                };
+                let event = match event {
+                    Ok(event) => {
+                        upstream_event_count += 1;
+                        event
+                    }
+                    Err(err) => {
+                        tracing::warn!(
                             protocol = "anthropic",
                             model = %body.model,
                             source_client = ?profile.kind,
                             prompt_hash,
+                            attempt = attempts_used,
+                            max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                            error = %err.message,
+                            elapsed_ms = attempt_started.elapsed().as_millis() as u64,
                             idle_ping_count,
-                            idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
-                            "sent ClaudeCode stream idle ping while waiting for upstream event"
+                            upstream_event_count,
+                            text_chars = text.len(),
+                            reasoning_chars = reasoning.len(),
+                            tool_call_count = tool_calls.len(),
+                            finish_reason = ?upstream_finish_reason,
+                            text_block_open,
+                            "ClaudeCode stream guard observed upstream stream error"
                         );
-                        yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
-                        last_downstream_event = Instant::now();
-                        continue;
+                        final_stream_error = Some(err.message);
+                        if should_retry_stream_error_before_output(profile, attempt, &text, &tool_calls) {
+                            retry_attempt = true;
+                        }
+                        break;
                     }
+                };
+                let mut emitted_downstream_event = false;
+                if event.usage.is_some() {
+                    usage = event.usage;
                 }
-            } else {
-                upstream.next().await
-            };
-            let Some(event) = next_event else { break; };
-            let event = match event {
-                Ok(event) => event,
-                Err(err) => {
-                    yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":err.message}}).to_string()));
-                    return;
-                }
-            };
-            let mut emitted_downstream_event = false;
-            if event.usage.is_some() {
-                usage = event.usage;
-            }
-            if let Some(choices) = event.choices {
-                for choice in choices {
-                    if let Some(reason) = choice.finish_reason.as_deref().filter(|reason| !reason.is_empty()) {
-                        upstream_finish_reason = Some(reason.to_string());
-                    }
-                    let Some(delta) = choice.delta else { continue; };
-                    if let Some(content) = delta.content {
-                        let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
-                            markdown_guard.push(&crate::redact::redact_text(&content))
-                        } else {
-                            content
-                        };
-                        let should_emit =
-                            !content.trim().is_empty()
-                                || (profile.preserves_stream_whitespace() && !content.is_empty());
-                        if should_emit {
-                            if !text_block_open {
-                                text_block_open = true;
-                                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
+                if let Some(choices) = event.choices {
+                    for choice in choices {
+                        if let Some(reason) = choice.finish_reason.as_deref().filter(|reason| !reason.is_empty()) {
+                            upstream_finish_reason = Some(reason.to_string());
+                        }
+                        let Some(delta) = choice.delta else { continue; };
+                        if let Some(content) = delta.content {
+                            let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
+                                markdown_guard.push(&crate::redact::redact_text(&content))
+                            } else {
+                                content
+                            };
+                            let should_emit =
+                                !content.trim().is_empty()
+                                    || (profile.preserves_stream_whitespace() && !content.is_empty());
+                            if should_emit {
+                                if !text_block_open {
+                                    text_block_open = true;
+                                    yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
+                                }
+                                text.push_str(&content);
+                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":content}}).to_string()));
+                                emitted_downstream_event = true;
                             }
-                            text.push_str(&content);
-                            yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":content}}).to_string()));
-                            emitted_downstream_event = true;
+                        }
+                        if let Some(reasoning_content) = delta.reasoning_content {
+                            reasoning.push_str(&reasoning_content);
+                        }
+                        if let Some(items) = delta.tool_calls {
+                            merge_tool_deltas(&mut tool_calls, items);
                         }
                     }
-                    if let Some(reasoning_content) = delta.reasoning_content {
-                        reasoning.push_str(&reasoning_content);
-                    }
-                    if let Some(items) = delta.tool_calls {
-                        merge_tool_deltas(&mut tool_calls, items);
+                }
+                if emitted_downstream_event {
+                    last_downstream_event = Instant::now();
+                } else if send_idle_ping && last_downstream_event.elapsed() >= idle_ping_interval {
+                    idle_ping_count += 1;
+                    tracing::info!(
+                        protocol = "anthropic",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        prompt_hash,
+                        attempt = attempts_used,
+                        idle_ping_count,
+                        idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
+                        "sent ClaudeCode stream idle ping while upstream produced no forwardable output"
+                    );
+                    yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
+                    last_downstream_event = Instant::now();
+                    if should_retry_stream_without_forwardable_output(
+                        profile,
+                        attempt,
+                        &text,
+                        &tool_calls,
+                        attempt_started.elapsed(),
+                    ) {
+                        tracing::warn!(
+                            protocol = "anthropic",
+                            model = %body.model,
+                            source_client = ?profile.kind,
+                            prompt_hash,
+                            attempt = attempts_used,
+                            max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                            elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                            idle_ping_count,
+                            upstream_event_count,
+                            text_chars = text.len(),
+                            reasoning_chars = reasoning.len(),
+                            tool_call_count = tool_calls.len(),
+                            "ClaudeCode stream guard retrying after reasoning-only/no-forwardable upstream output"
+                        );
+                        retry_attempt = true;
+                        break;
                     }
                 }
             }
-            if emitted_downstream_event {
-                last_downstream_event = Instant::now();
-            } else if send_idle_ping && last_downstream_event.elapsed() >= idle_ping_interval {
-                idle_ping_count += 1;
-                tracing::info!(
-                    protocol = "anthropic",
-                    model = %body.model,
-                    source_client = ?profile.kind,
-                    prompt_hash,
-                    idle_ping_count,
-                    idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
-                    "sent ClaudeCode stream idle ping while upstream produced no forwardable output"
-                );
-                yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
-                last_downstream_event = Instant::now();
+            if completed_upstream {
+                final_stream_error = None;
+                break;
             }
+            if retry_attempt {
+                if attempt + 2 == CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+                    && !used_disabled_thinking_retry
+                    && body.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                {
+                    used_disabled_thinking_retry = true;
+                    attempt_body = super::reasoning_disabled_retry_body(&base_body);
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        prompt_hash,
+                        next_attempt = attempt + 2,
+                        "ClaudeCode stream guard enabling disabled-thinking fallback for final tool retry"
+                    );
+                }
+                continue;
+            }
+            break;
+        }
+        if final_stream_error.is_some() && !tool_calls.is_empty() {
+            tracing::warn!(
+                protocol = "anthropic",
+                model = %body.model,
+                source_client = ?profile.kind,
+                prompt_hash,
+                attempts_used,
+                text_chars = text.len(),
+                reasoning_chars = reasoning.len(),
+                tool_call_count = tool_calls.len(),
+                error = ?final_stream_error,
+                "ClaudeCode stream guard refusing to emit possibly partial tool calls after upstream truncation"
+            );
+            yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":final_stream_error.unwrap_or_else(||"upstream stream truncated after partial tool call".to_string())}}).to_string()));
+            return;
+        }
+        if final_stream_error.is_some() && !text.trim().is_empty() {
+            tracing::warn!(
+                protocol = "anthropic",
+                model = %body.model,
+                source_client = ?profile.kind,
+                prompt_hash,
+                attempts_used,
+                text_chars = text.len(),
+                reasoning_chars = reasoning.len(),
+                error = ?final_stream_error,
+                "ClaudeCode stream guard closing partial text stream with max_tokens stop reason after upstream truncation"
+            );
+            upstream_finish_reason = Some("length".to_string());
         }
         let final_markdown = markdown_guard
             .as_mut()
@@ -828,7 +1054,10 @@ async fn handle_stream(
                     content_chars = text.len(),
                     "stream upstream returned no assistant content or tool call"
                 );
-                yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":format!("upstream returned no assistant content or tool call (class={empty_output_class})")}}).to_string()));
+                let message = final_stream_error
+                    .clone()
+                    .unwrap_or_else(|| format!("upstream returned no assistant content or tool call (class={empty_output_class})"));
+                yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":message}}).to_string()));
                 return;
             }
         }
@@ -846,7 +1075,11 @@ async fn handle_stream(
                 let input:Value=serde_json::from_str(&ct.function.arguments).unwrap_or_default();
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));
                 let js=serde_json::to_string(&input).unwrap_or_default();
-                if js!="{}" { yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":tidx,"delta":{"type":"input_json_delta","partial_json":js}}).to_string())); }
+                if js!="{}" {
+                    for chunk in anthropic_tool_json_delta_chunks(&js) {
+                        yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":tidx,"delta":{"type":"input_json_delta","partial_json":chunk}}).to_string()));
+                    }
+                }
                 yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":tidx}).to_string()));
             }
         }
@@ -877,7 +1110,7 @@ async fn handle_stream(
             })
             .unwrap_or(0);
         let cache_signals = cache_signals.with_body_usage(usage.as_ref());
-        super::log_provider_cache_observation("anthropic", &body, profile, &cache_signals, 1, 1);
+        super::log_provider_cache_observation("anthropic", &body, profile, &cache_signals, attempts_used, CLAUDE_CODE_STREAM_GUARD_ATTEMPTS);
         yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
@@ -1142,7 +1375,9 @@ fn anthropic_buffered_stream_resp(
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));
                 let js = serde_json::to_string(&input).unwrap_or_default();
                 if js != "{}" {
-                    yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":tidx,"delta":{"type":"input_json_delta","partial_json":js}}).to_string()));
+                    for chunk in anthropic_tool_json_delta_chunks(&js) {
+                        yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":tidx,"delta":{"type":"input_json_delta","partial_json":chunk}}).to_string()));
+                    }
                 }
                 yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":tidx}).to_string()));
             }
@@ -1184,5 +1419,70 @@ fn merge_tool_deltas(
                 item.arguments.push_str(&arguments);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_profile::ClientProfileSource;
+
+    fn claude_code_profile() -> ClientProfile {
+        ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+    }
+
+    #[test]
+    fn anthropic_tool_json_delta_chunks_preserve_input() {
+        let input = format!(
+            "{{\"content\":\"{}中文{}\"}}",
+            "a".repeat(ANTHROPIC_TOOL_JSON_DELTA_CHUNK_BYTES + 17),
+            "b".repeat(ANTHROPIC_TOOL_JSON_DELTA_CHUNK_BYTES + 31)
+        );
+        let chunks = anthropic_tool_json_delta_chunks(&input);
+
+        assert!(chunks.len() >= 3);
+        assert_eq!(chunks.concat(), input);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= ANTHROPIC_TOOL_JSON_DELTA_CHUNK_BYTES));
+    }
+
+    #[test]
+    fn anthropic_tool_json_delta_chunks_handle_empty_input() {
+        assert!(anthropic_tool_json_delta_chunks("").is_empty());
+    }
+
+    #[test]
+    fn stream_guard_retries_only_before_forwardable_output() {
+        let profile = claude_code_profile();
+
+        assert!(should_retry_stream_without_forwardable_output(
+            profile,
+            0,
+            "",
+            &[],
+            std::time::Duration::from_secs(CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS)
+        ));
+        assert!(!should_retry_stream_without_forwardable_output(
+            profile,
+            0,
+            "partial text",
+            &[],
+            std::time::Duration::from_secs(CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS)
+        ));
+        assert!(!should_retry_stream_without_forwardable_output(
+            profile,
+            0,
+            "",
+            &[crate::zen::client::CollectedToolCall::default()],
+            std::time::Duration::from_secs(CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS)
+        ));
+        assert!(!should_retry_stream_without_forwardable_output(
+            profile,
+            CLAUDE_CODE_STREAM_GUARD_ATTEMPTS - 1,
+            "",
+            &[],
+            std::time::Duration::from_secs(CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS)
+        ));
     }
 }

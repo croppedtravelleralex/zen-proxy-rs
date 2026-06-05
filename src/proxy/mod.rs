@@ -69,12 +69,15 @@ pub(crate) fn apply_initial_thinking_policy(
         .is_some_and(|max_tokens| max_tokens <= 512);
     let no_tools = shape.tool_count == 0 && !shape.tool_choice_present;
     let tiny_prompt = shape.estimated_total_tokens <= 512;
+    let claude_code_forced_tool_choice = profile.kind == ClientKind::ClaudeCode
+        && is_forced_tool_choice(request.tool_choice.as_ref());
     let low_budget_tool_probe = translate::is_claude_code_low_budget_tool_probe(
         request,
         profile.kind == ClientKind::ClaudeCode,
     );
 
     let should_disable = low_budget_tool_probe
+        || claude_code_forced_tool_choice
         || (no_tools
             && low_output_budget
             && (matches!(
@@ -89,6 +92,8 @@ pub(crate) fn apply_initial_thinking_policy(
     if should_disable && translate::set_thinking_disabled_if_absent(body) {
         return if low_budget_tool_probe {
             "low_budget_tool_probe_disabled"
+        } else if claude_code_forced_tool_choice {
+            "claude_code_forced_tool_choice_disabled"
         } else {
             "low_budget_probe_disabled"
         };
@@ -98,6 +103,19 @@ pub(crate) fn apply_initial_thinking_policy(
     } else {
         "keep_default"
     }
+}
+
+fn is_forced_tool_choice(tool_choice: Option<&serde_json::Value>) -> bool {
+    let Some(choice) = tool_choice else {
+        return false;
+    };
+    if choice.is_null() {
+        return false;
+    }
+    if choice.as_str().is_some_and(|value| value == "auto") {
+        return false;
+    }
+    true
 }
 
 pub(crate) fn reasoning_disabled_retry_body(body: &serde_json::Value) -> serde_json::Value {
@@ -217,4 +235,74 @@ pub(crate) fn log_empty_output_class(
         tool_call_count = collected.tool_calls.len(),
         "upstream returned no assistant content or tool call"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_profile::ClientProfileSource;
+    use crate::protocol::types::Message;
+    use serde_json::Value;
+
+    fn request_with_tool_choice(tool_choice: Option<Value>) -> ChatRequest {
+        ChatRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String("call the selected tool".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: Some(true),
+            max_tokens: Some(512),
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice,
+        }
+    }
+
+    #[test]
+    fn claude_code_forced_tool_choice_disables_thinking() {
+        let request = request_with_tool_choice(Some(serde_json::json!({
+            "type": "function",
+            "function": { "name": "Write" }
+        })));
+        let mut body = serde_json::json!({});
+        let policy = apply_initial_thinking_policy(
+            &mut body,
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        );
+
+        assert_eq!(policy, "claude_code_forced_tool_choice_disabled");
+        assert_eq!(body["thinking"], serde_json::json!({"type":"disabled"}));
+    }
+
+    #[test]
+    fn claude_code_auto_tool_choice_keeps_default_thinking() {
+        let request = request_with_tool_choice(Some(Value::String("auto".to_string())));
+        let mut body = serde_json::json!({});
+        let policy = apply_initial_thinking_policy(
+            &mut body,
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        );
+
+        assert_eq!(policy, "keep_default");
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn unknown_forced_tool_choice_keeps_default_thinking() {
+        let request = request_with_tool_choice(Some(serde_json::json!({
+            "type": "function",
+            "function": { "name": "Write" }
+        })));
+        let mut body = serde_json::json!({});
+        let policy = apply_initial_thinking_policy(&mut body, &request, ClientProfile::unknown());
+
+        assert_eq!(policy, "keep_default");
+        assert!(body.get("thinking").is_none());
+    }
 }
