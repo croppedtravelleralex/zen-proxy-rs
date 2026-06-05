@@ -18,7 +18,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - `fmt --check` 通过。
 - `clippy --all-targets -- -D warnings` 通过。
-- `cargo test` 通过：库测试 83 条、kernel golden 95 条、doc tests 0 条。
+- `cargo test` 通过：库测试 83 条、kernel golden 100 条、doc tests 0 条。
 - `zen-proxy-rs` 本轮已改外层 V4 context compactor 和 e2e harness；当前已验证 `clippy -D warnings`、bin 单元测试 132 条、context 相关单元测试 12 条、e2e 27 条、shell e2e 9/9 通过。
 
 注意：上述验证覆盖本仓库当前源码。2026-06-04 18:54 已将输出限制取消、模型策略收窄、flash/free 输入放行和 cache 四态观测构建进 `zen-proxy-rs` release 并部署到 panda；部署后已通过 NewAPI models、短请求和手工大上下文不折叠 smoke。真实 panda `policy-smoke/policy-dry` 和四客户端压测仍未跑，不能当作生产压测结论。
@@ -55,6 +55,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 28. `zen-proxy-rs` 外层 V4 context compactor 已按模型分流：`deepseek-v4-flash/deepseek-v4-flash-free` 只记录 `warn/pass`，不 compact、不因 token target reject；`deepseek-v4-flash-lite/big-pickle` 仍保留 compactor 能力，避免把全局大上下文保护误关。
 29. V4.98 cache-friendly session 已在本仓库源码落地：大请求上游 `x-opencode-session` 不再按完整 `messages` hash 每轮变化，而是按稳定前缀 hash、tools hash、tool_choice hash、模型、api key hash 和时间桶分组；请求正文、消息顺序、`max_tokens` 均不改写。
 30. V4.98 新增脱敏 prefix 观测：request-shape 和 cache observation 日志记录 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes`，用于判断长会话前缀是否稳定；仍不记录原始 prompt、请求体或 key。
+31. 2026-06-05 已补并部署 ClaudeCode 低预算工具探针保护：仅当 `source_client=ClaudeCode`、非流式、`max_tokens<=32`、工具数 1-2、无显式 `tool_choice`、小上下文时，第一次上游请求前禁用 thinking，并把上游 `max_tokens` 最小抬到 64，避免 `/context` 等内部探针被 DeepSeek 消耗在 reasoning-only 后裸 502；普通工具调用、长上下文、Hermes/OpenClaw 不受影响。
+32. 2026-06-05 已补并部署 ClaudeCode Anthropic 流式 idle ping 保活：仅对 `source_client=ClaudeCode` 的 Anthropic SSE 流，在 15 秒内没有下游可转发事件时发送协议级 `event: ping` / `{"type":"ping"}`；不伪造内容、不计入 first content、不改写 prompt，用来降低 50k+ 流式请求在真实内容前被 NewAPI/客户端判为 `client_gone` 的概率。
 
 ## 附属工具
 
@@ -490,6 +492,35 @@ P1.16 2026-06-05 V4.99 reasoning-aware output guard 源码记录：
 | 部署验收 | `zen-proxy-rs@1/@2/@3` 和 nginx 均 active；4001/4002/4004/4000 `/health` 均为 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`；4000 `/v1/models` 返回两个公开模型；panda NewAPI 8081 `/v1/models` 200。 |
 | 烟测结果 | panda NewAPI OpenAI 非流式短问答 200，约 2.03s，返回 `2+2 equals 4.`；panda NewAPI Anthropic 流式 exact prompt 返回 `STREAM_OK` 且无 error；非 exact 小流式返回正常 greeting 且日志显示 `protocol="anthropic"`，未因 `max_tokens=64` 进入 `anthropic_buffered`。 |
 | 线上观测 | 部署后日志已出现 V4.99 `applied upstream thinking policy`、`thinking_policy="low_budget_probe_disabled"`、`provider cache usage observation` 和 request shape 字段；部署后最小窗口内未见 `empty_output_class`、`upstream returned no assistant`、`stream error`、`retry budget`、`client_gone`。 |
+
+P1.17 2026-06-05 ClaudeCode low-budget tool probe 部署记录：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户反馈部署前后又出现多条 NewAPI 502；复查最近两小时 channel 69：`deepseek-v4-flash` 成功 stream 742、成功 non-stream 382、错误 non-stream 56、错误 stream 1。 |
+| 根因 | 线上旧 V4.99 未包含本地低预算工具探针补丁。错误集中在 ClaudeCode 内部 `/context`/探针形态：Anthropic 非流式、`message_count=1`、`tool_count=1`、`max_tokens=1/16`、`prompt_tokens=57/417`，上游返回 `reasoning_only_length` 后变成空输出 502。 |
+| 修复 | 部署本仓库最新补丁到 `zen-proxy-rs`：ClaudeCode 非流式低预算工具探针第一次上游请求前 `thinking=disabled`，并把 `max_tokens<=32` 最小抬到 64。 |
+| 本地构建 | `/home/lenovo/zen-proxy-rs` 执行 `CARGO_INCREMENTAL=0 cargo build --release` 通过；未 strip release SHA256 为 `5732beb2c6cc7b9092ae7d9dfe580fd69d48f602b8cb16c859e9beb5f2022f67`。 |
+| 部署 | 2026-06-05 20:52 已部署到 panda；线上 stripped SHA256 为 `369e45062f870f8460ebf4d52f06bda30d94fe0f4459cf8cdebbc4829fe3316d`，旧 V4.99 hash `8f8513c418c40704bd50c8ce73f27696fdc9fbb1aa75290f2829cedd9eb9e2f2` 已备份到 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-low-budget-probe-20260605-205234-8f8513c`。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`；二进制包含 `low_budget_tool_probe_disabled` 与 `raised ClaudeCode low-budget tool probe max_tokens before upstream` 字符串。 |
+| NewAPI 验收 | panda 本机 NewAPI Anthropic `/v1/messages?beta=true`，带 1 个 `ctx_probe` 工具，`max_tokens=1` 返回 HTTP 200、2.31s、`stop_reason=tool_use`；`max_tokens=16` 返回 HTTP 200、2.13s、`stop_reason=tool_use`。 |
+| 日志验收 | ZenProxy 新 pid 日志出现 `requested_max_tokens=Some(1/16)`、`effective_max_tokens=Some(64)`、`thinking_policy="low_budget_tool_probe_disabled"`；部署后近 10 分钟 channel 69 无错误记录，ZenProxy 近 5 分钟未见 `upstream returned no assistant content`、`stream truncated`、`retry budget exhausted`。 |
+| 残留 | 仍需用户真实 ClaudeCode `/context` 和日常使用长窗口观察；单条历史 `stream truncated before DONE or finish_reason` 与本次批量非流式 502 不同，若复发需单独排查。 |
+
+P1.18 2026-06-05 ClaudeCode Anthropic stream idle ping 部署记录：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户反馈 NewAPI 仍有红行和偶发无输出。复查截图时段后确认这些记录不是上一轮非流式低预算工具探针 502，而是成功消费 `type=2`、`stream=true`、约 50k prompt tokens、`completion=0`、`use_time≈64s`，`other.stream_status.end_reason=client_gone`。 |
+| 根因判断 | ZenProxy 同窗口无 `upstream returned no assistant content`、无 `stream truncated`、无 `retry budget exhausted`；更像是 ClaudeCode/NewAPI/cc-switch 在真实内容或工具调用长时间未到达时断开下游流。 |
+| 修复 | `src/proxy/anthropic.rs` 对 ClaudeCode Anthropic SSE 增加 15 秒 idle ping：等待上游事件超时，或上游只有 reasoning/usage 等不可转发事件且下游 15 秒无活动时，发送 `event: ping`、`data: {"type":"ping"}`。 |
+| 边界 | 不对 OpenAI SSE 启用；不对 Hermes/OpenClaw 启用；不把 ping 当首字；不生成空 content delta；不改变模型输出、工具调用、prompt、`max_tokens` 或 thinking 策略。 |
+| 本地验证 | WSL 原生路径执行 `CARGO_INCREMENTAL=0 cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 均通过；新增 golden `claude_code_anthropic_stream_sends_idle_ping_before_delayed_content`，模拟上游 16 秒后才出内容，断言先出现 `event: ping`，随后仍完整输出 `delayed answer` 和 `message_stop`。 |
+| 构建 | `/home/lenovo/zen-proxy-rs` release 构建通过；未 strip SHA256 为 `00ffe54a9b8b9ab09a5fda5c55cf68ebc06825dbece2dabbe6e888bc2bd2f300`；部署 stripped SHA256 为 `be6b859576169d2cc710ed2c079a125c50d0a51a0d744abbd3668ba1e030e793`。 |
+| 部署 | 2026-06-05 22:34 已部署到 panda；旧 hash `369e45062f870f8460ebf4d52f06bda30d94fe0f4459cf8cdebbc4829fe3316d` 备份到 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-stream-idle-ping-20260605-223420-369e450`。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dispatch=90`、`dead=0`、`ratelimited=0`；线上二进制包含 `sent ClaudeCode stream idle ping while upstream produced no forwardable output` 和 `sent ClaudeCode stream idle ping while waiting for upstream event` 字符串。 |
+| NewAPI smoke | panda 本机 token id `38`/name `ds`/group `vip` 下，`/v1/models` 200 且包含 `deepseek-v4-flash`、`deepseek-v4-flash-lite`；Anthropic `/v1/messages?beta=true` + `x-fmc-client=claude-code` 流式 smoke HTTP 200，starttransfer 约 1.39s、total 约 1.92s，响应按 SSE 分片输出目标 marker，无 error。 |
+| 残留 | idle ping 只能解决“下游长时间无字节活动”的 client_gone；如果上游 60 秒后仍真实空输出，或客户端有“必须真实内容在 N 秒内出现”的硬超时，还需要 first-content watchdog / retry 降级另行设计。 |
 
 ## 临时产物归类
 

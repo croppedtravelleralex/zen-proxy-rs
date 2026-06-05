@@ -69,20 +69,29 @@ pub(crate) fn apply_initial_thinking_policy(
         .is_some_and(|max_tokens| max_tokens <= 512);
     let no_tools = shape.tool_count == 0 && !shape.tool_choice_present;
     let tiny_prompt = shape.estimated_total_tokens <= 512;
+    let low_budget_tool_probe = translate::is_claude_code_low_budget_tool_probe(
+        request,
+        profile.kind == ClientKind::ClaudeCode,
+    );
 
-    let should_disable = no_tools
-        && low_output_budget
-        && (matches!(
-            short_kind,
-            translate::ShortNonStreamRequestKind::HealthProbe
-                | translate::ShortNonStreamRequestKind::ChannelTest
-                | translate::ShortNonStreamRequestKind::InternalClaudeCodeProbe
-        ) || (request.stream.unwrap_or(false)
-            && profile.kind == ClientKind::ClaudeCode
-            && tiny_prompt));
+    let should_disable = low_budget_tool_probe
+        || (no_tools
+            && low_output_budget
+            && (matches!(
+                short_kind,
+                translate::ShortNonStreamRequestKind::HealthProbe
+                    | translate::ShortNonStreamRequestKind::ChannelTest
+                    | translate::ShortNonStreamRequestKind::InternalClaudeCodeProbe
+            ) || (request.stream.unwrap_or(false)
+                && profile.kind == ClientKind::ClaudeCode
+                && tiny_prompt)));
 
     if should_disable && translate::set_thinking_disabled_if_absent(body) {
-        return "low_budget_probe_disabled";
+        return if low_budget_tool_probe {
+            "low_budget_tool_probe_disabled"
+        } else {
+            "low_budget_probe_disabled"
+        };
     }
     if body.get("thinking").is_some() {
         "keep_existing"

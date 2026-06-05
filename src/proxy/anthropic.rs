@@ -14,6 +14,7 @@ use serde_json::Value;
 const CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS: u64 = 50_000;
 const CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS: u64 = 2_048;
 const CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS: usize = 3;
+const CLAUDE_CODE_STREAM_IDLE_PING_SECS: u64 = 15;
 const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
 
 pub async fn handle_anthropic_messages(
@@ -146,7 +147,7 @@ pub async fn handle_anthropic_messages(
     if let Some(max_tok) = max_tok {
         zb["max_tokens"] = serde_json::json!(max_tok);
     }
-    let cr = ChatRequest {
+    let mut cr = ChatRequest {
         model: model.clone(),
         messages: msgs,
         stream: Some(stream_requested),
@@ -157,6 +158,29 @@ pub async fn handle_anthropic_messages(
         tool_choice,
     };
     let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
+    let probe_max_tokens = translate::claude_code_low_budget_tool_probe_max_tokens(
+        &cr,
+        profile.kind == ClientKind::ClaudeCode,
+    );
+    if probe_max_tokens != cr.max_tokens {
+        let shape = translate::request_shape(&cr);
+        tracing::warn!(
+            protocol = "anthropic",
+            model = %cr.model,
+            source_client = ?profile.kind,
+            requested_max_tokens = ?cr.max_tokens,
+            effective_max_tokens = ?probe_max_tokens,
+            prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
+            prompt_tokens = shape.estimated_total_tokens,
+            message_count = shape.message_count,
+            tool_count = shape.tool_count,
+            "raised ClaudeCode low-budget tool probe max_tokens before upstream"
+        );
+        cr.max_tokens = probe_max_tokens;
+        if let Some(max_tok) = probe_max_tokens {
+            zb["max_tokens"] = serde_json::json!(max_tok);
+        }
+    }
     tracing::info!(
         protocol = "anthropic",
         model = %cr.model,
@@ -622,6 +646,7 @@ async fn handle_stream(
 ) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
+    use std::time::{Duration, Instant};
 
     let model = cr.model.clone();
     let msg_id = format!(
@@ -633,6 +658,7 @@ async fn handle_stream(
     );
     let body = cr.clone();
     let m = model.clone();
+    let prompt_hash = translate::request_shape(&body).prompt_hash;
     let prompt = translate::build_prompt_text(&body.messages);
     let estimated_input_tokens = estimate(&prompt).max(1);
     let initial_input_tokens = estimated_input_tokens;
@@ -657,8 +683,12 @@ async fn handle_stream(
     .await?;
     let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
     let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
+    let send_idle_ping = profile.kind == ClientKind::ClaudeCode;
+    let idle_ping_interval = Duration::from_secs(CLAUDE_CODE_STREAM_IDLE_PING_SECS);
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+        let mut last_downstream_event = Instant::now();
+        let mut idle_ping_count = 0_u64;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut text_block_open = false;
@@ -670,7 +700,30 @@ async fn handle_stream(
         let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
         let mut usage: Option<crate::zen::client::ZenUsage> = None;
         let mut upstream_finish_reason: Option<String> = None;
-        while let Some(event) = upstream.next().await {
+        loop {
+            let next_event = if send_idle_ping {
+                match tokio::time::timeout(idle_ping_interval, upstream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        idle_ping_count += 1;
+                        tracing::info!(
+                            protocol = "anthropic",
+                            model = %body.model,
+                            source_client = ?profile.kind,
+                            prompt_hash,
+                            idle_ping_count,
+                            idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
+                            "sent ClaudeCode stream idle ping while waiting for upstream event"
+                        );
+                        yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
+                        last_downstream_event = Instant::now();
+                        continue;
+                    }
+                }
+            } else {
+                upstream.next().await
+            };
+            let Some(event) = next_event else { break; };
             let event = match event {
                 Ok(event) => event,
                 Err(err) => {
@@ -678,6 +731,7 @@ async fn handle_stream(
                     return;
                 }
             };
+            let mut emitted_downstream_event = false;
             if event.usage.is_some() {
                 usage = event.usage;
             }
@@ -703,6 +757,7 @@ async fn handle_stream(
                             }
                             text.push_str(&content);
                             yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":content}}).to_string()));
+                            emitted_downstream_event = true;
                         }
                     }
                     if let Some(reasoning_content) = delta.reasoning_content {
@@ -712,6 +767,22 @@ async fn handle_stream(
                         merge_tool_deltas(&mut tool_calls, items);
                     }
                 }
+            }
+            if emitted_downstream_event {
+                last_downstream_event = Instant::now();
+            } else if send_idle_ping && last_downstream_event.elapsed() >= idle_ping_interval {
+                idle_ping_count += 1;
+                tracing::info!(
+                    protocol = "anthropic",
+                    model = %body.model,
+                    source_client = ?profile.kind,
+                    prompt_hash,
+                    idle_ping_count,
+                    idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
+                    "sent ClaudeCode stream idle ping while upstream produced no forwardable output"
+                );
+                yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
+                last_downstream_event = Instant::now();
             }
         }
         let final_markdown = markdown_guard

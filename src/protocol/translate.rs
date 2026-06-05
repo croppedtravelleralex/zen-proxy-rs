@@ -483,6 +483,10 @@ impl ShortNonStreamRequestKind {
     }
 }
 
+const CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_REQUEST_TOKENS: u64 = 32;
+const CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_TOTAL_TOKENS: u64 = 2_048;
+pub const CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MIN_OUTPUT_TOKENS: u64 = 64;
+
 pub fn request_shape(body: &ChatRequest) -> RequestShape {
     let mut system_tokens = 0u64;
     let mut messages_tokens = 0u64;
@@ -580,6 +584,9 @@ pub fn classify_short_non_stream_request(
         return ShortNonStreamRequestKind::NotShortNonStream;
     }
     let shape = request_shape(body);
+    if is_claude_code_low_budget_tool_probe_shape(body, &shape, is_claude_code) {
+        return ShortNonStreamRequestKind::InternalClaudeCodeProbe;
+    }
     if shape.tool_count > 0 || shape.tool_choice_present {
         return ShortNonStreamRequestKind::NotShortNonStream;
     }
@@ -609,6 +616,42 @@ pub fn classify_short_non_stream_request(
         return ShortNonStreamRequestKind::UserShortRequest;
     }
     ShortNonStreamRequestKind::UnknownShortNonStream
+}
+
+pub fn is_claude_code_low_budget_tool_probe(body: &ChatRequest, is_claude_code: bool) -> bool {
+    let shape = request_shape(body);
+    is_claude_code_low_budget_tool_probe_shape(body, &shape, is_claude_code)
+}
+
+fn is_claude_code_low_budget_tool_probe_shape(
+    body: &ChatRequest,
+    shape: &RequestShape,
+    is_claude_code: bool,
+) -> bool {
+    if !is_claude_code || body.stream.unwrap_or(false) {
+        return false;
+    }
+    let Some(max_tokens) = body.max_tokens else {
+        return false;
+    };
+    max_tokens <= CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_REQUEST_TOKENS
+        && (1..=2).contains(&shape.tool_count)
+        && !shape.tool_choice_present
+        && shape.message_count <= 2
+        && shape.last_user_tokens <= 64
+        && shape.estimated_total_tokens <= CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_TOTAL_TOKENS
+}
+
+pub fn claude_code_low_budget_tool_probe_max_tokens(
+    body: &ChatRequest,
+    is_claude_code: bool,
+) -> Option<u64> {
+    if is_claude_code_low_budget_tool_probe(body, is_claude_code) {
+        return body
+            .max_tokens
+            .map(|max_tokens| max_tokens.max(CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MIN_OUTPUT_TOKENS));
+    }
+    body.max_tokens
 }
 
 fn value_shape_tokens(value: &Value) -> u64 {

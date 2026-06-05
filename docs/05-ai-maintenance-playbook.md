@@ -124,8 +124,10 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - 2026-06-03 晚间已部署源码层非流式第二层兜底：同类极短非流式无工具探测在上游连续空输出后返回本地 `ok`；普通请求仍返回结构化空输出错误。
 - 2026-06-03 晚间已部署 ClaudeCode 格式误伤修复：`web_fetch`/`web_search` 和普通 OpenClaw/Hermes 文本引用不再把请求判为 OpenClaw；受控 `Task + web_fetch` `/v1/messages` 新 pid 日志为 `source_client=claude-code`。
 - 2026-06-04 18:54 已部署最新策略到 panda：输出限制已完全取消，缺省 `max_tokens` 不再补 1024/2048，显式 `max_tokens` 原样透传；OpenAI/Anthropic 只有显式值才写上游。ZenProxy 外层 context compactor 对 flash/free 只 warn/pass，对 lite 仍可 compact。已通过手工 NewAPI smoke 和大上下文不折叠 smoke；真实 panda `policy-smoke/policy-dry` 尚未跑，不能把该策略写成生产压测已验证。
+- 2026-06-05 已部署 ClaudeCode Anthropic stream idle ping：只对 ClaudeCode Anthropic SSE 15 秒下游无可转发事件时发送协议 `ping`，用于缓解 `client_gone/use_time≈64s/completion=0`；不得把 ping 当 first content 或成功输出。
 - panda 当前没有 Rust 工具链；上线源码补丁时优先在本机/WSL 构建 Linux release，再上传 strip 后二进制，不要在生产机上临时高负载编译。
 - Windows `ssh panda` 使用 `C:\Users\Lenovo\.ssh\config` 中的 `root@100.69.228.93`；WSL 默认 `ssh panda` 可能没有该配置。WSL 需要显式使用 `/mnt/c/Users/Lenovo/.ssh/id_ed25519`。
+- 本机到 panda 的 Tailscale/SSH 可能临时抖动：表现为 `scp`/SSH stdin/HTTP taildrop 大文件传输 reset，但短 SSH 和端口检测偶尔正常。遇到时先跑 `tailscale ping` 和 `tailscale netcheck`，优先传 xz 压缩包；不要在服务半重启状态下继续折腾。部署脚本从 PowerShell 调远端 shell 时，避免 `$()` 和 `$var` 被 PowerShell 提前展开，复杂远端脚本用 `bash -s` 且去掉 CRLF。
 - huge stream 日志里若出现 `ClaudeCode huge stream buffered upstream returned empty output`，先按 buffered retry 已兜底处理归类；只有最终裸透给客户端或耗尽重试才算失败。最新输出策略不再通过 `max_tokens` cap 控制长输出，20k/32k 等显式长输出应原样透传给上游。
 - 如果需要临时中止压测，保留已有 `raw-results.jsonl`，再生成 partial summary，不要补写伪造的完成数。
 - WSL ClaudeCode 当前不能直接作为有效客户端样本：`/home/lenovo/.local/bin/claude` 和 `claude-deepseek-free` 是 clawgod launcher，实际启动 `/root/.clawgod/cli.cjs`，不是 Anthropic ClaudeCode CLI；正式四客户端压测前必须修复或替换。
@@ -145,7 +147,8 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - NewAPI 看到 70k-90k input tokens：不要直接判定为 NewAPI 输入墙。先对齐三种口径：ZenProxy `body_size` 是 JSON 字节数；free-model-client-rs `prompt_tokens` 是估算/策略口径；NewAPI/cc-switch usage 是最终账单口径。最新 flash 策略只观测不压缩；如果日志里还看到 `compacted` 或 `capped` 字样，必须先确认是历史日志、lite/其他模型路径，还是旧二进制。
 - Windows ClaudeCode 当前可能先走 cc-switch：检查 `C:\Users\Lenovo\.claude\settings.json` 里的 `ANTHROPIC_BASE_URL`，再查 cc-switch provider。不要把 `ClaudeCode -> cc-switch -> closeapi` 的记录和 `panda NewAPI channel 69 -> ZenProxy` 的记录合并归因。
 - ClaudeCode 表面短 prompt 不等于短请求：ClaudeCode 会带系统提示、工具 schema、plugins/skills、agent 信息、历史上下文和模型别名。当前源码已增加并部署脱敏 request-shape 采样，字段包括 `system_tokens/messages_tokens/tools_tokens/tool_count/message_count/largest_message_tokens/last_user_tokens/estimated_total_tokens/stream/max_tokens/tool_choice_present/prompt_hash/source_client/profile_source`；禁止保存原始 prompt、请求体或密钥。
-- `body_size=342` 这类小非流式空输出：先看 `short_request_kind`。当前分类只用于观测，`internal_claude_code_probe` 不会自动本地 `ok`；只有 `channel_test` 且上游连续空输出时才允许本地 `ok`，普通短请求仍应返回结构化空上游错误。
+- `body_size=342` 或 `/context` 这类小非流式空输出：先看 `short_request_kind`、`tool_count`、`max_tokens` 和 `empty_output_class`。2026-06-05 已确认一类 ClaudeCode 内部工具探针会带 1 个小工具、`max_tokens=1/16`，上游 DeepSeek 容易返回 `reasoning_only_length` 且正文/工具调用为空；当前源码和 panda 线上均已对这类低预算工具探针做 thinking disabled + `max_tokens` 最小 64 的窄保护，不返回本地假答案。`channel_test` 且上游连续空输出时才允许本地 `ok`，普通短请求仍应返回结构化空上游错误。
+- NewAPI 红行但 `type=2`、`stream=true`、`stream_status.end_reason=client_gone`：不要按上一类非流式 502 处理。先查是否 `completion=0`、`use_time≈60-65s`、ZenProxy 同窗口是否没有空上游/截断/retry 错误；若吻合，优先归类为下游流式读空闲断开。2026-06-05 起 ClaudeCode Anthropic 流式会发协议 ping 保活，但如果客户端要求真实内容在固定时间内到达，仍需 first-content watchdog，而不是伪造文本。
 
 必须记录：
 

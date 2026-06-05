@@ -134,7 +134,7 @@ pub async fn handle_openai_chat(
     if let Some(max_tok) = max_tok {
         zb["max_tokens"] = serde_json::json!(max_tok);
     }
-    let cr = ChatRequest {
+    let mut cr = ChatRequest {
         model: model.clone(),
         messages: body.messages.clone(),
         stream: Some(stream_requested),
@@ -145,6 +145,29 @@ pub async fn handle_openai_chat(
         tool_choice: body.tool_choice.clone(),
     };
     let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
+    let probe_max_tokens = translate::claude_code_low_budget_tool_probe_max_tokens(
+        &cr,
+        profile.kind == ClientKind::ClaudeCode,
+    );
+    if probe_max_tokens != cr.max_tokens {
+        let shape = translate::request_shape(&cr);
+        tracing::warn!(
+            protocol = "openai",
+            model = %cr.model,
+            source_client = ?profile.kind,
+            requested_max_tokens = ?cr.max_tokens,
+            effective_max_tokens = ?probe_max_tokens,
+            prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
+            prompt_tokens = shape.estimated_total_tokens,
+            message_count = shape.message_count,
+            tool_count = shape.tool_count,
+            "raised ClaudeCode low-budget tool probe max_tokens before upstream"
+        );
+        cr.max_tokens = probe_max_tokens;
+        if let Some(max_tok) = probe_max_tokens {
+            zb["max_tokens"] = serde_json::json!(max_tok);
+        }
+    }
     tracing::info!(
         protocol = "openai",
         model = %cr.model,

@@ -46,9 +46,20 @@
 
 ### 运行指标细分
 
-- 状态：待设计。
+- 状态：部分落地。
 - 当前不足：代码层有错误结构化，但缺少完整阶段耗时暴露。
 - 建议指标：请求入站、认证、解析、协议修复、上游连接、上游首包、first content、first tool call、stream decode、响应结束。
+- 2026-06-05 追加：已先补 ClaudeCode Anthropic SSE idle ping，缓解 `client_gone/use_time≈64s/completion=0` 这类下游读空闲断开；但这不是完整阶段耗时指标，后续仍需区分 `protocol_first_byte`、`first_content` 和 `first_tool_call`，避免把 ping 当真实首字。
+
+### ClaudeCode 流式 client_gone 观测
+
+- 状态：源码已修复并部署 panda，待真实长窗口观察。
+- 触发：NewAPI 红行里出现 stream 成功消费但 `stream_status.end_reason=client_gone`、`completion=0`、`use_time≈64s`，与非流式低预算探针 502 不是同一问题。
+- 已做：ClaudeCode Anthropic SSE 15 秒 idle ping；本地 delayed-stream golden 覆盖，panda 三实例部署并 smoke 通过。
+- 待办：
+  1. 观察用户真实 ClaudeCode 50k+ 流式请求中 `client_gone` 是否下降。
+  2. 如果仍出现，补 first-content watchdog，而不是把 ping 伪装成内容。
+  3. 与 NewAPI `frt`、ZenProxy 日志、provider usage 对齐，区分客户端断开、上游空输出、上游超时和 stream decode 错误。
 
 ### NewAPI 使用日志导出 sidecar
 
@@ -202,9 +213,9 @@
 
 ### ClaudeCode 小非流式空输出请求分类
 
-- 状态：第一阶段已在 `free-model-client-rs` 源码落地，并已随 `zen-proxy-rs` 部署到 panda。
+- 状态：第一阶段已部署；2026-06-05 低预算工具探针修复已部署 panda，并通过 NewAPI 复现路径验收。
 - 背景：2026-06-03 21:28 panda 日志出现 `source_client=claude-code`、`stream=false`、`body_size=342` 的 `/v1/messages` 请求，随后多次 `non-stream upstream returned empty output; retrying`。
-- 当前判断：该请求形态不像用户主对话，更像 ClaudeCode 内部非流式探测、摘要、标题、能力检查或小模型辅助请求；当前日志没有保存脱敏 request shape，无法确认具体用途。
+- 当前判断：这类请求不像用户主对话，更像 ClaudeCode 内部非流式探测、摘要、标题、能力检查、`/context` 上下文检测或小模型辅助请求。2026-06-05 NewAPI/ZenProxy 日志进一步确认，失败高发样本里有一类带 1 个小工具、`max_tokens=1/16`、`empty_output_class=reasoning_only_length` 的低预算工具探针。
 - 已有保护：`hi/hello/test/echo hi` 类极短无工具 channel-test probe 在上游连续空输出后会返回本地 `ok`；普通请求仍返回结构化空输出错误。
 - 已完成：
   1. 新增分类：`health_probe/channel_test/internal_claude_code_probe/user_short_request/unknown_short_nonstream/not_short_nonstream`。
@@ -212,9 +223,10 @@
   3. `echo hi` 仍是 channel-test probe；普通短请求不是 channel-test。
   4. 新增 kernel golden：ClaudeCode 小非流式、非探针、上游空输出时仍返回 `upstream returned no assistant content or tool call`，不会被本地 `ok` 误短路。
   5. 2026-06-04 新增显式 smoke 探针兜底：`strict smoke`、`reply PASS`、`answer OK` 等无工具短测在上游空输出后返回本地测试文本；普通 ClaudeCode 短输入仍不兜底。
+  6. 2026-06-05 新增 ClaudeCode 低预算工具探针窄保护：非流式、`max_tokens<=32`、工具数 1-2、无显式 `tool_choice`、小上下文时，第一次上游请求前禁用 thinking，并把上游 `max_tokens` 最小抬到 64；OpenAI/Anthropic 两入口均有 golden 覆盖。
 - 待办：
-  1. 继续用真实小非流式样本确认分类是否稳定命中 `internal_claude_code_probe`，并记录最终是否 retry 成功。
-  2. 只有确认是 ClaudeCode 内部探测后，才评估本地安全 fallback 或短冷却；当前源码没有新增普通请求短路。
+  1. 用用户真实 ClaudeCode `/context` 和日常使用长窗口复验：NewAPI 非流式 502 应明显下降，ZenProxy 日志应继续出现 `thinking_policy=low_budget_tool_probe_disabled` 和 `raised ClaudeCode low-budget tool probe max_tokens before upstream`。
+  2. 继续用真实小非流式样本确认分类是否稳定命中 `internal_claude_code_probe`，并记录最终是否 retry 成功。
   3. 如日志仍无法区分用途，再补不含原文的 `last_user_prefix_class`。
   4. Windows ClaudeCode/cc-switch 若访问 panda Tailscale IP，需确认进程是否继承 `HTTP_PROXY=http://127.0.0.1:7897`；若继承，必须为 `100.69.228.93` 配置 no-proxy，否则 Windows HTTP 客户端可能走代理返回 502。
 

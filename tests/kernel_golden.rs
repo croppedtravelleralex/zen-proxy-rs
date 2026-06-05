@@ -244,6 +244,21 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("delayed-before-content") {
+        use axum::response::sse::{Event, Sse};
+        use std::convert::Infallible;
+        use std::time::Duration;
+
+        let stream = async_stream::stream! {
+            tokio::time::sleep(Duration::from_secs(16)).await;
+            yield Ok::<_, Infallible>(Event::default().data(json!({
+                "choices": [{"delta": {"content": "delayed answer"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+            }).to_string()));
+            yield Ok(Event::default().data("[DONE]"));
+        };
+        return Sse::new(stream).into_response();
+    }
 
     let chunk = if prompt.contains("mixed-text-tool-delta") {
         json!({
@@ -908,6 +923,26 @@ async fn anthropic_stream_returns_golden_event_sequence() {
 }
 
 #[tokio::test]
+async fn claude_code_anthropic_stream_sends_idle_ping_before_delayed_content() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            anthropic_request("deepseek-v4-flash", "delayed-before-content", true),
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("event: ping"));
+    assert!(body.contains("\"type\":\"ping\""));
+    assert!(body.contains("delayed answer"));
+    assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
 async fn anthropic_stream_closes_unclosed_markdown_fence() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -1473,6 +1508,75 @@ async fn claude_code_tools_do_not_disable_thinking() {
         sent[0].thinking.is_none(),
         "ClaudeCode tool requests must not be forced into disabled thinking"
     );
+}
+
+#[tokio::test]
+async fn claude_code_low_budget_openai_tool_probe_disables_thinking_and_raises_max_tokens() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = chat_request(
+        "deepseek-v4-flash",
+        "reasoning-only-length",
+        false,
+        Some(vec![OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: "ctx_probe".to_string(),
+                description: None,
+                parameters: Some(json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"]
+                })),
+            },
+        }]),
+    );
+    req.max_tokens = Some(16);
+
+    let response = kernel
+        .openai_chat_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer after disabled thinking"));
+    let sent = observed.requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+    assert_eq!(sent[0].max_tokens, Some(64));
+}
+
+#[tokio::test]
+async fn claude_code_low_budget_anthropic_tool_probe_disables_thinking_and_raises_max_tokens() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = anthropic_request("deepseek-v4-flash", "reasoning-only-length", false);
+    req.max_tokens = Some(16);
+    req.tools = Some(vec![anthropic_tool(
+        "ctx_probe",
+        json!({"ok": {"type": "boolean"}}),
+        &["ok"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer after disabled thinking"));
+    let sent = observed.requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+    assert_eq!(sent[0].max_tokens, Some(64));
 }
 
 #[tokio::test]
