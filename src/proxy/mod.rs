@@ -5,7 +5,97 @@ pub mod sse;
 
 use crate::client_profile::{ClientKind, ClientProfile};
 use crate::protocol::{translate, types::ChatRequest};
-use crate::zen::client::ProviderCacheSignals;
+use crate::zen::client::{CollectedStream, ProviderCacheSignals};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputClass {
+    Valid,
+    Empty,
+    ReasoningOnly,
+    ReasoningOnlyLength,
+}
+
+impl OutputClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Empty => "empty_output",
+            Self::ReasoningOnly => "reasoning_only",
+            Self::ReasoningOnlyLength => "reasoning_only_length",
+        }
+    }
+
+    pub(crate) const fn should_retry_with_disabled_thinking(self) -> bool {
+        matches!(self, Self::ReasoningOnlyLength)
+    }
+}
+
+pub(crate) fn classify_collected_output(
+    collected: &CollectedStream,
+    rendered_content: &str,
+) -> OutputClass {
+    if !rendered_content.trim().is_empty() || !collected.tool_calls.is_empty() {
+        return OutputClass::Valid;
+    }
+    if !collected.reasoning.trim().is_empty() {
+        if collected.finish_reason.as_deref() == Some("length") {
+            return OutputClass::ReasoningOnlyLength;
+        }
+        return OutputClass::ReasoningOnly;
+    }
+    OutputClass::Empty
+}
+
+pub(crate) fn apply_initial_thinking_policy(
+    body: &mut serde_json::Value,
+    request: &ChatRequest,
+    profile: ClientProfile,
+) -> &'static str {
+    if profile.disables_thinking_for_tool_use() {
+        return if translate::disable_thinking_for_tool_use(body) {
+            "compat_tool_use_disabled"
+        } else {
+            "compat_tool_use_keep_existing"
+        };
+    }
+
+    let shape = translate::request_shape(request);
+    let short_kind = translate::classify_short_non_stream_request(
+        request,
+        profile.kind == ClientKind::ClaudeCode,
+    );
+    let low_output_budget = request
+        .max_tokens
+        .is_some_and(|max_tokens| max_tokens <= 512);
+    let no_tools = shape.tool_count == 0 && !shape.tool_choice_present;
+    let tiny_prompt = shape.estimated_total_tokens <= 512;
+
+    let should_disable = no_tools
+        && low_output_budget
+        && (matches!(
+            short_kind,
+            translate::ShortNonStreamRequestKind::HealthProbe
+                | translate::ShortNonStreamRequestKind::ChannelTest
+                | translate::ShortNonStreamRequestKind::InternalClaudeCodeProbe
+        ) || (request.stream.unwrap_or(false)
+            && profile.kind == ClientKind::ClaudeCode
+            && tiny_prompt));
+
+    if should_disable && translate::set_thinking_disabled_if_absent(body) {
+        return "low_budget_probe_disabled";
+    }
+    if body.get("thinking").is_some() {
+        "keep_existing"
+    } else {
+        "keep_default"
+    }
+}
+
+pub(crate) fn reasoning_disabled_retry_body(body: &serde_json::Value) -> serde_json::Value {
+    let mut retry = body.clone();
+    translate::set_thinking_disabled_if_absent(&mut retry);
+    retry
+}
 
 pub(crate) fn log_request_shape(
     protocol: &'static str,
@@ -82,5 +172,40 @@ pub(crate) fn log_provider_cache_observation(
         cache_material_bytes = shape.cache_material_bytes,
         estimated_total_tokens = shape.estimated_total_tokens,
         "provider cache usage observation"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn log_empty_output_class(
+    protocol: &'static str,
+    request: &ChatRequest,
+    profile: ClientProfile,
+    class: OutputClass,
+    attempt: usize,
+    max_attempts: usize,
+    collected: &CollectedStream,
+) {
+    let shape = translate::request_shape(request);
+    let short_request_kind = translate::classify_short_non_stream_request(
+        request,
+        profile.kind == ClientKind::ClaudeCode,
+    );
+    tracing::warn!(
+        protocol,
+        model = %request.model,
+        source_client = ?profile.kind,
+        empty_output_class = class.as_str(),
+        attempt,
+        max_attempts,
+        short_request_kind = short_request_kind.as_str(),
+        prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
+        prompt_tokens = shape.estimated_total_tokens,
+        message_count = shape.message_count,
+        max_tokens = ?shape.max_tokens,
+        finish_reason = ?collected.finish_reason,
+        reasoning_chars = collected.reasoning.len(),
+        content_chars = collected.content.len(),
+        tool_call_count = collected.tool_calls.len(),
+        "upstream returned no assistant content or tool call"
     );
 }

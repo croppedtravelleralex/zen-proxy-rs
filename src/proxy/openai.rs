@@ -134,9 +134,6 @@ pub async fn handle_openai_chat(
     if let Some(max_tok) = max_tok {
         zb["max_tokens"] = serde_json::json!(max_tok);
     }
-    if profile.disables_thinking_for_tool_use() {
-        translate::disable_thinking_for_tool_use(&mut zb);
-    }
     let cr = ChatRequest {
         model: model.clone(),
         messages: body.messages.clone(),
@@ -147,6 +144,14 @@ pub async fn handle_openai_chat(
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice: body.tool_choice.clone(),
     };
+    let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
+    tracing::info!(
+        protocol = "openai",
+        model = %cr.model,
+        source_client = ?profile.kind,
+        thinking_policy,
+        "applied upstream thinking policy"
+    );
     super::log_request_shape("openai", &cr, observed_profile, profile);
     if translate::is_short_no_tool_health_request(&cr) {
         super::log_provider_cache_observation(
@@ -200,13 +205,16 @@ async fn handle_oa_non_stream(
         translate::classify_short_non_stream_request(cr, profile.kind == ClientKind::ClaudeCode);
     let (collected, content) = {
         let mut last_empty = false;
+        let mut last_empty_class = None;
+        let mut used_reasoning_disabled_retry = false;
+        let mut attempt_body = zb.clone();
         let mut output = None;
         for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
             let resp = crate::zen::client::fetch_zen_stream_with_headers(
                 client,
                 &config.zen_chat_url,
                 &config.zen_api_key,
-                zb,
+                &attempt_body,
                 &config.extra_headers,
             )
             .await?;
@@ -223,19 +231,34 @@ async fn handle_oa_non_stream(
                 NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
             );
             let content = response_text_for_profile(profile, &collected.content);
-            if content.trim().is_empty() && collected.tool_calls.is_empty() {
+            let output_class = super::classify_collected_output(&collected, &content);
+            if output_class != super::OutputClass::Valid {
                 last_empty = true;
-                tracing::warn!(
-                    attempt,
-                    max_attempts = NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
-                    source_client = ?profile.kind,
-                    short_request_kind = short_request_kind.as_str(),
-                    prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
-                    prompt_tokens = request_shape.estimated_total_tokens,
-                    message_count = request_shape.message_count,
-                    max_tokens = ?request_shape.max_tokens,
-                    "non-stream upstream returned empty output; retrying"
+                last_empty_class = Some(output_class);
+                super::log_empty_output_class(
+                    "openai",
+                    cr,
+                    profile,
+                    output_class,
+                    attempt + 1,
+                    NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+                    &collected,
                 );
+                if output_class.should_retry_with_disabled_thinking()
+                    && !used_reasoning_disabled_retry
+                {
+                    used_reasoning_disabled_retry = true;
+                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    tracing::warn!(
+                        protocol = "openai",
+                        model = %cr.model,
+                        source_client = ?profile.kind,
+                        empty_output_class = output_class.as_str(),
+                        attempt = attempt + 1,
+                        "retrying reasoning-only output with disabled thinking"
+                    );
+                    continue;
+                }
                 continue;
             }
             output = Some((collected, content));
@@ -273,7 +296,11 @@ async fn handle_oa_non_stream(
                 prompt_tokens + completion_tokens,
             ));
         } else {
-            return Err(AppError::empty_upstream());
+            return Err(AppError::empty_upstream_class(
+                last_empty_class
+                    .map(super::OutputClass::as_str)
+                    .unwrap_or("empty_output"),
+            ));
         }
     };
     let prompt = translate::build_prompt_text(&cr.messages);
@@ -533,6 +560,7 @@ async fn handle_oa_stream(
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut markdown_guard = if profile.preserves_model_text_exactly() {
             None
         } else {
@@ -573,6 +601,9 @@ async fn handle_oa_stream(
                             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string()));
                         }
                     }
+                    if let Some(reasoning_content) = delta.reasoning_content {
+                        reasoning.push_str(&reasoning_content);
+                    }
                     if let Some(items) = delta.tool_calls {
                         merge_tool_deltas(&mut tool_calls, items);
                     }
@@ -597,7 +628,26 @@ async fn handle_oa_stream(
                 text.push_str(fallback_text);
                 yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":fallback_text},"finish_reason":null}]}).to_string()));
             } else {
-                yield Ok(Event::default().data(serde_json::json!({"error":{"message":"upstream returned no assistant content or tool call"}}).to_string()));
+                let empty_output_class = if !reasoning.trim().is_empty() {
+                    if upstream_finish_reason.as_deref() == Some("length") {
+                        "reasoning_only_length"
+                    } else {
+                        "reasoning_only"
+                    }
+                } else {
+                    "empty_output"
+                };
+                tracing::warn!(
+                    protocol = "openai",
+                    model = %body.model,
+                    source_client = ?profile.kind,
+                    empty_output_class,
+                    finish_reason = ?upstream_finish_reason,
+                    reasoning_chars = reasoning.len(),
+                    content_chars = text.len(),
+                    "stream upstream returned no assistant content or tool call"
+                );
+                yield Ok(Event::default().data(serde_json::json!({"error":{"message":format!("upstream returned no assistant content or tool call (class={empty_output_class})")}}).to_string()));
                 yield Ok(Event::default().data("[DONE]"));
                 return;
             }

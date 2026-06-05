@@ -146,9 +146,6 @@ pub async fn handle_anthropic_messages(
     if let Some(max_tok) = max_tok {
         zb["max_tokens"] = serde_json::json!(max_tok);
     }
-    if profile.disables_thinking_for_tool_use() {
-        translate::disable_thinking_for_tool_use(&mut zb);
-    }
     let cr = ChatRequest {
         model: model.clone(),
         messages: msgs,
@@ -159,6 +156,14 @@ pub async fn handle_anthropic_messages(
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
     };
+    let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
+    tracing::info!(
+        protocol = "anthropic",
+        model = %cr.model,
+        source_client = ?profile.kind,
+        thinking_policy,
+        "applied upstream thinking policy"
+    );
     super::log_request_shape("anthropic", &cr, observed_profile, profile);
     if stream_requested && profile.protects_recovery_safe_markers() {
         if let Some(literal) = translate::claude_code_recovery_literal_from_messages(&cr.messages) {
@@ -259,9 +264,8 @@ fn should_use_claude_code_buffered_stream(
     let Some(max_tokens) = effective_max_tokens else {
         return false;
     };
-    max_tokens <= 512
-        || (max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS
-            && before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS)
+    max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS
+        && before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS
 }
 
 async fn handle_non_stream(
@@ -277,13 +281,16 @@ async fn handle_non_stream(
         translate::classify_short_non_stream_request(cr, profile.kind == ClientKind::ClaudeCode);
     let (collected, content) = {
         let mut last_empty = false;
+        let mut last_empty_class = None;
+        let mut used_reasoning_disabled_retry = false;
+        let mut attempt_body = zb.clone();
         let mut output = None;
         for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
             let resp = crate::zen::client::fetch_zen_stream_with_headers(
                 client,
                 &config.zen_chat_url,
                 &config.zen_api_key,
-                zb,
+                &attempt_body,
                 &config.extra_headers,
             )
             .await?;
@@ -300,19 +307,34 @@ async fn handle_non_stream(
                 NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
             );
             let content = response_text_for_profile(profile, &collected.content);
-            if content.trim().is_empty() && collected.tool_calls.is_empty() {
+            let output_class = super::classify_collected_output(&collected, &content);
+            if output_class != super::OutputClass::Valid {
                 last_empty = true;
-                tracing::warn!(
-                    attempt,
-                    max_attempts = NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
-                    source_client = ?profile.kind,
-                    short_request_kind = short_request_kind.as_str(),
-                    prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
-                    prompt_tokens = request_shape.estimated_total_tokens,
-                    message_count = request_shape.message_count,
-                    max_tokens = ?request_shape.max_tokens,
-                    "non-stream upstream returned empty output; retrying"
+                last_empty_class = Some(output_class);
+                super::log_empty_output_class(
+                    "anthropic",
+                    cr,
+                    profile,
+                    output_class,
+                    attempt + 1,
+                    NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+                    &collected,
                 );
+                if output_class.should_retry_with_disabled_thinking()
+                    && !used_reasoning_disabled_retry
+                {
+                    used_reasoning_disabled_retry = true;
+                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %cr.model,
+                        source_client = ?profile.kind,
+                        empty_output_class = output_class.as_str(),
+                        attempt = attempt + 1,
+                        "retrying reasoning-only output with disabled thinking"
+                    );
+                    continue;
+                }
                 continue;
             }
             output = Some((collected, content));
@@ -347,7 +369,11 @@ async fn handle_non_stream(
                 estimate(fallback_text).max(1),
             ));
         } else {
-            return Err(AppError::empty_upstream());
+            return Err(AppError::empty_upstream_class(
+                last_empty_class
+                    .map(super::OutputClass::as_str)
+                    .unwrap_or("empty_output"),
+            ));
         }
     };
     let prompt = translate::build_prompt_text(&cr.messages);
@@ -634,6 +660,7 @@ async fn handle_stream(
     let stream = async_stream::stream! {
         yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut text_block_open = false;
         let mut markdown_guard = if profile.preserves_model_text_exactly() {
             None
@@ -678,6 +705,9 @@ async fn handle_stream(
                             yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":content}}).to_string()));
                         }
                     }
+                    if let Some(reasoning_content) = delta.reasoning_content {
+                        reasoning.push_str(&reasoning_content);
+                    }
                     if let Some(items) = delta.tool_calls {
                         merge_tool_deltas(&mut tool_calls, items);
                     }
@@ -708,7 +738,26 @@ async fn handle_stream(
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
                 yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":fallback_text}}).to_string()));
             } else {
-                yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":"upstream returned no assistant content or tool call"}}).to_string()));
+                let empty_output_class = if !reasoning.trim().is_empty() {
+                    if upstream_finish_reason.as_deref() == Some("length") {
+                        "reasoning_only_length"
+                    } else {
+                        "reasoning_only"
+                    }
+                } else {
+                    "empty_output"
+                };
+                tracing::warn!(
+                    protocol = "anthropic",
+                    model = %body.model,
+                    source_client = ?profile.kind,
+                    empty_output_class,
+                    finish_reason = ?upstream_finish_reason,
+                    reasoning_chars = reasoning.len(),
+                    content_chars = text.len(),
+                    "stream upstream returned no assistant content or tool call"
+                );
+                yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":format!("upstream returned no assistant content or tool call (class={empty_output_class})")}}).to_string()));
                 return;
             }
         }
@@ -773,13 +822,15 @@ async fn handle_buffered_claude_code_huge_stream(
     profile: ClientProfile,
 ) -> Result<Response, AppError> {
     let exact_output_literal = translate::exact_output_literal_from_messages(&cr.messages);
+    let mut attempt_body = zb.clone();
+    let mut used_reasoning_disabled_retry = false;
 
     for attempt in 0..CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
         let resp = match crate::zen::client::fetch_zen_stream_with_headers(
             client,
             &config.zen_chat_url,
             &config.zen_api_key,
-            zb,
+            &attempt_body,
             &config.extra_headers,
         )
         .await
@@ -825,12 +876,31 @@ async fn handle_buffered_claude_code_huge_stream(
             CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
         );
         let content = response_text_for_profile(profile, &collected.content);
-        if content.trim().is_empty() && collected.tool_calls.is_empty() {
-            tracing::warn!(
-                attempt,
-                max_attempts = CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
-                "ClaudeCode huge stream buffered upstream returned empty output"
+        let output_class = super::classify_collected_output(&collected, &content);
+        if output_class != super::OutputClass::Valid {
+            super::log_empty_output_class(
+                "anthropic_buffered",
+                cr,
+                profile,
+                output_class,
+                attempt + 1,
+                CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
+                &collected,
             );
+            if output_class.should_retry_with_disabled_thinking() && !used_reasoning_disabled_retry
+            {
+                used_reasoning_disabled_retry = true;
+                attempt_body = super::reasoning_disabled_retry_body(zb);
+                tracing::warn!(
+                    protocol = "anthropic_buffered",
+                    model = %cr.model,
+                    source_client = ?profile.kind,
+                    empty_output_class = output_class.as_str(),
+                    attempt = attempt + 1,
+                    "retrying buffered reasoning-only output with disabled thinking"
+                );
+                continue;
+            }
             if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(cr) {
                 tracing::warn!(
                     model = cr.model,
@@ -945,7 +1015,7 @@ async fn handle_buffered_claude_code_huge_stream(
         ));
     }
 
-    Err(AppError::empty_upstream())
+    Err(AppError::empty_upstream_class("buffered_retry_exhausted"))
 }
 
 #[allow(clippy::too_many_arguments)]

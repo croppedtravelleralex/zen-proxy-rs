@@ -393,9 +393,17 @@ pub fn disable_thinking_by_default(_body: &mut Value) {
     // V4.6 no longer disables thinking for ordinary requests by default.
 }
 
-pub fn disable_thinking_for_tool_use(body: &mut Value) {
+pub fn set_thinking_disabled_if_absent(body: &mut Value) -> bool {
     if body.get("thinking").is_some() {
-        return;
+        return false;
+    }
+    body["thinking"] = serde_json::json!({"type":"disabled"});
+    true
+}
+
+pub fn disable_thinking_for_tool_use(body: &mut Value) -> bool {
+    if body.get("thinking").is_some() {
+        return false;
     }
     let has_tools = body
         .get("tools")
@@ -405,8 +413,9 @@ pub fn disable_thinking_for_tool_use(body: &mut Value) {
         .get("tool_choice")
         .is_some_and(|choice| !choice.is_null());
     if has_tools || has_tool_choice {
-        body["thinking"] = serde_json::json!({"type":"disabled"});
+        return set_thinking_disabled_if_absent(body);
     }
+    false
 }
 
 pub fn stabilize_short_user_prompt(_body: &mut Value) {

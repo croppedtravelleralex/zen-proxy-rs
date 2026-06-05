@@ -205,6 +205,23 @@
   3. 如日志仍无法区分用途，再补不含原文的 `last_user_prefix_class`。
   4. Windows ClaudeCode/cc-switch 若访问 panda Tailscale IP，需确认进程是否继承 `HTTP_PROXY=http://127.0.0.1:7897`；若继承，必须为 `100.69.228.93` 配置 no-proxy，否则 Windows HTTP 客户端可能走代理返回 502。
 
+### V4.99 reasoning-only 空输出保护
+
+- 状态：源码已落地，本地验证通过；panda 尚未部署。
+- 背景：V4.98 后 cache 前缀观测正常，但短/中非流式和低输出预算请求仍可能遇到上游只返回 `reasoning_content`、正文为空，最终被判为 `upstream returned no assistant content or tool call`。
+- 已完成：
+  1. 新增共享输出分类：`valid/empty_output/reasoning_only/reasoning_only_length`。
+  2. OpenAI/Anthropic 非流式遇到 `reasoning_only_length` 时只重试一次 `thinking: disabled`，不全局禁用 thinking。
+  3. 大流式 ClaudeCode 主会话、工具请求和长上下文仍保留默认 thinking 策略；低预算探针/ClaudeCode 小流式才做初始 disabled。
+  4. Anthropic ClaudeCode buffered stream 触发条件收窄：不再仅因 `max_tokens<=512` 进入 huge buffered。
+  5. 空输出错误和日志增加 `class=`、`reasoning_chars/content_chars/finish_reason/tool_call_count/short_request_kind`。
+  6. 新增 golden tests：OpenAI/Anthropic 非流式 reasoning-only-length disabled retry、小流式低预算不走 buffered retry、普通小非流式非探针仍不被本地 ok 误短路。
+- 待办：
+  1. 部署 panda 后验证 NewAPI 短非流式/小流式不再出现高发 `reasoning_only_length` 502。
+  2. 确认 ClaudeCode 大流式主会话没有被 `thinking: disabled` 误伤，Task/subagent 和 Markdown 格式不回退。
+  3. 观察 `class=empty_output` 是否仍高发；若高发且不是 reasoning-only，再回到节点质量、上游空输出或 ZenProxy lane/pool 排查。
+  4. 如后续需要 99+ 观测，把本仓库分类同步到 ZenProxy `/metrics` 或新增轻量诊断出口。
+
 ### 压测矩阵
 
 - 状态：方案和报告模板已落地，执行器与真实压测待落地。

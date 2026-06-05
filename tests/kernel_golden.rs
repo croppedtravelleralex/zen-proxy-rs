@@ -73,6 +73,11 @@ async fn mock_zen_handler(
                 .join("\n")
         })
         .unwrap_or_default();
+    let thinking_disabled = body
+        .get("thinking")
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        == Some("disabled");
 
     if prompt.contains("rate-limit") {
         return (
@@ -293,6 +298,10 @@ async fn mock_zen_handler(
                 }
             }]
         })
+    } else if prompt.contains("reasoning-only-length") && thinking_disabled {
+        json!({"choices": [{"delta": {"content": "golden answer after disabled thinking"}, "finish_reason": "stop"}]})
+    } else if prompt.contains("reasoning-only-length") {
+        json!({"choices": [{"delta": {"reasoning_content": "hidden chain only"}, "finish_reason": "length"}], "usage": {"prompt_tokens": 3, "completion_tokens": 128, "total_tokens": 131}})
     } else if prompt.contains("reasoning-only") {
         json!({"choices": [{"delta": {"reasoning_content": "hidden chain only"}}]})
     } else {
@@ -1129,10 +1138,10 @@ async fn openai_claude_code_tiny_non_probe_empty_upstream_stays_error() {
         .unwrap_err();
 
     assert_eq!(err.status, StatusCode::BAD_GATEWAY);
-    assert_eq!(
-        err.message,
-        "upstream returned no assistant content or tool call"
-    );
+    assert!(err
+        .message
+        .contains("upstream returned no assistant content or tool call"));
+    assert!(err.message.contains("class=empty_output"));
     assert_eq!(state.requests.lock().unwrap().len(), 3);
 }
 
@@ -2330,10 +2339,10 @@ async fn openai_empty_stream_probe_shortcuts_without_upstream() {
 }
 
 #[tokio::test]
-async fn claude_code_small_low_max_tokens_stream_uses_buffer_retry() {
+async fn claude_code_small_low_max_tokens_stream_disables_thinking_without_buffer_retry() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let mut request = anthropic_request("deepseek-v4-flash", "empty-once", true);
+    let mut request = anthropic_request("deepseek-v4-flash", "reasoning-only-length", true);
     request.max_tokens = Some(64);
 
     let response = kernel
@@ -2346,9 +2355,14 @@ async fn claude_code_small_low_max_tokens_stream_uses_buffer_retry() {
         .unwrap();
 
     let body = response_text(response).await;
-    assert!(body.contains("golden answer"));
+    assert!(body.contains("golden answer after disabled thinking"));
     assert!(!body.contains("upstream returned no assistant content or tool call"));
-    assert_eq!(state.requests.lock().unwrap().len(), 2);
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
 }
 
 #[tokio::test]
@@ -2670,6 +2684,65 @@ async fn reasoning_only_output_is_rejected_as_empty_upstream() {
         .unwrap_err();
     assert_eq!(err.status, axum::http::StatusCode::BAD_GATEWAY);
     assert!(err.message.contains("no assistant content"));
+}
+
+#[tokio::test]
+async fn openai_non_stream_reasoning_only_length_retries_with_disabled_thinking() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request(
+                "deepseek-v4-flash-free",
+                "reasoning-only-length",
+                false,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "golden answer after disabled thinking"
+    );
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].thinking.is_none());
+    assert_eq!(
+        requests[1].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_non_stream_reasoning_only_length_retries_with_disabled_thinking() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "reasoning-only-length", false),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(
+        body["content"][0]["text"],
+        "golden answer after disabled thinking"
+    );
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].thinking.is_none());
+    assert_eq!(
+        requests[1].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
 }
 
 #[tokio::test]

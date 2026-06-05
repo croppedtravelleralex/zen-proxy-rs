@@ -446,6 +446,19 @@ P1.15 2026-06-05 V4.98 cache-friendly session 源码记录：
 | 烟测结果 | NewAPI exact smoke `reply pong only` 返回 `PONG`；真实中文短问答返回 200；真实英文短问答出现 `upstream returned no assistant content or tool call`，用 V47 备份临时实例同 prompt 对照也 502，因此不是 V4.98 新增回归，而是既有上游空输出/节点质量问题。 |
 | 待验收 | 仍需用同一 ClaudeCode 长会话 A/B 观察 cache hit rate、`frt`、总耗时、空输出/工具错误和回答质量。 |
 
+P1.16 2026-06-05 V4.99 reasoning-aware output guard 源码记录：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | V4.98 部署后，大流式 ClaudeCode 主请求已能成功且 cache token 可见，但 panda/NewAPI 仍有短/中等非流式或低输出预算请求返回 `upstream returned no assistant content or tool call`。 |
+| 根因 | 上游 `deepseek-v4-flash-free` 在部分低预算请求里只返回 `reasoning_content`，正文 `content` 为空，且常见 `finish_reason=length`；旧逻辑只看正文和工具调用，因此把 reasoning-only 判为空输出。 |
+| 修复 | 新增共享输出分类：`valid/empty_output/reasoning_only/reasoning_only_length`；OpenAI/Anthropic 非流式遇到 `reasoning_only_length` 时只重试一次 `thinking: disabled`；流式不能安全重试时会记录并返回带 `class=` 的错误分类。 |
+| 策略 | 大流式 ClaudeCode 主会话、工具请求、长上下文仍不默认禁用 thinking；只对低预算探针/ClaudeCode 小流式探针做初始 `thinking: disabled`，并保留 Hermes/OpenClaw compat tool-use thinking 策略。 |
+| buffered | ClaudeCode Anthropic buffered stream 不再仅因 `max_tokens<=512` 触发；现在需要 exact-output literal，或 `before_tokens>=50k && max_tokens<=2048`。小流式请求走直接流式 + 初始低预算策略。 |
+| 错误可观测 | 空输出错误现在可带 `class=empty_output/reasoning_only/reasoning_only_length/buffered_retry_exhausted`；日志记录 `reasoning_chars/content_chars/finish_reason/tool_call_count/short_request_kind`。 |
+| 验证 | 本地 `cargo fmt`、`CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings`、`CARGO_INCREMENTAL=0 cargo test` 已通过；golden 测试新增 OpenAI/Anthropic 非流式 reasoning-only-length disabled retry 和小流式低预算不走 buffered retry。 |
+| 部署 | 源码已落地；尚未部署 panda，不能写成生产已验证。 |
+
 ## 临时产物归类
 
 | 路径 | 当前归类 | 处理原则 |
