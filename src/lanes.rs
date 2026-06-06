@@ -162,12 +162,38 @@ impl LaneLimiter {
                 return Ok(permit);
             }
             if waited_ms >= config.v43_lane_wait_timeout_ms {
+                let snapshot = state.snapshot();
+                let profile = request_profile(body);
+                let estimated_tokens = estimate_request_tokens(body);
+                let body_mb = body.len().div_ceil(1024 * 1024);
+                tracing::warn!(
+                    lane = lane_name(kind),
+                    lane_limit = snapshot.max,
+                    lane_in_flight = snapshot.in_flight,
+                    waited_ms,
+                    path,
+                    body_bytes = body.len(),
+                    body_mb,
+                    estimated_tokens,
+                    stream = profile.streaming,
+                    max_tokens = profile.max_tokens,
+                    tool_heavy = profile.tool_heavy,
+                    "zenproxy lane saturated"
+                );
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
                     axum::Json(serde_json::json!({
                         "error": {
                             "message": "zenproxy lane is saturated",
                             "lane": kind,
+                            "lane_name": lane_name(kind),
+                            "lane_limit": snapshot.max,
+                            "lane_in_flight": snapshot.in_flight,
+                            "waited_ms": waited_ms,
+                            "body_mb": body_mb,
+                            "estimated_tokens": estimated_tokens,
+                            "stream": profile.streaming,
+                            "max_tokens": profile.max_tokens,
                             "retry_after_ms": 250
                         }
                     })),
