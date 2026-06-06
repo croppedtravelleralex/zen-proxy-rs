@@ -16,6 +16,7 @@ pub struct Config {
     pub api_key: String,
     pub timeout: Duration,
     pub request_body_limit_bytes: usize,
+    pub true_first_token_frt: bool,
     pub free_models: Vec<String>,
     pub model_mappings: Vec<ModelMapping>,
 }
@@ -69,6 +70,7 @@ impl Config {
                 .max(1)
                 * 1024
                 * 1024,
+            true_first_token_frt: env_flag("FREE_MODEL_TRUE_FIRST_TOKEN_FRT", true),
             free_models: model_mappings
                 .iter()
                 .map(|mapping| mapping.public_name.clone())
@@ -76,4 +78,15 @@ impl Config {
             model_mappings,
         }
     }
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(default)
 }

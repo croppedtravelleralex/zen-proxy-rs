@@ -37,6 +37,7 @@ mod tests {
             api_key: api_key.into(),
             timeout: Duration::from_secs(120),
             request_body_limit_bytes: 64 * 1024 * 1024,
+            true_first_token_frt: true,
             free_models: vec![],
             model_mappings: vec![],
         }

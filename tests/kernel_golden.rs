@@ -387,6 +387,7 @@ async fn spawn_mock_zen() -> (KernelConfig, reqwest::Client, MockState) {
             "deepseek-v4-flash".to_string(),
             "deepseek-v4-flash-free".to_string(),
         )],
+        true_first_token_frt: true,
     };
     (config, client, state)
 }
@@ -953,8 +954,29 @@ async fn anthropic_stream_returns_golden_event_sequence() {
 }
 
 #[tokio::test]
-async fn claude_code_anthropic_stream_sends_idle_ping_before_delayed_content() {
+async fn claude_code_anthropic_stream_suppresses_pre_first_ping_for_true_frt() {
     let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            anthropic_request("deepseek-v4-flash", "delayed-before-content", true),
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(!body.contains("event: ping"));
+    assert!(!body.contains("\"type\":\"ping\""));
+    assert!(body.contains("delayed answer"));
+    assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_can_keep_legacy_pre_first_ping() {
+    let (mut config, client, _) = spawn_mock_zen().await;
+    config.true_first_token_frt = false;
     let kernel = FreeModelKernel::new(config);
     let response = kernel
         .anthropic_messages_with_profile(

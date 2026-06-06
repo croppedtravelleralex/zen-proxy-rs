@@ -754,8 +754,13 @@ async fn handle_stream(
     let base_body = zb.clone();
     let send_idle_ping = profile.kind == ClientKind::ClaudeCode;
     let idle_ping_interval = Duration::from_secs(CLAUDE_CODE_STREAM_IDLE_PING_SECS);
+    let true_first_token_frt = config.true_first_token_frt;
     let stream = async_stream::stream! {
-        yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+        let mut message_started = false;
+        if !true_first_token_frt {
+            yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+            message_started = true;
+        }
         let mut last_downstream_event = Instant::now();
         let mut idle_ping_count = 0_u64;
         let mut attempts_used = 0_usize;
@@ -834,18 +839,30 @@ async fn handle_stream(
                         Ok(next) => next,
                         Err(_) => {
                             idle_ping_count += 1;
-                            tracing::info!(
-                                protocol = "anthropic",
-                                model = %body.model,
-                                source_client = ?profile.kind,
-                                prompt_hash,
-                                attempt = attempts_used,
-                                idle_ping_count,
-                                idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
-                                "sent ClaudeCode stream idle ping while waiting for upstream event"
-                            );
-                            yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
-                            last_downstream_event = Instant::now();
+                            if !true_first_token_frt || message_started {
+                                tracing::info!(
+                                    protocol = "anthropic",
+                                    model = %body.model,
+                                    source_client = ?profile.kind,
+                                    prompt_hash,
+                                    attempt = attempts_used,
+                                    idle_ping_count,
+                                    idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
+                                    "sent ClaudeCode stream idle ping while waiting for upstream event"
+                                );
+                                yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
+                                last_downstream_event = Instant::now();
+                            } else {
+                                tracing::debug!(
+                                    protocol = "anthropic",
+                                    model = %body.model,
+                                    source_client = ?profile.kind,
+                                    prompt_hash,
+                                    attempt = attempts_used,
+                                    idle_ping_count,
+                                    "suppressed pre-first-token ping to keep NewAPI FRT tied to real content"
+                                );
+                            }
                             if should_retry_stream_without_forwardable_output(
                                 profile,
                                 attempt,
@@ -932,6 +949,10 @@ async fn handle_stream(
                                 !content.trim().is_empty()
                                     || (profile.preserves_stream_whitespace() && !content.is_empty());
                             if should_emit {
+                                if !message_started {
+                                    yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                                    message_started = true;
+                                }
                                 if !text_block_open {
                                     text_block_open = true;
                                     yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
@@ -953,18 +974,30 @@ async fn handle_stream(
                     last_downstream_event = Instant::now();
                 } else if send_idle_ping && last_downstream_event.elapsed() >= idle_ping_interval {
                     idle_ping_count += 1;
-                    tracing::info!(
-                        protocol = "anthropic",
-                        model = %body.model,
-                        source_client = ?profile.kind,
-                        prompt_hash,
-                        attempt = attempts_used,
-                        idle_ping_count,
-                        idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
-                        "sent ClaudeCode stream idle ping while upstream produced no forwardable output"
-                    );
-                    yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
-                    last_downstream_event = Instant::now();
+                    if !true_first_token_frt || message_started {
+                        tracing::info!(
+                            protocol = "anthropic",
+                            model = %body.model,
+                            source_client = ?profile.kind,
+                            prompt_hash,
+                            attempt = attempts_used,
+                            idle_ping_count,
+                            idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
+                            "sent ClaudeCode stream idle ping while upstream produced no forwardable output"
+                        );
+                        yield Ok(Event::default().event("ping").data(serde_json::json!({"type":"ping"}).to_string()));
+                        last_downstream_event = Instant::now();
+                    } else {
+                        tracing::debug!(
+                            protocol = "anthropic",
+                            model = %body.model,
+                            source_client = ?profile.kind,
+                            prompt_hash,
+                            attempt = attempts_used,
+                            idle_ping_count,
+                            "suppressed pre-first-token ping after non-forwardable upstream event"
+                        );
+                    }
                     if should_retry_stream_without_forwardable_output(
                         profile,
                         attempt,
@@ -1051,6 +1084,10 @@ async fn handle_stream(
             .map(crate::proxy::markdown::MarkdownFenceGuard::finish)
             .unwrap_or_default();
         if !final_markdown.is_empty() {
+            if !message_started {
+                yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                message_started = true;
+            }
             if !text_block_open {
                 text_block_open = true;
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
@@ -1065,6 +1102,10 @@ async fn handle_stream(
                     source_client = ?profile.kind,
                     "short channel-test probe received empty upstream; returning local ok"
                 );
+                if !message_started {
+                    yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                    message_started = true;
+                }
                 text_block_open = true;
                 text.push_str(fallback_text);
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
@@ -1100,6 +1141,9 @@ async fn handle_stream(
             yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string()));
         }
         if !tool_calls.is_empty() {
+            if !message_started {
+                yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+            }
             for (ti,tool) in tool_calls.iter().enumerate() {
                 let tidx = ti as u64 + u64::from(text_block_open);
                 let clean_id = tool.id.clone().unwrap_or_else(||format!("call_{}", tool.index));

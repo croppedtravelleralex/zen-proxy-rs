@@ -12,6 +12,7 @@ pub struct KernelConfig {
     pub zen_api_key: String,
     pub extra_headers: Vec<(String, String)>,
     pub model_mappings: Vec<(String, String)>,
+    pub true_first_token_frt: bool,
 }
 
 impl From<&Config> for KernelConfig {
@@ -25,6 +26,7 @@ impl From<&Config> for KernelConfig {
                 .iter()
                 .map(|mapping| (mapping.public_name.clone(), mapping.upstream_name.clone()))
                 .collect(),
+            true_first_token_frt: config.true_first_token_frt,
         }
     }
 }

@@ -615,8 +615,13 @@ async fn handle_oa_stream(
     };
     let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
     let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
+    let true_first_token_frt = config.true_first_token_frt;
     let stream = async_stream::stream! {
-        yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+        let mut role_sent = false;
+        if !true_first_token_frt {
+            yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+            role_sent = true;
+        }
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut markdown_guard = if profile.preserves_model_text_exactly() {
@@ -655,6 +660,10 @@ async fn handle_oa_stream(
                             !content.trim().is_empty()
                                 || (profile.preserves_stream_whitespace() && !content.is_empty());
                         if should_emit {
+                            if !role_sent {
+                                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                                role_sent = true;
+                            }
                             text.push_str(&content);
                             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string()));
                         }
@@ -673,6 +682,10 @@ async fn handle_oa_stream(
             .map(crate::proxy::markdown::MarkdownFenceGuard::finish)
             .unwrap_or_default();
         if !final_markdown.is_empty() {
+            if !role_sent {
+                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                role_sent = true;
+            }
             text.push_str(&final_markdown);
             yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":final_markdown},"finish_reason":null}]}).to_string()));
         }
@@ -683,6 +696,10 @@ async fn handle_oa_stream(
                     source_client = ?profile.kind,
                     "short channel-test probe received empty upstream; returning local ok"
                 );
+                if !role_sent {
+                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                    role_sent = true;
+                }
                 text.push_str(fallback_text);
                 yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":fallback_text},"finish_reason":null}]}).to_string()));
             } else {
@@ -711,6 +728,10 @@ async fn handle_oa_stream(
             }
         }
         for tool in tool_calls.iter() {
+            if !role_sent {
+                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                role_sent = true;
+            }
             let clean_id = tool.id.clone().unwrap_or_else(|| format!("call_{}", tool.index));
             let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
             let tc = ToolCall {

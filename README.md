@@ -33,6 +33,7 @@ cargo build --release
 | `FREE_MODEL_API_KEY` | development placeholder | Client API key; set a real value via env |
 | `FREE_MODEL_TIMEOUT_MS` | `120000` | Upstream timeout (ms) |
 | `FREE_MODEL_REQUEST_BODY_LIMIT_MB` | `64` | Incoming request body limit in MB |
+| `FREE_MODEL_TRUE_FIRST_TOKEN_FRT` | `true` | Delay stream prelude frames until real content/tool output so NewAPI FRT reflects the first real token instead of an empty protocol frame |
 | `ZEN_UPSTREAM_SESSION_TTL_SECS` | `3600` | Stable upstream session bucket TTL |
 
 ## Models
