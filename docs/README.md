@@ -34,6 +34,7 @@ Start here:
 | [18_v4.8_four_client_500_round_acceptance.md](./v4.0/18_v4.8_four_client_500_round_acceptance.md) | V4.8 99+ four-client 500-round acceptance plan for Windows ClaudeCode, WSL ClaudeCode, OpenClaw, and Hermes |
 | [19_2026-05-30_handoff_and_unfinished_work.md](./v4.0/19_2026-05-30_handoff_and_unfinished_work.md) | 2026-05-30 handoff: verified facts, unfinished Hermes/OpenClaw panda-NewAPI work, unimplemented V4.8 harness, and next-session guardrails |
 | [20_2026-06-01_final_anchor_deploy.md](./v4.0/20_2026-06-01_final_anchor_deploy.md) | 2026-06-01 panda deployment: ClaudeCode huge-context final-anchor, buffered retry, and panda-local huge stream smoke evidence |
+| [21_2026-06-06_stream_leasefix_and_usage_analysis.md](./v4.0/21_2026-06-06_stream_leasefix_and_usage_analysis.md) | 2026-06-06 stream client-gone lease fix, panda deployment evidence, NewAPI usage analysis, and per-node budget observations |
 
 ## AI Maintenance Rule
 

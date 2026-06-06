@@ -71,6 +71,7 @@ impl Pool for ActivePool {
                     let next = cur.saturating_add(1).min(20);
                     entry.max_concurrent.store(next, Ordering::Relaxed);
                 }
+                ResultKind::ClientGone => {}
                 ResultKind::RateLimited
                 | ResultKind::EmptyOutput
                 | ResultKind::SoftFailure { .. }

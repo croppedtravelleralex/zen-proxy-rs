@@ -53,7 +53,7 @@ the sidecar's own client, not the proxy node selected by `zen-proxy-rs`.
 V4.0 replaces all older documentation. Do not revive archived legacy docs or
 root-level legacy audit reports as active guidance.
 
-Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md) and then [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md) before making any claim about panda NewAPI, Hermes, OpenClaw, closeapi, ClaudeCode huge-context behavior, or V4.8 acceptance progress.
+Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md), [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md), and [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md) before making any claim about panda NewAPI, Hermes, OpenClaw, closeapi, ClaudeCode huge-context behavior, V4.8 acceptance progress, or current proxy-pool health.
 
 ## Required Reading Order
 
@@ -74,6 +74,7 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
 15. [V4.8 Four-Client 500-Round Acceptance](./18_v4.8_four_client_500_round_acceptance.md)
 16. [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md)
 17. [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md)
+18. [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md)
 
 ## Hard Decisions
 

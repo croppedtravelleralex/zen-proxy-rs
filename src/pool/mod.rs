@@ -31,6 +31,7 @@ pub enum ResultKind {
     Success(u16),
     RateLimited,
     EmptyOutput,
+    ClientGone,
     SoftFailure { kind: ErrorKind },
     Error { kind: ErrorKind },
 }

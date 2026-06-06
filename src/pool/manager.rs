@@ -224,6 +224,11 @@ where
                 self.dispatch
                     .release_with_latency(&node_id, &result, latency_ms);
             }
+            ResultKind::ClientGone => {
+                self.active.release(&node_id, &result);
+                self.dispatch
+                    .release_with_latency(&node_id, &result, latency_ms);
+            }
             ResultKind::SoftFailure { .. } => {
                 self.active.release(&node_id, &result);
                 self.dispatch

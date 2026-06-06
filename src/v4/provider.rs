@@ -28,6 +28,7 @@ use crate::v4::model::{ModelError, ModelRegistry, StaticModelRegistry};
 use crate::v4::protocol_guard::{self, GuardPhase};
 
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+const STREAM_DOWNSTREAM_SEND_TIMEOUT_SECS: u64 = 30;
 
 pub async fn handle_v4_proxy(
     state: &Arc<AppState>,
@@ -1637,12 +1638,15 @@ fn metered_stream_response(
 
     tokio::spawn(async move {
         let mut telemetry = telemetry;
+        let mut lease_guard =
+            StreamLeaseGuard::new(state.clone(), telemetry.selected_node_id.clone());
         let mut metrics = StreamMetrics::new(fallback_usage);
         let mut first_chunk_ms = 0u64;
         let mut first_content_token_ms = 0u64;
         let mut first_tool_call_ms = 0u64;
         let mut stream_error: Option<String> = None;
         let mut client_gone = false;
+        let mut client_gone_reason = "client disconnected before stream completed".to_string();
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(bytes) => {
@@ -1668,20 +1672,41 @@ fn metered_stream_response(
                     if first_tool_call_ms == 0 && !had_tool && metrics.has_tool_signal() {
                         first_tool_call_ms = elapsed_ms;
                     }
-                    if tx.send(Ok(bytes)).await.is_err() {
-                        client_gone = true;
-                        break;
+                    match send_stream_bytes(&tx, bytes).await {
+                        Ok(()) => {}
+                        Err(StreamSendError::Closed) => {
+                            client_gone = true;
+                            client_gone_reason =
+                                "client disconnected before stream completed".to_string();
+                            break;
+                        }
+                        Err(StreamSendError::Timeout) => {
+                            client_gone = true;
+                            client_gone_reason = format!(
+                                "downstream stream backpressure exceeded {}s",
+                                STREAM_DOWNSTREAM_SEND_TIMEOUT_SECS
+                            );
+                            break;
+                        }
                     }
                 }
                 Err(err) => {
                     let kind = classify_stream_body_error(&err);
                     let message = format!("upstream stream error ({kind}): {err}");
-                    if tx
-                        .send(Ok(stream_error_frame(&path, &message)))
-                        .await
-                        .is_err()
-                    {
-                        client_gone = true;
+                    match send_stream_bytes(&tx, stream_error_frame(&path, &message)).await {
+                        Ok(()) => {}
+                        Err(StreamSendError::Closed) => {
+                            client_gone = true;
+                            client_gone_reason =
+                                "client disconnected before stream error frame".to_string();
+                        }
+                        Err(StreamSendError::Timeout) => {
+                            client_gone = true;
+                            client_gone_reason = format!(
+                                "downstream stream backpressure exceeded {}s before error frame",
+                                STREAM_DOWNSTREAM_SEND_TIMEOUT_SECS
+                            );
+                        }
                     }
                     stream_error = Some(message);
                     break;
@@ -1711,7 +1736,7 @@ fn metered_stream_response(
         if client_gone {
             telemetry.outcome = "client_gone".to_string();
             telemetry.failure_kind = "client_gone".to_string();
-            telemetry.failure_message = "client disconnected before stream completed".to_string();
+            telemetry.failure_message = client_gone_reason;
             telemetry.retry_chain.push(RequestAttemptTelemetry {
                 attempt: telemetry.retry_count,
                 node_id: telemetry.selected_node_id.clone(),
@@ -1721,6 +1746,7 @@ fn metered_stream_response(
                 outcome: "client_gone".to_string(),
                 error_type: "client_gone".to_string(),
             });
+            lease_guard.release(ResultKind::ClientGone, stream_complete_ms);
         } else if let Some(message) = stream_error {
             let error_type = classify_stream_error_message(&message).to_string();
             telemetry.outcome = "stream_error".to_string();
@@ -1742,6 +1768,7 @@ fn metered_stream_response(
                 },
                 stream_complete_ms,
             );
+            lease_guard.mark_released();
         } else if empty_output {
             telemetry.outcome = "empty_output".to_string();
             telemetry.failure_kind = "empty_output".to_string();
@@ -1761,6 +1788,7 @@ fn metered_stream_response(
                 ResultKind::EmptyOutput,
                 stream_complete_ms,
             );
+            lease_guard.mark_released();
         } else {
             if !telemetry.affinity_key.is_empty() {
                 state.pool_manager.record_affinity_success(
@@ -1773,6 +1801,7 @@ fn metered_stream_response(
                 ResultKind::Success(telemetry.status),
                 stream_complete_ms,
             );
+            lease_guard.mark_released();
         }
         collector.record_request(&telemetry);
     });
@@ -1781,6 +1810,74 @@ fn metered_stream_response(
     *rebuilt.status_mut() = status;
     *rebuilt.headers_mut() = headers;
     rebuilt
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSendError {
+    Closed,
+    Timeout,
+}
+
+async fn send_stream_bytes(
+    tx: &mpsc::Sender<Result<Bytes, Infallible>>,
+    bytes: Bytes,
+) -> Result<(), StreamSendError> {
+    match tokio::time::timeout(
+        Duration::from_secs(STREAM_DOWNSTREAM_SEND_TIMEOUT_SECS),
+        tx.send(Ok(bytes)),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(StreamSendError::Closed),
+        Err(_) => Err(StreamSendError::Timeout),
+    }
+}
+
+struct StreamLeaseGuard {
+    state: Arc<AppState>,
+    node_id: String,
+    released: bool,
+}
+
+impl StreamLeaseGuard {
+    fn new(state: Arc<AppState>, node_id: String) -> Self {
+        Self {
+            state,
+            node_id,
+            released: false,
+        }
+    }
+
+    fn release(&mut self, result: ResultKind, latency_ms: u64) {
+        if self.released || self.node_id.is_empty() {
+            return;
+        }
+        self.state
+            .pool_manager
+            .report(self.node_id.clone(), result, latency_ms);
+        self.released = true;
+    }
+
+    fn mark_released(&mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for StreamLeaseGuard {
+    fn drop(&mut self) {
+        if self.released || self.node_id.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            node_id = %self.node_id,
+            "stream lease guard released leaked stream lease"
+        );
+        self.state
+            .pool_manager
+            .report(self.node_id.clone(), ResultKind::ClientGone, 0);
+        self.released = true;
+    }
 }
 
 fn stream_error_frame(path: &str, message: &str) -> Bytes {
@@ -2458,6 +2555,18 @@ mod tests {
             "stream_connection_error"
         );
         assert_eq!(classify_stream_error_message("other"), "stream_error");
+    }
+
+    #[tokio::test]
+    async fn stream_send_detects_closed_downstream() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(1);
+        drop(rx);
+
+        let err = send_stream_bytes(&tx, Bytes::from_static(b"data: test\n\n"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, StreamSendError::Closed);
     }
 
     #[test]

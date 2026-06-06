@@ -949,6 +949,12 @@ impl Pool for DispatchPool {
         if let Some(pn) = nodes.iter_mut().find(|n| n.node.id == *node_id) {
             pn.release_lease();
             if let Some(meta) = pn.take_admitted_meta() {
+                if matches!(result, ResultKind::ClientGone) {
+                    if let Some(registry) = &self.global_budget {
+                        registry.release_one(node_id);
+                    }
+                    return;
+                }
                 pn.record_completion_latency_for_meta(&meta, latency_ms);
             }
             if let Some(registry) = &self.global_budget {
@@ -966,6 +972,7 @@ impl Pool for DispatchPool {
                 ResultKind::EmptyOutput => {
                     pn.record_result(false, latency_ms, &self.aimd);
                 }
+                ResultKind::ClientGone => {}
                 ResultKind::SoftFailure { .. } => {
                     pn.record_result(false, latency_ms, &self.aimd);
                 }
@@ -1207,6 +1214,36 @@ mod tests {
         assert_eq!(
             detail["token_completion_latency_ms"]["200k_400k"].as_u64(),
             Some(4_321)
+        );
+    }
+
+    #[test]
+    fn client_gone_releases_lease_without_learning_completion_latency() {
+        let pool = DispatchPool::new();
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:108511".to_string(),
+        ));
+
+        let node = pool.acquire_for(&meta(1_200_000)).unwrap();
+        let before = pool.node_budget_detail(&node.id).unwrap()["local_budget"]["max_concurrent"]
+            .as_u64()
+            .unwrap();
+
+        pool.release_with_latency(&node.id, &ResultKind::ClientGone, 99_999);
+
+        let snapshot = pool
+            .budget_snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.node_id == node.id)
+            .unwrap();
+        let detail = pool.node_budget_detail(&node.id).unwrap();
+        let after = detail["local_budget"]["max_concurrent"].as_u64().unwrap();
+
+        assert_eq!(snapshot.concurrent_now, 0);
+        assert_eq!(after, before);
+        assert_eq!(
+            detail["body_completion_latency_ms"]["huge"].as_u64(),
+            Some(0)
         );
     }
 
