@@ -552,7 +552,7 @@ P1.20 2026-06-06 provider reasoning_content 400 修复记录：
 | 修复 | 对 `provider_missing_reasoning_content` 增加一次性 disabled-thinking 重试，覆盖 OpenAI/Anthropic 非流式、OpenAI 流式、ClaudeCode Anthropic 流式和 buffered huge-stream；只有 provider 明确返回该错误才触发。 |
 | 错误映射 | 上游错误 public response 统一脱敏，不再返回 `opencode zen` 或原始 provider body；返回稳定 `type/code/message`，并保留 `Retry-After`。 |
 | 本地验证 | `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；库测试 89 条、kernel golden 103 条。新增 3 条 golden 覆盖 missing reasoning_content 非流式/流式重试和 public error 脱敏。 |
-| 部署状态 | 尚未部署 panda；部署后需复查 channel 69 是否仍出现 `provider_missing_reasoning_content` 或 `opencode zen`。 |
+| 部署状态 | 已于 2026-06-06 12:40 部署 panda 三实例；源码 commit `68bf5383f7c8915f0950a6864134b77dd51a1214`，线上 stripped hash `d5b7558c9f8f9fc7ea6faa802634dba85435868f1e338a4830f77079c3a1fc8e`，旧版本备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260606-124001.pre-68bf538`。部署后 ZenProxy `/health`、`/v1/models`、ZenProxy OpenAI/Anthropic smoke、panda NewAPI OpenAI/Anthropic smoke 均通过；部署后 10 分钟窗口未见新的 `reasoning_content`、`opencode zen`、空输出或 NewAPI 错误日志。 |
 
 ## 临时产物归类
 
