@@ -30,6 +30,14 @@ Required fields:
   `affinity_key`, `affinity_hit`, `affinity_node_id`, `body_size_bucket`
 - token usage when available
 
+`first_chunk_ms` / `protocol_first_byte_ms` is not always the same thing as
+real first content. When the free-model kernel runs with
+`FREE_MODEL_TRUE_FIRST_TOKEN_FRT=true` (default), ordinary OpenAI/Anthropic
+stream prelude frames are delayed until real text or tool output is ready, so
+NewAPI FRT is closer to real first token time. If that flag is disabled, NewAPI
+FRT can again mean only an empty protocol frame or pre-first ping. The canonical
+true-content fields remain `first_content_token_ms` and `first_tool_call_ms`.
+
 ## Exit-IP Proof
 
 V4.0 must make the selected transport verifiable.

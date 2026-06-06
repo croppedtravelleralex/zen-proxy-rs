@@ -263,6 +263,7 @@ pub struct Config {
     pub audit_log_enabled: bool,
     pub audit_log_dir: String,
     pub zen_provider_mode: ProviderMode,
+    pub free_model_true_first_token_frt: bool,
     pub v4_model_registry_enabled: bool,
     pub node_max_calls_per_window: u64,
     pub node_max_tokens_per_window: u64,
@@ -392,6 +393,7 @@ impl Config {
             audit_log_dir: env::var("AUDIT_LOG_DIR")
                 .unwrap_or_else(|_| "/tmp/zen-proxy-audit".into()),
             zen_provider_mode: load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy),
+            free_model_true_first_token_frt: load_env_var("FREE_MODEL_TRUE_FIRST_TOKEN_FRT", true),
             v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
             node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
             node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 10_000_000u64),
@@ -672,6 +674,7 @@ mod tests {
             "OPENCODE_PROJECT_SEED",
             "OPENCODE_SESSION_TTL_SECS",
             "ZEN_PROVIDER_MODE",
+            "FREE_MODEL_TRUE_FIRST_TOKEN_FRT",
             "V4_MODEL_REGISTRY_ENABLED",
             "V4_RETRY_BUDGET_MS",
             "CONNECT_TIMEOUT_SECS",
@@ -744,6 +747,7 @@ mod tests {
         assert_eq!(cfg.opencode_project_seed, "zen-proxy-rs");
         assert_eq!(cfg.opencode_session_ttl_secs, 1800);
         assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
+        assert!(cfg.free_model_true_first_token_frt);
         assert!(!cfg.v4_model_registry_enabled);
         assert_eq!(cfg.v4_retry_budget_ms, 45_000);
         assert_eq!(cfg.connect_timeout_secs, 5);
@@ -822,6 +826,7 @@ mod tests {
         unsafe { env::set_var("OPENCODE_HEADERS_ENABLED", "true") };
         unsafe { env::set_var("OPENCODE_CLIENT_NAME", "desktop-cli") };
         unsafe { env::set_var("ZEN_PROVIDER_MODE", "free_model_kernel") };
+        unsafe { env::set_var("FREE_MODEL_TRUE_FIRST_TOKEN_FRT", "false") };
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
         unsafe { env::set_var("V4_RETRY_BUDGET_MS", "12345") };
         unsafe { env::set_var("CONNECT_TIMEOUT_SECS", "9") };
@@ -901,6 +906,7 @@ mod tests {
         assert!(cfg.opencode_headers_enabled);
         assert_eq!(cfg.opencode_client_name, "desktop-cli");
         assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
+        assert!(!cfg.free_model_true_first_token_frt);
         assert!(cfg.v4_model_registry_enabled);
         assert_eq!(cfg.v4_retry_budget_ms, 12_345);
         assert_eq!(cfg.connect_timeout_secs, 9);
@@ -981,6 +987,7 @@ mod tests {
             "OPENCODE_HEADERS_ENABLED",
             "OPENCODE_CLIENT_NAME",
             "ZEN_PROVIDER_MODE",
+            "FREE_MODEL_TRUE_FIRST_TOKEN_FRT",
             "V4_MODEL_REGISTRY_ENABLED",
             "V4_RETRY_BUDGET_MS",
             "CONNECT_TIMEOUT_SECS",

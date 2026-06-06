@@ -813,6 +813,7 @@ async fn call_with_retry(
                 .iter()
                 .map(|(public, upstream)| (public.clone(), upstream.clone()))
                 .collect(),
+            true_first_token_frt: conf.free_model_true_first_token_frt,
         });
         let call_start = Instant::now();
         let response = match path {
