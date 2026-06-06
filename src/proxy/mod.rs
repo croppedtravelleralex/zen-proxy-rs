@@ -4,6 +4,7 @@ pub mod openai;
 pub mod sse;
 
 use crate::client_profile::{ClientKind, ClientProfile};
+use crate::error::AppError;
 use crate::protocol::{translate, types::ChatRequest};
 use crate::zen::client::{CollectedStream, ProviderCacheSignals};
 
@@ -122,6 +123,33 @@ pub(crate) fn reasoning_disabled_retry_body(body: &serde_json::Value) -> serde_j
     let mut retry = body.clone();
     translate::set_thinking_disabled_if_absent(&mut retry);
     retry
+}
+
+pub(crate) fn should_retry_missing_reasoning_content(
+    err: &AppError,
+    used_disabled_thinking_retry: bool,
+) -> bool {
+    err.is_missing_reasoning_content() && !used_disabled_thinking_retry
+}
+
+pub(crate) fn log_missing_reasoning_content_retry(
+    protocol: &'static str,
+    request: &ChatRequest,
+    profile: ClientProfile,
+    attempt: usize,
+) {
+    let shape = translate::request_shape(request);
+    tracing::warn!(
+        protocol,
+        model = %request.model,
+        source_client = ?profile.kind,
+        attempt,
+        prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
+        prompt_tokens = shape.estimated_total_tokens,
+        message_count = shape.message_count,
+        tool_count = shape.tool_count,
+        "retrying upstream missing reasoning_content error with disabled thinking"
+    );
 }
 
 pub(crate) fn log_request_shape(

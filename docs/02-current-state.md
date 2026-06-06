@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-06-05
+更新时间：2026-06-06
 分支：`codex/v47-client-split-cache-harness`
 
 ## 代码已确认能力
@@ -18,7 +18,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - `fmt --check` 通过。
 - `clippy --all-targets -- -D warnings` 通过。
-- `cargo test` 通过：库测试 83 条、kernel golden 100 条、doc tests 0 条。
+- `cargo test` 通过：库测试 89 条、kernel golden 103 条、doc tests 0 条。
 - `zen-proxy-rs` 本轮已改外层 V4 context compactor 和 e2e harness；当前已验证 `clippy -D warnings`、bin 单元测试 132 条、context 相关单元测试 12 条、e2e 27 条、shell e2e 9/9 通过。
 
 注意：上述验证覆盖本仓库当前源码。2026-06-04 18:54 已将输出限制取消、模型策略收窄、flash/free 输入放行和 cache 四态观测构建进 `zen-proxy-rs` release 并部署到 panda；部署后已通过 NewAPI models、短请求和手工大上下文不折叠 smoke。真实 panda `policy-smoke/policy-dry` 和四客户端压测仍未跑，不能当作生产压测结论。
@@ -59,6 +59,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 32. 2026-06-05 已补并部署 ClaudeCode Anthropic 流式 idle ping 保活：仅对 `source_client=ClaudeCode` 的 Anthropic SSE 流，在 15 秒内没有下游可转发事件时发送协议级 `event: ping` / `{"type":"ping"}`；不伪造内容、不计入 first content、不改写 prompt，用来降低 50k+ 流式请求在真实内容前被 NewAPI/客户端判为 `client_gone` 的概率。
 33. 2026-06-06 已补并部署 V4.99 ClaudeCode Anthropic Stream Guard：当 ClaudeCode Anthropic stream 在真实 text/tool 输出前遇到上游 `stream truncated before DONE or finish_reason` 或 60 秒无可转发内容时，最多 3 次原地重试；最后一次仅在工具请求场景启用 disabled thinking 兜底。正常请求不改 prompt、不裁剪输入、不限制输出、不默认禁用 thinking。
 34. 2026-06-06 已补 Anthropic 工具调用 `input_json_delta` 分片：普通流式和 buffered huge-stream 返回工具参数时按 4KB 安全切片发送，保证拼接后 JSON 字符完全一致，降低大 Write 参数导致客户端/中间层解析压力。ClaudeCode 显式 forced `tool_choice` 会首跳禁用 thinking，避免上游返回 `Thinking mode does not support this tool_choice`；`tool_choice=auto` 和普通 tools 请求仍保持默认 thinking。
+35. 2026-06-06 已补 provider `reasoning_content` 缺失兜底：当上游直接返回 `The reasoning_content in the thinking mode must be passed back to the API` 时，OpenAI/Anthropic 非流式、OpenAI 流式、ClaudeCode Anthropic 流式和 buffered huge-stream 会将同一请求重试一次 `thinking: disabled`；仅在 provider 明确拒绝当前请求后触发，不全局禁用 ClaudeCode tools auto thinking。
+36. 2026-06-06 已补上游错误脱敏映射：`AppError::upstream` 不再把 `opencode zen`、上游原始 body、内部路由或节点标识写进 public response；public body 使用 `upstream_provider_error` 和稳定 `code`，私有 provider 状态只进服务端日志。
 
 ## 附属工具
 
@@ -540,6 +542,17 @@ P1.19 2026-06-06 V4.99 ClaudeCode Anthropic Stream Guard 部署记录：
 | NewAPI smoke | panda 本机有效 `vip` token 下，`/v1/models` HTTP 200；Anthropic stream PONG HTTP 200、`message_stop` 存在、`event:error=0`；Anthropic forced `tool_choice` 工具流 HTTP 200，`tool_use` 和 `input_json_delta` 存在，`Thinking mode does not support this tool_choice=0`。 |
 | 部署后观察 | 00:54:16 最终部署后 channel 69 采样 13/13 成功、0 错误。部署前仍有 3 条非流式 300s/504 旧记录，属于另一类长非流式超时，不计入 V4.99 Stream Guard 后验收。 |
 | 残留 | 仍需用户真实 ClaudeCode 长会话观察 1-2 小时，重点看 `stream guard retrying`、`refusing to emit possibly partial tool calls`、`stream truncated` 是否继续出现；非流式 300s/504 需另按 long non-stream 保护排查。 |
+
+P1.20 2026-06-06 provider reasoning_content 400 修复记录：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | NewAPI channel 69 日志出现 `status_code=400/500`，public content 包含 `opencode zen 400` 和 provider 返回的 `The reasoning_content in the thinking mode must be passed back to the API`。 |
+| 根因 | ClaudeCode Anthropic `/v1/messages` 被内核转换为 OpenAI-compatible 上游请求；历史 assistant/tool 调用没有可回传的 `reasoning_content`，但普通 tools auto 仍保持默认 thinking，DeepSeek provider 直接 400。 |
+| 修复 | 对 `provider_missing_reasoning_content` 增加一次性 disabled-thinking 重试，覆盖 OpenAI/Anthropic 非流式、OpenAI 流式、ClaudeCode Anthropic 流式和 buffered huge-stream；只有 provider 明确返回该错误才触发。 |
+| 错误映射 | 上游错误 public response 统一脱敏，不再返回 `opencode zen` 或原始 provider body；返回稳定 `type/code/message`，并保留 `Retry-After`。 |
+| 本地验证 | `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；库测试 89 条、kernel golden 103 条。新增 3 条 golden 覆盖 missing reasoning_content 非流式/流式重试和 public error 脱敏。 |
+| 部署状态 | 尚未部署 panda；部署后需复查 channel 69 是否仍出现 `provider_missing_reasoning_content` 或 `opencode zen`。 |
 
 ## 临时产物归类
 

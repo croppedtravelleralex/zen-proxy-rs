@@ -230,17 +230,33 @@ async fn handle_oa_non_stream(
         let mut last_empty = false;
         let mut last_empty_class = None;
         let mut used_reasoning_disabled_retry = false;
+        let mut used_missing_reasoning_disabled_retry = false;
         let mut attempt_body = zb.clone();
         let mut output = None;
         for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
-            let resp = crate::zen::client::fetch_zen_stream_with_headers(
+            let resp = match crate::zen::client::fetch_zen_stream_with_headers(
                 client,
                 &config.zen_chat_url,
                 &config.zen_api_key,
                 &attempt_body,
                 &config.extra_headers,
             )
-            .await?;
+            .await
+            {
+                Ok(resp) => resp,
+                Err(err)
+                    if super::should_retry_missing_reasoning_content(
+                        &err,
+                        used_missing_reasoning_disabled_retry,
+                    ) =>
+                {
+                    used_missing_reasoning_disabled_retry = true;
+                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    super::log_missing_reasoning_content_retry("openai", cr, profile, attempt + 1);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
             observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
             let collected = crate::zen::client::collect_stream_parts(resp).await?;
@@ -570,14 +586,33 @@ async fn handle_oa_stream(
     let id = cid.clone();
     let prompt = translate::build_prompt_text(&cr.messages);
     let body = cr.clone();
-    let resp = crate::zen::client::fetch_zen_stream_with_headers(
-        client,
-        &config.zen_chat_url,
-        &config.zen_api_key,
-        zb,
-        &config.extra_headers,
-    )
-    .await?;
+    let mut attempt_body = zb.clone();
+    let mut used_missing_reasoning_disabled_retry = false;
+    let resp = loop {
+        match crate::zen::client::fetch_zen_stream_with_headers(
+            client,
+            &config.zen_chat_url,
+            &config.zen_api_key,
+            &attempt_body,
+            &config.extra_headers,
+        )
+        .await
+        {
+            Ok(resp) => break resp,
+            Err(err)
+                if super::should_retry_missing_reasoning_content(
+                    &err,
+                    used_missing_reasoning_disabled_retry,
+                ) =>
+            {
+                used_missing_reasoning_disabled_retry = true;
+                attempt_body = super::reasoning_disabled_retry_body(zb);
+                super::log_missing_reasoning_content_retry("openai_stream", cr, profile, 1);
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    };
     let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
     let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
     let stream = async_stream::stream! {

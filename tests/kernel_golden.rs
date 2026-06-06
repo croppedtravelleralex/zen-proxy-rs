@@ -87,6 +87,36 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("leaky-upstream-error") {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            json!({
+                "error": {
+                    "message": "opencode zen 400: internal proxy route leaked",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error"
+                }
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
+    if prompt.contains("missing-reasoning-content") && !thinking_disabled {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            json!({
+                "error": {
+                    "message": "Error from provider (DeepSeek): The `reasoning_content` in the thinking mode must be passed back to the API.",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error"
+                }
+            })
+            .to_string(),
+        )
+            .into_response();
+    }
     if prompt.contains("broken-json") {
         return (
             StatusCode::OK,
@@ -2850,6 +2880,73 @@ async fn anthropic_non_stream_reasoning_only_length_retries_with_disabled_thinki
 }
 
 #[tokio::test]
+async fn anthropic_non_stream_missing_reasoning_content_retries_with_disabled_thinking() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "missing-reasoning-content", false);
+    request.max_tokens = Some(32_000);
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({"file_path": {"type": "string"}, "content": {"type": "string"}}),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["content"][0]["text"], "golden answer");
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].thinking.is_none());
+    assert_eq!(
+        requests[1].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_stream_missing_reasoning_content_retries_with_disabled_thinking() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "missing-reasoning-content", true);
+    request.max_tokens = Some(32_000);
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({"file_path": {"type": "string"}, "content": {"type": "string"}}),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer"));
+    assert!(!body.contains("reasoning_content in the thinking mode"));
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].thinking.is_none());
+    assert_eq!(
+        requests[1].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
+}
+
+#[tokio::test]
 async fn upstream_429_is_returned_as_rate_limit_error() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -2861,7 +2958,8 @@ async fn upstream_429_is_returned_as_rate_limit_error() {
         .await
         .unwrap_err();
     assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
-    assert!(err.message.contains("FreeUsageLimitError"));
+    assert!(err.message.contains("upstream provider rate limited"));
+    assert!(!err.message.contains("FreeUsageLimitError"));
     assert_eq!(
         err.upstream_headers
             .unwrap()
@@ -2870,6 +2968,30 @@ async fn upstream_429_is_returned_as_rate_limit_error() {
             .map(|(_, value)| value.as_str()),
         Some("60")
     );
+}
+
+#[tokio::test]
+async fn upstream_error_message_does_not_leak_internal_proxy_label() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let err = kernel
+        .openai_chat(
+            &client,
+            chat_request(
+                "deepseek-v4-flash-free",
+                "leaky-upstream-error",
+                false,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(!err.message.contains("opencode"));
+    assert!(!err.message.contains("zen"));
+    assert!(!err.message.contains("internal proxy route"));
+    assert!(err.message.contains("upstream provider error"));
 }
 
 #[tokio::test]
