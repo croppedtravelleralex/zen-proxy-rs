@@ -7,6 +7,11 @@ use crate::client_profile::{ClientKind, ClientProfile};
 use crate::error::AppError;
 use crate::protocol::{translate, types::ChatRequest};
 use crate::zen::client::{CollectedStream, ProviderCacheSignals};
+use serde_json::{json, Value};
+
+const PROVIDER_INVALID_RETRY_LARGE_USER_BYTES: usize = 12 * 1024;
+const PROVIDER_INVALID_RETRY_HEAD_CHARS: usize = 6 * 1024;
+const PROVIDER_INVALID_RETRY_TAIL_CHARS: usize = 2 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputClass {
@@ -121,8 +126,184 @@ fn is_forced_tool_choice(tool_choice: Option<&serde_json::Value>) -> bool {
 
 pub(crate) fn reasoning_disabled_retry_body(body: &serde_json::Value) -> serde_json::Value {
     let mut retry = body.clone();
-    translate::set_thinking_disabled_if_absent(&mut retry);
+    retry["thinking"] = json!({"type":"disabled"});
     retry
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderInvalidRetryMode {
+    DisableThinking,
+    TextOnly,
+}
+
+impl ProviderInvalidRetryMode {
+    const fn strips_tools(self) -> bool {
+        matches!(self, Self::TextOnly)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DisableThinking => "disable_thinking",
+            Self::TextOnly => "text_only",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderInvalidRetryStats {
+    pub sanitized_tools: usize,
+    pub compacted_user_messages: usize,
+    pub stripped_tools: bool,
+}
+
+pub(crate) fn provider_invalid_tool_history_retry_mode(
+    err: &AppError,
+    request: &ChatRequest,
+    profile: ClientProfile,
+    repair: translate::ToolHistoryRepair,
+    used_disabled_thinking_retry: bool,
+    used_text_only_retry: bool,
+) -> Option<ProviderInvalidRetryMode> {
+    if !err.is_provider_invalid_request()
+        || !is_risky_claude_code_tool_history_request(request, profile, repair)
+    {
+        return None;
+    }
+    if !used_disabled_thinking_retry {
+        return Some(ProviderInvalidRetryMode::DisableThinking);
+    }
+    if !used_text_only_retry {
+        return Some(ProviderInvalidRetryMode::TextOnly);
+    }
+    None
+}
+
+pub(crate) fn provider_invalid_tool_history_retry_body(
+    body: &Value,
+    mode: ProviderInvalidRetryMode,
+) -> (Value, ProviderInvalidRetryStats) {
+    let mut retry = reasoning_disabled_retry_body(body);
+    let sanitized_tools = sanitize_upstream_tools(&mut retry);
+    let compacted_user_messages = compact_large_user_messages_for_retry(&mut retry);
+    if mode.strips_tools() {
+        retry["tools"] = Value::Null;
+        retry["tool_choice"] = Value::Null;
+    }
+    (
+        retry,
+        ProviderInvalidRetryStats {
+            sanitized_tools,
+            compacted_user_messages,
+            stripped_tools: mode.strips_tools(),
+        },
+    )
+}
+
+fn is_risky_claude_code_tool_history_request(
+    request: &ChatRequest,
+    profile: ClientProfile,
+    repair: translate::ToolHistoryRepair,
+) -> bool {
+    profile.kind == ClientKind::ClaudeCode
+        && !request.stream.unwrap_or(false)
+        && request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        && (repair.downgraded_tool_results > 0 || repair.downgraded_assistant_calls > 0)
+}
+
+fn sanitize_upstream_tools(body: &mut Value) -> usize {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut changed = 0usize;
+    for tool in tools {
+        let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let params = function
+            .entry("parameters")
+            .or_insert_with(|| json!({"type":"object","properties":{}}));
+        if !params.is_object() {
+            *params = json!({"type":"object","properties":{}});
+            changed += 1;
+            continue;
+        }
+        let Some(params_obj) = params.as_object_mut() else {
+            continue;
+        };
+        if params_obj.get("type").and_then(Value::as_str) != Some("object") {
+            params_obj.insert("type".to_string(), Value::String("object".to_string()));
+            changed += 1;
+        }
+        if !params_obj.get("properties").is_some_and(Value::is_object) {
+            params_obj.insert("properties".to_string(), Value::Object(Default::default()));
+            changed += 1;
+        }
+        let property_keys = params_obj
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|props| props.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if let Some(required) = params_obj.get_mut("required") {
+            if let Some(items) = required.as_array_mut() {
+                let before = items.len();
+                items.retain(|item| {
+                    item.as_str()
+                        .is_some_and(|key| property_keys.iter().any(|known| known == key))
+                });
+                if items.len() != before {
+                    changed += 1;
+                }
+            } else {
+                *required = Value::Array(Vec::new());
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+fn compact_large_user_messages_for_retry(body: &mut Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut changed = 0usize;
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        let Some(text) = content.as_str() else {
+            continue;
+        };
+        if text.len() <= PROVIDER_INVALID_RETRY_LARGE_USER_BYTES {
+            continue;
+        }
+        *content = Value::String(compact_text_for_provider_invalid_retry(text));
+        changed += 1;
+    }
+    changed
+}
+
+fn compact_text_for_provider_invalid_retry(text: &str) -> String {
+    let head = text
+        .chars()
+        .take(PROVIDER_INVALID_RETRY_HEAD_CHARS)
+        .collect::<String>();
+    let tail_reversed = text
+        .chars()
+        .rev()
+        .take(PROVIDER_INVALID_RETRY_TAIL_CHARS)
+        .collect::<String>();
+    let tail = tail_reversed.chars().rev().collect::<String>();
+    format!(
+        "{head}\n[free-model-client-rs provider-invalid retry: omitted stale recovered tool context; original_bytes={}]\n{tail}",
+        text.len()
+    )
 }
 
 pub(crate) fn should_retry_missing_reasoning_content(
@@ -130,6 +311,35 @@ pub(crate) fn should_retry_missing_reasoning_content(
     used_disabled_thinking_retry: bool,
 ) -> bool {
     err.is_missing_reasoning_content() && !used_disabled_thinking_retry
+}
+
+pub(crate) fn log_provider_invalid_tool_history_retry(
+    protocol: &'static str,
+    request: &ChatRequest,
+    profile: ClientProfile,
+    repair: translate::ToolHistoryRepair,
+    mode: ProviderInvalidRetryMode,
+    stats: ProviderInvalidRetryStats,
+    attempt: usize,
+) {
+    let shape = translate::request_shape(request);
+    tracing::warn!(
+        protocol,
+        model = %request.model,
+        source_client = ?profile.kind,
+        attempt,
+        retry_mode = mode.as_str(),
+        downgraded_tool_results = repair.downgraded_tool_results,
+        downgraded_assistant_calls = repair.downgraded_assistant_calls,
+        sanitized_tools = stats.sanitized_tools,
+        compacted_user_messages = stats.compacted_user_messages,
+        stripped_tools = stats.stripped_tools,
+        prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
+        prompt_tokens = shape.estimated_total_tokens,
+        message_count = shape.message_count,
+        tool_count = shape.tool_count,
+        "retrying provider invalid_request_error for repaired ClaudeCode non-stream tool history"
+    );
 }
 
 pub(crate) fn log_missing_reasoning_content_retry(
@@ -269,7 +479,8 @@ pub(crate) fn log_empty_output_class(
 mod tests {
     use super::*;
     use crate::client_profile::ClientProfileSource;
-    use crate::protocol::types::Message;
+    use crate::error::UpstreamErrorKind;
+    use crate::protocol::types::{Message, OpenAITool, OpenAIToolFunction};
     use serde_json::Value;
 
     fn request_with_tool_choice(tool_choice: Option<Value>) -> ChatRequest {
@@ -332,5 +543,140 @@ mod tests {
 
         assert_eq!(policy, "keep_default");
         assert!(body.get("thinking").is_none());
+    }
+
+    fn provider_invalid_error() -> AppError {
+        AppError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            message: "upstream provider error (status=400, code=invalid_request_error)".to_string(),
+            upstream_headers: None,
+            upstream_error_kind: Some(UpstreamErrorKind::ProviderInvalidRequest),
+        }
+    }
+
+    fn repaired_claude_code_nonstream_tool_request() -> ChatRequest {
+        ChatRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String("x".repeat(14 * 1024)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String("now continue".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            stream: Some(false),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: Some(vec![OpenAITool {
+                tool_type: "function".to_string(),
+                function: OpenAIToolFunction {
+                    name: "TodoWrite".to_string(),
+                    description: Some("todo".to_string()),
+                    parameters: Some(serde_json::json!({
+                        "type": "array",
+                        "properties": [],
+                        "required": ["items", "missing"]
+                    })),
+                },
+            }]),
+            tool_choice: Some(Value::String("auto".to_string())),
+        }
+    }
+
+    #[test]
+    fn provider_invalid_retries_repaired_claude_code_tool_history() {
+        let request = repaired_claude_code_nonstream_tool_request();
+        let repair = translate::ToolHistoryRepair {
+            downgraded_tool_results: 1,
+            ..Default::default()
+        };
+        let mode = provider_invalid_tool_history_retry_mode(
+            &provider_invalid_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            repair,
+            false,
+            false,
+        );
+
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::DisableThinking));
+    }
+
+    #[test]
+    fn provider_invalid_retry_body_sanitizes_without_stripping_tools_first() {
+        let request = repaired_claude_code_nonstream_tool_request();
+        let body = serde_json::json!({
+            "messages": request.messages,
+            "tools": request.tools,
+            "tool_choice": request.tool_choice,
+            "thinking": {"type":"enabled"}
+        });
+
+        let (retry, stats) = provider_invalid_tool_history_retry_body(
+            &body,
+            ProviderInvalidRetryMode::DisableThinking,
+        );
+
+        assert_eq!(retry["thinking"], serde_json::json!({"type":"disabled"}));
+        assert!(retry["tools"].is_array());
+        assert_eq!(
+            retry["tools"][0]["function"]["parameters"]["type"],
+            Value::String("object".to_string())
+        );
+        assert_eq!(
+            retry["tools"][0]["function"]["parameters"]["properties"],
+            serde_json::json!({})
+        );
+        assert!(retry["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("provider-invalid retry"));
+        assert!(stats.sanitized_tools > 0);
+        assert_eq!(stats.compacted_user_messages, 1);
+        assert!(!stats.stripped_tools);
+    }
+
+    #[test]
+    fn provider_invalid_text_only_retry_strips_tools() {
+        let request = repaired_claude_code_nonstream_tool_request();
+        let body = serde_json::json!({
+            "messages": request.messages,
+            "tools": request.tools,
+            "tool_choice": request.tool_choice
+        });
+
+        let (retry, stats) =
+            provider_invalid_tool_history_retry_body(&body, ProviderInvalidRetryMode::TextOnly);
+
+        assert!(retry["tools"].is_null());
+        assert!(retry["tool_choice"].is_null());
+        assert!(stats.stripped_tools);
+    }
+
+    #[test]
+    fn provider_invalid_does_not_retry_normal_requests() {
+        let mut request = repaired_claude_code_nonstream_tool_request();
+        request.stream = Some(true);
+        let mode = provider_invalid_tool_history_retry_mode(
+            &provider_invalid_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            translate::ToolHistoryRepair {
+                downgraded_tool_results: 1,
+                ..Default::default()
+            },
+            false,
+            false,
+        );
+
+        assert_eq!(mode, None);
     }
 }

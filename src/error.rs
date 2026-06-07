@@ -96,6 +96,10 @@ impl AppError {
     pub fn is_missing_reasoning_content(&self) -> bool {
         self.upstream_error_kind == Some(UpstreamErrorKind::MissingReasoningContent)
     }
+
+    pub fn is_provider_invalid_request(&self) -> bool {
+        self.upstream_error_kind == Some(UpstreamErrorKind::ProviderInvalidRequest)
+    }
 }
 
 impl std::fmt::Display for AppError {

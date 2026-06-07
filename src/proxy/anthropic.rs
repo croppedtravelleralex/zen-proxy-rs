@@ -272,7 +272,7 @@ pub async fn handle_anthropic_messages(
         )
         .await
     } else {
-        handle_non_stream(client, config, &cr, &zb, profile).await
+        handle_non_stream(client, config, &cr, &zb, profile, repair).await
     }
 }
 
@@ -301,6 +301,7 @@ async fn handle_non_stream(
     cr: &ChatRequest,
     zb: &Value,
     profile: ClientProfile,
+    tool_history_repair: translate::ToolHistoryRepair,
 ) -> Result<Response, AppError> {
     let mut observed_exit_ip = None;
     let request_shape = translate::request_shape(cr);
@@ -311,6 +312,8 @@ async fn handle_non_stream(
         let mut last_empty_class = None;
         let mut used_reasoning_disabled_retry = false;
         let mut used_missing_reasoning_disabled_retry = false;
+        let mut used_provider_invalid_disabled_retry = false;
+        let mut used_provider_invalid_text_retry = false;
         let mut attempt_body = zb.clone();
         let mut output = None;
         for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
@@ -340,7 +343,39 @@ async fn handle_non_stream(
                     );
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if let Some(mode) = super::provider_invalid_tool_history_retry_mode(
+                        &err,
+                        cr,
+                        profile,
+                        tool_history_repair,
+                        used_provider_invalid_disabled_retry,
+                        used_provider_invalid_text_retry,
+                    ) {
+                        match mode {
+                            super::ProviderInvalidRetryMode::DisableThinking => {
+                                used_provider_invalid_disabled_retry = true;
+                            }
+                            super::ProviderInvalidRetryMode::TextOnly => {
+                                used_provider_invalid_text_retry = true;
+                            }
+                        }
+                        let (retry_body, stats) =
+                            super::provider_invalid_tool_history_retry_body(zb, mode);
+                        attempt_body = retry_body;
+                        super::log_provider_invalid_tool_history_retry(
+                            "anthropic",
+                            cr,
+                            profile,
+                            tool_history_repair,
+                            mode,
+                            stats,
+                            attempt + 1,
+                        );
+                        continue;
+                    }
+                    return Err(err);
+                }
             };
             let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
             observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
