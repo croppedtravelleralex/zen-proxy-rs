@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use free_model_client_rs::client_profile::{ClientKind, ClientProfile, ClientProfileSource};
-use free_model_client_rs::error::AppError;
+use free_model_client_rs::error::{AppError, UpstreamErrorKind};
 use free_model_client_rs::kernel::{FreeModelKernel, KernelConfig};
 use free_model_client_rs::protocol::types::{AnthropicRequest, ChatRequest};
 use futures::StreamExt;
@@ -1185,19 +1185,17 @@ async fn call_with_retry(
                         retry_chain,
                     ));
                 }
-                let max_for_error = if is_empty_upstream_error(&err) {
-                    empty_upstream_max
-                } else {
-                    base_max
-                };
+                let max_for_error = max_retries_for_app_error(&err, base_max, empty_upstream_max);
                 if attempt >= max_for_error {
-                    let (error_kind, outcome, _) = classify_app_error(&err);
+                    let (error_kind, outcome, error_type) = classify_app_error(&err);
                     let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
                         "rate_limited"
                     } else if is_upstream_busy(status, &err.message) {
                         "upstream_busy"
                     } else if is_empty_upstream_error(&err) {
                         "empty_output"
+                    } else if error_type == "provider_invalid_request" {
+                        outcome
                     } else if matches!(
                         error_kind,
                         ErrorKind::Timeout
@@ -1383,6 +1381,13 @@ fn is_upstream_busy(status: StatusCode, message: &str) -> bool {
 
 fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str) {
     let message = err.message.to_ascii_lowercase();
+    if is_provider_invalid_request_error(err) {
+        return (
+            ErrorKind::Other,
+            "upstream_error",
+            "provider_invalid_request",
+        );
+    }
     if is_empty_upstream_message(&message) {
         return (ErrorKind::Other, "empty_output", "empty_output");
     }
@@ -1413,6 +1418,10 @@ fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str)
 }
 
 fn result_kind_for_classified_error(error_kind: ErrorKind, error_type: &str) -> ResultKind {
+    if error_type == "provider_invalid_request" {
+        return ResultKind::Success(400);
+    }
+
     if error_type == "empty_output" {
         return ResultKind::EmptyOutput;
     }
@@ -1439,6 +1448,20 @@ fn is_transport_error_type(error_type: &str) -> bool {
 
 fn is_empty_upstream_error(err: &AppError) -> bool {
     is_empty_upstream_message(&err.message.to_ascii_lowercase())
+}
+
+fn is_provider_invalid_request_error(err: &AppError) -> bool {
+    err.upstream_error_kind == Some(UpstreamErrorKind::ProviderInvalidRequest)
+}
+
+fn max_retries_for_app_error(err: &AppError, base_max: u32, empty_upstream_max: u32) -> u32 {
+    if is_provider_invalid_request_error(err) {
+        0
+    } else if is_empty_upstream_error(err) {
+        empty_upstream_max
+    } else {
+        base_max
+    }
 }
 
 fn is_empty_upstream_message(message: &str) -> bool {
@@ -2418,6 +2441,49 @@ mod tests {
                 kind: ErrorKind::Upstream5xx
             }
         ));
+    }
+
+    #[test]
+    fn provider_invalid_request_is_not_proxy_failure() {
+        let err = AppError {
+            status: StatusCode::BAD_REQUEST,
+            message: "upstream provider error (status=400, code=invalid_request_error)".to_string(),
+            upstream_headers: None,
+            upstream_error_kind: Some(UpstreamErrorKind::ProviderInvalidRequest),
+        };
+
+        let (kind, outcome, error_type) = classify_app_error(&err);
+
+        assert_eq!(kind, ErrorKind::Other);
+        assert_eq!(outcome, "upstream_error");
+        assert_eq!(error_type, "provider_invalid_request");
+        assert!(matches!(
+            result_kind_for_classified_error(kind, error_type),
+            ResultKind::Success(400)
+        ));
+        assert_eq!(max_retries_for_app_error(&err, 3, 5), 0);
+
+        let terminal_outcome = if err.status == StatusCode::TOO_MANY_REQUESTS {
+            "rate_limited"
+        } else if is_upstream_busy(err.status, &err.message) {
+            "upstream_busy"
+        } else if is_empty_upstream_error(&err) {
+            "empty_output"
+        } else if error_type == "provider_invalid_request" {
+            outcome
+        } else if matches!(
+            kind,
+            ErrorKind::Timeout
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::DnsFailure
+                | ErrorKind::SocksHandshake
+                | ErrorKind::Other
+        ) {
+            "transport_error"
+        } else {
+            outcome
+        };
+        assert_eq!(terminal_outcome, "upstream_error");
     }
 
     #[test]
