@@ -264,6 +264,9 @@ pub struct Config {
     pub audit_log_dir: String,
     pub zen_provider_mode: ProviderMode,
     pub free_model_true_first_token_frt: bool,
+    pub free_model_claude_code_stream_initial_fetch_timeout_secs: u64,
+    pub free_model_claude_code_stream_slow_guard_min_input_tokens: u64,
+    pub free_model_claude_code_stream_no_forwardable_retry_secs: u64,
     pub v4_model_registry_enabled: bool,
     pub node_max_calls_per_window: u64,
     pub node_max_tokens_per_window: u64,
@@ -394,6 +397,19 @@ impl Config {
                 .unwrap_or_else(|_| "/tmp/zen-proxy-audit".into()),
             zen_provider_mode: load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy),
             free_model_true_first_token_frt: load_env_var("FREE_MODEL_TRUE_FIRST_TOKEN_FRT", true),
+            free_model_claude_code_stream_initial_fetch_timeout_secs: load_env_var(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_INITIAL_FETCH_TIMEOUT_SECS",
+                30u64,
+            ),
+            free_model_claude_code_stream_slow_guard_min_input_tokens: load_env_var(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_SLOW_GUARD_MIN_INPUT_TOKENS",
+                150_000u64,
+            ),
+            free_model_claude_code_stream_no_forwardable_retry_secs: load_env_var(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS",
+                45u64,
+            )
+            .max(1),
             v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
             node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
             node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 10_000_000u64),

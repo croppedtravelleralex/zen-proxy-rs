@@ -26,6 +26,9 @@ impl ProbePeriod {
             extra_headers: vec![("x-zen-proxy-probe".to_string(), "dead".to_string())],
             model_mappings: Vec::new(),
             true_first_token_frt: true,
+            claude_code_stream_initial_fetch_timeout_secs: 30,
+            claude_code_stream_slow_guard_min_input_tokens: 150_000,
+            claude_code_stream_no_forwardable_retry_secs: 45,
         });
         for i in 0..3 {
             if i > 0 {

@@ -815,6 +815,12 @@ async fn call_with_retry(
                 .map(|(public, upstream)| (public.clone(), upstream.clone()))
                 .collect(),
             true_first_token_frt: conf.free_model_true_first_token_frt,
+            claude_code_stream_initial_fetch_timeout_secs: conf
+                .free_model_claude_code_stream_initial_fetch_timeout_secs,
+            claude_code_stream_slow_guard_min_input_tokens: conf
+                .free_model_claude_code_stream_slow_guard_min_input_tokens,
+            claude_code_stream_no_forwardable_retry_secs: conf
+                .free_model_claude_code_stream_no_forwardable_retry_secs,
         });
         let call_start = Instant::now();
         let response = match path {
