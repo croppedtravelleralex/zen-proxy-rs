@@ -17,6 +17,9 @@ pub struct Config {
     pub timeout: Duration,
     pub request_body_limit_bytes: usize,
     pub true_first_token_frt: bool,
+    pub claude_code_stream_initial_fetch_timeout_secs: u64,
+    pub claude_code_stream_slow_guard_min_input_tokens: u64,
+    pub claude_code_stream_no_forwardable_retry_secs: u64,
     pub free_models: Vec<String>,
     pub model_mappings: Vec<ModelMapping>,
 }
@@ -71,6 +74,19 @@ impl Config {
                 * 1024
                 * 1024,
             true_first_token_frt: env_flag("FREE_MODEL_TRUE_FIRST_TOKEN_FRT", true),
+            claude_code_stream_initial_fetch_timeout_secs: env_u64(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_INITIAL_FETCH_TIMEOUT_SECS",
+                30,
+            ),
+            claude_code_stream_slow_guard_min_input_tokens: env_u64(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_SLOW_GUARD_MIN_INPUT_TOKENS",
+                150_000,
+            ),
+            claude_code_stream_no_forwardable_retry_secs: env_u64(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS",
+                45,
+            )
+            .max(1),
             free_models: model_mappings
                 .iter()
                 .map(|mapping| mapping.public_name.clone())
@@ -88,5 +104,12 @@ fn env_flag(name: &str, default: bool) -> bool {
                 "0" | "false" | "no" | "off"
             )
         })
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(default)
 }

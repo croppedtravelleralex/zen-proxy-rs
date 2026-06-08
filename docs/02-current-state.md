@@ -554,6 +554,21 @@ P1.20 2026-06-06 provider reasoning_content 400 修复记录：
 | 本地验证 | `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；库测试 89 条、kernel golden 103 条。新增 3 条 golden 覆盖 missing reasoning_content 非流式/流式重试和 public error 脱敏。 |
 | 部署状态 | 已于 2026-06-06 12:40 部署 panda 三实例；源码 commit `68bf5383f7c8915f0950a6864134b77dd51a1214`，线上 stripped hash `d5b7558c9f8f9fc7ea6faa802634dba85435868f1e338a4830f77079c3a1fc8e`，旧版本备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260606-124001.pre-68bf538`。部署后 ZenProxy `/health`、`/v1/models`、ZenProxy OpenAI/Anthropic smoke、panda NewAPI OpenAI/Anthropic smoke 均通过；部署后 10 分钟窗口未见新的 `reasoning_content`、`opencode zen`、空输出或 NewAPI 错误日志。 |
 
+P1.21 2026-06-08 ClaudeCode 大上下文慢首字诊断与首包保护：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户反馈 2026-06-08 channel 69 调用中，约 180k input tokens 场景偶发首字很长，cache 观感不稳定，整体耗时和 FRT 不够快。 |
+| 数据结论 | 截至 2026-06-08 11:55 CST 左右，`deepseek-v4-flash` 成功流式 `ok/eof` 约 2783 条，NewAPI `frt` P50 约 4.1s、P90 约 8.7s、P99 约 35.9s；`150k-220k` 桶 cache hit 约 98.4%，首字 >=15s 约 3.45%，首字 >=30s 仅 1 条。 |
+| 根因样本 | NewAPI id `136957`：prompt `173751`、completion `218`、FRT `47123ms`、cache `270976`。ZenProxy 对应 11:13:13 入口，estimated tokens `194191`，第一次上游 fetch 在 11:13:55 返回 520，第二次 attempt 在 11:14:00 cache accepted；慢首字来自上游慢失败+重试，不是 cache miss 或本地 CPU/池资源耗尽。 |
+| 已实现 | `src/proxy/anthropic.rs` 对 ClaudeCode Anthropic stream 增加大上下文首包 fetch 超时保护：仅在真实 text/tool 输出前、且满足 token 门槛时触发；超时后按既有 Stream Guard 重试，不对已输出内容或半截工具调用重试。 |
+| 新配置 | `FREE_MODEL_CLAUDE_CODE_STREAM_INITIAL_FETCH_TIMEOUT_SECS` 默认 `30`，设 `0` 可关闭；`FREE_MODEL_CLAUDE_CODE_STREAM_SLOW_GUARD_MIN_INPUT_TOKENS` 默认 `150000`；`FREE_MODEL_CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS` 默认 `45`。 |
+| 新观测 | ClaudeCode Anthropic stream 正常结束时新增 `ClaudeCode stream guard completion summary` 日志，包含 `attempts_used/retry_count/first_upstream_response_ms/first_upstream_event_ms/first_reasoning_ms/first_content_ms/first_tool_call_ms/idle_ping_count/cache_observation/cache_read_input_tokens/estimated_total_tokens/max_tokens/prompt_hash_hex`。 |
+| 边界 | 不改 prompt、不裁剪输入、不限制输出、不把 ping 当真实首字、不对 Hermes/OpenClaw 生效、不在已有 text/tool 输出后重试。 |
+| 本地验证 | `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 均通过；库测试 94 条、kernel golden 105 条。新增 golden `claude_code_anthropic_stream_retries_slow_initial_fetch_before_output` 覆盖首包慢失败主动重试。 |
+| 部署状态 | 2026-06-08 15:14 CST 先滚动部署 P1.21；15:42 CST 又补齐 ZenProxy env 配置透传并再次滚动部署。最终线上 stripped SHA256 `a771174350bf6701c97b7deed1bbf4deecd995463c5cfb27ff4b4e6c7c440f6b`。旧版本备份包括 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-p121-20260608-151426-dfd52e3489e6` 和 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-p121-envwired-20260608-153746-5c33046808ae`。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dead=0`、`ratelimited=0`；`/v1/models` 返回 `deepseek-v4-flash` 和 `deepseek-v4-flash-lite`；Anthropic/ClaudeCode 最小流式 smoke HTTP 200，`starttransfer=1.663s`，返回 `pong`。OpenAI-compatible 极短流式 smoke 仍返回 `reasoning_only_length`，列为 OpenAI 短流式残留，不作为本轮 ClaudeCode 主链路回滚条件。 |
+
 ## 临时产物归类
 
 | 路径 | 当前归类 | 处理原则 |

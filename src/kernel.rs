@@ -13,6 +13,9 @@ pub struct KernelConfig {
     pub extra_headers: Vec<(String, String)>,
     pub model_mappings: Vec<(String, String)>,
     pub true_first_token_frt: bool,
+    pub claude_code_stream_initial_fetch_timeout_secs: u64,
+    pub claude_code_stream_slow_guard_min_input_tokens: u64,
+    pub claude_code_stream_no_forwardable_retry_secs: u64,
 }
 
 impl From<&Config> for KernelConfig {
@@ -27,6 +30,12 @@ impl From<&Config> for KernelConfig {
                 .map(|mapping| (mapping.public_name.clone(), mapping.upstream_name.clone()))
                 .collect(),
             true_first_token_frt: config.true_first_token_frt,
+            claude_code_stream_initial_fetch_timeout_secs: config
+                .claude_code_stream_initial_fetch_timeout_secs,
+            claude_code_stream_slow_guard_min_input_tokens: config
+                .claude_code_stream_slow_guard_min_input_tokens,
+            claude_code_stream_no_forwardable_retry_secs: config
+                .claude_code_stream_no_forwardable_retry_secs,
         }
     }
 }

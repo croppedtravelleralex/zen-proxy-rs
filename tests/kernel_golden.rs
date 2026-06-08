@@ -221,6 +221,15 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("slow-fetch-then-ok") && request_count == 1 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        return (
+            StatusCode::from_u16(520).unwrap(),
+            [("content-type", "text/plain")],
+            "temporary upstream slow failure",
+        )
+            .into_response();
+    }
 
     if prompt.contains("inline-fence-markdown") {
         return (
@@ -388,6 +397,9 @@ async fn spawn_mock_zen() -> (KernelConfig, reqwest::Client, MockState) {
             "deepseek-v4-flash-free".to_string(),
         )],
         true_first_token_frt: true,
+        claude_code_stream_initial_fetch_timeout_secs: 30,
+        claude_code_stream_slow_guard_min_input_tokens: 150_000,
+        claude_code_stream_no_forwardable_retry_secs: 45,
     };
     (config, client, state)
 }
@@ -971,6 +983,27 @@ async fn claude_code_anthropic_stream_suppresses_pre_first_ping_for_true_frt() {
     assert!(!body.contains("\"type\":\"ping\""));
     assert!(body.contains("delayed answer"));
     assert!(body.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_retries_slow_initial_fetch_before_output() {
+    let (mut config, client, observed) = spawn_mock_zen().await;
+    config.claude_code_stream_initial_fetch_timeout_secs = 1;
+    config.claude_code_stream_slow_guard_min_input_tokens = 1;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            anthropic_request("deepseek-v4-flash", "slow-fetch-then-ok", true),
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer"), "{body}");
+    let sent = observed.requests.lock().unwrap();
+    assert_eq!(sent.len(), 2);
 }
 
 #[tokio::test]

@@ -16,7 +16,6 @@ const CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS: u64 = 2_048;
 const CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS: usize = 3;
 const CLAUDE_CODE_STREAM_IDLE_PING_SECS: u64 = 15;
 const CLAUDE_CODE_STREAM_GUARD_ATTEMPTS: usize = 3;
-const CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS: u64 = 60;
 const ANTHROPIC_TOOL_JSON_DELTA_CHUNK_BYTES: usize = 4 * 1024;
 const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
 
@@ -701,12 +700,13 @@ fn should_retry_stream_without_forwardable_output(
     text: &str,
     tool_calls: &[crate::zen::client::CollectedToolCall],
     elapsed: std::time::Duration,
+    retry_after: std::time::Duration,
 ) -> bool {
     profile.kind == ClientKind::ClaudeCode
         && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
         && text.trim().is_empty()
         && tool_calls.is_empty()
-        && elapsed.as_secs() >= CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS
+        && elapsed >= retry_after
 }
 
 fn should_retry_stream_error_before_output(
@@ -719,6 +719,17 @@ fn should_retry_stream_error_before_output(
         && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
         && text.trim().is_empty()
         && tool_calls.is_empty()
+}
+
+fn should_apply_initial_fetch_timeout(
+    profile: ClientProfile,
+    estimated_input_tokens: u64,
+    min_input_tokens: u64,
+    timeout_secs: u64,
+) -> bool {
+    profile.kind == ClientKind::ClaudeCode
+        && timeout_secs > 0
+        && estimated_input_tokens >= min_input_tokens
 }
 
 fn anthropic_tool_json_delta_chunks(input: &str) -> Vec<&str> {
@@ -767,7 +778,9 @@ async fn handle_stream(
     );
     let body = cr.clone();
     let m = model.clone();
-    let prompt_hash = translate::request_shape(&body).prompt_hash;
+    let request_shape = translate::request_shape(&body);
+    let prompt_hash = request_shape.prompt_hash;
+    let prompt_hash_hex = format!("{prompt_hash:016x}");
     let prompt = translate::build_prompt_text(&body.messages);
     let estimated_input_tokens = estimate(&prompt).max(1);
     let initial_input_tokens = estimated_input_tokens;
@@ -790,7 +803,23 @@ async fn handle_stream(
     let send_idle_ping = profile.kind == ClientKind::ClaudeCode;
     let idle_ping_interval = Duration::from_secs(CLAUDE_CODE_STREAM_IDLE_PING_SECS);
     let true_first_token_frt = config.true_first_token_frt;
+    let no_forwardable_retry_after =
+        Duration::from_secs(config.claude_code_stream_no_forwardable_retry_secs.max(1));
+    let initial_fetch_timeout = if should_apply_initial_fetch_timeout(
+        profile,
+        request_shape.estimated_total_tokens,
+        config.claude_code_stream_slow_guard_min_input_tokens,
+        config.claude_code_stream_initial_fetch_timeout_secs,
+    ) {
+        Some(Duration::from_secs(
+            config.claude_code_stream_initial_fetch_timeout_secs,
+        ))
+    } else {
+        None
+    };
+    let slow_guard_min_input_tokens = config.claude_code_stream_slow_guard_min_input_tokens;
     let stream = async_stream::stream! {
+        let stream_started = Instant::now();
         let mut message_started = false;
         if !true_first_token_frt {
             yield Ok::<_, Infallible>(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
@@ -815,19 +844,36 @@ async fn handle_stream(
         let mut final_stream_error: Option<String> = None;
         let mut completed_upstream = false;
         let mut attempt_body = base_body.clone();
+        let mut first_upstream_response_ms = 0_u64;
+        let mut first_upstream_event_ms = 0_u64;
+        let mut first_content_ms = 0_u64;
+        let mut first_tool_call_ms = 0_u64;
+        let mut first_reasoning_ms = 0_u64;
         for attempt in 0..CLAUDE_CODE_STREAM_GUARD_ATTEMPTS {
             attempts_used = attempt + 1;
             let attempt_started = Instant::now();
             let mut upstream_event_count = 0_u64;
-            let resp = match crate::zen::client::fetch_zen_stream_with_headers(
+            let fetch = crate::zen::client::fetch_zen_stream_with_headers(
                 &client,
                 &zen_chat_url,
                 &zen_api_key,
                 &attempt_body,
                 &extra_headers,
-            )
-            .await
-            {
+            );
+            let resp = match if let Some(timeout) = initial_fetch_timeout {
+                match tokio::time::timeout(timeout, fetch).await {
+                    Ok(result) => result,
+                    Err(_) => Err(AppError::new(
+                        axum::http::StatusCode::GATEWAY_TIMEOUT,
+                        format!(
+                            "upstream initial stream fetch timeout after {}s",
+                            timeout.as_secs()
+                        ),
+                    )),
+                }
+            } else {
+                fetch.await
+            } {
                 Ok(resp) => resp,
                 Err(err) => {
                     tracing::warn!(
@@ -835,8 +881,13 @@ async fn handle_stream(
                         model = %body.model,
                         source_client = ?profile.kind,
                         prompt_hash,
+                        prompt_hash_hex = %prompt_hash_hex,
                         attempt = attempts_used,
                         max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                        elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                        initial_fetch_timeout_secs = initial_fetch_timeout.map(|timeout| timeout.as_secs()).unwrap_or(0),
+                        slow_guard_min_input_tokens,
+                        estimated_total_tokens = request_shape.estimated_total_tokens,
                         error = %err.message,
                         text_chars = text.len(),
                         reasoning_chars = reasoning.len(),
@@ -865,6 +916,9 @@ async fn handle_stream(
                     break;
                 }
             };
+            if first_upstream_response_ms == 0 {
+                first_upstream_response_ms = stream_started.elapsed().as_millis() as u64;
+            }
             cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
             let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
             let mut retry_attempt = false;
@@ -880,6 +934,7 @@ async fn handle_stream(
                                     model = %body.model,
                                     source_client = ?profile.kind,
                                     prompt_hash,
+                                    prompt_hash_hex = %prompt_hash_hex,
                                     attempt = attempts_used,
                                     idle_ping_count,
                                     idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
@@ -893,6 +948,7 @@ async fn handle_stream(
                                     model = %body.model,
                                     source_client = ?profile.kind,
                                     prompt_hash,
+                                    prompt_hash_hex = %prompt_hash_hex,
                                     attempt = attempts_used,
                                     idle_ping_count,
                                     "suppressed pre-first-token ping to keep NewAPI FRT tied to real content"
@@ -904,15 +960,18 @@ async fn handle_stream(
                                 &text,
                                 &tool_calls,
                                 attempt_started.elapsed(),
+                                no_forwardable_retry_after,
                             ) {
                                 tracing::warn!(
                                     protocol = "anthropic",
                                     model = %body.model,
                                     source_client = ?profile.kind,
                                     prompt_hash,
+                                    prompt_hash_hex = %prompt_hash_hex,
                                     attempt = attempts_used,
                                     max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
                                     elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                                    no_forwardable_retry_after_secs = no_forwardable_retry_after.as_secs(),
                                     idle_ping_count,
                                     upstream_event_count,
                                     text_chars = text.len(),
@@ -936,6 +995,9 @@ async fn handle_stream(
                 let event = match event {
                     Ok(event) => {
                         upstream_event_count += 1;
+                        if first_upstream_event_ms == 0 {
+                            first_upstream_event_ms = stream_started.elapsed().as_millis() as u64;
+                        }
                         event
                     }
                     Err(err) => {
@@ -944,6 +1006,7 @@ async fn handle_stream(
                             model = %body.model,
                             source_client = ?profile.kind,
                             prompt_hash,
+                            prompt_hash_hex = %prompt_hash_hex,
                             attempt = attempts_used,
                             max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
                             error = %err.message,
@@ -984,6 +1047,9 @@ async fn handle_stream(
                                 !content.trim().is_empty()
                                     || (profile.preserves_stream_whitespace() && !content.is_empty());
                             if should_emit {
+                                if first_content_ms == 0 {
+                                    first_content_ms = stream_started.elapsed().as_millis() as u64;
+                                }
                                 if !message_started {
                                     yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
                                     message_started = true;
@@ -998,10 +1064,17 @@ async fn handle_stream(
                             }
                         }
                         if let Some(reasoning_content) = delta.reasoning_content {
+                            if first_reasoning_ms == 0 {
+                                first_reasoning_ms = stream_started.elapsed().as_millis() as u64;
+                            }
                             reasoning.push_str(&reasoning_content);
                         }
                         if let Some(items) = delta.tool_calls {
+                            let had_tool_calls = !tool_calls.is_empty();
                             merge_tool_deltas(&mut tool_calls, items);
+                            if first_tool_call_ms == 0 && !had_tool_calls && !tool_calls.is_empty() {
+                                first_tool_call_ms = stream_started.elapsed().as_millis() as u64;
+                            }
                         }
                     }
                 }
@@ -1015,6 +1088,7 @@ async fn handle_stream(
                             model = %body.model,
                             source_client = ?profile.kind,
                             prompt_hash,
+                            prompt_hash_hex = %prompt_hash_hex,
                             attempt = attempts_used,
                             idle_ping_count,
                             idle_ping_secs = CLAUDE_CODE_STREAM_IDLE_PING_SECS,
@@ -1028,6 +1102,7 @@ async fn handle_stream(
                             model = %body.model,
                             source_client = ?profile.kind,
                             prompt_hash,
+                            prompt_hash_hex = %prompt_hash_hex,
                             attempt = attempts_used,
                             idle_ping_count,
                             "suppressed pre-first-token ping after non-forwardable upstream event"
@@ -1039,15 +1114,18 @@ async fn handle_stream(
                         &text,
                         &tool_calls,
                         attempt_started.elapsed(),
+                        no_forwardable_retry_after,
                     ) {
                         tracing::warn!(
                             protocol = "anthropic",
                             model = %body.model,
                             source_client = ?profile.kind,
                             prompt_hash,
+                            prompt_hash_hex = %prompt_hash_hex,
                             attempt = attempts_used,
                             max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
                             elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                            no_forwardable_retry_after_secs = no_forwardable_retry_after.as_secs(),
                             idle_ping_count,
                             upstream_event_count,
                             text_chars = text.len(),
@@ -1076,6 +1154,7 @@ async fn handle_stream(
                         model = %body.model,
                         source_client = ?profile.kind,
                         prompt_hash,
+                        prompt_hash_hex = %prompt_hash_hex,
                         next_attempt = attempt + 2,
                         "ClaudeCode stream guard enabling disabled-thinking fallback for final tool retry"
                     );
@@ -1090,6 +1169,7 @@ async fn handle_stream(
                 model = %body.model,
                 source_client = ?profile.kind,
                 prompt_hash,
+                prompt_hash_hex = %prompt_hash_hex,
                 attempts_used,
                 text_chars = text.len(),
                 reasoning_chars = reasoning.len(),
@@ -1106,6 +1186,7 @@ async fn handle_stream(
                 model = %body.model,
                 source_client = ?profile.kind,
                 prompt_hash,
+                prompt_hash_hex = %prompt_hash_hex,
                 attempts_used,
                 text_chars = text.len(),
                 reasoning_chars = reasoning.len(),
@@ -1159,6 +1240,8 @@ async fn handle_stream(
                     protocol = "anthropic",
                     model = %body.model,
                     source_client = ?profile.kind,
+                    prompt_hash,
+                    prompt_hash_hex = %prompt_hash_hex,
                     empty_output_class,
                     finish_reason = ?upstream_finish_reason,
                     reasoning_chars = reasoning.len(),
@@ -1225,6 +1308,42 @@ async fn handle_stream(
             .unwrap_or(0);
         let cache_signals = cache_signals.with_body_usage(usage.as_ref());
         super::log_provider_cache_observation("anthropic", &body, profile, &cache_signals, attempts_used, CLAUDE_CODE_STREAM_GUARD_ATTEMPTS);
+        tracing::info!(
+            protocol = "anthropic",
+            model = %body.model,
+            source_client = ?profile.kind,
+            prompt_hash,
+            prompt_hash_hex = %prompt_hash_hex,
+            attempts_used,
+            retry_count = attempts_used.saturating_sub(1),
+            used_disabled_thinking_retry,
+            completed_upstream,
+            final_stream_error = ?final_stream_error,
+            finish_reason = ?upstream_finish_reason,
+            estimated_prompt_tokens = initial_input_tokens,
+            estimated_total_tokens = request_shape.estimated_total_tokens,
+            max_tokens = ?request_shape.max_tokens,
+            message_count = request_shape.message_count,
+            tool_count = request_shape.tool_count,
+            first_upstream_response_ms,
+            first_upstream_event_ms,
+            first_reasoning_ms,
+            first_content_ms,
+            first_tool_call_ms,
+            total_elapsed_ms = stream_started.elapsed().as_millis() as u64,
+            idle_ping_count,
+            text_chars = text.len(),
+            reasoning_chars = reasoning.len(),
+            tool_call_count = tool_calls.len(),
+            output_tokens,
+            cache_creation_input_tokens = cache_creation,
+            cache_read_input_tokens = cache_read,
+            cache_observation = cache_signals.status().as_str(),
+            initial_fetch_timeout_secs = initial_fetch_timeout.map(|timeout| timeout.as_secs()).unwrap_or(0),
+            slow_guard_min_input_tokens,
+            no_forwardable_retry_after_secs = no_forwardable_retry_after.as_secs(),
+            "ClaudeCode stream guard completion summary"
+        );
         yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
@@ -1590,28 +1709,60 @@ mod tests {
             0,
             "",
             &[],
-            std::time::Duration::from_secs(CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS)
+            std::time::Duration::from_secs(45),
+            std::time::Duration::from_secs(45)
         ));
         assert!(!should_retry_stream_without_forwardable_output(
             profile,
             0,
             "partial text",
             &[],
-            std::time::Duration::from_secs(CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS)
+            std::time::Duration::from_secs(45),
+            std::time::Duration::from_secs(45)
         ));
         assert!(!should_retry_stream_without_forwardable_output(
             profile,
             0,
             "",
             &[crate::zen::client::CollectedToolCall::default()],
-            std::time::Duration::from_secs(CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS)
+            std::time::Duration::from_secs(45),
+            std::time::Duration::from_secs(45)
         ));
         assert!(!should_retry_stream_without_forwardable_output(
             profile,
             CLAUDE_CODE_STREAM_GUARD_ATTEMPTS - 1,
             "",
             &[],
-            std::time::Duration::from_secs(CLAUDE_CODE_STREAM_NO_FORWARDABLE_RETRY_SECS)
+            std::time::Duration::from_secs(45),
+            std::time::Duration::from_secs(45)
+        ));
+        assert!(!should_retry_stream_without_forwardable_output(
+            profile,
+            0,
+            "",
+            &[],
+            std::time::Duration::from_secs(44),
+            std::time::Duration::from_secs(45)
+        ));
+    }
+
+    #[test]
+    fn initial_fetch_timeout_only_applies_to_large_claude_code_streams() {
+        let profile = claude_code_profile();
+        assert!(should_apply_initial_fetch_timeout(
+            profile, 150_000, 150_000, 30
+        ));
+        assert!(!should_apply_initial_fetch_timeout(
+            profile, 149_999, 150_000, 30
+        ));
+        assert!(!should_apply_initial_fetch_timeout(
+            profile, 150_000, 150_000, 0
+        ));
+        assert!(!should_apply_initial_fetch_timeout(
+            ClientProfile::unknown(),
+            200_000,
+            150_000,
+            30
         ));
     }
 }

@@ -2,6 +2,15 @@
 
 ## P0：必须优先处理
 
+### 部署 2026-06-08 ClaudeCode 首包保护
+
+- 状态：已于 2026-06-08 15:14 CST 滚动部署到 panda 三实例，进入长窗口观察。
+- 原因：2026-06-08 180k 左右慢首字主样本来自上游慢失败后重试；本地已新增 ClaudeCode Anthropic stream 大上下文首包 fetch 超时保护和 `ClaudeCode stream guard completion summary`。
+- 验证结果：`cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；库测试 94 条、kernel golden 105 条。
+- 部署验收：最终线上 stripped SHA256 为 `a771174350bf6701c97b7deed1bbf4deecd995463c5cfb27ff4b4e6c7c440f6b`；`zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`；`/v1/models` 返回 `deepseek-v4-flash` 和 `deepseek-v4-flash-lite`；Anthropic/ClaudeCode 最小流式 smoke 返回 `pong`。
+- 部署边界：OpenAI-compatible 极短流式 smoke 仍可触发 `reasoning_only_length`，这是 OpenAI 短流式/上游 reasoning-only 残留，未作为本轮 ClaudeCode Anthropic 主链路回滚条件。
+- 后续观察：继续看 150k+ 桶的 `attempts_used/retry_count/first_content_ms/cache_observation`、NewAPI FRT 分位和 `reasoning_only/no-forwardable` 是否下降；该修复不裁剪输入、不限制输出、不改 NewAPI。
+
 ### panda NewAPI 真实链路验收
 
 - 状态：已完成小矩阵。
@@ -46,20 +55,25 @@
 
 ### 运行指标细分
 
-- 状态：部分落地。
-- 当前不足：代码层有错误结构化，但缺少完整阶段耗时暴露。
+- 状态：部分落地，2026-06-08 已补 ClaudeCode Anthropic stream 结束摘要日志。
+- 当前不足：代码层有错误结构化和 stream summary，但 NewAPI `other` 仍不能直接显示 `attempt_count/first_reasoning/first_tool/cache_observation` 等字段；正式分析仍需结合 ZenProxy/free-model-client-rs 日志。
 - 建议指标：请求入站、认证、解析、协议修复、上游连接、上游首包、first content、first tool call、stream decode、响应结束。
 - 2026-06-05 追加：已先补 ClaudeCode Anthropic SSE idle ping，缓解 `client_gone/use_time≈64s/completion=0` 这类下游读空闲断开；但这不是完整阶段耗时指标，后续仍需区分 `protocol_first_byte`、`first_content` 和 `first_tool_call`，避免把 ping 当真实首字。
+- 2026-06-08 追加：ClaudeCode Anthropic stream 正常结束会记录 `ClaudeCode stream guard completion summary`，字段包括 `attempts_used/retry_count/first_upstream_response_ms/first_upstream_event_ms/first_reasoning_ms/first_content_ms/first_tool_call_ms/idle_ping_count/cache_observation/cache_read_input_tokens/estimated_total_tokens/max_tokens/prompt_hash_hex`。
+- 待办：如果需要让低阶模型直接分析 NewAPI 导出，应把上述 summary 通过 sidecar 或 ZenProxy admin 汇总到可导出数据里，而不是要求每次人工 grep journal。
 
 ### ClaudeCode 流式 client_gone 观测
 
-- 状态：源码已修复并部署 panda，待真实长窗口观察。
+- 状态：idle ping 已部署 panda；2026-06-08 大上下文首包 fetch 超时保护和 stream summary 已部署 panda，待长窗口观察。
 - 触发：NewAPI 红行里出现 stream 成功消费但 `stream_status.end_reason=client_gone`、`completion=0`、`use_time≈64s`，与非流式低预算探针 502 不是同一问题。
 - 已做：ClaudeCode Anthropic SSE 15 秒 idle ping；本地 delayed-stream golden 覆盖，panda 三实例部署并 smoke 通过。
 - 待办：
   1. 观察用户真实 ClaudeCode 50k+ 流式请求中 `client_gone` 是否下降。
   2. 如果仍出现，补 first-content watchdog，而不是把 ping 伪装成内容。
   3. 与 NewAPI `frt`、ZenProxy 日志、provider usage 对齐，区分客户端断开、上游空输出、上游超时和 stream decode 错误。
+  4. 部署 2026-06-08 首包保护后，重点观察 `initial_fetch_timeout_secs`、`attempts_used>1`、`first_content_ms` 和 `upstream provider error (status=520)` 是否下降；如果重试成本放大，再调高 `FREE_MODEL_CLAUDE_CODE_STREAM_INITIAL_FETCH_TIMEOUT_SECS` 或关闭。
+  5. 2026-06-08 12:20-14:10 数据显示另有 `reasoning_only/no-forwardable` 残留：40 条 `client_gone`，其中 38 条 `completion=0` 且 NewAPI FRT 为 `-1000`，use_time P50 约 59s、P90 约 64s；这不是首包 fetch 卡死，而是上游持续吐 reasoning/空事件但没有 text/tool。
+  6. 新待办：为 ClaudeCode stream 增加更明确的 first-content/no-forwardable watchdog 和 disabled-thinking 兜底条件，优先覆盖 `reasoning_only + finish_reason=stop + content/tool 为空`，但仍不得伪造文本或把 ping 当真实首字。
 
 ### NewAPI 使用日志导出 sidecar
 

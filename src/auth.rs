@@ -38,6 +38,9 @@ mod tests {
             timeout: Duration::from_secs(120),
             request_body_limit_bytes: 64 * 1024 * 1024,
             true_first_token_frt: true,
+            claude_code_stream_initial_fetch_timeout_secs: 30,
+            claude_code_stream_slow_guard_min_input_tokens: 150_000,
+            claude_code_stream_no_forwardable_retry_secs: 45,
             free_models: vec![],
             model_mappings: vec![],
         }
