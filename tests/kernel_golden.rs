@@ -298,6 +298,32 @@ async fn mock_zen_handler(
         };
         return Sse::new(stream).into_response();
     }
+    if prompt.contains("split-tool-delta") {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_split_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+    if prompt.contains("tool-then-text-delta") {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_tool_text_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"README.md\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"after tool text\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
 
     let chunk = if prompt.contains("mixed-text-tool-delta") {
         json!({
@@ -1143,6 +1169,60 @@ async fn claude_code_anthropic_stream_canonicalizes_web_tool_name() {
 
     assert!(body.contains("\"name\":\"WebSearch\""));
     assert!(!body.contains("\"name\":\"web_search\""));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_emits_complete_split_tool_once() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash-free", "split-tool-delta", true);
+    request.tools = Some(vec![anthropic_tool(
+        "Read",
+        json!({"file_path":{"type":"string"}}),
+        &["file_path"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert_eq!(body.matches("\"type\":\"tool_use\"").count(), 1, "{body}");
+    assert!(body.contains("\"name\":\"Read\""));
+    assert!(body.contains("README.md"));
+    assert!(body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_keeps_block_indexes_after_early_tool() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash-free", "tool-then-text-delta", true);
+    request.tools = Some(vec![anthropic_tool(
+        "Read",
+        json!({"file_path":{"type":"string"}}),
+        &["file_path"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("\"index\":0"));
+    assert!(body.contains("\"index\":1"));
+    assert!(body.contains("call_tool_text_1"));
+    assert!(body.contains("after tool text"));
 }
 
 #[tokio::test]

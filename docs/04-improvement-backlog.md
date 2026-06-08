@@ -2,6 +2,27 @@
 
 ## P0：必须优先处理
 
+### 部署并验收 V4.101 质量保全低延迟优化
+
+- 状态：已于 2026-06-08 22:27 CST 部署 panda 三实例，进入真实流量观察。
+- 目标：在不裁剪 `deepseek-v4-flash/deepseek-v4-flash-free` 输入、不限制输出、不默认禁用 thinking、不注入隐藏提示词的前提下，降低 ClaudeCode 真实 first content / first tool 长尾，并提升工具调用稳定性。
+- 已完成源码项：
+  1. ClaudeCode Anthropic stream 的完整 JSON 工具调用提前释放，新增 `first_tool_emit_ms` 和 `emitted_tool_call_count` 观测。
+  2. ClaudeCode Anthropic stream 的 no-forwardable retry 从固定 45s 改为按输入桶自适应：`<50k=10s`、`50k-100k=14s`、`100k-200k=22s`、`200k-400k=32s`、`400k+=45s`，且只在真实 text/tool 发出前生效。
+  3. ZenProxy 大流式 affinity key 加入稳定 messages 前缀 hash、tools hash 和 tool_choice hash，帮助 cache accepted 节点复用。
+  4. ZenProxy tool-heavy lane 阈值下调到 `tools>=8` 或 `tool_markers>=6`，让中等 ClaudeCode 工具链请求更早隔离。
+- 待验收：
+  1. 已完成：本地完整 `fmt/clippy/test` 通过。
+  2. 已完成：构建 `zen-proxy-rs` stripped release 并滚动部署 panda 三实例。
+  3. 已完成：panda `/health`、`/v1/models`、OpenAI stream、Anthropic ClaudeCode stream、NewAPI OpenAI stream 最小 smoke 通过。
+  4. 待观察：部署后 30-60 分钟比较 NewAPI FRT 和 ZenProxy/free-model-client-rs summary：`first_tool_emit_ms`、`first_tool_call_ms`、`first_content_ms`、`attempts_used`、`cache_observation`。
+  5. 待验收：普通 ClaudeCode 流式 first-forwardable P50 2-3s、P90 4-6s、P95 8-10s；150k+ 大上下文优先看 P95 是否从 15s+ 长尾下降，不要求牺牲输出质量强压到短请求口径。
+- 回滚条件：
+  1. `tool_use` / `tool_call_id` / JSON parse 类错误上升。
+  2. ClaudeCode 工具调用重复执行或参数缺失。
+  3. 输出 tokens P50/P90 下降超过 5%，或 `finish_reason=length` 异常上升。
+  4. lane saturated、no proxy resources、502/503/504 明显上升。
+
 ### 部署 2026-06-08 ClaudeCode 首包保护
 
 - 状态：已于 2026-06-08 15:14 CST 滚动部署到 panda 三实例，进入长窗口观察。

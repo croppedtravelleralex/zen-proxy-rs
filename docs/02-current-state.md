@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-06-06
+更新时间：2026-06-08
 分支：`codex/v47-client-split-cache-harness`
 
 ## 代码已确认能力
@@ -61,6 +61,11 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 34. 2026-06-06 已补 Anthropic 工具调用 `input_json_delta` 分片：普通流式和 buffered huge-stream 返回工具参数时按 4KB 安全切片发送，保证拼接后 JSON 字符完全一致，降低大 Write 参数导致客户端/中间层解析压力。ClaudeCode 显式 forced `tool_choice` 会首跳禁用 thinking，避免上游返回 `Thinking mode does not support this tool_choice`；`tool_choice=auto` 和普通 tools 请求仍保持默认 thinking。
 35. 2026-06-06 已补 provider `reasoning_content` 缺失兜底：当上游直接返回 `The reasoning_content in the thinking mode must be passed back to the API` 时，OpenAI/Anthropic 非流式、OpenAI 流式、ClaudeCode Anthropic 流式和 buffered huge-stream 会将同一请求重试一次 `thinking: disabled`；仅在 provider 明确拒绝当前请求后触发，不全局禁用 ClaudeCode tools auto thinking。
 36. 2026-06-06 已补上游错误脱敏映射：`AppError::upstream` 不再把 `opencode zen`、上游原始 body、内部路由或节点标识写进 public response；public body 使用 `upstream_provider_error` 和稳定 `code`，私有 provider 状态只进服务端日志。
+37. 2026-06-08 源码已补 V4.101 ClaudeCode Anthropic 工具流提前释放：只有当上游工具调用参数已经拼成完整、可解析 JSON 后才向下游发送 `tool_use`，并在日志中记录 `first_tool_emit_ms` 和 `emitted_tool_call_count`；不发送 partial tool、不伪造工具、不改写 prompt。
+38. 2026-06-08 源码已补 V4.101 自适应 no-forwardable watchdog：ClaudeCode Anthropic stream 在真实 text/tool 发出前按输入桶使用 10s/14s/22s/32s/45s 上限，而不是固定等满 45s；若用户配置更低值，则继续尊重更低值。
+39. 2026-06-08 `zen-proxy-rs` 源码已补 V4.101 cache-friendly affinity key：大流式请求的 affinity 从 `model/path/client/body_bucket` 升级为包含稳定 `messages` 前缀 hash、`tools` hash 和 `tool_choice` hash；只保存 hash，不保存 prompt 原文。
+40. 2026-06-08 `zen-proxy-rs` 源码已补 V4.101 中等工具流隔离：tool-heavy lane 阈值从 `tools>=16 / tool_markers>=12` 下调到 `tools>=8 / tool_markers>=6`，让 ClaudeCode 中等工具链请求更早进入隔离 lane，降低普通流式请求被工具流拖慢的概率。
+41. 2026-06-08 22:27 CST 已将 V4.101 stripped release 部署到 panda 三实例；线上二进制 hash `149dd2f65c8b33228498bcc1f2e94f6742e1e1a5417592c0eb6921e7cc7deb49`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260608-222704.pre-v4101`。部署后 `/health`、`/v1/models`、OpenAI stream、Anthropic ClaudeCode stream 和 NewAPI OpenAI stream 最小 smoke 均通过。
 
 ## 附属工具
 

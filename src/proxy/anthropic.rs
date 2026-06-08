@@ -732,6 +732,20 @@ fn should_apply_initial_fetch_timeout(
         && estimated_input_tokens >= min_input_tokens
 }
 
+fn adaptive_no_forwardable_retry_after(
+    configured: std::time::Duration,
+    estimated_input_tokens: u64,
+) -> std::time::Duration {
+    let bucket_secs = match estimated_input_tokens {
+        0..=49_999 => 10,
+        50_000..=99_999 => 14,
+        100_000..=199_999 => 22,
+        200_000..=399_999 => 32,
+        _ => 45,
+    };
+    configured.min(std::time::Duration::from_secs(bucket_secs))
+}
+
 fn anthropic_tool_json_delta_chunks(input: &str) -> Vec<&str> {
     if input.is_empty() {
         return Vec::new();
@@ -754,6 +768,46 @@ fn anthropic_tool_json_delta_chunks(input: &str) -> Vec<&str> {
         start = end;
     }
     chunks
+}
+
+fn streamable_anthropic_tool_call(
+    tool: &crate::zen::client::CollectedToolCall,
+    body: &ChatRequest,
+    profile: ClientProfile,
+) -> Option<(ToolCall, Value)> {
+    let clean_id = tool
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("call_{}", tool.index));
+    let clean_id = if let Some(pos) = clean_id.find('{') {
+        clean_id[..pos].to_string()
+    } else {
+        clean_id
+    };
+    let tc = ToolCall {
+        id: Some(clean_id),
+        call_type: "function".into(),
+        function: ToolFunction {
+            name: tool.name.clone(),
+            arguments: tool.arguments.clone(),
+        },
+        index: Some(tool.index),
+    };
+    let tc = synthesis::tool::canonicalize_tool_call_name(&tc, body);
+    let ct = if profile.uses_compat_tool_history() {
+        synthesis::tool::complete_tool_call(&tc, body)
+    } else {
+        tc
+    };
+    if ct.function.name.trim().is_empty() {
+        return None;
+    }
+    let input = if ct.function.arguments.trim().is_empty() {
+        Value::Object(Default::default())
+    } else {
+        serde_json::from_str(&ct.function.arguments).ok()?
+    };
+    Some((ct, input))
 }
 
 async fn handle_stream(
@@ -803,8 +857,10 @@ async fn handle_stream(
     let send_idle_ping = profile.kind == ClientKind::ClaudeCode;
     let idle_ping_interval = Duration::from_secs(CLAUDE_CODE_STREAM_IDLE_PING_SECS);
     let true_first_token_frt = config.true_first_token_frt;
-    let no_forwardable_retry_after =
-        Duration::from_secs(config.claude_code_stream_no_forwardable_retry_secs.max(1));
+    let no_forwardable_retry_after = adaptive_no_forwardable_retry_after(
+        Duration::from_secs(config.claude_code_stream_no_forwardable_retry_secs.max(1)),
+        request_shape.estimated_total_tokens,
+    );
     let initial_fetch_timeout = if should_apply_initial_fetch_timeout(
         profile,
         request_shape.estimated_total_tokens,
@@ -832,6 +888,7 @@ async fn handle_stream(
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut text_block_open = false;
+        let mut text_block_index = 0_u64;
         let mut markdown_guard = if profile.preserves_model_text_exactly() {
             None
         } else {
@@ -843,6 +900,9 @@ async fn handle_stream(
         let mut cache_signals = ProviderCacheSignals::ignored();
         let mut final_stream_error: Option<String> = None;
         let mut completed_upstream = false;
+        let mut emitted_tool_call_indexes = std::collections::HashSet::<i64>::new();
+        let mut emitted_tool_call_blocks = 0_u64;
+        let mut first_tool_emit_ms = 0_u64;
         let mut attempt_body = base_body.clone();
         let mut first_upstream_response_ms = 0_u64;
         let mut first_upstream_event_ms = 0_u64;
@@ -1056,10 +1116,11 @@ async fn handle_stream(
                                 }
                                 if !text_block_open {
                                     text_block_open = true;
-                                    yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
+                                    text_block_index = emitted_tool_call_blocks;
+                                    yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":text_block_index,"content_block":{"type":"text","text":""}}).to_string()));
                                 }
                                 text.push_str(&content);
-                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":content}}).to_string()));
+                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":content}}).to_string()));
                                 emitted_downstream_event = true;
                             }
                         }
@@ -1074,6 +1135,43 @@ async fn handle_stream(
                             merge_tool_deltas(&mut tool_calls, items);
                             if first_tool_call_ms == 0 && !had_tool_calls && !tool_calls.is_empty() {
                                 first_tool_call_ms = stream_started.elapsed().as_millis() as u64;
+                            }
+                            if profile.kind == ClientKind::ClaudeCode && text.trim().is_empty() {
+                                let ready_tools: Vec<(i64, ToolCall, Value)> = tool_calls
+                                    .iter()
+                                    .filter(|tool| !emitted_tool_call_indexes.contains(&tool.index))
+                                    .filter_map(|tool| {
+                                        streamable_anthropic_tool_call(tool, &body, profile)
+                                            .map(|(call, input)| (tool.index, call, input))
+                                    })
+                                    .collect();
+                                if !ready_tools.is_empty() {
+                                    if !message_started {
+                                        yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                                        message_started = true;
+                                    }
+                                    if text_block_open {
+                                        yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":text_block_index}).to_string()));
+                                        text_block_open = false;
+                                    }
+                                    for (tool_index, ct, input) in ready_tools {
+                                        let tidx = emitted_tool_call_blocks + u64::from(!text.is_empty());
+                                        yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));
+                                        let js = serde_json::to_string(&input).unwrap_or_default();
+                                        if js != "{}" {
+                                            for chunk in anthropic_tool_json_delta_chunks(&js) {
+                                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":tidx,"delta":{"type":"input_json_delta","partial_json":chunk}}).to_string()));
+                                            }
+                                        }
+                                        yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":tidx}).to_string()));
+                                        emitted_tool_call_indexes.insert(tool_index);
+                                        emitted_tool_call_blocks = emitted_tool_call_blocks.saturating_add(1);
+                                        if first_tool_emit_ms == 0 {
+                                            first_tool_emit_ms = stream_started.elapsed().as_millis() as u64;
+                                        }
+                                        emitted_downstream_event = true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1163,7 +1261,7 @@ async fn handle_stream(
             }
             break;
         }
-        if final_stream_error.is_some() && !tool_calls.is_empty() {
+        if final_stream_error.is_some() && !tool_calls.is_empty() && emitted_tool_call_indexes.is_empty() {
             tracing::warn!(
                 protocol = "anthropic",
                 model = %body.model,
@@ -1179,6 +1277,21 @@ async fn handle_stream(
             );
             yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":final_stream_error.unwrap_or_else(||"upstream stream truncated after partial tool call".to_string())}}).to_string()));
             return;
+        } else if final_stream_error.is_some() && !emitted_tool_call_indexes.is_empty() {
+            tracing::warn!(
+                protocol = "anthropic",
+                model = %body.model,
+                source_client = ?profile.kind,
+                prompt_hash,
+                prompt_hash_hex = %prompt_hash_hex,
+                attempts_used,
+                text_chars = text.len(),
+                reasoning_chars = reasoning.len(),
+                tool_call_count = tool_calls.len(),
+                emitted_tool_call_count = emitted_tool_call_indexes.len(),
+                error = ?final_stream_error,
+                "ClaudeCode stream guard preserving already emitted complete tool calls after upstream truncation"
+            );
         }
         if final_stream_error.is_some() && !text.trim().is_empty() {
             tracing::warn!(
@@ -1206,10 +1319,11 @@ async fn handle_stream(
             }
             if !text_block_open {
                 text_block_open = true;
-                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
+                text_block_index = emitted_tool_call_blocks;
+                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":text_block_index,"content_block":{"type":"text","text":""}}).to_string()));
             }
             text.push_str(&final_markdown);
-            yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":final_markdown}}).to_string()));
+            yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":final_markdown}}).to_string()));
         }
         if text.trim().is_empty() && tool_calls.is_empty() {
             if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body) {
@@ -1223,9 +1337,10 @@ async fn handle_stream(
                     message_started = true;
                 }
                 text_block_open = true;
+                text_block_index = emitted_tool_call_blocks;
                 text.push_str(fallback_text);
-                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));
-                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":fallback_text}}).to_string()));
+                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":text_block_index,"content_block":{"type":"text","text":""}}).to_string()));
+                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":fallback_text}}).to_string()));
             } else {
                 let empty_output_class = if !reasoning.trim().is_empty() {
                     if upstream_finish_reason.as_deref() == Some("length") {
@@ -1256,20 +1371,20 @@ async fn handle_stream(
             }
         }
         if text_block_open {
-            yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string()));
+            yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":text_block_index}).to_string()));
         }
         if !tool_calls.is_empty() {
             if !message_started {
                 yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
             }
             for (ti,tool) in tool_calls.iter().enumerate() {
+                if emitted_tool_call_indexes.contains(&tool.index) {
+                    continue;
+                }
                 let tidx = ti as u64 + u64::from(text_block_open);
-                let clean_id = tool.id.clone().unwrap_or_else(||format!("call_{}", tool.index));
-                let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
-                let tc=ToolCall{id:Some(clean_id),call_type:"function".into(),function:ToolFunction{name:tool.name.clone(),arguments:tool.arguments.clone()},index:Some(tool.index)};
-                let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
-                let ct=if profile.uses_compat_tool_history() { synthesis::tool::complete_tool_call(&tc,&body) } else { tc };
-                let input:Value=serde_json::from_str(&ct.function.arguments).unwrap_or_default();
+                let Some((ct, input)) = streamable_anthropic_tool_call(tool, &body, profile) else {
+                    continue;
+                };
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));
                 let js=serde_json::to_string(&input).unwrap_or_default();
                 if js!="{}" {
@@ -1330,11 +1445,13 @@ async fn handle_stream(
             first_reasoning_ms,
             first_content_ms,
             first_tool_call_ms,
+            first_tool_emit_ms,
             total_elapsed_ms = stream_started.elapsed().as_millis() as u64,
             idle_ping_count,
             text_chars = text.len(),
             reasoning_chars = reasoning.len(),
             tool_call_count = tool_calls.len(),
+            emitted_tool_call_count = emitted_tool_call_indexes.len(),
             output_tokens,
             cache_creation_input_tokens = cache_creation,
             cache_read_input_tokens = cache_read,
@@ -1744,6 +1861,36 @@ mod tests {
             std::time::Duration::from_secs(44),
             std::time::Duration::from_secs(45)
         ));
+    }
+
+    #[test]
+    fn no_forwardable_retry_after_is_adaptive_by_input_bucket() {
+        let configured = std::time::Duration::from_secs(45);
+
+        assert_eq!(
+            adaptive_no_forwardable_retry_after(configured, 40_000),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            adaptive_no_forwardable_retry_after(configured, 80_000),
+            std::time::Duration::from_secs(14)
+        );
+        assert_eq!(
+            adaptive_no_forwardable_retry_after(configured, 150_000),
+            std::time::Duration::from_secs(22)
+        );
+        assert_eq!(
+            adaptive_no_forwardable_retry_after(configured, 300_000),
+            std::time::Duration::from_secs(32)
+        );
+        assert_eq!(
+            adaptive_no_forwardable_retry_after(configured, 450_000),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(
+            adaptive_no_forwardable_retry_after(std::time::Duration::from_secs(8), 300_000),
+            std::time::Duration::from_secs(8)
+        );
     }
 
     #[test]
