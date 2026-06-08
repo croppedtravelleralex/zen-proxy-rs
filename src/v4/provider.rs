@@ -147,6 +147,7 @@ pub async fn handle_v4_proxy(
             client_id,
             effective_body_len,
             streaming,
+            &upstream_body,
         ),
     };
     let request_body_bucket = body_size_bucket(effective_body_len).to_string();
@@ -424,6 +425,7 @@ fn build_affinity_key(
     client_id: &str,
     body_size: u64,
     streaming: bool,
+    body: &Value,
 ) -> String {
     if !streaming || body_size < 128 * 1024 {
         return String::new();
@@ -433,13 +435,41 @@ fn build_affinity_key(
     } else {
         LedgerEvent::short_hash(client_id)
     };
+    let prefix_hash = affinity_prefix_hash(body);
+    let tools_hash = affinity_component_hash(body.get("tools"));
+    let tool_choice_hash = affinity_component_hash(body.get("tool_choice"));
     format!(
-        "{}:{}:{}:{}",
+        "{}:{}:{}:{}:p{}:tools{}:choice{}",
         public_model,
         path,
         client_bucket,
-        body_size_bucket(body_size)
+        body_size_bucket(body_size),
+        prefix_hash,
+        tools_hash,
+        tool_choice_hash
     )
+}
+
+fn affinity_prefix_hash(body: &Value) -> String {
+    let material = body
+        .get("messages")
+        .and_then(|messages| serde_json::to_vec(messages).ok())
+        .unwrap_or_default();
+    let prefix_len = material.len().min(256 * 1024);
+    short_hash_bytes(&material[..prefix_len])
+}
+
+fn affinity_component_hash(value: Option<&Value>) -> String {
+    value
+        .and_then(|value| serde_json::to_vec(value).ok())
+        .map(|bytes| short_hash_bytes(&bytes))
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn short_hash_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(bytes);
+    hex::encode(&hash[..8])
 }
 
 fn infer_gateway(headers: &HeaderMap, external_request_id: &str) -> String {
@@ -2588,11 +2618,44 @@ mod tests {
 
     #[test]
     fn affinity_key_is_only_for_large_streaming_requests() {
-        assert!(build_affinity_key("m", "chat/completions", "sk", 10, true).is_empty());
-        assert!(build_affinity_key("m", "chat/completions", "sk", 200_000, false).is_empty());
-        let key = build_affinity_key("m", "chat/completions", "sk", 200_000, true);
+        let body = serde_json::json!({"messages":[{"role":"user","content":"hello"}]});
+        assert!(build_affinity_key("m", "chat/completions", "sk", 10, true, &body).is_empty());
+        assert!(
+            build_affinity_key("m", "chat/completions", "sk", 200_000, false, &body).is_empty()
+        );
+        let key = build_affinity_key("m", "chat/completions", "sk", 200_000, true, &body);
         assert!(key.starts_with("m:chat/completions:"));
-        assert!(key.ends_with(":small"));
+        assert!(key.contains(":small:p"));
+        assert!(key.contains(":tools"));
+        assert!(key.contains(":choice"));
+    }
+
+    #[test]
+    fn affinity_key_uses_stable_prefix_and_tools_hash() {
+        let prefix = "a".repeat(400_000);
+        let first = serde_json::json!({
+            "messages":[{"role":"user","content":prefix}],
+            "tools":[{"function":{"name":"Read"}}],
+            "tool_choice":"auto"
+        });
+        let mut second = first.clone();
+        second["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"role":"user","content":"continue"}));
+        let changed_prefix = serde_json::json!({
+            "messages":[{"role":"user","content":format!("b{}", "a".repeat(399_999))}],
+            "tools":[{"function":{"name":"Read"}}],
+            "tool_choice":"auto"
+        });
+
+        let first_key = build_affinity_key("m", "messages", "client", 800_000, true, &first);
+        let second_key = build_affinity_key("m", "messages", "client", 820_000, true, &second);
+        let changed_key =
+            build_affinity_key("m", "messages", "client", 800_000, true, &changed_prefix);
+
+        assert_eq!(first_key, second_key);
+        assert_ne!(first_key, changed_key);
     }
 
     #[test]

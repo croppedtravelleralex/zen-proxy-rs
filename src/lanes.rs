@@ -300,7 +300,7 @@ fn request_profile(body: &Bytes) -> RequestProfile {
     RequestProfile {
         streaming,
         max_tokens,
-        tool_heavy: tools_count >= 16 || tool_markers >= 12,
+        tool_heavy: tools_count >= 8 || tool_markers >= 6,
     }
 }
 
@@ -470,6 +470,33 @@ mod tests {
                 "model": "deepseek-v4-flash",
                 "stream": true,
                 "messages": messages
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            classify_lane(&cfg, "chat/completions", &body),
+            LaneKind::ToolHeavy
+        );
+    }
+
+    #[test]
+    fn routes_medium_claude_code_tool_stream_to_isolated_lane() {
+        let cfg = cfg_with_lanes();
+        let tools = (0..8)
+            .map(|idx| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {"name": format!("Tool{idx}"), "parameters": {"type":"object"}}
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "stream": true,
+                "tools": tools,
+                "messages": [{"role": "user", "content": "continue"}]
             })
             .to_string(),
         );
