@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const UA: &str = "opencode/1.15.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 const DEFAULT_STABLE_SESSION_PREFIX_BYTES: usize = 256 * 1024;
+const DEFAULT_MEDIUM_STABLE_SESSION_PREFIX_BYTES: usize = 32 * 1024;
 const MIN_STABLE_SESSION_PREFIX_BYTES: usize = 4 * 1024;
 const MAX_STABLE_SESSION_PREFIX_BYTES: usize = 1024 * 1024;
 
@@ -374,28 +375,43 @@ fn session_scope(body: &serde_json::Value) -> String {
     let estimated_tokens = material.len() / 4;
     let compacted = material.contains("free-model-client-rs context compactor");
     if compacted || estimated_tokens >= 10_000 {
-        let prefix_bytes = stable_session_prefix_bytes();
+        let prefix_bytes = stable_session_prefix_bytes(material.len());
         let prefix_len = material.len().min(prefix_bytes);
         let prefix_hash = short_hash_bytes(&material.as_bytes()[..prefix_len]);
         let tools_hash = component_hash(body.get("tools"));
         let tool_choice_hash = component_hash(body.get("tool_choice"));
         return format!(
-            "large_prefix_v498:p{}:{}:tools{}:choice{}",
+            "large_prefix_v4106:p{}:{}:tools{}:choice{}",
             prefix_bytes, prefix_hash, tools_hash, tool_choice_hash
         );
     }
     "normal".to_string()
 }
 
-fn stable_session_prefix_bytes() -> usize {
-    std::env::var("ZEN_UPSTREAM_SESSION_PREFIX_BYTES")
+fn stable_session_prefix_bytes(material_bytes: usize) -> usize {
+    let large_prefix_bytes = env_usize_clamped(
+        "ZEN_UPSTREAM_SESSION_PREFIX_BYTES",
+        DEFAULT_STABLE_SESSION_PREFIX_BYTES,
+        MIN_STABLE_SESSION_PREFIX_BYTES,
+        MAX_STABLE_SESSION_PREFIX_BYTES,
+    );
+    if material_bytes <= large_prefix_bytes {
+        return env_usize_clamped(
+            "ZEN_UPSTREAM_MEDIUM_SESSION_PREFIX_BYTES",
+            DEFAULT_MEDIUM_STABLE_SESSION_PREFIX_BYTES,
+            MIN_STABLE_SESSION_PREFIX_BYTES,
+            large_prefix_bytes,
+        );
+    }
+    large_prefix_bytes
+}
+
+fn env_usize_clamped(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_STABLE_SESSION_PREFIX_BYTES)
-        .clamp(
-            MIN_STABLE_SESSION_PREFIX_BYTES,
-            MAX_STABLE_SESSION_PREFIX_BYTES,
-        )
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 fn session_material(body: &serde_json::Value) -> String {
@@ -973,6 +989,41 @@ mod tests {
         );
 
         assert_eq!(
+            header_value(&first, "x-opencode-session"),
+            header_value(&second, "x-opencode-session")
+        );
+    }
+
+    #[test]
+    fn opencode_session_keeps_medium_stable_prefix_when_tail_grows() {
+        let prefix = "a".repeat(80_000);
+        let first = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":prefix}]}),
+        );
+        let second = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":prefix},{"role":"assistant","content":"done"},{"role":"user","content":"continue"}]}),
+        );
+
+        assert_eq!(
+            header_value(&first, "x-opencode-session"),
+            header_value(&second, "x-opencode-session")
+        );
+    }
+
+    #[test]
+    fn opencode_session_changes_when_medium_prefix_changes() {
+        let first = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"a".repeat(80_000)}]}),
+        );
+        let second = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"b".repeat(80_000)}]}),
+        );
+
+        assert_ne!(
             header_value(&first, "x-opencode-session"),
             header_value(&second, "x-opencode-session")
         );

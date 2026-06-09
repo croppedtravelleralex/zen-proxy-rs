@@ -2,6 +2,39 @@
 
 ## P0：必须优先处理
 
+### V4.106 质量保全 cache-friendly 新增输入优化
+
+- 状态：源码实现中；目标验收已确认。
+- 目标：
+  1. 不裁剪上下文、不摘要替换、不修改用户提示词、不限制输出、不默认禁用 thinking。
+  2. 通过稳定 prefix/session/tools 路由降低 cc-switch 口径的“新增输入”占比。
+  3. 保持或提升 ClaudeCode 质量：最新指令不漏接、工具参数完整、长会话目标不丢、Markdown/代码块/列表/引用不退化。
+- 当前基线：
+  1. `2026-06-09 17:45-20:40 CST`，cc-switch 口径约为：新增输入约 `3.01 亿`、缓存命中约 `5.76 亿`、缓存命中率约 `65.7%`。
+  2. 同窗口 ZenProxy 复算：NewAPI prompt/new input `308,496,934`，provider cache read `580,939,136`，cc-switch 风格命中率约 `65.32%`。
+  3. 10k-50k 输入桶 cache hit 约 `37.82%`，明显低于 50k+ 桶的 `96%+`，是新增输入占比偏高的主要结构性来源。
+- 根因候选：
+  1. V4.98 的上游 session scope 默认使用 `256KB` 稳定前缀；10k-50k 中等上下文的 `messages` material 常常整体小于 256KB，导致尾部每轮变化时 session/project 也跟着变化。
+  2. 对超大上下文，256KB 前缀稳定可以保留长前缀隔离；对中等上下文，过长前缀反而让 session 不够稳定。
+- 已落地源码项：
+  1. 中等上下文新增独立稳定前缀：`ZEN_UPSTREAM_MEDIUM_SESSION_PREFIX_BYTES`，默认 `32KB`，只用于 material 小于等于 large prefix 的 10k+ 请求。
+  2. 大上下文仍保留 `ZEN_UPSTREAM_SESSION_PREFIX_BYTES`，默认 `256KB`，不影响 200k+ 长会话隔离。
+  3. session scope 版本升级为 `large_prefix_v4106`，避免和旧 V4.98 分组混淆。
+  4. 请求正文、messages、tools、tool_choice、max_tokens 均不改写；这是 header/session 层 cache-friendly 优化，不是语义压缩。
+- 回归测试：
+  1. 中等上下文稳定前缀不变、尾部追加时，`x-opencode-session` 保持稳定。
+  2. 中等上下文前缀变化时，`x-opencode-session` 必须变化。
+  3. 既有大上下文稳定前缀测试继续保留。
+- 质量硬门槛：
+  1. 输出质量不得下降：不得出现系统性变短、变钝、漏接用户最新指令、工具参数缺失、工具重复风暴或 Markdown 格式退化。
+  2. 不允许用裁剪、摘要、隐藏提示词、输出 cap、全局 disabled thinking 来换 cache hit。
+  3. 如果 cache hit 提升但 `Invalid tool parameters`、`provider_missing_reasoning_content`、`reasoning_only_length` 或输出截断上升，视为失败。
+- 线上验收：
+  1. cc-switch 口径 cache hit 从当前约 `65%` 向 `75%+` 改善；若不足，必须按输入桶解释。
+  2. 10k-50k 输入桶 cache hit 明显上升，目标先从 `37.82%` 提到 `60%+`。
+  3. 首字不退化：cache accepted 首字 P95 不高于当前约 `8s`，rejected P95 不高于当前约 `11.6s`。
+  4. NewAPI/ZenProxy 错误率不升高；`anthropic_buffered` 仍只允许窄场景。
+
 ### V4.105 ClaudeCode true-stream 与 cache hit 对齐专项
 
 - 状态：源码已落地，本地验证通过，并已部署 panda；仍需真实 ClaudeCode 长会话线上验收。

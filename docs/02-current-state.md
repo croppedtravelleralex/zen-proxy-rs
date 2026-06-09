@@ -18,7 +18,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - `fmt --check` 通过。
 - `clippy --all-targets -- -D warnings` 通过。
-- `cargo test` 通过：库测试 114 条、kernel golden 112 条、doc tests 0 条。
+- `cargo test` 通过：库测试 122 条、kernel golden 112 条、doc tests 0 条。
 - `zen-proxy-rs` 本轮已改外层 V4 context compactor 和 e2e harness；当前已验证 `clippy -D warnings`、bin 单元测试 132 条、context 相关单元测试 12 条、e2e 27 条、shell e2e 9/9 通过。
 
 注意：上述验证覆盖本仓库当前源码。2026-06-04 18:54 已将输出限制取消、模型策略收窄、flash/free 输入放行和 cache 四态观测构建进 `zen-proxy-rs` release 并部署到 panda；部署后已通过 NewAPI models、短请求和手工大上下文不折叠 smoke。真实 panda `policy-smoke/policy-dry` 和四客户端压测仍未跑，不能当作生产压测结论。
@@ -69,6 +69,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 42. 2026-06-09 已补并部署 V4.102 ClaudeCode 工具参数完整性门控：Anthropic/ClaudeCode 流式和非流式只在工具参数包含必填字段且 JSON 完整后下发 `tool_use`；上游空 `{}` 或缺必填参数时先做窄范围 disabled-thinking retry，仍不完整则返回结构化 `upstream returned incomplete tool call arguments`，不再把坏工具调用交给 ClaudeCode 造成 `Invalid tool parameters`。同时新增重复补参防循环：同一修复后工具调用如果历史中已有 assistant tool_call 和对应 tool_result，不再重复补发。另补文件工具坏路径保护：`Read/Write/Edit` 等收到 `file_path="\\\\"`、`"/"`、`"."` 这类明显非文件路径时，优先从最新用户明确指令修复，修不了则拒绝下发。线上 stripped hash `ebe41572fe76a5f99783ba5e4308e164368415b00277432cd9829e60ecc651dd`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-111046.pre-v4102-tool-input-guard`。
 43. 2026-06-09 V4.103 ClaudeCode 工具门控续修已随 V4.104 部署 panda：`SendMessage` 字符串消息缺 `summary` 时自动补短 summary，结构化消息不误补；`Bash/ToolSearch/WebSearch` 的空 `command/query` 不再因字段存在而放行；同一 assistant response 内完全相同的 ClaudeCode 工具名+输入 JSON 只下发一次，降低重复 `Read/Edit/Bash` 风暴；流式 `provider_missing_reasoning_content` 在首轮 disabled-thinking 后可继续走工具历史 sanitize/text-only 降级重试。
 44. 2026-06-09 V4.104 ClaudeCode progressive tool streaming 已部署 panda：ClaudeCode Anthropic 工具流在工具 id/name 和非空 arguments 开始出现后立即发送真实 `content_block_start tool_use`，后续按 `input_json_delta` 增量透传，最终完整 JSON 校验通过后才 `content_block_stop`；同时取消从最新 user 文本推断 `Read/Write/Edit/Bash/Task/ToolSearch/WebSearch` 参数，只保留 `SendMessage.summary` 确定性窄修复。线上 stripped hash `08d9064600e66097ab45bbe97290bf5e7015174a15adbe27dc5fcf8261c2ed9f`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-134330.pre-v4104-ebe41572fe76a5f99783ba5e4308e164368415b00277432cd9829e60ecc651dd`。
+45. 2026-06-09 V4.106 源码已补质量保全 cache-friendly 中等上下文 session 优化：当 10k+ 请求的 `messages` material 小于等于大前缀阈值时，`x-opencode-session/project` 使用默认 `32KB` 中等稳定前缀分组；大上下文仍使用默认 `256KB` 前缀。该改动只影响上游 session header，不改请求正文、不裁剪上下文、不改提示词、不限制输出。当前本地 `fmt/clippy/test` 通过，尚未部署 panda。
 
 ## 附属工具
 

@@ -2,19 +2,20 @@
 
 ## Now
 
-1. V4.105 ClaudeCode true-stream/cache-hit 已部署到 panda；下一步用真实 ClaudeCode 长会话确认 `anthropic_buffered` 误触发、cc-switch 真实首字和 cache hit 统计是否改善。
-2. 继续验收 V4.98 cache-friendly session：代码和 panda 部署已完成，下一步用同一 ClaudeCode 长会话确认 `prefix_4k/32k/128k/256k` 是否稳定，并与 cache tokens、`frt`、总耗时对齐判断是否提升命中。
-3. 观察已部署的 V4.104 ClaudeCode progressive tool streaming：确认大 Write/Edit/Agent 工具参数不再等完整 JSON 才出现真实 tool_use 首字，同时 `Invalid tool parameters`、半截工具 JSON 和重复工具风暴不回潮。
-4. 观察已部署的 ClaudeCode 低预算工具探针保护：确认真实 `/context` 等非流式小工具探针不再因 `reasoning_only_length` 裸 502，同时普通 ClaudeCode 工具调用仍不默认禁用 thinking。
-5. 观察已部署的 ClaudeCode Anthropic stream idle ping：确认 50k+ 流式请求 `client_gone/use_time≈64s/completion=0` 红行是否下降；注意该 ping 只保活，不代表 first content 变快。
-6. 观察 V4.99 reasoning-aware output guard 生产效果：确认短/中非流式 `reasoning_only_length` 不再裸 502，低预算小流式不再误进 huge buffered，且 ClaudeCode 大流式主会话不被默认禁用 thinking。
-7. 继续跑真实 panda `policy-smoke` / `policy-dry`，确认输出限制取消、flash 输入只观测不压缩、provider usage/header/body 信号、cache 四态和 V4.99 空输出分类在生产链路上闭环；同时记录既有上游空输出/节点质量问题，避免误归因到 V4.98/V4.99。
-8. policy harness 通过后再跑修复后的四客户端 smoke/dry，确认 OpenClaw、Hermes、Windows ClaudeCode、WSL ClaudeCode 的真实客户端状态。
-9. 针对 huge_context、`deepseek-v4-flash-lite` 长上下文语义漂移、Hermes 慢路径和输出限制取消后的 413/超时/空输出/成本风险做 lane/case 降级或隔离。
-10. 清理或归类未跟踪文件，避免把 `.codex_tmp/`、密钥、测试输出混进提交。
-11. 对压测前配置做安全确认：不污染 Hermes/OpenClaw/ClaudeCode 用户默认配置，不使用本机 `127.0.0.1:8081` 代替 panda。
-12. 提交前复查 README、维护文档和 git 状态。
-13. NewAPI 使用日志导出器已在 panda 以 systemd 服务上线；后续补专用只读 DB 用户和 NewAPI `type` 精确映射。
+1. V4.106 质量保全 cache-friendly 新增输入优化进入实现与验收：目标是在不裁上下文、不改提示词、不降质量的前提下，提高 cc-switch 口径 cache hit，优先修 10k-50k 输入桶低命中。
+2. V4.105 ClaudeCode true-stream/cache-hit 已部署到 panda；下一步用真实 ClaudeCode 长会话确认 `anthropic_buffered` 误触发、cc-switch 真实首字和 cache hit 统计是否改善。
+3. 继续验收 V4.98/V4.106 cache-friendly session：确认 `prefix_4k/32k/128k/256k` 是否稳定，并与 cache tokens、`frt`、总耗时对齐判断是否提升命中。
+4. 观察已部署的 V4.104 ClaudeCode progressive tool streaming：确认大 Write/Edit/Agent 工具参数不再等完整 JSON 才出现真实 tool_use 首字，同时 `Invalid tool parameters`、半截工具 JSON 和重复工具风暴不回潮。
+5. 观察已部署的 ClaudeCode 低预算工具探针保护：确认真实 `/context` 等非流式小工具探针不再因 `reasoning_only_length` 裸 502，同时普通 ClaudeCode 工具调用仍不默认禁用 thinking。
+6. 观察已部署的 ClaudeCode Anthropic stream idle ping：确认 50k+ 流式请求 `client_gone/use_time≈64s/completion=0` 红行是否下降；注意该 ping 只保活，不代表 first content 变快。
+7. 观察 V4.99 reasoning-aware output guard 生产效果：确认短/中非流式 `reasoning_only_length` 不再裸 502，低预算小流式不再误进 huge buffered，且 ClaudeCode 大流式主会话不被默认禁用 thinking。
+8. 继续跑真实 panda `policy-smoke` / `policy-dry`，确认输出限制取消、flash 输入只观测不压缩、provider usage/header/body 信号、cache 四态和 V4.99 空输出分类在生产链路上闭环；同时记录既有上游空输出/节点质量问题，避免误归因到 V4.98/V4.99。
+9. policy harness 通过后再跑修复后的四客户端 smoke/dry，确认 OpenClaw、Hermes、Windows ClaudeCode、WSL ClaudeCode 的真实客户端状态。
+10. 针对 huge_context、`deepseek-v4-flash-lite` 长上下文语义漂移、Hermes 慢路径和输出限制取消后的 413/超时/空输出/成本风险做 lane/case 降级或隔离。
+11. 清理或归类未跟踪文件，避免把 `.codex_tmp/`、密钥、测试输出混进提交。
+12. 对压测前配置做安全确认：不污染 Hermes/OpenClaw/ClaudeCode 用户默认配置，不使用本机 `127.0.0.1:8081` 代替 panda。
+13. 提交前复查 README、维护文档和 git 状态。
+14. NewAPI 使用日志导出器已在 panda 以 systemd 服务上线；后续补专用只读 DB 用户和 NewAPI `type` 精确映射。
 
 ## Done This Phase
 
@@ -42,15 +43,16 @@
 
 ## Next
 
-1. 观察 V4.105 线上效果：确认 `buffer_reason` 日志只出现在窄场景、普通 ClaudeCode 长会话不因宽泛 exact-output 进入 buffered、DeepSeek `prompt_cache_hit_tokens/prompt_cache_miss_tokens` 能透传为 cache usage、cache hit 分桶报表能对齐 cc-switch/NewAPI/ZenProxy。
-2. 按 `docs/06-panda-pressure-test-plan.md` 执行 policy-smoke / policy-dry；任一 policy gate 失败都不进入四客户端 dry/full，尤其要确认 panda 上 flash/free 没有输入墙、输出墙或隐藏 compactor。
-3. 用真实 ClaudeCode 长会话观察 V4.104/V4.105：`first_tool_call_ms` 与 NewAPI FRT 是否靠近、`first_tool_emit_ms` 长尾是否不再阻塞首字、`anthropic_buffered` 是否只在窄场景出现，以及 `Invalid tool parameters`、`summary is required when message is a string`、`provider_missing_reasoning_content`、重复 `Read/Edit/Bash`、`Agent` 初始化卡住和输出格式是否回归。
-4. 继续补强 Windows ClaudeCode 和 WSL ClaudeCode 测试执行环境，避免从 WSL 非交互环境或 clawgod launcher 误报 `config_error`。
-5. policy 通过后按 `docs/06-panda-pressure-test-plan.md` 执行四客户端 dry run，再决定是否进入 full run：Windows ClaudeCode、WSL ClaudeCode、WSL Hermes、WSL OpenClaw。
-6. 加入更细粒度运行指标采集：protocol first byte、first content、first tool call、first downstream、upstream connect、upstream status、stream parse error、empty upstream。
-7. 补足 API 覆盖文档：OpenAI、Anthropic、Models、Health、错误响应、认证头、请求体限制。
-8. 如果代码继续变化，保持根 README 和维护文档同步。
-9. NewAPI 使用日志导出器下一步是生产收紧：专用只读 DB 用户、审计日志、NewAPI `type` 精确错误分类、可选日趋势统计。
+1. 验证 V4.106 中等上下文 session 优化：本地测试通过后部署 panda，比较 cc-switch 口径 cache hit、10k-50k 输入桶命中率、真实首字和工具质量；不得用降质换命中率。
+2. 观察 V4.105 线上效果：确认 `buffer_reason` 日志只出现在窄场景、普通 ClaudeCode 长会话不因宽泛 exact-output 进入 buffered、DeepSeek `prompt_cache_hit_tokens/prompt_cache_miss_tokens` 能透传为 cache usage、cache hit 分桶报表能对齐 cc-switch/NewAPI/ZenProxy。
+3. 按 `docs/06-panda-pressure-test-plan.md` 执行 policy-smoke / policy-dry；任一 policy gate 失败都不进入四客户端 dry/full，尤其要确认 panda 上 flash/free 没有输入墙、输出墙或隐藏 compactor。
+4. 用真实 ClaudeCode 长会话观察 V4.104/V4.105/V4.106：`first_tool_call_ms` 与 NewAPI FRT 是否靠近、`first_tool_emit_ms` 长尾是否不再阻塞首字、`anthropic_buffered` 是否只在窄场景出现，以及 `Invalid tool parameters`、`summary is required when message is a string`、`provider_missing_reasoning_content`、重复 `Read/Edit/Bash`、`Agent` 初始化卡住和输出格式是否回归。
+5. 继续补强 Windows ClaudeCode 和 WSL ClaudeCode 测试执行环境，避免从 WSL 非交互环境或 clawgod launcher 误报 `config_error`。
+6. policy 通过后按 `docs/06-panda-pressure-test-plan.md` 执行四客户端 dry run，再决定是否进入 full run：Windows ClaudeCode、WSL ClaudeCode、WSL Hermes、WSL OpenClaw。
+7. 加入更细粒度运行指标采集：protocol first byte、first content、first tool call、first downstream、upstream connect、upstream status、stream parse error、empty upstream。
+8. 补足 API 覆盖文档：OpenAI、Anthropic、Models、Health、错误响应、认证头、请求体限制。
+9. 如果代码继续变化，保持根 README 和维护文档同步。
+10. NewAPI 使用日志导出器下一步是生产收紧：专用只读 DB 用户、审计日志、NewAPI `type` 精确错误分类、可选日趋势统计。
 
 ## Later
 
