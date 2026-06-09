@@ -2,7 +2,7 @@
 
 ## Now
 
-1. V4.106 质量保全 cache-friendly 新增输入优化进入实现与验收：目标是在不裁上下文、不改提示词、不降质量的前提下，提高 cc-switch 口径 cache hit，优先修 10k-50k 输入桶低命中。
+1. V4.106 质量保全 cache-friendly 新增输入优化已部署 panda，进入真实流量观察：目标是在不裁上下文、不改提示词、不降质量的前提下，提高 cc-switch 口径 cache hit，优先修 10k-50k 输入桶低命中。
 2. V4.105 ClaudeCode true-stream/cache-hit 已部署到 panda；下一步用真实 ClaudeCode 长会话确认 `anthropic_buffered` 误触发、cc-switch 真实首字和 cache hit 统计是否改善。
 3. 继续验收 V4.98/V4.106 cache-friendly session：确认 `prefix_4k/32k/128k/256k` 是否稳定，并与 cache tokens、`frt`、总耗时对齐判断是否提升命中。
 4. 观察已部署的 V4.104 ClaudeCode progressive tool streaming：确认大 Write/Edit/Agent 工具参数不再等完整 JSON 才出现真实 tool_use 首字，同时 `Invalid tool parameters`、半截工具 JSON 和重复工具风暴不回潮。
@@ -43,7 +43,7 @@
 
 ## Next
 
-1. 验证 V4.106 中等上下文 session 优化：本地测试通过后部署 panda，比较 cc-switch 口径 cache hit、10k-50k 输入桶命中率、真实首字和工具质量；不得用降质换命中率。
+1. 验证 V4.106 中等上下文 session 优化的线上效果：比较部署后 15-30 分钟和更长窗口的 cc-switch 口径 cache hit、10k-50k 输入桶命中率、真实首字和工具质量；不得用部署后前 5 分钟 warm-up 样本下结论，不得用降质换命中率。
 2. 观察 V4.105 线上效果：确认 `buffer_reason` 日志只出现在窄场景、普通 ClaudeCode 长会话不因宽泛 exact-output 进入 buffered、DeepSeek `prompt_cache_hit_tokens/prompt_cache_miss_tokens` 能透传为 cache usage、cache hit 分桶报表能对齐 cc-switch/NewAPI/ZenProxy。
 3. 按 `docs/06-panda-pressure-test-plan.md` 执行 policy-smoke / policy-dry；任一 policy gate 失败都不进入四客户端 dry/full，尤其要确认 panda 上 flash/free 没有输入墙、输出墙或隐藏 compactor。
 4. 用真实 ClaudeCode 长会话观察 V4.104/V4.105/V4.106：`first_tool_call_ms` 与 NewAPI FRT 是否靠近、`first_tool_emit_ms` 长尾是否不再阻塞首字、`anthropic_buffered` 是否只在窄场景出现，以及 `Invalid tool parameters`、`summary is required when message is a string`、`provider_missing_reasoning_content`、重复 `Read/Edit/Bash`、`Agent` 初始化卡住和输出格式是否回归。

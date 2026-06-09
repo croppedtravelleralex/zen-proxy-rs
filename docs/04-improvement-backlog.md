@@ -4,7 +4,7 @@
 
 ### V4.106 质量保全 cache-friendly 新增输入优化
 
-- 状态：源码实现中；目标验收已确认。
+- 状态：已部署 panda，进入真实流量观察；目标验收已确认。
 - 目标：
   1. 不裁剪上下文、不摘要替换、不修改用户提示词、不限制输出、不默认禁用 thinking。
   2. 通过稳定 prefix/session/tools 路由降低 cc-switch 口径的“新增输入”占比。
@@ -21,6 +21,14 @@
   2. 大上下文仍保留 `ZEN_UPSTREAM_SESSION_PREFIX_BYTES`，默认 `256KB`，不影响 200k+ 长会话隔离。
   3. session scope 版本升级为 `large_prefix_v4106`，避免和旧 V4.98 分组混淆。
   4. 请求正文、messages、tools、tool_choice、max_tokens 均不改写；这是 header/session 层 cache-friendly 优化，不是语义压缩。
+- 部署事实：
+  1. 2026-06-09 21:37 CST 已部署到 panda 三实例，线上 stripped hash `b401c9463e29788e67aaecbe53c02b8743b2e25970e135e767410df9d4e0edab`。
+  2. 旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-213725.pre-v4106-a52f4d6add0a`。
+  3. 部署后 `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`，池 `dead=0`、`ratelimited=0`。
+  4. 4000 `/v1/models` 只暴露 `deepseek-v4-flash`、`deepseek-v4-flash-lite`。
+  5. ZenProxy 直连 OpenAI/Anthropic 非流式 `PONG` smoke 通过；panda NewAPI -> channel 69 OpenAI/Anthropic smoke 通过，channel 69 当前启用且 group 为 `vip,ds`，base URL 为 `http://172.17.0.1:4000`。
+  6. 部署后短窗口未见 `panic`、`Invalid tool parameters`、`Failed to parse JSON`、`lane is saturated`、`no proxy resources`、`stream truncated` 或 `provider_missing_reasoning_content`；但可见 `reasoning_only_length` 首跳空输出和 disabled-thinking retry 警告，NewAPI 侧也有少量 type=5 500，必须继续按最终裸透率和用户体感观察。
+  7. 早期 ZenProxy 日志 token 口径样本显示 `cache_read=159,576,192`、`cache_miss=5,763,765`、hit rate 约 `96.51%`；该窗口混有 warm-up 和短请求，不等于最终 10k-50k 桶验收结论。
 - 回归测试：
   1. 中等上下文稳定前缀不变、尾部追加时，`x-opencode-session` 保持稳定。
   2. 中等上下文前缀变化时，`x-opencode-session` 必须变化。
@@ -34,6 +42,7 @@
   2. 10k-50k 输入桶 cache hit 明显上升，目标先从 `37.82%` 提到 `60%+`。
   3. 首字不退化：cache accepted 首字 P95 不高于当前约 `8s`，rejected P95 不高于当前约 `11.6s`。
   4. NewAPI/ZenProxy 错误率不升高；`anthropic_buffered` 仍只允许窄场景。
+  5. 部署后前几分钟因 session scope 升级为 `large_prefix_v4106`，可能出现 cache warm-up/rejected 样本；最终验收必须看 15-30 分钟以上真实流量窗口，并按输入桶拆分。
 
 ### V4.105 ClaudeCode true-stream 与 cache hit 对齐专项
 
