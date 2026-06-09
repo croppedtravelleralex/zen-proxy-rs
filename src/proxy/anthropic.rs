@@ -19,6 +19,21 @@ const CLAUDE_CODE_STREAM_GUARD_ATTEMPTS: usize = 3;
 const ANTHROPIC_TOOL_JSON_DELTA_CHUNK_BYTES: usize = 4 * 1024;
 const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeCodeBufferedStreamReason {
+    TinyExactOutputNoTools,
+    SmallOutputHugeContextNoTools,
+}
+
+impl ClaudeCodeBufferedStreamReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::TinyExactOutputNoTools => "tiny_exact_output_no_tools",
+            Self::SmallOutputHugeContextNoTools => "small_output_huge_context_no_tools",
+        }
+    }
+}
+
 pub async fn handle_anthropic_messages(
     client: &Client,
     config: &KernelConfig,
@@ -145,6 +160,8 @@ pub async fn handle_anthropic_messages(
             .as_ref()
             .map(translate::anthropic_tool_choice_to_openai)
     };
+    let has_tools = !tools.is_empty();
+    let tool_count = tools.len();
     let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":tool_choice});
     if let Some(max_tok) = max_tok {
         zb["max_tokens"] = serde_json::json!(max_tok);
@@ -254,13 +271,34 @@ pub async fn handle_anthropic_messages(
         return Ok(text_resp(ts, &cr.model, "ok", input_tokens, output_tokens));
     }
     if body.stream.unwrap_or(false) {
-        let use_claude_code_huge_buffer = should_use_claude_code_buffered_stream(
+        let exact_output_literal = translate::exact_output_literal_from_messages(&cr.messages);
+        let claude_code_buffer_reason = claude_code_buffered_stream_reason(
             profile,
             context_repair.before_tokens,
             cr.max_tokens,
-            reduced_exact_output_anchor
-                || translate::exact_output_literal_from_messages(&cr.messages).is_some(),
+            has_tools,
+            reduced_exact_output_anchor,
+            exact_output_literal.as_deref(),
         );
+        if let Some(reason) = claude_code_buffer_reason {
+            tracing::warn!(
+                model = %cr.model,
+                source_client = ?profile.kind,
+                buffer_reason = reason.as_str(),
+                before_tokens = context_repair.before_tokens,
+                after_tokens = context_repair.after_tokens,
+                effective_max_tokens = ?cr.max_tokens,
+                reduced_exact_output_anchor,
+                has_exact_output_literal = exact_output_literal.is_some(),
+                exact_output_literal_chars = exact_output_literal
+                    .as_deref()
+                    .map(|literal| literal.chars().count())
+                    .unwrap_or(0),
+                tool_count,
+                message_count = cr.messages.len(),
+                "ClaudeCode stream entering buffered compatibility path"
+            );
+        }
         handle_stream(
             client,
             config,
@@ -268,7 +306,7 @@ pub async fn handle_anthropic_messages(
             &zb,
             profile,
             repair,
-            use_claude_code_huge_buffer,
+            claude_code_buffer_reason,
         )
         .await
     } else {
@@ -276,23 +314,40 @@ pub async fn handle_anthropic_messages(
     }
 }
 
-fn should_use_claude_code_buffered_stream(
+fn claude_code_buffered_stream_reason(
     profile: ClientProfile,
     before_tokens: u64,
     effective_max_tokens: Option<u64>,
-    has_exact_output_literal: bool,
-) -> bool {
+    has_tools: bool,
+    reduced_exact_output_anchor: bool,
+    exact_output_literal: Option<&str>,
+) -> Option<ClaudeCodeBufferedStreamReason> {
     if profile.kind != ClientKind::ClaudeCode {
-        return false;
+        return None;
     }
-    if has_exact_output_literal {
-        return true;
+    if has_tools {
+        return None;
     }
-    let Some(max_tokens) = effective_max_tokens else {
-        return false;
-    };
-    max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS
+    let has_tiny_exact_output_literal = reduced_exact_output_anchor
+        || exact_output_literal.is_some_and(is_tiny_exact_output_literal);
+    if has_tiny_exact_output_literal {
+        return Some(ClaudeCodeBufferedStreamReason::TinyExactOutputNoTools);
+    }
+    let max_tokens = effective_max_tokens?;
+    if max_tokens <= CLAUDE_CODE_BUFFERED_STREAM_MAX_OUTPUT_TOKENS
         && before_tokens >= CLAUDE_CODE_HUGE_BUFFER_MIN_INPUT_TOKENS
+    {
+        return Some(ClaudeCodeBufferedStreamReason::SmallOutputHugeContextNoTools);
+    }
+    None
+}
+
+fn is_tiny_exact_output_literal(literal: &str) -> bool {
+    let trimmed = literal.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains('\n')
+        && trimmed.chars().count() <= 80
+        && trimmed.split_whitespace().count() <= 1
 }
 
 async fn handle_non_stream(
@@ -669,13 +724,7 @@ fn cache_creation_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
 
 fn cache_read_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
     usage
-        .and_then(|usage| usage.cache_read_input_tokens)
-        .or_else(|| {
-            usage
-                .and_then(|usage| usage.prompt_tokens_details.as_ref())
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(|value| value.as_u64())
-        })
+        .and_then(crate::zen::client::ZenUsage::cache_read_tokens)
         .unwrap_or(0)
 }
 
@@ -1166,7 +1215,7 @@ async fn handle_stream(
     zb: &Value,
     profile: ClientProfile,
     tool_history_repair: translate::ToolHistoryRepair,
-    use_claude_code_huge_buffer: bool,
+    claude_code_buffer_reason: Option<ClaudeCodeBufferedStreamReason>,
 ) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
@@ -1188,7 +1237,7 @@ async fn handle_stream(
     let prompt = translate::build_prompt_text(&body.messages);
     let estimated_input_tokens = estimate(&prompt).max(1);
     let initial_input_tokens = estimated_input_tokens;
-    if use_claude_code_huge_buffer {
+    if claude_code_buffer_reason.is_some() {
         return handle_buffered_claude_code_huge_stream(
             client,
             config,
@@ -1917,14 +1966,7 @@ async fn handle_stream(
             .unwrap_or(0);
         let cache_read = usage
             .as_ref()
-            .and_then(|usage| usage.cache_read_input_tokens)
-            .or_else(|| {
-                usage
-                    .as_ref()
-                    .and_then(|usage| usage.prompt_tokens_details.as_ref())
-                    .and_then(|details| details.get("cached_tokens"))
-                    .and_then(|value| value.as_u64())
-            })
+            .and_then(crate::zen::client::ZenUsage::cache_read_tokens)
             .unwrap_or(0);
         let cache_signals = cache_signals.with_body_usage(usage.as_ref());
         super::log_provider_cache_observation("anthropic", &body, profile, &cache_signals, attempts_used, CLAUDE_CODE_STREAM_GUARD_ATTEMPTS);
@@ -2220,15 +2262,7 @@ async fn handle_buffered_claude_code_huge_stream(
         let cache_read = collected
             .usage
             .as_ref()
-            .and_then(|usage| usage.cache_read_input_tokens)
-            .or_else(|| {
-                collected
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| usage.prompt_tokens_details.as_ref())
-                    .and_then(|details| details.get("cached_tokens"))
-                    .and_then(|value| value.as_u64())
-            })
+            .and_then(crate::zen::client::ZenUsage::cache_read_tokens)
             .unwrap_or(0);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2356,6 +2390,68 @@ mod tests {
 
     fn claude_code_profile() -> ClientProfile {
         ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+    }
+
+    #[test]
+    fn claude_code_buffered_stream_skips_tool_sessions_even_with_exact_output_literal() {
+        let reason = claude_code_buffered_stream_reason(
+            claude_code_profile(),
+            180_000,
+            Some(32_000),
+            true,
+            false,
+            Some("HUGE_OK"),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn claude_code_buffered_stream_skips_multiline_exact_output() {
+        let reason = claude_code_buffered_stream_reason(
+            claude_code_profile(),
+            180_000,
+            Some(32_000),
+            false,
+            false,
+            Some("# Title\n\n| A | B |\n| --- | --- |"),
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn claude_code_buffered_stream_allows_tiny_exact_output_without_tools() {
+        let reason = claude_code_buffered_stream_reason(
+            claude_code_profile(),
+            180_000,
+            Some(32_000),
+            false,
+            false,
+            Some("HUGE_OK"),
+        );
+
+        assert_eq!(
+            reason,
+            Some(ClaudeCodeBufferedStreamReason::TinyExactOutputNoTools)
+        );
+    }
+
+    #[test]
+    fn claude_code_buffered_stream_allows_small_output_huge_context_without_tools() {
+        let reason = claude_code_buffered_stream_reason(
+            claude_code_profile(),
+            180_000,
+            Some(1_024),
+            false,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            reason,
+            Some(ClaudeCodeBufferedStreamReason::SmallOutputHugeContextNoTools)
+        );
     }
 
     #[test]

@@ -428,6 +428,7 @@ pub(crate) fn log_provider_cache_observation(
         provider_body_cache_read_input_tokens = ?signals.body_cache_read_input_tokens,
         provider_body_cache_creation_input_tokens = ?signals.body_cache_creation_input_tokens,
         provider_body_cached_tokens = ?signals.body_cached_tokens,
+        provider_body_cache_miss_input_tokens = ?signals.body_cache_miss_input_tokens,
         prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
         prefix_4k_hash = %format_args!("{:016x}", shape.prefix_4k_hash),
         prefix_32k_hash = %format_args!("{:016x}", shape.prefix_32k_hash),

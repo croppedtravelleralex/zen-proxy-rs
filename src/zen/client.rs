@@ -59,6 +59,8 @@ pub struct ZenUsage {
     pub prompt_tokens_details: Option<serde_json::Value>,
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
+    pub prompt_cache_hit_tokens: Option<u64>,
+    pub prompt_cache_miss_tokens: Option<u64>,
 }
 
 impl ZenUsage {
@@ -67,6 +69,7 @@ impl ZenUsage {
             .as_ref()
             .and_then(|details| details.get("cached_tokens"))
             .and_then(serde_json::Value::as_u64)
+            .or(self.prompt_cache_hit_tokens)
     }
 
     pub fn cache_read_tokens(&self) -> Option<u64> {
@@ -78,6 +81,7 @@ impl ZenUsage {
         self.cache_creation_input_tokens.is_some()
             || self.cache_read_input_tokens.is_some()
             || self.prompt_cached_tokens().is_some()
+            || self.prompt_cache_miss_tokens.is_some()
     }
 }
 
@@ -112,6 +116,7 @@ pub struct ProviderCacheSignals {
     pub body_cache_read_input_tokens: Option<u64>,
     pub body_cache_creation_input_tokens: Option<u64>,
     pub body_cached_tokens: Option<u64>,
+    pub body_cache_miss_input_tokens: Option<u64>,
 }
 
 impl ProviderCacheSignals {
@@ -137,8 +142,11 @@ impl ProviderCacheSignals {
             &[
                 "x-cache-read-input-tokens",
                 "x-prompt-cache-read-input-tokens",
+                "x-prompt-cache-hit-tokens",
                 "x-provider-cache-read-input-tokens",
+                "x-provider-prompt-cache-hit-tokens",
                 "x-litellm-cache-read-input-tokens",
+                "x-litellm-prompt-cache-hit-tokens",
             ],
         );
         let header_cache_creation_input_tokens = parse_header_u64_any(
@@ -180,9 +188,10 @@ impl ProviderCacheSignals {
             return self;
         };
         self.body_usage_signal = true;
-        self.body_cache_read_input_tokens = usage.cache_read_input_tokens;
+        self.body_cache_read_input_tokens = usage.cache_read_tokens();
         self.body_cache_creation_input_tokens = usage.cache_creation_input_tokens;
         self.body_cached_tokens = usage.prompt_cached_tokens();
+        self.body_cache_miss_input_tokens = usage.prompt_cache_miss_tokens;
         self
     }
 
@@ -222,7 +231,8 @@ impl ProviderCacheSignals {
             || self.body_usage_signal
                 && (is_zero(self.body_cache_read_input_tokens)
                     || is_zero(self.body_cache_creation_input_tokens)
-                    || is_zero(self.body_cached_tokens))
+                    || is_zero(self.body_cached_tokens)
+                    || is_positive(self.body_cache_miss_input_tokens))
     }
 }
 
@@ -782,6 +792,8 @@ mod tests {
             prompt_tokens_details: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
         };
 
         let signals = ProviderCacheSignals::from_response(&HeaderMap::new(), Some(&usage));
@@ -801,6 +813,8 @@ mod tests {
             prompt_tokens_details: Some(json!({"cached_tokens": 22})),
             cache_creation_input_tokens: Some(11),
             cache_read_input_tokens: None,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
         };
 
         let signals = ProviderCacheSignals::from_response(&HeaderMap::new(), Some(&usage));
@@ -839,6 +853,8 @@ mod tests {
             prompt_tokens_details: Some(json!({"cached_tokens": 0})),
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
         };
 
         let signals = ProviderCacheSignals::from_response(&headers, Some(&usage));
@@ -846,6 +862,49 @@ mod tests {
         assert_eq!(signals.status(), ProviderCacheObservationStatus::Rejected);
         assert_eq!(signals.header_cache_hit, Some(false));
         assert_eq!(signals.body_cache_read_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn provider_cache_signals_accept_deepseek_prompt_cache_hit_tokens() {
+        let usage = ZenUsage {
+            prompt_tokens: Some(30),
+            completion_tokens: Some(5),
+            total_tokens: Some(35),
+            prompt_tokens_details: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            prompt_cache_hit_tokens: Some(22),
+            prompt_cache_miss_tokens: Some(8),
+        };
+
+        let signals = ProviderCacheSignals::from_response(&HeaderMap::new(), Some(&usage));
+
+        assert_eq!(usage.cache_read_tokens(), Some(22));
+        assert_eq!(signals.status(), ProviderCacheObservationStatus::Accepted);
+        assert_eq!(signals.body_cache_read_input_tokens, Some(22));
+        assert_eq!(signals.body_cached_tokens, Some(22));
+        assert_eq!(signals.body_cache_miss_input_tokens, Some(8));
+    }
+
+    #[test]
+    fn provider_cache_signals_reject_deepseek_prompt_cache_miss_only() {
+        let usage = ZenUsage {
+            prompt_tokens: Some(30),
+            completion_tokens: Some(5),
+            total_tokens: Some(35),
+            prompt_tokens_details: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            prompt_cache_hit_tokens: Some(0),
+            prompt_cache_miss_tokens: Some(30),
+        };
+
+        let signals = ProviderCacheSignals::from_response(&HeaderMap::new(), Some(&usage));
+
+        assert_eq!(usage.cache_read_tokens(), Some(0));
+        assert_eq!(signals.status(), ProviderCacheObservationStatus::Rejected);
+        assert_eq!(signals.body_cache_read_input_tokens, Some(0));
+        assert_eq!(signals.body_cache_miss_input_tokens, Some(30));
     }
 
     #[test]

@@ -592,6 +592,22 @@ P1.22 2026-06-09 V4.104 ClaudeCode progressive tool streaming 与质量回退：
 | 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dead=0`、`ratelimited=0`；ZenProxy 直连 `/v1/models` 200，只暴露 `deepseek-v4-flash` 和 `deepseek-v4-flash-lite`；ZenProxy OpenAI 非流式 `PONG` HTTP 200、2.06s；ZenProxy Anthropic 非流式 `PONG` HTTP 200、1.78s；panda NewAPI `/v1/models` 200；NewAPI OpenAI 非流式 `PONG` HTTP 200、1.90s；NewAPI Anthropic 非流式 `PONG` HTTP 200、1.72s；ClaudeCode Anthropic forced `Bash` tool stream HTTP 200，输出 `content_block_start tool_use`、完整 `input_json_delta`、`content_block_stop`、`message_stop`。部署后日志窗口未扫到 `Invalid tool parameters`、`Failed to parse JSON`、`summary is required`、`provider_missing_reasoning_content` 或 panic。 |
 | 待观察 | 继续用真实 ClaudeCode 长会话观察 NewAPI channel 69 FRT 分位、`client_gone`、`provider_missing_reasoning_content`、`Invalid tool parameters`、`first_tool_call_ms/first_tool_emit_ms` 差值和工具成功率；短非流式 `reasoning_only_length` 警告仍按既有上游空输出/低预算探针分类继续跟踪，不作为 V4.104 部署失败结论。 |
 
+P1.23 2026-06-09 V4.105 true-stream/cache-hit 诊断记录：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户换 Clash Verge 节点后，ClaudeCode 真实首字明显提升并稳定在约 6-9s，但仍有 20-50s 慢尾；同时 cc-switch 显示 cache hit 约 60.6%，要求继续深入检查。 |
+| cc-switch 真实体验 | 2026-06-09 15:29 CST 后，`deepseek-v4-flash-free` 成功样本约 955 次，首字 P50 约 6.5s、P90 约 13.5s、P95 约 17.2s、P99 约 31.6s；输入最大约 227k tokens，未见 90k 输入墙。 |
+| 假流式慢尾 | 同窗口 `first_token_ms≈latency_ms` 的 buffer-like 请求约 290 次，P95 约 26.6s；progressive 真流式约 665 次，P95 约 13.5s。100k+ 输入桶中约 44%-47% 为 buffer-like，是慢尾主因。 |
+| 代码根因候选 | `src/proxy/anthropic.rs::should_use_claude_code_buffered_stream` 只要 `has_exact_output_literal=true` 就进入 `anthropic_buffered`；`src/protocol/translate.rs` 的 exact-output 检测包含 `只输出/只回复/reply exactly/output only`，容易被普通 ClaudeCode 格式要求误触发。 |
+| buffered 机制 | `anthropic_buffered` 会先 `collect_stream_parts(resp).await` 收完整个上游流，再组装 Anthropic SSE 给下游；所以缓存命中也无法改善真实首字，cc-switch 会看到首字接近总耗时。 |
+| cache 现状 | 当日 cc-switch `deepseek-v4-flash-free` 成功流式约 6840 次，cache_read 命中约 4988 次，命中率约 72.9%；小时维度 13:00 约 63.2%、14:00 约 59.8%、16:00 约 95.3%。 |
+| cache 分桶 | `10k-50k` 命中约 9.9%，`50k-100k` 约 84.1%，`100k-200k` 约 98.1%，`200k+` 约 98.3%；用户看到的 60.6% 更像是统计口径或中等上下文样本拉低，不代表大上下文 cache 全面失败。 |
+| cache 代码风险 | 修复前 `src/zen/client.rs::ZenUsage` 只解析 `cache_read_input_tokens`、`cache_creation_input_tokens` 和 `prompt_tokens_details.cached_tokens`；未显式解析 DeepSeek 官方常见 `prompt_cache_hit_tokens/prompt_cache_miss_tokens`，可能导致 cache 命中低估或 NewAPI/cc-switch 显示不完整。 |
+| 已落地源码 | V4.105 已补 `buffer_reason` 日志；ClaudeCode 带 tools 的长会话、Markdown/JSON/代码块格式要求不再仅因 `只输出/只回复/output only` 进入 `anthropic_buffered`；`prompt_cache_hit_tokens` 会映射到通用 `cache_read_input_tokens`/`cached_tokens` 路径，`prompt_cache_miss_tokens` 会进入 cache miss 观测。 |
+| 本地验证 | WSL 原生路径执行 `cargo fmt -- --check`、`CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings`、`CARGO_INCREMENTAL=0 cargo test` 均通过；完整测试为 lib/main 120 条、kernel golden 112 条。 |
+| 待办 | 尚未部署 panda；部署后需建立 cc-switch/NewAPI/ZenProxy 三侧 cache hit 对齐报表，并用真实 ClaudeCode 长会话确认 `anthropic_buffered` 误触发和 buffer-like 慢尾下降。 |
+
 ## 临时产物归类
 
 | 路径 | 当前归类 | 处理原则 |

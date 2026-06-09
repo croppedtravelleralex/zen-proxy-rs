@@ -579,14 +579,7 @@ fn append_openai_usage_metadata(
 }
 
 fn cache_read_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> Option<u64> {
-    usage
-        .and_then(|usage| usage.cache_read_input_tokens)
-        .or_else(|| {
-            usage
-                .and_then(|usage| usage.prompt_tokens_details.as_ref())
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64)
-        })
+    usage.and_then(crate::zen::client::ZenUsage::cache_read_tokens)
 }
 
 fn with_observed_exit_ip(

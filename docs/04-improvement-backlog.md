@@ -2,6 +2,43 @@
 
 ## P0：必须优先处理
 
+### V4.105 ClaudeCode true-stream 与 cache hit 对齐专项
+
+- 状态：源码已落地，本地验证通过；尚未部署 panda，仍需真实 ClaudeCode 长会话线上验收。
+- 触发：
+  1. 用户换 Clash Verge 节点后，ClaudeCode 真实体感首字明显改善，但仍有 20-50s 慢尾；cc-switch 比 NewAPI FRT 更符合真实体验。
+  2. cc-switch 显示 cache hit 约 60.6%，用户要求继续深入检查缓存命中问题。
+- 当前数据：
+  1. 2026-06-09 15:29 CST 后，cc-switch `deepseek-v4-flash-free` 成功样本约 955 次，真实首字 P50 约 6.5s、P90 约 13.5s、P95 约 17.2s、P99 约 31.6s。
+  2. 同窗口 `first_token_ms≈latency_ms` 的 buffer-like 请求约 290 次，P95 约 26.6s；progressive 真流式约 665 次，P95 约 13.5s。
+  3. 100k+ 输入桶中，buffer-like 占比约 44%-47%；说明慢尾集中在“假流式/等完整响应后才下发”的路径，而不是所有大上下文都慢。
+  4. cc-switch 当日 `deepseek-v4-flash-free` 成功流式统计约 6840 次，cache_read 命中约 4988 次，命中率约 72.9%；小时维度 13:00 约 63.2%、14:00 约 59.8%、16:00 约 95.3%。
+  5. 输入桶维度：`10k-50k` 命中约 9.9%，`50k-100k` 约 84.1%，`100k-200k` 约 98.1%，`200k+` 约 98.3%。用户看到的 60.6% 大概率来自更长窗口、全局口径或低命中中等上下文样本拉低。
+- 已确认代码风险：
+  1. `src/proxy/anthropic.rs` 的 `should_use_claude_code_buffered_stream` 只要检测到 `exact_output_literal` 就直接进入 `anthropic_buffered`，不受 `max_tokens<=2048` 限制。
+  2. `src/protocol/translate.rs` 的 exact-output 检测包含 `只输出`、`只回复`、`reply exactly`、`return exactly`、`output X only`；ClaudeCode 日常 Markdown/JSON/格式要求容易误触发。
+  3. buffered 路径会先 `collect_stream_parts(resp).await` 完整收完上游，再调用 `anthropic_buffered_stream_resp` 发送 Anthropic SSE，因此真实首字会接近总耗时。
+  4. `src/zen/client.rs::ZenUsage` 当前只解析 `cache_read_input_tokens`、`cache_creation_input_tokens` 和 `prompt_tokens_details.cached_tokens`；未显式解析 DeepSeek 官方常见的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 字段，存在 cache 命中低估或统计丢失风险。
+- 必做改动：
+  1. 已完成：给 buffered 决策加结构化日志：`buffer_reason`、`before_tokens`、`effective_max_tokens`、`has_exact_output_literal`、`reduced_exact_output_anchor`、`tool_count`、`message_count`。
+  2. 已完成：收窄 ClaudeCode buffered 触发；带 tools 的开发会话、Markdown/JSON/代码块格式要求不得仅因 `只输出/只回复/output only` 进入 buffered。
+  3. 已完成：buffered 只保留给无 tools 的 tiny literal 或无 tools 的小输出大上下文保护；不得作为常规 ClaudeCode 工具长会话路径。
+  4. 已保持：正常 ClaudeCode stream 继续 progressive 透传真实 text/tool start 和 `input_json_delta`，不回退到完整 JSON 后才下发。
+  5. 已完成：补 DeepSeek cache usage 字段别名；解析并透传 `prompt_cache_hit_tokens` 到 `cache_read_input_tokens`/`prompt_tokens_details.cached_tokens` 等兼容字段，记录 `prompt_cache_miss_tokens` 作为 miss 证据。
+  6. 待完成：增加 cache hit 审计脚本或 sidecar 查询：按小时、输入桶、session、prefix hash、buffered/progressive、stream/non-stream 输出 cc-switch/NewAPI/ZenProxy 三侧对齐表。
+  7. 待线上验收：将 NewAPI FRT 与真实体验指标拆开；报告必须列 `first_content_ms`、`first_tool_call_ms`、`first_downstream_ms`、cc-switch `first_token_ms`，不得只用 NewAPI FRT 代表用户体感。
+- 回归测试：
+  1. 已完成：ClaudeCode 长上下文 + tools + tiny exact-output literal 不进入 buffered。
+  2. 已完成：多行 Markdown/JSON/代码块 exact-output 不进入 buffered。
+  3. 已完成：无 tools tiny exact literal 仍可走窄 buffered；无 tools 小输出大上下文保护仍可走 buffered。
+  4. 已完成：`prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、`prompt_tokens_details.cached_tokens`、`cache_read_input_tokens` 相关 usage 形态可被解析、透传和记录。
+  5. 已复验：完整 `cargo test` 通过，lib/main 120 条、kernel golden 112 条。
+- 验收标准：
+  1. 真实 ClaudeCode 15 分钟窗口内，非探针 `anthropic_buffered` 占比降到可解释的窄场景；buffer-like 占比目标 < 5%，或每条都有 `buffer_reason` 证明必要。
+  2. cc-switch 真实首字总体 P95 接近 progressive 路径；在当前网络质量下，目标 P95 先压到 13-15s 区间，P99 慢尾显著少于当前 31s+。
+  3. 100k+ 连续长会话 cache_read 命中应保持 95%+；`10k-50k` 低命中需要给出明确归因：provider 阈值/前缀不稳/新 session/字段未解析/统计口径，而不是继续混在总命中率里。
+  4. 不牺牲质量：不裁剪输入、不恢复输出上限、不默认禁用 thinking、不注入隐藏提示词、不让工具参数错误回潮。
+
 ### V4.104 ClaudeCode progressive tool streaming 与质量回退
 
 - 状态：已落地并滚动部署 panda；进入真实 ClaudeCode 长会话观察期。
