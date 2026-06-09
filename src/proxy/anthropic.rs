@@ -309,6 +309,7 @@ async fn handle_non_stream(
     let (collected, content) = {
         let mut last_empty = false;
         let mut last_empty_class = None;
+        let mut last_incomplete_tool_arguments = false;
         let mut used_reasoning_disabled_retry = false;
         let mut used_missing_reasoning_disabled_retry = false;
         let mut used_provider_invalid_disabled_retry = false;
@@ -419,11 +420,39 @@ async fn handle_non_stream(
                 }
                 continue;
             }
+            if has_only_incomplete_tool_arguments(&content, &collected.tool_calls, cr, profile) {
+                last_empty = true;
+                last_incomplete_tool_arguments = true;
+                tracing::warn!(
+                    protocol = "anthropic",
+                    model = %cr.model,
+                    source_client = ?profile.kind,
+                    attempt = attempt + 1,
+                    max_attempts = NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+                    tool_call_count = collected.tool_calls.len(),
+                    finish_reason = ?collected.finish_reason,
+                    "ClaudeCode non-stream guard received only incomplete tool calls"
+                );
+                if profile.kind == ClientKind::ClaudeCode && !used_reasoning_disabled_retry {
+                    used_reasoning_disabled_retry = true;
+                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %cr.model,
+                        source_client = ?profile.kind,
+                        next_attempt = attempt + 2,
+                        "ClaudeCode non-stream guard enabling disabled-thinking retry for incomplete tool arguments"
+                    );
+                }
+                continue;
+            }
             output = Some((collected, content));
             break;
         }
         if let Some(output) = output {
             output
+        } else if last_incomplete_tool_arguments {
+            return Err(incomplete_tool_arguments_error());
         } else if let Some(fallback_text) = last_empty
             .then(|| translate::short_no_tool_empty_fallback_text(cr))
             .flatten()
@@ -467,19 +496,15 @@ async fn handle_non_stream(
         let blocks = collected
             .tool_calls
             .iter()
-            .filter(|tool| !tool.name.is_empty())
-            .map(|tool| {
-                let tc = collected_tool_call_to_tool_call(tool);
-                let ct = synthesis::tool::canonicalize_tool_call_name(&tc, cr);
-                AnthropicContentBlock {
+            .filter_map(|tool| {
+                let (ct, input) = streamable_anthropic_tool_call(tool, cr, profile)?;
+                Some(AnthropicContentBlock {
                     block_type: "tool_use".to_string(),
                     text: None,
                     id: ct.id,
                     name: Some(ct.function.name),
-                    input: Some(
-                        serde_json::from_str(&ct.function.arguments).unwrap_or(Value::Null),
-                    ),
-                }
+                    input: Some(input),
+                })
             })
             .collect::<Vec<_>>();
         if !blocks.is_empty() {
@@ -672,28 +697,6 @@ fn with_observed_exit_ip(
     response
 }
 
-fn collected_tool_call_to_tool_call(tool: &crate::zen::client::CollectedToolCall) -> ToolCall {
-    let clean_id = tool
-        .id
-        .clone()
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| format!("call_{}", tool.index));
-    let clean_id = if let Some(pos) = clean_id.find('{') {
-        clean_id[..pos].to_string()
-    } else {
-        clean_id
-    };
-    ToolCall {
-        id: Some(clean_id),
-        call_type: "function".into(),
-        function: ToolFunction {
-            name: tool.name.clone(),
-            arguments: tool.arguments.clone(),
-        },
-        index: Some(tool.index),
-    }
-}
-
 fn should_retry_stream_without_forwardable_output(
     profile: ClientProfile,
     attempt: usize,
@@ -719,6 +722,58 @@ fn should_retry_stream_error_before_output(
         && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
         && text.trim().is_empty()
         && tool_calls.is_empty()
+}
+
+fn has_unemitted_streamable_tool_call(
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+    emitted_tool_call_indexes: &std::collections::HashSet<i64>,
+    body: &ChatRequest,
+    profile: ClientProfile,
+) -> bool {
+    tool_calls
+        .iter()
+        .filter(|tool| !emitted_tool_call_indexes.contains(&tool.index))
+        .any(|tool| streamable_anthropic_tool_call(tool, body, profile).is_some())
+}
+
+fn has_forwardable_anthropic_output(
+    text: &str,
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+    emitted_tool_call_indexes: &std::collections::HashSet<i64>,
+    body: &ChatRequest,
+    profile: ClientProfile,
+) -> bool {
+    !text.trim().is_empty()
+        || !emitted_tool_call_indexes.is_empty()
+        || has_unemitted_streamable_tool_call(tool_calls, emitted_tool_call_indexes, body, profile)
+}
+
+fn has_streamable_anthropic_tool_call(
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+    body: &ChatRequest,
+    profile: ClientProfile,
+) -> bool {
+    tool_calls
+        .iter()
+        .any(|tool| streamable_anthropic_tool_call(tool, body, profile).is_some())
+}
+
+fn has_only_incomplete_tool_arguments(
+    text: &str,
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+    body: &ChatRequest,
+    profile: ClientProfile,
+) -> bool {
+    text.trim().is_empty()
+        && !tool_calls.is_empty()
+        && !has_streamable_anthropic_tool_call(tool_calls, body, profile)
+}
+
+fn incomplete_tool_arguments_error() -> AppError {
+    AppError::new(
+        axum::http::StatusCode::BAD_GATEWAY,
+        "upstream returned incomplete tool call arguments",
+    )
 }
 
 fn should_apply_initial_fetch_timeout(
@@ -770,6 +825,125 @@ fn anthropic_tool_json_delta_chunks(input: &str) -> Vec<&str> {
     chunks
 }
 
+#[derive(Debug, Default)]
+struct ToolInputGate {
+    required: Vec<String>,
+}
+
+fn input_gate_for_tool(body: &ChatRequest, name: &str) -> ToolInputGate {
+    let Some(tools) = body.tools.as_ref() else {
+        return ToolInputGate::default();
+    };
+    let name_lower = name.to_lowercase();
+    let Some(parameters) = tools
+        .iter()
+        .find(|tool| tool.function.name.to_lowercase() == name_lower)
+        .and_then(|tool| tool.function.parameters.as_ref())
+    else {
+        return ToolInputGate::default();
+    };
+    let required = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    ToolInputGate { required }
+}
+
+fn fallback_required_fields_for_claude_code_tool(name: &str) -> Vec<String> {
+    match name.to_ascii_lowercase().as_str() {
+        "bash" => vec!["command"],
+        "bashoutput" => vec!["bash_id"],
+        "agent" => vec!["description", "prompt"],
+        "edit" => vec!["file_path", "old_string", "new_string"],
+        "glob" => vec!["pattern"],
+        "grep" => vec!["pattern"],
+        "killbash" => vec!["shell_id"],
+        "ls" => vec!["path"],
+        "multiedit" => vec!["file_path", "edits"],
+        "notebookedit" => vec!["notebook_path", "cell_id", "new_source"],
+        "notebookread" => vec!["notebook_path"],
+        "read" => vec!["file_path"],
+        "task" => vec!["description", "prompt", "subagent_type"],
+        "todowrite" => vec!["todos"],
+        "toolsearch" => vec!["query"],
+        "webfetch" => vec!["url"],
+        "websearch" => vec!["query"],
+        "write" => vec!["file_path", "content"],
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn required_fields_for_tool(body: &ChatRequest, name: &str, profile: ClientProfile) -> Vec<String> {
+    let gate = input_gate_for_tool(body, name);
+    if !gate.required.is_empty() {
+        return gate.required;
+    }
+    if profile.kind == ClientKind::ClaudeCode {
+        return fallback_required_fields_for_claude_code_tool(name);
+    }
+    Vec::new()
+}
+
+fn json_object_is_empty(input: &Value) -> bool {
+    input.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
+fn tool_input_has_required_fields(input: &Value, required: &[String]) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let Some(input) = input.as_object() else {
+        return false;
+    };
+    required
+        .iter()
+        .all(|field| input.get(field).is_some_and(|value| !value.is_null()))
+}
+
+fn claude_code_required_field_needs_repair(tool_name: &str, field: &str, value: &Value) -> bool {
+    let tool = tool_name.to_ascii_lowercase();
+    if matches!(field, "file_path" | "notebook_path")
+        && matches!(
+            tool.as_str(),
+            "read" | "write" | "edit" | "multiedit" | "notebookread" | "notebookedit"
+        )
+    {
+        return value.as_str().is_none_or(|path| {
+            let path = path.trim();
+            path.is_empty() || matches!(path, "." | "/" | "\\")
+        });
+    }
+    false
+}
+
+fn claude_code_tool_input_has_repairable_required_fields(
+    tool_name: &str,
+    input: &Value,
+    required: &[String],
+) -> bool {
+    let Some(input) = input.as_object() else {
+        return false;
+    };
+    required.iter().any(|field| {
+        input
+            .get(field)
+            .is_some_and(|value| claude_code_required_field_needs_repair(tool_name, field, value))
+    })
+}
+
+fn schema_allows_empty_tool_input(body: &ChatRequest, name: &str, profile: ClientProfile) -> bool {
+    required_fields_for_tool(body, name, profile).is_empty()
+}
+
 fn streamable_anthropic_tool_call(
     tool: &crate::zen::client::CollectedToolCall,
     body: &ChatRequest,
@@ -778,6 +952,7 @@ fn streamable_anthropic_tool_call(
     let clean_id = tool
         .id
         .clone()
+        .filter(|id| !id.is_empty())
         .unwrap_or_else(|| format!("call_{}", tool.index));
     let clean_id = if let Some(pos) = clean_id.find('{') {
         clean_id[..pos].to_string()
@@ -802,12 +977,341 @@ fn streamable_anthropic_tool_call(
     if ct.function.name.trim().is_empty() {
         return None;
     }
-    let input = if ct.function.arguments.trim().is_empty() {
+    let required = required_fields_for_tool(body, &ct.function.name, profile);
+    let mut input = if ct.function.arguments.trim().is_empty() {
         Value::Object(Default::default())
     } else {
         serde_json::from_str(&ct.function.arguments).ok()?
     };
+    if profile.kind == ClientKind::ClaudeCode
+        && (!tool_input_has_required_fields(&input, &required)
+            || claude_code_tool_input_has_repairable_required_fields(
+                &ct.function.name,
+                &input,
+                &required,
+            ))
+    {
+        if let Some(repaired) =
+            repair_claude_code_tool_input(&ct.function.name, &input, body, &required)
+        {
+            if repaired_tool_input_repeats_completed_call(body, &ct.function.name, &repaired) {
+                tracing::warn!(
+                    protocol = "anthropic",
+                    source_client = ?profile.kind,
+                    tool_name = %ct.function.name,
+                    "refusing to repair duplicate ClaudeCode tool call already completed in history"
+                );
+                return None;
+            }
+            tracing::warn!(
+                protocol = "anthropic",
+                source_client = ?profile.kind,
+                tool_name = %ct.function.name,
+                required_fields = required.len(),
+                "repaired ClaudeCode tool call arguments from latest user instruction"
+            );
+            input = repaired;
+        }
+    }
+    if !tool_input_has_required_fields(&input, &required) {
+        return None;
+    }
+    if profile.kind == ClientKind::ClaudeCode
+        && claude_code_tool_input_has_repairable_required_fields(
+            &ct.function.name,
+            &input,
+            &required,
+        )
+    {
+        return None;
+    }
+    if json_object_is_empty(&input)
+        && !schema_allows_empty_tool_input(body, &ct.function.name, profile)
+    {
+        return None;
+    }
     Some((ct, input))
+}
+
+fn repair_claude_code_tool_input(
+    tool_name: &str,
+    input: &Value,
+    body: &ChatRequest,
+    required: &[String],
+) -> Option<Value> {
+    if required.is_empty() {
+        return None;
+    }
+    let prompt = latest_user_text(body)?;
+    let mut object = input.as_object().cloned().unwrap_or_default();
+    for field in required {
+        if object.get(field).is_some_and(|value| {
+            !value.is_null() && !claude_code_required_field_needs_repair(tool_name, field, value)
+        }) {
+            continue;
+        }
+        let value = infer_claude_code_tool_field(tool_name, field, &prompt)?;
+        object.insert(field.clone(), value);
+    }
+    Some(Value::Object(object))
+}
+
+fn repaired_tool_input_repeats_completed_call(
+    body: &ChatRequest,
+    tool_name: &str,
+    repaired: &Value,
+) -> bool {
+    let target_name = tool_name.to_ascii_lowercase();
+    let mut completed_ids = std::collections::HashSet::new();
+    for message in &body.messages {
+        if message.role == "tool" {
+            if let Some(id) = message.tool_call_id.as_deref().filter(|id| !id.is_empty()) {
+                completed_ids.insert(id.to_string());
+            }
+        }
+    }
+    if completed_ids.is_empty() {
+        return false;
+    }
+    body.messages.iter().any(|message| {
+        if message.role != "assistant" {
+            return false;
+        }
+        let Some(tool_calls) = message.tool_calls.as_ref() else {
+            return false;
+        };
+        tool_calls.iter().any(|tool_call| {
+            let Some(id) = tool_call.id.as_deref() else {
+                return false;
+            };
+            if !completed_ids.contains(id) {
+                return false;
+            }
+            if tool_call.function.name.to_ascii_lowercase() != target_name {
+                return false;
+            }
+            serde_json::from_str::<Value>(&tool_call.function.arguments)
+                .is_ok_and(|arguments| arguments == *repaired)
+        })
+    })
+}
+
+fn latest_user_text(body: &ChatRequest) -> Option<String> {
+    body.messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| text_from_message_content(&message.content))
+}
+
+fn text_from_message_content(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => non_empty(text),
+        Value::Array(items) => {
+            let texts = items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str).and_then(non_empty))
+                .collect::<Vec<_>>();
+            if texts.is_empty() {
+                None
+            } else {
+                Some(texts.join("\n"))
+            }
+        }
+        _ => content.as_str().and_then(non_empty),
+    }
+}
+
+fn non_empty(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn infer_claude_code_tool_field(tool_name: &str, field: &str, prompt: &str) -> Option<Value> {
+    let tool = tool_name.to_ascii_lowercase();
+    let value = match field {
+        "file_path" | "notebook_path" => infer_explicit_file_path(prompt)?,
+        "content" => infer_explicit_write_content(prompt)?,
+        "command" => infer_explicit_command(prompt)?,
+        "pattern" => infer_explicit_pattern(&tool, prompt)?,
+        "path" => infer_explicit_path(prompt)?,
+        "query" => infer_explicit_query(prompt)?,
+        "old_string" => infer_replace_part(prompt, ReplacePart::Old)?,
+        "new_string" | "new_source" => infer_replace_part(prompt, ReplacePart::New)?,
+        "description" => infer_task_description(prompt)?,
+        "prompt" => infer_task_prompt(prompt)?,
+        "subagent_type" => infer_subagent_type(prompt)?,
+        _ => return None,
+    };
+    Some(Value::String(value))
+}
+
+fn infer_explicit_file_path(prompt: &str) -> Option<String> {
+    let patterns = [
+        r#"(?i)\b(?:read|open|create|write|edit)\s+(?:the\s+)?(?:file\s+)?["'`]?([^"'`\s]+)["'`]?"#,
+        r#"(?i)\bin\s+["'`]?([^"'`\s]+)["'`]?"#,
+        r#"(?i)\bfile[_ -]?path\s*[:=]\s*["'`]?([^"'`\s]+)["'`]?"#,
+    ];
+    patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures_iter(prompt)
+            .find_map(|captures| explicit_path_candidate(captures.get(1)?.as_str()))
+    })
+}
+
+fn explicit_path_candidate(value: &str) -> Option<String> {
+    let candidate = value
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '.' | ',' | ';' | ':'));
+    if candidate.is_empty() {
+        return None;
+    }
+    if candidate.contains('.')
+        || candidate.contains('/')
+        || candidate.contains('\\')
+        || candidate.starts_with("~")
+    {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn infer_explicit_write_content(prompt: &str) -> Option<String> {
+    let patterns = [
+        r#"(?is)\bwith exactly\s+(.+?)(?:\.\s+(?:Then\b|Finally\b|Use\b|\d+[.)])|\n|$)"#,
+        r#"(?is)\bcontent\s*[:=]\s*(.+?)(?:\n|$)"#,
+    ];
+    patterns.iter().find_map(|pattern| {
+        let value = regex::Regex::new(pattern)
+            .ok()?
+            .captures(prompt)?
+            .get(1)?
+            .as_str()
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '.' | ','))
+            .to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
+fn infer_explicit_command(prompt: &str) -> Option<String> {
+    let patterns = [
+        r#"(?is)\brun\s*:\s*(.+?)(?:\.\s+(?:Then\b|Finally\b|Use\b|\d+[.)])|\n|$)"#,
+        r#"(?is)\brun\s+exactly\s*:\s*(.+?)(?:\.\s+(?:Then\b|Finally\b|Use\b|\d+[.)])|\n|$)"#,
+        r#"(?is)\brun\s+`([^`]+)`"#,
+        r#"(?is)\bcommand\s*[:=]\s*(.+?)(?:\n|$)"#,
+    ];
+    patterns.iter().find_map(|pattern| {
+        let command = regex::Regex::new(pattern)
+            .ok()?
+            .captures(prompt)?
+            .get(1)?
+            .as_str()
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`'))
+            .to_string();
+        if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        }
+    })
+}
+
+fn infer_explicit_pattern(tool: &str, prompt: &str) -> Option<String> {
+    let prefix = if tool.contains("grep") {
+        r"(?i)\bgrep\s+for\s+"
+    } else {
+        r"(?i)\bglob\s+for\s+"
+    };
+    let pattern = format!(r#"{prefix}["'`]?([^"'`\s]+)["'`]?"#);
+    regex::Regex::new(&pattern)
+        .ok()?
+        .captures(prompt)
+        .and_then(|captures| non_empty(captures.get(1)?.as_str()))
+}
+
+fn infer_explicit_path(prompt: &str) -> Option<String> {
+    let patterns = [
+        r#"(?i)\bls\s+(?:on\s+)?["'`]?([^"'`\s]+)["'`]?"#,
+        r#"(?i)\blist\s+["'`]?([^"'`\s]+)["'`]?"#,
+        r#"(?i)\bpath\s*[:=]\s*["'`]?([^"'`\s]+)["'`]?"#,
+    ];
+    patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures(prompt)
+            .and_then(|captures| non_empty(captures.get(1)?.as_str()))
+    })
+}
+
+fn infer_explicit_query(prompt: &str) -> Option<String> {
+    let patterns = [
+        r#"(?i)\bquery\s+["'`]?([^"'`\n.]+)["'`]?"#,
+        r#"(?i)\b(?:search|toolsearch|websearch)\s+(?:for\s+)?["'`]?([^"'`\n.]+)["'`]?"#,
+    ];
+    patterns.iter().find_map(|pattern| {
+        regex::Regex::new(pattern)
+            .ok()?
+            .captures(prompt)
+            .and_then(|captures| non_empty(captures.get(1)?.as_str()))
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ReplacePart {
+    Old,
+    New,
+}
+
+fn infer_replace_part(prompt: &str, part: ReplacePart) -> Option<String> {
+    let captures = regex::Regex::new(r#"(?is)\breplace\s+(.+?)\s+with\s+(.+?)(?:\s+in\b|\n|$)"#)
+        .ok()?
+        .captures(prompt)?;
+    let index = match part {
+        ReplacePart::Old => 1,
+        ReplacePart::New => 2,
+    };
+    non_empty(
+        captures
+            .get(index)?
+            .as_str()
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '.' | ',')),
+    )
+}
+
+fn infer_task_description(prompt: &str) -> Option<String> {
+    regex::Regex::new(r#"(?i)\bdescription\s+([^,\n.]+)"#)
+        .ok()?
+        .captures(prompt)
+        .and_then(|captures| non_empty(captures.get(1)?.as_str()))
+}
+
+fn infer_task_prompt(prompt: &str) -> Option<String> {
+    regex::Regex::new(
+        r#"(?is)\bprompt\s*:\s*(.+?)(?:\.\s+(?:Then\b|Finally\b|Use\b|\d+[.)])|\n|$)"#,
+    )
+    .ok()?
+    .captures(prompt)
+    .and_then(|captures| non_empty(captures.get(1)?.as_str()))
+}
+
+fn infer_subagent_type(prompt: &str) -> Option<String> {
+    regex::Regex::new(r#"(?i)\bsubagent_type\s+([A-Za-z0-9_-]+)"#)
+        .ok()?
+        .captures(prompt)
+        .and_then(|captures| non_empty(captures.get(1)?.as_str()))
 }
 
 async fn handle_stream(
@@ -1237,7 +1741,56 @@ async fn handle_stream(
                 }
             }
             if completed_upstream {
-                final_stream_error = None;
+                if !has_forwardable_anthropic_output(
+                    &text,
+                    &tool_calls,
+                    &emitted_tool_call_indexes,
+                    &body,
+                    profile,
+                ) && !tool_calls.is_empty()
+                {
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        prompt_hash,
+                        prompt_hash_hex = %prompt_hash_hex,
+                        attempt = attempts_used,
+                        max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                        upstream_event_count,
+                        tool_call_count = tool_calls.len(),
+                        finish_reason = ?upstream_finish_reason,
+                        "ClaudeCode stream guard received only incomplete tool calls"
+                    );
+                    if profile.kind == ClientKind::ClaudeCode
+                        && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+                    {
+                        if attempt + 2 == CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+                            && !used_disabled_thinking_retry
+                            && body.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                        {
+                            used_disabled_thinking_retry = true;
+                            attempt_body = super::reasoning_disabled_retry_body(&base_body);
+                            tracing::warn!(
+                                protocol = "anthropic",
+                                model = %body.model,
+                                source_client = ?profile.kind,
+                                prompt_hash,
+                                prompt_hash_hex = %prompt_hash_hex,
+                                next_attempt = attempt + 2,
+                                "ClaudeCode stream guard enabling disabled-thinking retry for incomplete tool arguments"
+                            );
+                        }
+                        completed_upstream = false;
+                        upstream_finish_reason = None;
+                        usage = None;
+                        cache_signals = ProviderCacheSignals::ignored();
+                        tool_calls.clear();
+                        continue;
+                    }
+                    final_stream_error =
+                        Some("upstream returned incomplete tool call arguments".to_string());
+                }
                 break;
             }
             if retry_attempt {
@@ -1621,6 +2174,34 @@ async fn handle_buffered_claude_code_huge_stream(
             }
             continue;
         }
+        if has_only_incomplete_tool_arguments(&content, &collected.tool_calls, cr, profile) {
+            tracing::warn!(
+                protocol = "anthropic_buffered",
+                model = %cr.model,
+                source_client = ?profile.kind,
+                attempt = attempt + 1,
+                max_attempts = CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
+                tool_call_count = collected.tool_calls.len(),
+                finish_reason = ?collected.finish_reason,
+                "ClaudeCode buffered stream guard received only incomplete tool calls"
+            );
+            if profile.kind == ClientKind::ClaudeCode && !used_reasoning_disabled_retry {
+                used_reasoning_disabled_retry = true;
+                attempt_body = super::reasoning_disabled_retry_body(zb);
+                tracing::warn!(
+                    protocol = "anthropic_buffered",
+                    model = %cr.model,
+                    source_client = ?profile.kind,
+                    next_attempt = attempt + 2,
+                    "ClaudeCode buffered stream guard enabling disabled-thinking retry for incomplete tool arguments"
+                );
+                continue;
+            }
+            if attempt + 1 >= CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
+                return Err(incomplete_tool_arguments_error());
+            }
+            continue;
+        }
 
         let input_tokens = collected
             .usage
@@ -1668,7 +2249,7 @@ async fn handle_buffered_claude_code_huge_stream(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let has_tool_calls = !collected.tool_calls.is_empty();
+        let has_tool_calls = has_streamable_anthropic_tool_call(&collected.tool_calls, cr, profile);
         return Ok(anthropic_buffered_stream_resp(
             ts,
             &cr.model,
@@ -1716,27 +2297,13 @@ fn anthropic_buffered_stream_resp(
             yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}).to_string()));
             yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":0}).to_string()));
         }
+        let mut emitted_tool_blocks = 0_u64;
         if !tool_calls.is_empty() {
-            for (ti, tool) in tool_calls.iter().enumerate() {
-                let tidx = ti as u64 + u64::from(has_text);
-                let clean_id = tool.id.clone().unwrap_or_else(|| format!("call_{}", tool.index));
-                let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
-                let tc = ToolCall {
-                    id: Some(clean_id),
-                    call_type: "function".into(),
-                    function: ToolFunction {
-                        name: tool.name.clone(),
-                        arguments: tool.arguments.clone(),
-                    },
-                    index: Some(tool.index),
+            for tool in tool_calls.iter() {
+                let tidx = emitted_tool_blocks + u64::from(has_text);
+                let Some((ct, input)) = streamable_anthropic_tool_call(tool, &body, profile) else {
+                    continue;
                 };
-                let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
-                let ct = if profile.uses_compat_tool_history() {
-                    synthesis::tool::complete_tool_call(&tc, &body)
-                } else {
-                    tc
-                };
-                let input: Value = serde_json::from_str(&ct.function.arguments).unwrap_or_default();
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));
                 let js = serde_json::to_string(&input).unwrap_or_default();
                 if js != "{}" {
@@ -1745,9 +2312,10 @@ fn anthropic_buffered_stream_resp(
                     }
                 }
                 yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":tidx}).to_string()));
+                emitted_tool_blocks = emitted_tool_blocks.saturating_add(1);
             }
         }
-        let stop_reason = if tool_calls.is_empty() { stop_reason } else { "tool_use".to_string() };
+        let stop_reason = if emitted_tool_blocks == 0 { stop_reason } else { "tool_use".to_string() };
         yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
@@ -1815,6 +2383,533 @@ mod tests {
     #[test]
     fn anthropic_tool_json_delta_chunks_handle_empty_input() {
         assert!(anthropic_tool_json_delta_chunks("").is_empty());
+    }
+
+    fn tool_gate_request(name: &str, parameters: Value) -> ChatRequest {
+        ChatRequest {
+            model: "deepseek-v4-flash".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String("test".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: Some(true),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: Some(vec![OpenAITool {
+                tool_type: "function".to_string(),
+                function: OpenAIToolFunction {
+                    name: name.to_string(),
+                    description: None,
+                    parameters: Some(parameters),
+                },
+            }]),
+            tool_choice: None,
+        }
+    }
+
+    fn collected_tool(name: &str, arguments: &str) -> crate::zen::client::CollectedToolCall {
+        crate::zen::client::CollectedToolCall {
+            index: 0,
+            id: Some("call_test".to_string()),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    #[test]
+    fn claude_code_tool_gate_waits_for_known_required_fields_without_schema_required() {
+        let body = tool_gate_request(
+            "Read",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"}
+                }
+            }),
+        );
+
+        assert!(streamable_anthropic_tool_call(
+            &collected_tool("Read", "{}"),
+            &body,
+            claude_code_profile()
+        )
+        .is_none());
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Read", "{\"file_path\":\"README.md\"}"),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("file_path should make Read streamable");
+        assert_eq!(ready.1["file_path"], "README.md");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_allows_true_zero_argument_tools() {
+        let body = tool_gate_request(
+            "Noop",
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        );
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Noop", ""),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("empty schema should allow zero-argument tools");
+        assert_eq!(ready.1, serde_json::json!({}));
+    }
+
+    #[test]
+    fn claude_code_tool_gate_allows_optional_schema_empty_input() {
+        let body = tool_gate_request(
+            "OptionalProbe",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string"}
+                }
+            }),
+        );
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("OptionalProbe", "{}"),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("optional-only schema should allow empty input");
+        assert_eq!(ready.1, serde_json::json!({}));
+    }
+
+    #[test]
+    fn claude_code_tool_gate_generates_id_when_upstream_id_is_empty() {
+        let body = tool_gate_request(
+            "Read",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"}
+                },
+                "required": ["file_path"]
+            }),
+        );
+        let mut tool = collected_tool("Read", "{\"file_path\":\"README.md\"}");
+        tool.id = Some(String::new());
+
+        let ready = streamable_anthropic_tool_call(&tool, &body, claude_code_profile())
+            .expect("complete input should be streamable");
+        assert_eq!(ready.0.id.as_deref(), Some("call_0"));
+    }
+
+    #[test]
+    fn claude_code_tool_gate_repairs_read_from_explicit_user_instruction() {
+        let body = tool_gate_request(
+            "Read",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"}
+                },
+                "required": ["file_path"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(
+                    "Use the Read tool to read cc_probe_read.txt. Then output done.".to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Read", ""),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("explicit read path should be repaired");
+        assert_eq!(ready.1["file_path"], "cc_probe_read.txt");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_repairs_bash_from_explicit_run_instruction() {
+        let body = tool_gate_request(
+            "Bash",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(
+                    "Use the Bash tool to run: printf BASH_PAYLOAD_OK. Then stop.".to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Bash", "{}"),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("explicit bash command should be repaired");
+        assert_eq!(ready.1["command"], "printf BASH_PAYLOAD_OK");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_repairs_bash_from_explicit_run_exactly_instruction() {
+        let body = tool_gate_request(
+            "Bash",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(
+                    "Use Bash to run exactly: printf LOCAL_CC_BASH_OK. Then stop.".to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Bash", "{}"),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("explicit bash run exactly command should be repaired");
+        assert_eq!(ready.1["command"], "printf LOCAL_CC_BASH_OK");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_repairs_write_from_explicit_create_instruction() {
+        let body = tool_gate_request(
+            "Write",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["file_path", "content"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(
+                    "Use Write to create cc_probe_write.txt with exactly WRITE_PAYLOAD_OK. Then read it."
+                        .to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Write", "{}"),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("explicit write path and content should be repaired");
+        assert_eq!(ready.1["file_path"], "cc_probe_write.txt");
+        assert_eq!(ready.1["content"], "WRITE_PAYLOAD_OK");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_repairs_bash_from_numbered_steps_without_swallowing_next_step() {
+        let body = tool_gate_request(
+            "Bash",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(
+                    "In this temporary directory, do exactly these steps using tools: 1. Use Bash to run exactly: printf PING_OK. 2. Use Write to create cc_probe.txt with exactly PROBE_CONTENT_OK. 3. Use Read to read cc_probe.txt. 4. Reply with exactly CLEAN_TOOL_OK and nothing else."
+                        .to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Bash", "{}"),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("explicit numbered bash command should be repaired");
+        assert_eq!(ready.1["command"], "printf PING_OK");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_does_not_repair_duplicate_completed_bash_command() {
+        let body = tool_gate_request(
+            "Bash",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::Null,
+                    tool_calls: Some(vec![ToolCall {
+                        id: Some("call_bash_done".to_string()),
+                        call_type: "function".to_string(),
+                        function: ToolFunction {
+                            name: "Bash".to_string(),
+                            arguments: "{\"command\":\"printf PING_OK\"}".to_string(),
+                        },
+                        index: Some(0),
+                    }]),
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "tool".to_string(),
+                    content: Value::String("PING_OK".to_string()),
+                    tool_calls: None,
+                    tool_call_id: Some("call_bash_done".to_string()),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String(
+                        "Use Bash to run exactly: printf PING_OK. Then continue.".to_string(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            ..body
+        };
+
+        assert!(streamable_anthropic_tool_call(
+            &collected_tool("Bash", "{}"),
+            &body,
+            claude_code_profile(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn claude_code_tool_gate_can_repair_same_bash_command_before_tool_result_exists() {
+        let body = tool_gate_request(
+            "Bash",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::Null,
+                    tool_calls: Some(vec![ToolCall {
+                        id: Some("call_bash_pending".to_string()),
+                        call_type: "function".to_string(),
+                        function: ToolFunction {
+                            name: "Bash".to_string(),
+                            arguments: "{\"command\":\"printf PING_OK\"}".to_string(),
+                        },
+                        index: Some(0),
+                    }]),
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String(
+                        "Use Bash to run exactly: printf PING_OK. Then continue.".to_string(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            ..body
+        };
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Bash", "{}"),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("no tool result means the repaired call is not completed yet");
+        assert_eq!(ready.1["command"], "printf PING_OK");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_repairs_write_from_numbered_steps_without_swallowing_next_step() {
+        let body = tool_gate_request(
+            "Write",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["file_path", "content"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(
+                    "In this temporary directory, do exactly these steps using tools: 1. Use Bash to run exactly: printf PING_OK. 2. Use Write to create cc_probe.txt with exactly PROBE_CONTENT_OK. 3. Use Read to read cc_probe.txt. 4. Reply with exactly CLEAN_TOOL_OK and nothing else."
+                        .to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool("Write", "{}"),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("explicit numbered write arguments should be repaired");
+        assert_eq!(ready.1["file_path"], "cc_probe.txt");
+        assert_eq!(ready.1["content"], "PROBE_CONTENT_OK");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_repairs_invalid_root_file_path_from_explicit_instruction() {
+        let body = tool_gate_request(
+            "Write",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["file_path", "content"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String(
+                    "Use Write to create cc_probe.txt with exactly PROBE_CONTENT_OK.".to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        let ready = streamable_anthropic_tool_call(
+            &collected_tool(
+                "Write",
+                r#"{"file_path":"\\","content":"PROBE_CONTENT_OK"}"#,
+            ),
+            &body,
+            claude_code_profile(),
+        )
+        .expect("obvious root file_path should be repaired from explicit instruction");
+        assert_eq!(ready.1["file_path"], "cc_probe.txt");
+        assert_eq!(ready.1["content"], "PROBE_CONTENT_OK");
+    }
+
+    #[test]
+    fn claude_code_tool_gate_rejects_invalid_root_file_path_without_explicit_instruction() {
+        let body = tool_gate_request(
+            "Read",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"}
+                },
+                "required": ["file_path"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String("Read the relevant file.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        assert!(streamable_anthropic_tool_call(
+            &collected_tool("Read", r#"{"file_path":"\\"}"#),
+            &body,
+            claude_code_profile(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn claude_code_tool_gate_does_not_repair_without_explicit_file_path() {
+        let body = tool_gate_request(
+            "Read",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"}
+                },
+                "required": ["file_path"]
+            }),
+        );
+        let body = ChatRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Value::String("Use Read when appropriate.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            ..body
+        };
+
+        assert!(streamable_anthropic_tool_call(
+            &collected_tool("Read", ""),
+            &body,
+            claude_code_profile()
+        )
+        .is_none());
     }
 
     #[test]

@@ -2,6 +2,27 @@
 
 ## P0：必须优先处理
 
+### V4.102 ClaudeCode 工具参数完整性门控
+
+- 状态：已于 2026-06-09 11:10 CST 部署 panda 三实例，最小真实客户端验收通过，进入长会话观察。
+- 触发：用户在 Windows ClaudeCode 真实会话中看到大量 `Invalid tool parameters`、`missing parameters`、`Failed to parse JSON` 和工具循环；复查发现上游可能返回空 `{}`、缺必填字段、重复补同一工具，或给出 `file_path="\\"` 这类语义坏参数。
+- 已完成源码项：
+  1. ClaudeCode Anthropic 流式/非流式只在工具参数 JSON 完整且包含必填字段后下发 `tool_use`。
+  2. 缺必填字段时先进行窄范围 disabled-thinking retry；仍不完整时返回结构化 `upstream returned incomplete tool call arguments`。
+  3. 已完成同一 repaired 工具调用后，不再从最新用户指令重复补出同一个工具，避免 Bash/Read/Write 循环。
+  4. `Read/Write/Edit/MultiEdit/Notebook*` 的明显非文件 `file_path` 会优先从最新用户明确路径修复；修不了就拒绝下发。
+- 验收：
+  1. 本地 `fmt --check`、`clippy --all-targets -- -D warnings`、`cargo test` 通过：lib/main 110 条，kernel golden 112 条。
+  2. panda 线上 stripped hash `ebe41572fe76a5f99783ba5e4308e164368415b00277432cd9829e60ecc651dd`；三实例 `/health` 正常，`dispatch=90/dead=0/ratelimited=0`。
+  3. NewAPI OpenAI/Anthropic stream smoke 均 HTTP 200，有真实文本且无 error event。
+  4. Windows ClaudeCode 真实 Bash/Write/Read 测试通过：文件创建成功、返回 `CLEAN_TOOL_OK`、无 `Invalid tool parameters`、无 `Failed to parse JSON`、无工具错误、无 `file_path="\\"`。
+  5. Windows ClaudeCode 小矩阵通过：ToolSearch 触发并成功，Task 通过 ClaudeCode 的 `Agent`/local_agent 路径启动 subagent 并成功，Markdown 输出成功。
+  6. NewAPI 最近 30 分钟 channel 69 只有正常消费日志；18 条带 usage 的 deepseek-v4-flash 调用中 `completion=0` 为 0，use_time 平均约 4.06s，NewAPI FRT 平均约 3892ms，最大约 6338ms，cache read/create 仍为 0。
+- 残留：
+  1. 这不是 24 小时稳定性结论；仍需真实长会话观察是否复发。
+  2. cache 仍未命中，需继续按 V4.98 prefix hash 和 provider cache 信号排查。
+  3. 23k-41k 工具请求 NewAPI FRT 仍在 3.4-6.3s，不等于全局 2-3s latency 目标已达成。
+
 ### 部署并验收 V4.101 质量保全低延迟优化
 
 - 状态：已于 2026-06-08 22:27 CST 部署 panda 三实例，进入真实流量观察。
@@ -19,7 +40,7 @@
   5. 待验收：普通 ClaudeCode 流式 first-forwardable P50 2-3s、P90 4-6s、P95 8-10s；150k+ 大上下文优先看 P95 是否从 15s+ 长尾下降，不要求牺牲输出质量强压到短请求口径。
 - 回滚条件：
   1. `tool_use` / `tool_call_id` / JSON parse 类错误上升。
-  2. ClaudeCode 工具调用重复执行或参数缺失。
+  2. ClaudeCode 工具调用重复执行或参数缺失；V4.102 已补源头门控，若复发优先查 V4.102 日志字段和线上 hash。
   3. 输出 tokens P50/P90 下降超过 5%，或 `finish_reason=length` 异常上升。
   4. lane saturated、no proxy resources、502/503/504 明显上升。
 

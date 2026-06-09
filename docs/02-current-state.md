@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-06-08
+更新时间：2026-06-09
 分支：`codex/v47-client-split-cache-harness`
 
 ## 代码已确认能力
@@ -66,6 +66,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 39. 2026-06-08 `zen-proxy-rs` 源码已补 V4.101 cache-friendly affinity key：大流式请求的 affinity 从 `model/path/client/body_bucket` 升级为包含稳定 `messages` 前缀 hash、`tools` hash 和 `tool_choice` hash；只保存 hash，不保存 prompt 原文。
 40. 2026-06-08 `zen-proxy-rs` 源码已补 V4.101 中等工具流隔离：tool-heavy lane 阈值从 `tools>=16 / tool_markers>=12` 下调到 `tools>=8 / tool_markers>=6`，让 ClaudeCode 中等工具链请求更早进入隔离 lane，降低普通流式请求被工具流拖慢的概率。
 41. 2026-06-08 22:27 CST 已将 V4.101 stripped release 部署到 panda 三实例；线上二进制 hash `149dd2f65c8b33228498bcc1f2e94f6742e1e1a5417592c0eb6921e7cc7deb49`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260608-222704.pre-v4101`。部署后 `/health`、`/v1/models`、OpenAI stream、Anthropic ClaudeCode stream 和 NewAPI OpenAI stream 最小 smoke 均通过。
+42. 2026-06-09 已补并部署 V4.102 ClaudeCode 工具参数完整性门控：Anthropic/ClaudeCode 流式和非流式只在工具参数包含必填字段且 JSON 完整后下发 `tool_use`；上游空 `{}` 或缺必填参数时先做窄范围 disabled-thinking retry，仍不完整则返回结构化 `upstream returned incomplete tool call arguments`，不再把坏工具调用交给 ClaudeCode 造成 `Invalid tool parameters`。同时新增重复补参防循环：同一修复后工具调用如果历史中已有 assistant tool_call 和对应 tool_result，不再重复补发。另补文件工具坏路径保护：`Read/Write/Edit` 等收到 `file_path="\\\\"`、`"/"`、`"."` 这类明显非文件路径时，优先从最新用户明确指令修复，修不了则拒绝下发。线上 stripped hash `ebe41572fe76a5f99783ba5e4308e164368415b00277432cd9829e60ecc651dd`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-111046.pre-v4102-tool-input-guard`。
 
 ## 附属工具
 

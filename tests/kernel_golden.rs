@@ -311,6 +311,50 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("tool-name-before-args") {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_late_args_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"file_path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+    if prompt.contains("tool-empty-args-then-disabled-complete") {
+        let body = if thinking_disabled {
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_disabled_args_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"file_path\\\":\\\"probe.txt\\\",\\\"content\\\":\\\"OK\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+        } else {
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_empty_args_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+        };
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+    if prompt.contains("tool-empty-args-complete") {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_empty_args_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
     if prompt.contains("tool-then-text-delta") {
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_tool_text_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"README.md\\\"}\"}}]}}]}\n\n",
@@ -1196,6 +1240,174 @@ async fn claude_code_anthropic_stream_emits_complete_split_tool_once() {
     assert!(body.contains("\"name\":\"Read\""));
     assert!(body.contains("README.md"));
     assert!(body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_waits_for_required_tool_arguments() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash-free", "tool-name-before-args", true);
+    request.tools = Some(vec![anthropic_tool(
+        "Read",
+        json!({"file_path":{"type":"string"}}),
+        &["file_path"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert_eq!(body.matches("\"type\":\"tool_use\"").count(), 1, "{body}");
+    assert!(body.contains("\"name\":\"Read\""));
+    assert!(body.contains("README.md"), "{body}");
+    assert!(body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_rejects_incomplete_tool_arguments() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash-free", "tool-empty-args-complete", true);
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({
+            "file_path": {"type": "string"},
+            "content": {"type": "string"}
+        }),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("event: error"), "{body}");
+    assert!(body.contains("incomplete tool call arguments"), "{body}");
+    assert!(!body.contains("\"type\":\"tool_use\""), "{body}");
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_recovers_incomplete_tool_arguments_with_disabled_retry() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash-free",
+        "tool-empty-args-then-disabled-complete",
+        true,
+    );
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({
+            "file_path": {"type": "string"},
+            "content": {"type": "string"}
+        }),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert_eq!(body.matches("\"type\":\"tool_use\"").count(), 1, "{body}");
+    assert!(body.contains("\"name\":\"Write\""), "{body}");
+    assert!(body.contains("probe.txt"), "{body}");
+    assert!(body.contains("OK"), "{body}");
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests
+            .last()
+            .and_then(|request| request.thinking.as_ref()),
+        Some(&json!({"type":"disabled"}))
+    );
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_non_stream_rejects_incomplete_tool_arguments() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request =
+        anthropic_request("deepseek-v4-flash-free", "tool-empty-args-complete", false);
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({
+            "file_path": {"type": "string"},
+            "content": {"type": "string"}
+        }),
+        &["file_path", "content"],
+    )]);
+
+    let err = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert!(err.message.contains("incomplete tool call arguments"));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_non_stream_recovers_incomplete_tool_arguments_with_disabled_retry() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash-free",
+        "tool-empty-args-then-disabled-complete",
+        false,
+    );
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({
+            "file_path": {"type": "string"},
+            "content": {"type": "string"}
+        }),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+    assert!(body.contains("\"name\":\"Write\""), "{body}");
+    assert!(body.contains("probe.txt"), "{body}");
+    assert!(body.contains("OK"), "{body}");
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests
+            .last()
+            .and_then(|request| request.thinking.as_ref()),
+        Some(&json!({"type":"disabled"}))
+    );
 }
 
 #[tokio::test]
