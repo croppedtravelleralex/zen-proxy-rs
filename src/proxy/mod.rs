@@ -164,7 +164,7 @@ pub(crate) fn provider_invalid_tool_history_retry_mode(
     used_disabled_thinking_retry: bool,
     used_text_only_retry: bool,
 ) -> Option<ProviderInvalidRetryMode> {
-    if !err.is_provider_invalid_request()
+    if !(err.is_provider_invalid_request() || err.is_missing_reasoning_content())
         || !is_risky_claude_code_tool_history_request(request, profile, repair)
     {
         return None;
@@ -205,7 +205,6 @@ fn is_risky_claude_code_tool_history_request(
     repair: translate::ToolHistoryRepair,
 ) -> bool {
     profile.kind == ClientKind::ClaudeCode
-        && !request.stream.unwrap_or(false)
         && request
             .tools
             .as_ref()
@@ -338,7 +337,7 @@ pub(crate) fn log_provider_invalid_tool_history_retry(
         prompt_tokens = shape.estimated_total_tokens,
         message_count = shape.message_count,
         tool_count = shape.tool_count,
-        "retrying provider invalid_request_error for repaired ClaudeCode non-stream tool history"
+        "retrying provider invalid_request_error for repaired ClaudeCode tool history"
     );
 }
 
@@ -662,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_invalid_does_not_retry_normal_requests() {
+    fn provider_invalid_retries_repaired_claude_code_stream_tool_history() {
         let mut request = repaired_claude_code_nonstream_tool_request();
         request.stream = Some(true);
         let mode = provider_invalid_tool_history_retry_mode(
@@ -677,6 +676,6 @@ mod tests {
             false,
         );
 
-        assert_eq!(mode, None);
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::DisableThinking));
     }
 }

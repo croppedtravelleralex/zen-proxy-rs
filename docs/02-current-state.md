@@ -18,7 +18,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - `fmt --check` 通过。
 - `clippy --all-targets -- -D warnings` 通过。
-- `cargo test` 通过：库测试 89 条、kernel golden 103 条、doc tests 0 条。
+- `cargo test` 通过：库测试 114 条、kernel golden 112 条、doc tests 0 条。
 - `zen-proxy-rs` 本轮已改外层 V4 context compactor 和 e2e harness；当前已验证 `clippy -D warnings`、bin 单元测试 132 条、context 相关单元测试 12 条、e2e 27 条、shell e2e 9/9 通过。
 
 注意：上述验证覆盖本仓库当前源码。2026-06-04 18:54 已将输出限制取消、模型策略收窄、flash/free 输入放行和 cache 四态观测构建进 `zen-proxy-rs` release 并部署到 panda；部署后已通过 NewAPI models、短请求和手工大上下文不折叠 smoke。真实 panda `policy-smoke/policy-dry` 和四客户端压测仍未跑，不能当作生产压测结论。
@@ -67,6 +67,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 40. 2026-06-08 `zen-proxy-rs` 源码已补 V4.101 中等工具流隔离：tool-heavy lane 阈值从 `tools>=16 / tool_markers>=12` 下调到 `tools>=8 / tool_markers>=6`，让 ClaudeCode 中等工具链请求更早进入隔离 lane，降低普通流式请求被工具流拖慢的概率。
 41. 2026-06-08 22:27 CST 已将 V4.101 stripped release 部署到 panda 三实例；线上二进制 hash `149dd2f65c8b33228498bcc1f2e94f6742e1e1a5417592c0eb6921e7cc7deb49`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260608-222704.pre-v4101`。部署后 `/health`、`/v1/models`、OpenAI stream、Anthropic ClaudeCode stream 和 NewAPI OpenAI stream 最小 smoke 均通过。
 42. 2026-06-09 已补并部署 V4.102 ClaudeCode 工具参数完整性门控：Anthropic/ClaudeCode 流式和非流式只在工具参数包含必填字段且 JSON 完整后下发 `tool_use`；上游空 `{}` 或缺必填参数时先做窄范围 disabled-thinking retry，仍不完整则返回结构化 `upstream returned incomplete tool call arguments`，不再把坏工具调用交给 ClaudeCode 造成 `Invalid tool parameters`。同时新增重复补参防循环：同一修复后工具调用如果历史中已有 assistant tool_call 和对应 tool_result，不再重复补发。另补文件工具坏路径保护：`Read/Write/Edit` 等收到 `file_path="\\\\"`、`"/"`、`"."` 这类明显非文件路径时，优先从最新用户明确指令修复，修不了则拒绝下发。线上 stripped hash `ebe41572fe76a5f99783ba5e4308e164368415b00277432cd9829e60ecc651dd`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-111046.pre-v4102-tool-input-guard`。
+43. 2026-06-09 V4.103 ClaudeCode 工具门控续修已随 V4.104 部署 panda：`SendMessage` 字符串消息缺 `summary` 时自动补短 summary，结构化消息不误补；`Bash/ToolSearch/WebSearch` 的空 `command/query` 不再因字段存在而放行；同一 assistant response 内完全相同的 ClaudeCode 工具名+输入 JSON 只下发一次，降低重复 `Read/Edit/Bash` 风暴；流式 `provider_missing_reasoning_content` 在首轮 disabled-thinking 后可继续走工具历史 sanitize/text-only 降级重试。
+44. 2026-06-09 V4.104 ClaudeCode progressive tool streaming 已部署 panda：ClaudeCode Anthropic 工具流在工具 id/name 和非空 arguments 开始出现后立即发送真实 `content_block_start tool_use`，后续按 `input_json_delta` 增量透传，最终完整 JSON 校验通过后才 `content_block_stop`；同时取消从最新 user 文本推断 `Read/Write/Edit/Bash/Task/ToolSearch/WebSearch` 参数，只保留 `SendMessage.summary` 确定性窄修复。线上 stripped hash `08d9064600e66097ab45bbe97290bf5e7015174a15adbe27dc5fcf8261c2ed9f`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-134330.pre-v4104-ebe41572fe76a5f99783ba5e4308e164368415b00277432cd9829e60ecc651dd`。
 
 ## 附属工具
 
@@ -574,6 +576,21 @@ P1.21 2026-06-08 ClaudeCode 大上下文慢首字诊断与首包保护：
 | 本地验证 | `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 均通过；库测试 94 条、kernel golden 105 条。新增 golden `claude_code_anthropic_stream_retries_slow_initial_fetch_before_output` 覆盖首包慢失败主动重试。 |
 | 部署状态 | 2026-06-08 15:14 CST 先滚动部署 P1.21；15:42 CST 又补齐 ZenProxy env 配置透传并再次滚动部署。最终线上 stripped SHA256 `a771174350bf6701c97b7deed1bbf4deecd995463c5cfb27ff4b4e6c7c440f6b`。旧版本备份包括 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-p121-20260608-151426-dfd52e3489e6` 和 `/opt/zen-proxy-rs/backups/zen-proxy-rs.pre-p121-envwired-20260608-153746-5c33046808ae`。 |
 | 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dead=0`、`ratelimited=0`；`/v1/models` 返回 `deepseek-v4-flash` 和 `deepseek-v4-flash-lite`；Anthropic/ClaudeCode 最小流式 smoke HTTP 200，`starttransfer=1.663s`，返回 `pong`。OpenAI-compatible 极短流式 smoke 仍返回 `reasoning_only_length`，列为 OpenAI 短流式残留，不作为本轮 ClaudeCode 主链路回滚条件。 |
+
+P1.22 2026-06-09 V4.104 ClaudeCode progressive tool streaming 与质量回退：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户反馈压首字后的多个版本体感变慢、变笨；cc-switch/NewAPI 出现 10-20s 甚至 60s+ 首字。复查确认线上跑的是 V4.102，三实例于 2026-06-09 11:10 CST 启动。 |
+| 数据结论 | channel 69 近 12 小时 NewAPI FRT P50 约 4.66s、P90 约 11.45s、P95 约 14.64s、P99 约 33s、最大约 114.7s；11:10 前 FRT P95 约 6.1s，11:10 后约 17.9s。ZenProxy `first_upstream_response_ms` P95 约 3.3s，说明主要不是网络/CPU，而是下游可见输出被工具门控延后。 |
+| 根因 | V4.102 为降低 `Invalid tool parameters`，要求 ClaudeCode 工具参数完整 JSON parse、required 字段和本地规则全部通过后才下发 `tool_use`；大 Write/Edit/Agent 参数会等完整 arguments 生成完，导致 `first_tool_call_ms` 已出现但 `first_tool_emit_ms` 长时间不动。另有 528 次“从最新 user 文本补工具参数”的日志，说明激进补参会带来质量漂移。 |
+| 修复 | ClaudeCode Anthropic stream 改为 progressive tool streaming：工具 id/name 出现且 arguments 开始生成后，立即发送真实 `content_block_start tool_use`，后续按上游累计 arguments 增量发送 `input_json_delta`；最终只有完整 JSON 通过 `streamable_anthropic_tool_call` 校验后才发送 `content_block_stop`。 |
+| 质量回退 | 取消从最新 user 文本推断 `Read/Write/Edit/Bash/Task/ToolSearch/WebSearch` 参数；缺 required、空 `command/query`、坏 `file_path` 不再由代理猜测修复。仅保留 `SendMessage` 字符串消息自动补 `summary` 这类确定性窄修复。 |
+| 边界 | 不裁剪输入、不恢复输出上限、不默认禁用 thinking、不注入隐藏提示词、不把 ping 当首字；`SendMessage` 不走 progressive，避免 deterministic summary 修复无法落到流里。 |
+| 本地验证 | WSL 原生执行 `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；库/main 114 条、kernel golden 112 条。测试语义已改为“代理不从用户文本猜工具参数”。 |
+| 部署状态 | 2026-06-09 13:43 CST 已滚动部署 panda 三实例；线上 stripped SHA256 `08d9064600e66097ab45bbe97290bf5e7015174a15adbe27dc5fcf8261c2ed9f`；旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-134330.pre-v4104-ebe41572fe76a5f99783ba5e4308e164368415b00277432cd9829e60ecc651dd`。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dead=0`、`ratelimited=0`；ZenProxy 直连 `/v1/models` 200，只暴露 `deepseek-v4-flash` 和 `deepseek-v4-flash-lite`；ZenProxy OpenAI 非流式 `PONG` HTTP 200、2.06s；ZenProxy Anthropic 非流式 `PONG` HTTP 200、1.78s；panda NewAPI `/v1/models` 200；NewAPI OpenAI 非流式 `PONG` HTTP 200、1.90s；NewAPI Anthropic 非流式 `PONG` HTTP 200、1.72s；ClaudeCode Anthropic forced `Bash` tool stream HTTP 200，输出 `content_block_start tool_use`、完整 `input_json_delta`、`content_block_stop`、`message_stop`。部署后日志窗口未扫到 `Invalid tool parameters`、`Failed to parse JSON`、`summary is required`、`provider_missing_reasoning_content` 或 panic。 |
+| 待观察 | 继续用真实 ClaudeCode 长会话观察 NewAPI channel 69 FRT 分位、`client_gone`、`provider_missing_reasoning_content`、`Invalid tool parameters`、`first_tool_call_ms/first_tool_emit_ms` 差值和工具成功率；短非流式 `reasoning_only_length` 警告仍按既有上游空输出/低预算探针分类继续跟踪，不作为 V4.104 部署失败结论。 |
 
 ## 临时产物归类
 

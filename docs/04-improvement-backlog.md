@@ -2,6 +2,62 @@
 
 ## P0：必须优先处理
 
+### V4.104 ClaudeCode progressive tool streaming 与质量回退
+
+- 状态：已落地并滚动部署 panda；进入真实 ClaudeCode 长会话观察期。
+- 触发：V4.102 部署后，NewAPI/cc-switch 真实首字明显变差，用户反馈 ClaudeCode 体感变慢、变笨。复查 channel 69 显示 11:10 当前版本启动后 FRT P95 从约 6.1s 升到约 17.9s；ZenProxy 上游首响应 P95 约 3.3s，主要瓶颈是完整工具 JSON 门控。
+- 根因：
+  1. V4.102 为避免 `Invalid tool parameters`，等工具 arguments 完整 JSON parse 且 required 校验通过后才下发 `tool_use`，大 Write/Edit/Agent 参数会把真实可见首字拖到 `first_tool_emit_ms`。
+  2. 旧策略会从最新 user 文本推断缺失的工具参数，12 小时内触发数百次，容易造成 ClaudeCode 看起来乱猜、重复或跑偏。
+  3. V4.103 修了 `provider_missing_reasoning_content` 流式重试漏口，但不解决完整 JSON 门控导致的慢首字。
+- 已完成源码项：
+  1. ClaudeCode Anthropic stream 改为 progressive tool streaming：工具 id/name 出现且 arguments 开始生成后即发送真实 `content_block_start tool_use`，arguments 按增量 `input_json_delta` 透传。
+  2. 最终只在完整 JSON 通过 `streamable_anthropic_tool_call` 校验后发送 `content_block_stop`；半截工具参数仍返回明确错误，不交给 ClaudeCode 执行。
+  3. 停用从最新 user 文本推断 `Read/Write/Edit/Bash/Task/ToolSearch/WebSearch` 参数；保留 `SendMessage.summary` 确定性窄修复。
+  4. 已开始 progressive 的工具不会被 no-forwardable watchdog 误判重试；文本块后工具块 index 已保持 distinct。
+- 验证：
+  1. `cargo fmt -- --check` 通过。
+  2. `cargo clippy --all-targets -- -D warnings` 通过。
+  3. `cargo test` 通过：lib/main 114 条，kernel golden 112 条。
+- 已验收：
+  1. `zen-proxy-rs` release 已构建并滚动部署 panda，线上 stripped SHA256 `08d9064600e66097ab45bbe97290bf5e7015174a15adbe27dc5fcf8261c2ed9f`。
+  2. panda 三实例 active，4001/4002/4004/4000 `/health` 均 `status=ok`。
+  3. ZenProxy 直连 OpenAI/Anthropic `PONG` smoke 均 HTTP 200；panda NewAPI OpenAI/Anthropic `PONG` smoke 均 HTTP 200。
+  4. ClaudeCode Anthropic forced `Bash` tool stream HTTP 200，输出 `content_block_start tool_use`、完整 `input_json_delta`、`content_block_stop`、`message_stop`。
+  5. 部署后日志窗口未扫到 `Invalid tool parameters`、`Failed to parse JSON`、`summary is required`、`provider_missing_reasoning_content` 或 panic。
+- 待观察：
+  1. NewAPI channel 69 最近窗口 FRT P95 是否明显低于 V4.102 后窗口；重点看大工具输出样本是否从 `first_tool_emit_ms` 对齐到 `first_tool_call_ms`。
+  2. 真实 Windows/WSL ClaudeCode 覆盖 Bash、Read、Write/Edit、ToolSearch/WebSearch、Agent/Task、Markdown 格式输出。
+  3. 短非流式 `reasoning_only_length` 警告继续按既有上游空输出/低预算探针分类跟踪，不直接归因到 V4.104。
+
+### V4.103 ClaudeCode 工具门控续修
+
+- 状态：源码已落地，本地验证通过；已随 V4.104 一起部署 panda。
+- 触发：V4.102 部署后，用户在 Windows ClaudeCode 真实会话中仍看到 `summary is required when message is a string`、`ToolSearch` 缺 `query`、`Bash(gh search repos)` 无搜索词、Agent 工具 JSON 解析错误、重复 `Read/Edit` 修复、以及 NewAPI 里持续出现 `provider_missing_reasoning_content`。
+- 根因：
+  1. ClaudeCode `SendMessage` 有条件必填规则：`message` 为字符串时必须带非空 `summary`；这不是普通 JSON schema 的 `required` 字段，V4.102 只检查通用必填字段会漏放。
+  2. 旧门控把 `command/query` 空字符串当作“字段存在”，会让部分本地必炸工具调用继续下发。
+  3. ClaudeCode Anthropic 流式路径没有拿到工具历史 repair 结果，`provider_missing_reasoning_content` 首轮 disabled-thinking 后不能继续走已有的 sanitize/text-only 降级策略。
+  4. 同一 assistant response 内可能出现多个完全相同的工具名+输入 JSON，尤其是上游给出多段不完整 `Read` 后被同一最新用户指令修复，容易形成重复工具风暴。
+- 已完成源码项：
+  1. `SendMessage` 加入 ClaudeCode fallback required：`to/message`；当 `message` 为字符串且 `summary` 缺失或为空时，自动生成短 summary；结构化 message 不误补。
+  2. `Bash/ToolSearch/WebSearch` 的空 `command/query` 视为需要修复或拒绝，不再仅因字段存在放行。
+  3. ClaudeCode 工具调用在本地规则层校验 `SendMessage.to`、`summary`、空 `query/command/url/pattern` 等，修不了则不下发给 ClaudeCode。
+  4. Anthropic 流式和 buffered huge-stream 路径补入 `tool_history_repair`，`provider_missing_reasoning_content` 首轮 disabled-thinking 后可继续走工具历史 sanitize/text-only 降级重试。
+  5. 同一 assistant response 内完全相同的 ClaudeCode 工具名+输入 JSON 只下发一次，降低重复 `Read/Edit/Bash` 风暴。
+- 验证：
+  1. 本地新增/覆盖测试：`SendMessage` 字符串 summary 自动补、结构化 `SendMessage` 不要求 summary、空 `ToolSearch.query` 被拒、重复同参工具被丢弃、流式 repaired tool history 可触发 provider-invalid retry。
+  2. `cargo fmt -- --check` 通过。
+  3. `cargo clippy --all-targets -- -D warnings` 通过。
+  4. `cargo test` 通过：库测试 114 条，kernel golden 112 条，doc tests 0 条。
+- 已随 V4.104 验收：
+  1. `zen-proxy-rs` release 已构建并滚动部署 panda。
+  2. 部署后日志窗口未扫到 `summary is required`、`Invalid tool parameters`、`provider_missing_reasoning_content` 或 panic。
+  3. ClaudeCode Anthropic forced `Bash` tool stream 已确认能输出完整 `tool_use` 增量流。
+- 待观察：
+  1. 继续用真实 Windows/WSL ClaudeCode 长会话覆盖 Bash、Read、Write、Edit、ToolSearch、Agent/Task、SendMessage、Markdown 输出。
+  2. 如果仍看到 `Bash(gh search repos)` 这类命令自身参数缺失，应归为模型命令选择质量问题；ZenProxy 不应硬改 Bash 命令语义，只应防空命令/重复工具/坏 JSON。
+
 ### V4.102 ClaudeCode 工具参数完整性门控
 
 - 状态：已于 2026-06-09 11:10 CST 部署 panda 三实例，最小真实客户端验收通过，进入长会话观察。

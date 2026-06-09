@@ -3,7 +3,7 @@
 ## Now
 
 1. 继续验收 V4.98 cache-friendly session：代码和 panda 部署已完成，下一步用同一 ClaudeCode 长会话确认 `prefix_4k/32k/128k/256k` 是否稳定，并与 cache tokens、`frt`、总耗时对齐判断是否提升命中。
-2. 观察 V4.102 后真实 ClaudeCode 长会话：重点看 `Invalid tool parameters`、`Failed to parse JSON`、重复工具执行、坏 `file_path`、`upstream returned incomplete tool call arguments` 是否复发。
+2. 观察已部署的 V4.104 ClaudeCode progressive tool streaming：确认大 Write/Edit/Agent 工具参数不再等完整 JSON 才出现真实 tool_use 首字，同时 `Invalid tool parameters`、半截工具 JSON 和重复工具风暴不回潮。
 3. 观察已部署的 ClaudeCode 低预算工具探针保护：确认真实 `/context` 等非流式小工具探针不再因 `reasoning_only_length` 裸 502，同时普通 ClaudeCode 工具调用仍不默认禁用 thinking。
 4. 观察已部署的 ClaudeCode Anthropic stream idle ping：确认 50k+ 流式请求 `client_gone/use_time≈64s/completion=0` 红行是否下降；注意该 ping 只保活，不代表 first content 变快。
 5. 观察 V4.99 reasoning-aware output guard 生产效果：确认短/中非流式 `reasoning_only_length` 不再裸 502，低预算小流式不再误进 huge buffered，且 ClaudeCode 大流式主会话不被默认禁用 thinking。
@@ -36,11 +36,13 @@
 17. ClaudeCode 低预算工具探针保护已在源码落地并部署 panda：OpenAI/Anthropic 非流式小工具探针会初始禁用 thinking，并将 `max_tokens<=32` 的上游预算最小抬到 64；panda NewAPI `max_tokens=1/16` 工具探针均返回 200 且 `stop_reason=tool_use`。
 18. ClaudeCode Anthropic stream idle ping 已在源码落地并部署 panda：ClaudeCode Anthropic SSE 下游 15 秒无可转发事件时发送协议级 `ping`，本地 delayed-stream golden 通过，panda 三实例健康，NewAPI Anthropic smoke 200。
 19. V4.102 ClaudeCode 工具参数完整性门控已落地并部署 panda：缺必填参数、空 `{}`、重复补参循环和明显坏文件路径均在源头拦截或窄修复；Windows ClaudeCode 真实 Bash/Write/Read、ToolSearch、Task/Agent、Markdown 小矩阵通过，NewAPI 近窗口无错误类型日志。
+20. V4.103 ClaudeCode 工具门控续修已随 V4.104 部署 panda：补 `SendMessage` 字符串消息缺 `summary`、空 `command/query`、同一 assistant response 内重复同参工具调用，以及流式 `provider_missing_reasoning_content` 工具历史降级重试漏口。
+21. V4.104 ClaudeCode 低延迟工具流与质量回退已落地并部署 panda：ClaudeCode Anthropic 工具调用改为先发真实 `tool_use` start，再按 `input_json_delta` 增量流参数，最终完整 JSON 校验通过才 stop；同时取消从最新 user 文本推断 Write/Edit/Bash/Task/ToolSearch 参数，只保留 `SendMessage.summary` 这种确定性窄修复。本地 WSL 原生 `fmt/clippy/test` 通过：lib/main 114 条、kernel golden 112 条；panda 三实例健康，ZenProxy/NewAPI OpenAI+Anthropic PONG smoke 通过，forced Bash tool stream 输出完整 `tool_use` 增量流。
 
 ## Next
 
 1. 按 `docs/06-panda-pressure-test-plan.md` 执行 policy-smoke / policy-dry；任一 policy gate 失败都不进入四客户端 dry/full，尤其要确认 panda 上 flash/free 没有输入墙、输出墙或隐藏 compactor。
-2. 用真实 ClaudeCode 长会话观察 V4.99 后的 `empty_output_class/reasoning_only_length`、cache、`frt/use_time`、工具调用和输出格式。
+2. 用真实 ClaudeCode 长会话观察 V4.104：`first_tool_call_ms` 与 NewAPI FRT 是否靠近、`first_tool_emit_ms` 长尾是否不再阻塞首字，以及 `Invalid tool parameters`、`summary is required when message is a string`、`provider_missing_reasoning_content`、重复 `Read/Edit/Bash`、`Agent` 初始化卡住和输出格式是否回归。
 3. 继续补强 Windows ClaudeCode 和 WSL ClaudeCode 测试执行环境，避免从 WSL 非交互环境或 clawgod launcher 误报 `config_error`。
 4. policy 通过后按 `docs/06-panda-pressure-test-plan.md` 执行四客户端 dry run，再决定是否进入 full run：Windows ClaudeCode、WSL ClaudeCode、WSL Hermes、WSL OpenClaw。
 5. 加入更细粒度运行指标采集：protocol first byte、first content、first tool call、upstream connect、upstream status、stream parse error、empty upstream。
