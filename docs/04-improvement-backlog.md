@@ -4,7 +4,7 @@
 
 ### V4.105 ClaudeCode true-stream 与 cache hit 对齐专项
 
-- 状态：源码已落地，本地验证通过；尚未部署 panda，仍需真实 ClaudeCode 长会话线上验收。
+- 状态：源码已落地，本地验证通过，并已部署 panda；仍需真实 ClaudeCode 长会话线上验收。
 - 触发：
   1. 用户换 Clash Verge 节点后，ClaudeCode 真实体感首字明显改善，但仍有 20-50s 慢尾；cc-switch 比 NewAPI FRT 更符合真实体验。
   2. cc-switch 显示 cache hit 约 60.6%，用户要求继续深入检查缓存命中问题。
@@ -25,8 +25,9 @@
   3. 已完成：buffered 只保留给无 tools 的 tiny literal 或无 tools 的小输出大上下文保护；不得作为常规 ClaudeCode 工具长会话路径。
   4. 已保持：正常 ClaudeCode stream 继续 progressive 透传真实 text/tool start 和 `input_json_delta`，不回退到完整 JSON 后才下发。
   5. 已完成：补 DeepSeek cache usage 字段别名；解析并透传 `prompt_cache_hit_tokens` 到 `cache_read_input_tokens`/`prompt_tokens_details.cached_tokens` 等兼容字段，记录 `prompt_cache_miss_tokens` 作为 miss 证据。
-  6. 待完成：增加 cache hit 审计脚本或 sidecar 查询：按小时、输入桶、session、prefix hash、buffered/progressive、stream/non-stream 输出 cc-switch/NewAPI/ZenProxy 三侧对齐表。
-  7. 待线上验收：将 NewAPI FRT 与真实体验指标拆开；报告必须列 `first_content_ms`、`first_tool_call_ms`、`first_downstream_ms`、cc-switch `first_token_ms`，不得只用 NewAPI FRT 代表用户体感。
+  6. 已完成：构建 `zen-proxy-rs` stripped release 并滚动部署 panda 三实例，线上 hash `a52f4d6add0a93fe0070a59c3a3ec9ee3b4bc0a9172047c7b3ec5855e67ff7e8`，旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-172830.pre-v4105-08d9064600e6`。
+  7. 待完成：增加 cache hit 审计脚本或 sidecar 查询：按小时、输入桶、session、prefix hash、buffered/progressive、stream/non-stream 输出 cc-switch/NewAPI/ZenProxy 三侧对齐表。
+  8. 待线上验收：将 NewAPI FRT 与真实体验指标拆开；报告必须列 `first_content_ms`、`first_tool_call_ms`、`first_downstream_ms`、cc-switch `first_token_ms`，不得只用 NewAPI FRT 代表用户体感。
 - 回归测试：
   1. 已完成：ClaudeCode 长上下文 + tools + tiny exact-output literal 不进入 buffered。
   2. 已完成：多行 Markdown/JSON/代码块 exact-output 不进入 buffered。

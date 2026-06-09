@@ -605,8 +605,9 @@ P1.23 2026-06-09 V4.105 true-stream/cache-hit 诊断记录：
 | cache 分桶 | `10k-50k` 命中约 9.9%，`50k-100k` 约 84.1%，`100k-200k` 约 98.1%，`200k+` 约 98.3%；用户看到的 60.6% 更像是统计口径或中等上下文样本拉低，不代表大上下文 cache 全面失败。 |
 | cache 代码风险 | 修复前 `src/zen/client.rs::ZenUsage` 只解析 `cache_read_input_tokens`、`cache_creation_input_tokens` 和 `prompt_tokens_details.cached_tokens`；未显式解析 DeepSeek 官方常见 `prompt_cache_hit_tokens/prompt_cache_miss_tokens`，可能导致 cache 命中低估或 NewAPI/cc-switch 显示不完整。 |
 | 已落地源码 | V4.105 已补 `buffer_reason` 日志；ClaudeCode 带 tools 的长会话、Markdown/JSON/代码块格式要求不再仅因 `只输出/只回复/output only` 进入 `anthropic_buffered`；`prompt_cache_hit_tokens` 会映射到通用 `cache_read_input_tokens`/`cached_tokens` 路径，`prompt_cache_miss_tokens` 会进入 cache miss 观测。 |
+| 部署验收 | 2026-06-09 17:28 CST 已构建并部署 panda 三实例；线上 stripped SHA256 为 `a52f4d6add0a93fe0070a59c3a3ec9ee3b4bc0a9172047c7b3ec5855e67ff7e8`，旧版 V4.104 备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260609-172830.pre-v4105-08d9064600e6`；`zen-proxy-rs@1/@2/@3` active，4000 `/health` 和 `/v1/models` 200，panda NewAPI OpenAI/Anthropic 非流式 `PONG` 均 200。 |
 | 本地验证 | WSL 原生路径执行 `cargo fmt -- --check`、`CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings`、`CARGO_INCREMENTAL=0 cargo test` 均通过；完整测试为 lib/main 120 条、kernel golden 112 条。 |
-| 待办 | 尚未部署 panda；部署后需建立 cc-switch/NewAPI/ZenProxy 三侧 cache hit 对齐报表，并用真实 ClaudeCode 长会话确认 `anthropic_buffered` 误触发和 buffer-like 慢尾下降。 |
+| 待办 | 需建立 cc-switch/NewAPI/ZenProxy 三侧 cache hit 对齐报表，并用真实 ClaudeCode 长会话确认 `anthropic_buffered` 误触发和 buffer-like 慢尾下降。 |
 
 ## 临时产物归类
 
