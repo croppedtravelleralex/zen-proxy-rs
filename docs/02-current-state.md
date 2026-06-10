@@ -625,6 +625,21 @@ P1.24 2026-06-10 V4.109 ClaudeCode Anthropic 非流式 no-forwardable 保护：
 | 观察结果 | V4.109 日志已出现 `ClaudeCode non-stream guard retrying after reasoning-only/no-forwardable upstream output`，说明新保护路径生效。滚动重启 08:46-08:48 UTC 期间 NewAPI 出现大量 `status_code=503, no proxy resources available`，稳定后最近 60 秒错误为 0；另有 3 条 08:48 发起、08:52 结束的 `empty_output` 502 残留，需要后续观察是否复发。 |
 | 待办 | 下一次生产滚动部署不能只看 `/health`；应等待每个实例资源池 active/dispatch 达到阈值再切下一个实例，避免池预热期产生 `no proxy resources available`。继续跟踪 V4.109 后真实 ClaudeCode 长会话里的 `Failed to parse JSON`、`empty_output`、非流式 300s、tool_use 完整率和 NewAPI 错误率。 |
 
+P1.25 2026-06-10 V4.110 预部署修复包：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | V4.109 上线后，channel 69 继续出现大量 `empty_output`、`zenproxy lane is saturated`、`do request failed` 和 nginx `768 worker_connections are not enough`。 |
+| 根因链 | ClaudeCode Anthropic 非流式无工具请求上游只吐 reasoning/no-forwardable -> V4.109 只允许 tools 场景 disabled-thinking 重试，no-tool 小请求会拖到 retry budget；同时 `max_tokens=4096` 的小非流式请求被 `>=4096` 误分到 `long_output`，8 个槽位被大量 1k-2k token 小请求占满；请求堆积后触发 nginx worker connection 上限。 |
+| free-model-client-rs 修复 | `src/proxy/anthropic.rs` 对 `ClientKind::ClaudeCode` 的 Anthropic non-stream `RetryNoForwardable` 增加 no-tool disabled-thinking 失败恢复路径。该路径只在 no-forwardable/empty reasoning 失败后触发，不全局禁用 thinking，不改 prompt，不裁剪上下文，不限制输出。 |
+| free-model-client-rs 验证 | 已提交 `76fa9f4 fix claude code nonstream no-forwardable retry`。完整验证已通过：`cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`；库测试 122 条、kernel golden 116 条。本轮复跑 targeted golden `claude_code_anthropic_non_stream_no_tool_retries_no_forwardable_reasoning_with_disabled_thinking` 通过。 |
+| zen-proxy-rs 修复 | `src/lanes.rs` 把 `max_tokens >= v46_long_output_tokens` 改为 `max_tokens > v46_long_output_tokens`，避免默认 `4096` 小非流式请求进入 `long_output` lane。 |
+| zen-proxy-rs 验证 | 已提交 `6481003 fix lane classification for default 4096 nonstream output`。本轮复跑 targeted test `routes_default_4096_output_small_nonstream_to_short_lane` 通过；release build 成功。 |
+| V4.110 包 | 本地新包 `/tmp/zen-proxy-rs-v4110` SHA256 `c768a71c928c97e5e9c0839c0eb2bb155ad50312aec9dbf90413d67023dcdd74`；压缩包 `/tmp/zen-proxy-rs-v4110.xz` SHA256 `056b179f4fb54e5dc057f448678ee6001a6a5b32938689eb5c2f508001f0a074`，大小约 3.3M。旧的 V4.110 包哈希作废。 |
+| panda 只读证据 | 2026-06-10 18:12 CST 只读检查确认：4001/4002/4004/4000 `/v1/models` 均 HTTP 200；nginx 当前仍是 `worker_connections 768`，错误日志有 `768 worker_connections are not enough`，涉及 public NewAPI 8081 和内部 4000 -> 4001/4002/4004 流量。 |
+| 部署状态 | 尚未部署。按用户要求先解决并打包，后续统一部署。统一部署必须同时包含 V4.110 二进制、滚动 readiness gate、nginx `worker_connections` 上限调整和部署后 NewAPI channel 69 错误窗口复查。 |
+| 验收重点 | 部署后必须检查 `empty_output`、`lane is saturated`、`do request failed`、`bad response status code 500`、`stream truncated`、`provider_missing_reasoning_content`、nginx `worker_connections are not enough` 是否清零或显著下降；不能只看 `/health`。 |
+
 ## 临时产物归类
 
 | 路径 | 当前归类 | 处理原则 |
