@@ -372,6 +372,34 @@ async fn mock_zen_handler(
         };
         return Sse::new(stream).into_response();
     }
+    if prompt.contains("nonstream-reasoning-loop-then-text") {
+        if thinking_disabled {
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"visible answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":4,\"total_tokens\":54,\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            return (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                body,
+            )
+                .into_response();
+        }
+
+        use axum::response::sse::{Event, Sse};
+        use std::convert::Infallible;
+        use std::time::Duration;
+
+        let stream = async_stream::stream! {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                yield Ok::<_, Infallible>(Event::default().data(json!({
+                    "choices": [{"delta": {"reasoning_content": "thinking"}}]
+                }).to_string()));
+            }
+        };
+        return Sse::new(stream).into_response();
+    }
     if prompt.contains("tool-empty-args-then-disabled-complete") {
         let body = if thinking_disabled {
             concat!(
@@ -3368,6 +3396,41 @@ async fn claude_code_anthropic_non_stream_retries_no_forwardable_reasoning_with_
     assert_eq!(body["content"][0]["type"], "tool_use");
     assert_eq!(body["content"][0]["name"], "Write");
     assert_eq!(body["content"][0]["input"]["file_path"], "guard.txt");
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].thinking.is_none());
+    assert_eq!(
+        requests[1].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_non_stream_no_tool_retries_no_forwardable_reasoning_with_disabled_thinking(
+) {
+    let (mut config, client, state) = spawn_mock_zen().await;
+    config.claude_code_stream_no_forwardable_retry_secs = 1;
+    let kernel = FreeModelKernel::new(config);
+    let prompt = format!(
+        "nonstream-reasoning-loop-then-text\n{}",
+        "context ".repeat(700)
+    );
+    let mut request = anthropic_request("deepseek-v4-flash", &prompt, false);
+    request.max_tokens = Some(512);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][0]["text"], "visible answer");
     let requests = state.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].thinking.is_none());

@@ -484,10 +484,7 @@ async fn handle_non_stream(
                     );
                     last_empty = true;
                     last_empty_class = Some(super::OutputClass::ReasoningOnly);
-                    if profile.kind == ClientKind::ClaudeCode
-                        && cr.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-                        && !used_reasoning_disabled_retry
-                    {
+                    if profile.kind == ClientKind::ClaudeCode && !used_reasoning_disabled_retry {
                         used_reasoning_disabled_retry = true;
                         attempt_body = super::reasoning_disabled_retry_body(zb);
                         tracing::warn!(
