@@ -2,6 +2,40 @@
 
 ## P0：必须优先处理
 
+### V4.107 cache usage/affinity 口径对齐补丁
+
+- 状态：已部署 panda，最小 smoke 通过；进入 15-30 分钟以上真实流量窗口观察。
+- 触发：
+  1. V4.106 部署后，cc-switch/NewAPI 显示口径仍可能低于 provider cache observation 口径。
+  2. ClaudeCode 中等上下文在尾部增长、跨 body bucket 或 final usage 帧缺少部分字段时，容易出现 cache 显示偏低或 affinity 不够稳定。
+- 已落地源码项：
+  1. `free-model-client-rs` Anthropic stream final `message_delta.usage` 增加 `input_tokens`，让下游能在最终 usage 帧里合并真实输入。
+  2. `zen-proxy-rs` stream usage 合并改为“字段存在才更新”，后续只带 `output_tokens` 或 cache 字段的帧不再把已有 `input_tokens/cache_read` 清零。
+  3. `zen-proxy-rs` OpenAI/Anthropic usage 都识别 DeepSeek `prompt_cache_hit_tokens`，并映射为 `cached_tokens/cache_read_input_tokens`。
+  4. `zen-proxy-rs` affinity key 从 128KB+ 下调到 32KB+ 流式请求，移除 `body_size_bucket`，避免同一稳定前缀因上下文增长或跨桶被当作新会话。
+  5. 中等 material 使用 32KB 稳定前缀；大上下文继续使用 256KB 稳定前缀，保留大上下文隔离。
+- 部署事实：
+  1. 2026-06-10 11:28 CST 已滚动部署到 panda 三实例，线上 stripped hash `e3001320300b37e8daf05266e7c1899652df8f42729a8f029db4c8602d4cd3c5`。
+  2. 旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260610-112855.pre-v4107-b401c9463e29`。
+  3. 4001/4002/4004/4000 `/health` 通过，`dead=0`、`ratelimited=0`；`/v1/models` 只返回 `deepseek-v4-flash` 和 `deepseek-v4-flash-lite`。
+  4. ZenProxy 直连 OpenAI/Anthropic 最小请求通过；panda NewAPI -> channel 69 OpenAI/Anthropic 最小请求通过。
+  5. 部署后约 8 分钟 channel 69 NewAPI 记录 1367 条、最终错误 0；其中流式 20 条，200k+ 大上下文 18 条。早期加权 cache hit：整体约 48.30%，200k+ 桶约 51.33%。这是 warm-up 窗口，不作为最终 75% 目标是否达成的结论。
+- 明确不做：
+  1. 不伪造 `cache_tokens`，只透传/合并上游真实 usage 字段。
+  2. 不减少输入、不摘要、不裁剪、不改用户提示词、不限制输出、不默认禁用 thinking。
+  3. 不修改 NewAPI、ClaudeCode、ccswitch。
+- 回归测试：
+  1. Anthropic stream cache usage metadata 必须包含 `input_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens`。
+  2. Anthropic SSE usage 后续帧缺字段时，不得清零已记录 prompt/cache。
+  3. `prompt_cache_hit_tokens` 必须能被 `extract_usage_counts` 和 `StreamMetrics` 识别。
+  4. 中等/大流式请求都要生成 affinity key；尾部追加和 body bucket 跨越不应改变 key；前缀变化必须改变 key。
+- 线上验收：
+  1. 部署后 15-30 分钟窗口按 channel 69 统计 cc-switch/NewAPI 风格 cache hit，不用部署后前几分钟 warm-up 判断。
+  2. 重点看 `10k-50k`、`50k-100k` 两个桶是否改善；如果仍低，继续拆 `client_gone`、短非流式探针、新会话、provider 拒绝 cache、prefix 不稳定。
+  3. 错误率不能升高：`Invalid tool parameters`、`Failed to parse JSON`、`lane is saturated`、`no proxy resources`、`provider_missing_reasoning_content` 不得回潮。
+  4. 质量不能下降：最新用户指令、工具调用、Markdown/代码块/列表/引用输出必须保持 V4.106 前后的质量边界。
+  5. 如果 15-30 分钟后大上下文 cache 仍约 50%-60%，下一步优先查真实 session reset、provider/account cache 行为、prefix 稳定性和 NewAPI/ccswitch 统计口径，不允许通过裁剪上下文或伪造 usage 解决。
+
 ### V4.106 质量保全 cache-friendly 新增输入优化
 
 - 状态：已部署 panda，进入真实流量观察；目标验收已确认。

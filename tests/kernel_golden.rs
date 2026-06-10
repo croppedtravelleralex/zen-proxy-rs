@@ -993,6 +993,7 @@ async fn anthropic_stream_preserves_cache_usage_metadata() {
         .unwrap();
 
     let body = response_text(response).await;
+    assert!(body.contains("\"input_tokens\":30"));
     assert!(body.contains("\"cache_creation_input_tokens\":11"));
     assert!(body.contains("\"cache_read_input_tokens\":22"));
 }
