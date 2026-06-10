@@ -35,6 +35,7 @@ Start here:
 | [19_2026-05-30_handoff_and_unfinished_work.md](./v4.0/19_2026-05-30_handoff_and_unfinished_work.md) | 2026-05-30 handoff: verified facts, unfinished Hermes/OpenClaw panda-NewAPI work, unimplemented V4.8 harness, and next-session guardrails |
 | [20_2026-06-01_final_anchor_deploy.md](./v4.0/20_2026-06-01_final_anchor_deploy.md) | 2026-06-01 panda deployment: ClaudeCode huge-context final-anchor, buffered retry, and panda-local huge stream smoke evidence |
 | [21_2026-06-06_stream_leasefix_and_usage_analysis.md](./v4.0/21_2026-06-06_stream_leasefix_and_usage_analysis.md) | 2026-06-06 stream client-gone lease fix, panda deployment evidence, NewAPI usage analysis, and per-node budget observations |
+| [22_2026-06-10_cache_usage_affinity_alignment.md](./v4.0/22_2026-06-10_cache_usage_affinity_alignment.md) | 2026-06-10 V4.107 cache usage merge and medium-context affinity alignment |
 
 ## AI Maintenance Rule
 

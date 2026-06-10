@@ -29,6 +29,9 @@ use crate::v4::protocol_guard::{self, GuardPhase};
 
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 const STREAM_DOWNSTREAM_SEND_TIMEOUT_SECS: u64 = 30;
+const AFFINITY_MIN_BODY_BYTES: u64 = 32 * 1024;
+const AFFINITY_MEDIUM_PREFIX_BYTES: usize = 32 * 1024;
+const AFFINITY_LARGE_PREFIX_BYTES: usize = 256 * 1024;
 
 pub async fn handle_v4_proxy(
     state: &Arc<AppState>,
@@ -427,7 +430,7 @@ fn build_affinity_key(
     streaming: bool,
     body: &Value,
 ) -> String {
-    if !streaming || body_size < 128 * 1024 {
+    if !streaming || body_size < AFFINITY_MIN_BODY_BYTES {
         return String::new();
     }
     let client_bucket = if client_id.trim().is_empty() {
@@ -439,14 +442,8 @@ fn build_affinity_key(
     let tools_hash = affinity_component_hash(body.get("tools"));
     let tool_choice_hash = affinity_component_hash(body.get("tool_choice"));
     format!(
-        "{}:{}:{}:{}:p{}:tools{}:choice{}",
-        public_model,
-        path,
-        client_bucket,
-        body_size_bucket(body_size),
-        prefix_hash,
-        tools_hash,
-        tool_choice_hash
+        "{}:{}:{}:p{}:tools{}:choice{}",
+        public_model, path, client_bucket, prefix_hash, tools_hash, tool_choice_hash
     )
 }
 
@@ -455,8 +452,16 @@ fn affinity_prefix_hash(body: &Value) -> String {
         .get("messages")
         .and_then(|messages| serde_json::to_vec(messages).ok())
         .unwrap_or_default();
-    let prefix_len = material.len().min(256 * 1024);
+    let prefix_len = material.len().min(affinity_prefix_bytes(material.len()));
     short_hash_bytes(&material[..prefix_len])
+}
+
+fn affinity_prefix_bytes(material_len: usize) -> usize {
+    if material_len <= AFFINITY_LARGE_PREFIX_BYTES {
+        AFFINITY_MEDIUM_PREFIX_BYTES
+    } else {
+        AFFINITY_LARGE_PREFIX_BYTES
+    }
 }
 
 fn affinity_component_hash(value: Option<&Value>) -> String {
@@ -2055,19 +2060,27 @@ impl StreamMetrics {
                 .and_then(|message| message.get("usage"))
                 .or_else(|| value.get("usage"))
             {
-                self.usage.prompt_tokens = usage_u32(usage, "input_tokens");
-                let output_tokens = usage_u32(usage, "output_tokens");
-                if output_tokens > 0 {
+                if let Some(input_tokens) = usage_u32_opt(usage, "input_tokens") {
+                    self.usage.prompt_tokens = input_tokens;
+                }
+                if let Some(output_tokens) =
+                    usage_u32_opt(usage, "output_tokens").filter(|tokens| *tokens > 0)
+                {
                     self.usage.completion_tokens = output_tokens;
                 }
                 self.usage.total_tokens = self
                     .usage
                     .prompt_tokens
                     .saturating_add(self.usage.completion_tokens);
-                self.usage.cache_creation_input_tokens =
-                    usage_u32(usage, "cache_creation_input_tokens");
-                self.usage.cache_read_input_tokens = usage_u32(usage, "cache_read_input_tokens");
-                self.usage.cached_tokens = self.usage.cache_read_input_tokens;
+                if let Some(cache_creation) = usage_u32_opt(usage, "cache_creation_input_tokens") {
+                    self.usage.cache_creation_input_tokens =
+                        self.usage.cache_creation_input_tokens.max(cache_creation);
+                }
+                if let Some(cache_read) = usage_cache_read_u32(usage) {
+                    self.usage.cache_read_input_tokens =
+                        self.usage.cache_read_input_tokens.max(cache_read);
+                    self.usage.cached_tokens = self.usage.cached_tokens.max(cache_read);
+                }
             }
             return;
         }
@@ -2100,16 +2113,19 @@ impl StreamMetrics {
         let Some(usage) = value.get("usage") else {
             return;
         };
-        let prompt_tokens = usage_u32(usage, "prompt_tokens");
-        let completion_tokens = usage_u32(usage, "completion_tokens");
-        let total_tokens = usage_u32(usage, "total_tokens");
-        if prompt_tokens > 0 {
+        if let Some(prompt_tokens) =
+            usage_u32_opt(usage, "prompt_tokens").filter(|tokens| *tokens > 0)
+        {
             self.usage.prompt_tokens = prompt_tokens;
         }
-        if completion_tokens > 0 {
+        if let Some(completion_tokens) =
+            usage_u32_opt(usage, "completion_tokens").filter(|tokens| *tokens > 0)
+        {
             self.usage.completion_tokens = completion_tokens;
         }
-        if total_tokens > 0 {
+        if let Some(total_tokens) =
+            usage_u32_opt(usage, "total_tokens").filter(|tokens| *tokens > 0)
+        {
             self.usage.total_tokens = total_tokens;
         } else {
             self.usage.total_tokens = self
@@ -2117,20 +2133,17 @@ impl StreamMetrics {
                 .prompt_tokens
                 .saturating_add(self.usage.completion_tokens);
         }
-        self.usage.cached_tokens = usage
-            .get("prompt_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| {
-                usage
-                    .get("cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-            })
-            .min(u32::MAX as u64) as u32;
-        self.usage.cache_creation_input_tokens = usage_u32(usage, "cache_creation_input_tokens");
-        self.usage.cache_read_input_tokens =
-            usage_u32(usage, "cache_read_input_tokens").max(self.usage.cached_tokens);
+        if let Some(cached_tokens) = usage_cached_tokens_u32(usage) {
+            self.usage.cached_tokens = self.usage.cached_tokens.max(cached_tokens);
+        }
+        if let Some(cache_creation) = usage_u32_opt(usage, "cache_creation_input_tokens") {
+            self.usage.cache_creation_input_tokens =
+                self.usage.cache_creation_input_tokens.max(cache_creation);
+        }
+        if let Some(cache_read) = usage_cache_read_u32(usage) {
+            self.usage.cache_read_input_tokens = self.usage.cache_read_input_tokens.max(cache_read);
+            self.usage.cached_tokens = self.usage.cached_tokens.max(cache_read);
+        }
     }
 
     fn final_usage(&self) -> UsageCounts {
@@ -2184,11 +2197,30 @@ impl StreamMetrics {
 }
 
 fn usage_u32(usage: &Value, name: &str) -> u32 {
+    usage_u32_opt(usage, name).unwrap_or(0)
+}
+
+fn usage_u32_opt(usage: &Value, name: &str) -> Option<u32> {
     usage
         .get(name)
         .and_then(|value| value.as_u64())
-        .unwrap_or(0)
-        .min(u32::MAX as u64) as u32
+        .map(|value| value.min(u32::MAX as u64) as u32)
+}
+
+fn usage_cached_tokens_u32(usage: &Value) -> Option<u32> {
+    usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cached_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .map(|value| value.min(u32::MAX as u64) as u32)
+}
+
+fn usage_cache_read_u32(usage: &Value) -> Option<u32> {
+    usage_u32_opt(usage, "cache_read_input_tokens")
+        .or_else(|| usage_u32_opt(usage, "prompt_cache_hit_tokens"))
+        .or_else(|| usage_cached_tokens_u32(usage))
 }
 
 fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
@@ -2201,26 +2233,17 @@ fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
     if path == "messages" {
         let prompt_tokens = usage_u32(usage, "input_tokens");
         let completion_tokens = usage_u32(usage, "output_tokens");
+        let cache_read = usage_cache_read_u32(usage).unwrap_or(0);
         UsageCounts {
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
-            cached_tokens: usage_u32(usage, "cache_read_input_tokens"),
+            cached_tokens: cache_read,
             cache_creation_input_tokens: usage_u32(usage, "cache_creation_input_tokens"),
-            cache_read_input_tokens: usage_u32(usage, "cache_read_input_tokens"),
+            cache_read_input_tokens: cache_read,
         }
     } else {
-        let cached_tokens = usage
-            .get("prompt_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| {
-                usage
-                    .get("cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-            })
-            .min(u32::MAX as u64) as u32;
+        let cached_tokens = usage_cached_tokens_u32(usage).unwrap_or(0);
         UsageCounts {
             prompt_tokens: usage_u32(usage, "prompt_tokens"),
             completion_tokens: usage_u32(usage, "completion_tokens"),
@@ -2458,6 +2481,20 @@ mod tests {
     }
 
     #[test]
+    fn extracts_deepseek_prompt_cache_hit_usage_counts() {
+        let body = Bytes::from_static(
+            br#"{"usage":{"input_tokens":100,"output_tokens":5,"prompt_cache_hit_tokens":70,"prompt_cache_miss_tokens":30}}"#,
+        );
+
+        let usage = extract_usage_counts("messages", &body);
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.cached_tokens, 70);
+        assert_eq!(usage.cache_read_input_tokens, 70);
+    }
+
+    #[test]
     fn transport_errors_are_hard_proxy_failures() {
         assert!(matches!(
             result_kind_for_classified_error(ErrorKind::Timeout, "timeout"),
@@ -2617,15 +2654,73 @@ mod tests {
     }
 
     #[test]
-    fn affinity_key_is_only_for_large_streaming_requests() {
+    fn stream_metrics_merges_anthropic_usage_without_zeroing_prompt_or_cache() {
+        let mut metrics = StreamMetrics::new(UsageCounts::default());
+
+        metrics.ingest(
+            "messages",
+            &Bytes::from_static(
+                br#"event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":55,"output_tokens":0}}}
+
+"#,
+            ),
+        );
+        metrics.ingest(
+            "messages",
+            &Bytes::from_static(
+                br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4,"cache_read_input_tokens":2}}
+
+"#,
+            ),
+        );
+
+        let usage = metrics.final_usage();
+
+        assert_eq!(usage.prompt_tokens, 55);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.total_tokens, 59);
+        assert_eq!(usage.cached_tokens, 2);
+        assert_eq!(usage.cache_read_input_tokens, 2);
+    }
+
+    #[test]
+    fn stream_metrics_accepts_deepseek_prompt_cache_hit_tokens() {
+        let mut metrics = StreamMetrics::new(UsageCounts::default());
+
+        metrics.ingest(
+            "messages",
+            &Bytes::from_static(
+                br#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":120,"output_tokens":8,"prompt_cache_hit_tokens":33,"prompt_cache_miss_tokens":87}}
+
+"#,
+            ),
+        );
+
+        let usage = metrics.final_usage();
+
+        assert_eq!(usage.prompt_tokens, 120);
+        assert_eq!(usage.completion_tokens, 8);
+        assert_eq!(usage.cached_tokens, 33);
+        assert_eq!(usage.cache_read_input_tokens, 33);
+    }
+
+    #[test]
+    fn affinity_key_is_for_medium_and_large_streaming_requests() {
         let body = serde_json::json!({"messages":[{"role":"user","content":"hello"}]});
         assert!(build_affinity_key("m", "chat/completions", "sk", 10, true, &body).is_empty());
         assert!(
             build_affinity_key("m", "chat/completions", "sk", 200_000, false, &body).is_empty()
         );
+        let medium_key = build_affinity_key("m", "chat/completions", "sk", 64_000, true, &body);
+        assert!(medium_key.starts_with("m:chat/completions:"));
+        assert!(medium_key.contains(":p"));
+
         let key = build_affinity_key("m", "chat/completions", "sk", 200_000, true, &body);
         assert!(key.starts_with("m:chat/completions:"));
-        assert!(key.contains(":small:p"));
+        assert!(key.contains(":p"));
         assert!(key.contains(":tools"));
         assert!(key.contains(":choice"));
     }
@@ -2656,6 +2751,54 @@ mod tests {
 
         assert_eq!(first_key, second_key);
         assert_ne!(first_key, changed_key);
+    }
+
+    #[test]
+    fn affinity_key_keeps_medium_stable_prefix_when_tail_grows() {
+        let prefix = "a".repeat(80_000);
+        let first = serde_json::json!({
+            "messages":[{"role":"user","content":prefix}],
+            "tools":[{"function":{"name":"Read"}}],
+            "tool_choice":"auto"
+        });
+        let mut second = first.clone();
+        second["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"role":"user","content":"continue"}));
+        let changed_prefix = serde_json::json!({
+            "messages":[{"role":"user","content":format!("b{}", "a".repeat(79_999))}],
+            "tools":[{"function":{"name":"Read"}}],
+            "tool_choice":"auto"
+        });
+
+        let first_key = build_affinity_key("m", "messages", "client", 180_000, true, &first);
+        let second_key = build_affinity_key("m", "messages", "client", 190_000, true, &second);
+        let changed_key =
+            build_affinity_key("m", "messages", "client", 180_000, true, &changed_prefix);
+
+        assert_eq!(first_key, second_key);
+        assert_ne!(first_key, changed_key);
+    }
+
+    #[test]
+    fn affinity_key_does_not_change_when_context_crosses_body_bucket() {
+        let prefix = "a".repeat(80_000);
+        let first = serde_json::json!({
+            "messages":[{"role":"user","content":prefix}],
+            "tools":[{"function":{"name":"Read"}}],
+            "tool_choice":"auto"
+        });
+        let mut second = first.clone();
+        second["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"role":"user","content":"x".repeat(120_000)}));
+
+        let first_key = build_affinity_key("m", "messages", "client", 120_000, true, &first);
+        let second_key = build_affinity_key("m", "messages", "client", 280_000, true, &second);
+
+        assert_eq!(first_key, second_key);
     }
 
     #[test]
