@@ -259,7 +259,7 @@ fn classify_lane(config: &Config, path: &str, body: &Bytes) -> LaneKind {
     if profile.tool_heavy {
         return LaneKind::ToolHeavy;
     }
-    if !profile.streaming && profile.max_tokens >= config.v46_long_output_tokens.max(1) {
+    if !profile.streaming && profile.max_tokens > config.v46_long_output_tokens.max(1) {
         return LaneKind::LongOutput;
     }
     if !profile.streaming && estimated_tokens >= config.v46_long_nonstream_tokens.max(1) {
@@ -451,6 +451,25 @@ mod tests {
         assert_eq!(
             classify_lane(&cfg, "chat/completions", &body),
             LaneKind::LongOutput
+        );
+    }
+
+    #[test]
+    fn routes_default_4096_output_small_nonstream_to_short_lane() {
+        let cfg = cfg_with_lanes();
+        let body = Bytes::from(
+            serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "stream": false,
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": "x".repeat(6_000)}]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            classify_lane(&cfg, "messages", &body),
+            LaneKind::ShortNonStream
         );
     }
 
