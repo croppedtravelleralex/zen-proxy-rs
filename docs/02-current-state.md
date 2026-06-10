@@ -637,8 +637,10 @@ P1.25 2026-06-10 V4.110 预部署修复包：
 | zen-proxy-rs 验证 | 已提交 `6481003 fix lane classification for default 4096 nonstream output`。本轮复跑 targeted test `routes_default_4096_output_small_nonstream_to_short_lane` 通过；release build 成功。 |
 | V4.110 包 | 本地新包 `/tmp/zen-proxy-rs-v4110` SHA256 `c768a71c928c97e5e9c0839c0eb2bb155ad50312aec9dbf90413d67023dcdd74`；压缩包 `/tmp/zen-proxy-rs-v4110.xz` SHA256 `056b179f4fb54e5dc057f448678ee6001a6a5b32938689eb5c2f508001f0a074`，大小约 3.3M。旧的 V4.110 包哈希作废。 |
 | panda 只读证据 | 2026-06-10 18:12 CST 只读检查确认：4001/4002/4004/4000 `/v1/models` 均 HTTP 200；nginx 当前仍是 `worker_connections 768`，错误日志有 `768 worker_connections are not enough`，涉及 public NewAPI 8081 和内部 4000 -> 4001/4002/4004 流量。 |
-| 部署状态 | 尚未部署。按用户要求先解决并打包，后续统一部署。统一部署必须同时包含 V4.110 二进制、滚动 readiness gate、nginx `worker_connections` 上限调整和部署后 NewAPI channel 69 错误窗口复查。 |
-| 验收重点 | 部署后必须检查 `empty_output`、`lane is saturated`、`do request failed`、`bad response status code 500`、`stream truncated`、`provider_missing_reasoning_content`、nginx `worker_connections are not enough` 是否清零或显著下降；不能只看 `/health`。 |
+| 部署状态 | 2026-06-10 18:30 CST 已通过 GitHub 临时仓中转部署到 panda 三实例；线上 stripped SHA256 `c768a71c928c97e5e9c0839c0eb2bb155ad50312aec9dbf90413d67023dcdd74`，xz SHA256 `056b179f4fb54e5dc057f448678ee6001a6a5b32938689eb5c2f508001f0a074`；旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260610-183000.pre-v4110-67c435b5a02c`。中转仓已强推为空提交，raw 包地址返回 404。 |
+| nginx 调整 | 2026-06-10 18:28 CST 已备份 `/etc/nginx/nginx.conf.20260610-182856.pre-v4110`，设置 `worker_rlimit_nofile 65535`、`worker_connections 4096`，`nginx -t` 通过并 reload，`nginx.service` active。 |
+| 部署验收 | 滚动重启 `zen-proxy-rs@1/@2/@3` 时，每个实例均等待 `/health` 达到 `dispatch>=60`、`dead=0` 后再继续；最终 4001/4002/4004/4000 `/health` 均 `status=ok`，`dispatch` 约 85-88，`dead=0`、`ratelimited=0`；4000 `/v1/models` 返回两个 deepseek 模型。panda NewAPI `ds` token smoke：`/v1/models` 可见两个模型，OpenAI 非流式 `只输出 OK` HTTP 200，Anthropic 非流式 `max_tokens=4096` HTTP 200 且返回 `OK`。 |
+| 部署后窗口 | 18:30 CST 后 NewAPI channel 69 共 1727 条记录，`type<>2` 错误 0；`empty_output`、`lane is saturated`、`do request failed`、`bad response status code 500`、`stream truncated`、`provider_missing_reasoning_content` 均为 0；nginx 同窗口 `worker_connections/upstream/reset/connect/recv` 匹配错误 0；ZenProxy 同窗口关键错误匹配 0。 |
 
 ## 临时产物归类
 
