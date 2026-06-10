@@ -133,6 +133,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("partial-tool-truncated") {
+        return (
+	            StatusCode::OK,
+	            [("content-type", "text/event-stream")],
+	            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_partial_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"file_path\\\":\"}}]}}]}\n\n",
+	        )
+	            .into_response();
+    }
     if prompt.contains("empty-upstream") {
         return (
             StatusCode::OK,
@@ -313,9 +321,9 @@ async fn mock_zen_handler(
     }
     if prompt.contains("tool-name-before-args") {
         let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_late_args_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\"}}]}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"file_path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
-            "data: [DONE]\n\n"
+	            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_late_args_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\"}}]}}]}\n\n",
+	            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"file_path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+	            "data: [DONE]\n\n"
         );
         return (
             StatusCode::OK,
@@ -323,6 +331,46 @@ async fn mock_zen_handler(
             body,
         )
             .into_response();
+    }
+    if prompt.contains("missing-reasoning-content-tool") {
+        let body = concat!(
+	            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_missing_reasoning_retry_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"file_path\\\":\\\"probe.txt\\\",\\\"content\\\":\\\"OK\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+	            "data: [DONE]\n\n"
+	        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+    if prompt.contains("nonstream-reasoning-loop-then-tool") {
+        if thinking_disabled {
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_nonstream_guard_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"file_path\\\":\\\"guard.txt\\\",\\\"content\\\":\\\"OK\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":8,\"total_tokens\":58,\"prompt_tokens_details\":{\"cached_tokens\":32}}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            return (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                body,
+            )
+                .into_response();
+        }
+
+        use axum::response::sse::{Event, Sse};
+        use std::convert::Infallible;
+        use std::time::Duration;
+
+        let stream = async_stream::stream! {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                yield Ok::<_, Infallible>(Event::default().data(json!({
+                    "choices": [{"delta": {"reasoning_content": "thinking"}}]
+                }).to_string()));
+            }
+        };
+        return Sse::new(stream).into_response();
     }
     if prompt.contains("tool-empty-args-then-disabled-complete") {
         let body = if thinking_disabled {
@@ -1241,6 +1289,33 @@ async fn claude_code_anthropic_stream_emits_complete_split_tool_once() {
     assert!(body.contains("\"name\":\"Read\""));
     assert!(body.contains("README.md"));
     assert!(body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_holds_partial_tool_json_until_complete() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash-free", "partial-tool-truncated", true);
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({"file_path":{"type":"string"},"content":{"type":"string"}}),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("event: error"), "{body}");
+    assert!(body.contains("stream truncated"), "{body}");
+    assert!(!body.contains("\"type\":\"tool_use\""), "{body}");
+    assert!(!body.contains("input_json_delta"), "{body}");
 }
 
 #[tokio::test]
@@ -3261,6 +3336,48 @@ async fn anthropic_non_stream_missing_reasoning_content_retries_with_disabled_th
 }
 
 #[tokio::test]
+async fn claude_code_anthropic_non_stream_retries_no_forwardable_reasoning_with_disabled_thinking()
+{
+    let (mut config, client, state) = spawn_mock_zen().await;
+    config.claude_code_stream_no_forwardable_retry_secs = 1;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash",
+        "nonstream-reasoning-loop-then-tool",
+        false,
+    );
+    request.max_tokens = Some(32_000);
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({"file_path": {"type": "string"}, "content": {"type": "string"}}),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert_eq!(body["content"][0]["type"], "tool_use");
+    assert_eq!(body["content"][0]["name"], "Write");
+    assert_eq!(body["content"][0]["input"]["file_path"], "guard.txt");
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].thinking.is_none());
+    assert_eq!(
+        requests[1].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
+}
+
+#[tokio::test]
 async fn anthropic_stream_missing_reasoning_content_retries_with_disabled_thinking() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -3285,6 +3402,47 @@ async fn anthropic_stream_missing_reasoning_content_retries_with_disabled_thinki
     let body = response_text(response).await;
     assert!(body.contains("golden answer"));
     assert!(!body.contains("reasoning_content in the thinking mode"));
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].thinking.is_none());
+    assert_eq!(
+        requests[1].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_stream_missing_reasoning_content_retry_can_emit_tool_call() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request =
+        anthropic_request("deepseek-v4-flash", "missing-reasoning-content-tool", true);
+    request.max_tokens = Some(32_000);
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({"file_path": {"type": "string"}, "content": {"type": "string"}}),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+    assert!(body.contains("\"name\":\"Write\""), "{body}");
+    assert!(body.contains("probe.txt"), "{body}");
+    assert!(!body.contains("event: error"), "{body}");
+    assert!(
+        !body.contains("provider_missing_reasoning_content"),
+        "{body}"
+    );
     let requests = state.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].thinking.is_none());

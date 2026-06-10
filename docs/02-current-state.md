@@ -611,6 +611,20 @@ P1.23 2026-06-09 V4.105 true-stream/cache-hit 诊断记录：
 | 本地验证 | WSL 原生路径执行 `cargo fmt -- --check`、`CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings`、`CARGO_INCREMENTAL=0 cargo test` 均通过；完整测试为 lib/main 120 条、kernel golden 112 条。 |
 | 待办 | 需建立 cc-switch/NewAPI/ZenProxy 三侧 cache hit 对齐报表，并用真实 ClaudeCode 长会话确认 `anthropic_buffered` 误触发和 buffer-like 慢尾下降。 |
 
+P1.24 2026-06-10 V4.109 ClaudeCode Anthropic 非流式 no-forwardable 保护：
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户持续反馈 ClaudeCode 使用中出现 `API Error: Failed to parse JSON`，NewAPI 日志可见 Anthropic `/v1/messages`、`stream=false`、tools、大上下文或 `max_tokens=32000` 请求最终 300s/504。 |
+| 根因 | Anthropic 非流式路径内部从上游收 SSE 后聚合成 JSON，但原路径缺少流式 guard 的 no-forwardable 检测和 disabled-thinking fallback；当上游长期只吐 reasoning 或空输出时，NewAPI 会等到超时，客户端侧表现为 JSON parse/read failure。 |
+| 修复 | `src/proxy/anthropic.rs` 增加 ClaudeCode 专用非流式 collect guard：检测 reasoning-only/no-forwardable 后重试；ClaudeCode tools 请求在 no-forwardable 后可切一次 disabled-thinking；已有完整 text/tool 时即使尾部 stream error 也返回结构化 JSON。 |
+| 边界 | 只对 `ClientKind::ClaudeCode` 生效；不改 prompt、不裁剪上下文、不限制输出、不全局禁用 thinking、不修改 NewAPI/ClaudeCode/cc-switch。 |
+| 本地验证 | `free-model-client-rs`：`cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；库测试 122 条、kernel golden 115 条。`zen-proxy-rs`：`cargo test` 通过，e2e 27 条；`cargo clippy --all-targets -- -D warnings` 通过。新增 golden 覆盖 ClaudeCode Anthropic 非流式 reasoning-loop 后 disabled-thinking 重试到 tool_use。 |
+| 部署状态 | 2026-06-10 16:44 CST 通过临时 GitHub 中转仓部署到 panda 三实例；线上 stripped SHA256 `67c435b5a02cc1d1ba9839110f01d017aa1acbff14a258f258171e328957b31b`，xz SHA256 `af53be47528f907b0f1c752e680ebf7fec34635d408a8281f93291190dc4f171`；旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260610-1644*.pre-v4109-nonstream-guard`。中转仓随后已强推为空提交，raw 包地址返回 404。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`；4000 `/v1/models` 返回 `deepseek-v4-flash`、`deepseek-v4-flash-lite`。panda NewAPI 使用 `ds` token 验证：`/v1/models` 可见两个 deepseek 模型；OpenAI 非流式 `只输出 OK` HTTP 200，总耗时约 1.63s；Anthropic 非流式 forced `echo_tool` HTTP 200，总耗时约 2.46s，返回 `tool_use`。 |
+| 观察结果 | V4.109 日志已出现 `ClaudeCode non-stream guard retrying after reasoning-only/no-forwardable upstream output`，说明新保护路径生效。滚动重启 08:46-08:48 UTC 期间 NewAPI 出现大量 `status_code=503, no proxy resources available`，稳定后最近 60 秒错误为 0；另有 3 条 08:48 发起、08:52 结束的 `empty_output` 502 残留，需要后续观察是否复发。 |
+| 待办 | 下一次生产滚动部署不能只看 `/health`；应等待每个实例资源池 active/dispatch 达到阈值再切下一个实例，避免池预热期产生 `no proxy resources available`。继续跟踪 V4.109 后真实 ClaudeCode 长会话里的 `Failed to parse JSON`、`empty_output`、非流式 300s、tool_use 完整率和 NewAPI 错误率。 |
+
 ## 临时产物归类
 
 | 路径 | 当前归类 | 处理原则 |

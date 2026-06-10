@@ -19,6 +19,15 @@ const CLAUDE_CODE_STREAM_GUARD_ATTEMPTS: usize = 3;
 const ANTHROPIC_TOOL_JSON_DELTA_CHUNK_BYTES: usize = 4 * 1024;
 const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
 
+enum NonStreamCollectOutcome {
+    Collected(Box<crate::zen::client::CollectedStream>),
+    RetryNoForwardable {
+        reasoning_chars: usize,
+        upstream_event_count: u64,
+        elapsed_ms: u64,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaudeCodeBufferedStreamReason {
     TinyExactOutputNoTools,
@@ -358,10 +367,16 @@ async fn handle_non_stream(
     profile: ClientProfile,
     tool_history_repair: translate::ToolHistoryRepair,
 ) -> Result<Response, AppError> {
+    use std::time::Duration;
+
     let mut observed_exit_ip = None;
     let request_shape = translate::request_shape(cr);
     let short_request_kind =
         translate::classify_short_non_stream_request(cr, profile.kind == ClientKind::ClaudeCode);
+    let no_forwardable_retry_after = adaptive_no_forwardable_retry_after(
+        Duration::from_secs(config.claude_code_stream_no_forwardable_retry_secs.max(1)),
+        request_shape.estimated_total_tokens,
+    );
     let (collected, content) = {
         let mut last_empty = false;
         let mut last_empty_class = None;
@@ -373,6 +388,7 @@ async fn handle_non_stream(
         let mut attempt_body = zb.clone();
         let mut output = None;
         for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
+            let attempt_started = std::time::Instant::now();
             let resp = match crate::zen::client::fetch_zen_stream_with_headers(
                 client,
                 &config.zen_chat_url,
@@ -435,7 +451,56 @@ async fn handle_non_stream(
             };
             let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
             observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
-            let collected = crate::zen::client::collect_stream_parts(resp).await?;
+            let collected = match collect_anthropic_non_stream_parts_with_guard(
+                resp,
+                cr,
+                profile,
+                no_forwardable_retry_after,
+                attempt_started,
+            )
+            .await?
+            {
+                NonStreamCollectOutcome::Collected(collected) => collected,
+                NonStreamCollectOutcome::RetryNoForwardable {
+                    reasoning_chars,
+                    upstream_event_count,
+                    elapsed_ms,
+                } => {
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %cr.model,
+                        source_client = ?profile.kind,
+                        attempt = attempt + 1,
+                        max_attempts = NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+                        elapsed_ms,
+                        no_forwardable_retry_after_secs = no_forwardable_retry_after.as_secs(),
+                        upstream_event_count,
+                        reasoning_chars,
+                        prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
+                        prompt_tokens = request_shape.estimated_total_tokens,
+                        message_count = request_shape.message_count,
+                        tool_count = request_shape.tool_count,
+                        "ClaudeCode non-stream guard retrying after reasoning-only/no-forwardable upstream output"
+                    );
+                    last_empty = true;
+                    last_empty_class = Some(super::OutputClass::ReasoningOnly);
+                    if profile.kind == ClientKind::ClaudeCode
+                        && cr.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                        && !used_reasoning_disabled_retry
+                    {
+                        used_reasoning_disabled_retry = true;
+                        attempt_body = super::reasoning_disabled_retry_body(zb);
+                        tracing::warn!(
+                            protocol = "anthropic",
+                            model = %cr.model,
+                            source_client = ?profile.kind,
+                            next_attempt = attempt + 2,
+                            "ClaudeCode non-stream guard enabling disabled-thinking retry after no forwardable output"
+                        );
+                    }
+                    continue;
+                }
+            };
             let cache_signals = cache_signals.with_body_usage(collected.usage.as_ref());
             super::log_provider_cache_observation(
                 "anthropic",
@@ -627,6 +692,89 @@ async fn handle_non_stream(
         ),
         observed_exit_ip,
     ))
+}
+
+async fn collect_anthropic_non_stream_parts_with_guard(
+    resp: reqwest::Response,
+    body: &ChatRequest,
+    profile: ClientProfile,
+    no_forwardable_retry_after: std::time::Duration,
+    attempt_started: std::time::Instant,
+) -> Result<NonStreamCollectOutcome, AppError> {
+    if profile.kind != ClientKind::ClaudeCode {
+        return crate::zen::client::collect_stream_parts(resp)
+            .await
+            .map(Box::new)
+            .map(NonStreamCollectOutcome::Collected);
+    }
+
+    let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
+    let mut collected = crate::zen::client::CollectedStream::default();
+    let mut upstream_event_count = 0_u64;
+    while let Some(event) = upstream.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                if !collected.content.trim().is_empty() && collected.tool_calls.is_empty() {
+                    collected.finish_reason = Some("length".to_string());
+                    return Ok(NonStreamCollectOutcome::Collected(Box::new(collected)));
+                }
+                if has_streamable_anthropic_tool_call(&collected.tool_calls, body, profile) {
+                    collected.finish_reason = Some("tool_calls".to_string());
+                    return Ok(NonStreamCollectOutcome::Collected(Box::new(collected)));
+                }
+                return Err(err);
+            }
+        };
+        upstream_event_count = upstream_event_count.saturating_add(1);
+        if event.usage.is_some() {
+            collected.usage = event.usage;
+        }
+        if let Some(choices) = event.choices {
+            for choice in choices {
+                if let Some(finish_reason) = choice.finish_reason {
+                    collected.finish_reason = Some(finish_reason);
+                }
+                if let Some(delta) = choice.delta {
+                    if let Some(content) = delta.content {
+                        collected.content.push_str(&content);
+                    }
+                    if let Some(reasoning) = delta.reasoning_content {
+                        collected.reasoning.push_str(&reasoning);
+                    }
+                    if let Some(tool_calls) = delta.tool_calls {
+                        merge_tool_deltas(&mut collected.tool_calls, tool_calls);
+                    }
+                }
+            }
+        }
+
+        if collected.finish_reason.is_some() {
+            collected.saw_done = true;
+            return Ok(NonStreamCollectOutcome::Collected(Box::new(collected)));
+        }
+        if !collected.content.trim().is_empty()
+            || has_streamable_anthropic_tool_call(&collected.tool_calls, body, profile)
+        {
+            continue;
+        }
+        if attempt_started.elapsed() >= no_forwardable_retry_after {
+            return Ok(NonStreamCollectOutcome::RetryNoForwardable {
+                reasoning_chars: collected.reasoning.len(),
+                upstream_event_count,
+                elapsed_ms: attempt_started.elapsed().as_millis() as u64,
+            });
+        }
+    }
+
+    collected.saw_done = true;
+    if !collected.saw_done && collected.finish_reason.is_none() {
+        return Err(AppError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "stream truncated before DONE or finish_reason",
+        ));
+    }
+    Ok(NonStreamCollectOutcome::Collected(Box::new(collected)))
 }
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
@@ -1315,13 +1463,25 @@ async fn handle_stream(
         let mut first_content_ms = 0_u64;
         let mut first_tool_call_ms = 0_u64;
         let mut first_reasoning_ms = 0_u64;
-        for attempt in 0..CLAUDE_CODE_STREAM_GUARD_ATTEMPTS {
-            attempts_used = attempt + 1;
-            let attempt_started = Instant::now();
-            let mut upstream_event_count = 0_u64;
-            let fetch = crate::zen::client::fetch_zen_stream_with_headers(
-                &client,
-                &zen_chat_url,
+            for attempt in 0..CLAUDE_CODE_STREAM_GUARD_ATTEMPTS {
+                attempts_used = attempt + 1;
+                let attempt_started = Instant::now();
+                let mut upstream_event_count = 0_u64;
+                if attempt > 0 && !message_started && emitted_tool_call_indexes.is_empty() {
+                    final_stream_error = None;
+                    completed_upstream = false;
+                    upstream_finish_reason = None;
+                    usage = None;
+                    cache_signals = ProviderCacheSignals::ignored();
+                    reasoning.clear();
+                    tool_calls.clear();
+                    started_tool_call_indexes.clear();
+                    started_tool_block_indexes.clear();
+                    tool_argument_offsets.clear();
+                }
+                let fetch = crate::zen::client::fetch_zen_stream_with_headers(
+                    &client,
+                    &zen_chat_url,
                 &zen_api_key,
                 &attempt_body,
                 &extra_headers,
@@ -1567,71 +1727,15 @@ async fn handle_stream(
                             }
                             reasoning.push_str(&reasoning_content);
                         }
-                        if let Some(items) = delta.tool_calls {
-                            let had_tool_calls = !tool_calls.is_empty();
-                            merge_tool_deltas(&mut tool_calls, items);
-                            if first_tool_call_ms == 0 && !had_tool_calls && !tool_calls.is_empty() {
-                                first_tool_call_ms = stream_started.elapsed().as_millis() as u64;
-                            }
-                            if profile.kind == ClientKind::ClaudeCode && text.trim().is_empty() {
-                                for tool in &tool_calls {
-                                    if emitted_tool_call_indexes.contains(&tool.index) {
-                                        continue;
-                                    }
-                                    let Some(ct) = anthropic_tool_call_identity(tool, &body) else {
-                                        continue;
-                                    };
-                                    if ct.function.name.eq_ignore_ascii_case("sendmessage") {
-                                        continue;
-                                    }
-                                    if tool.arguments.trim().is_empty()
-                                        || (serde_json::from_str::<Value>(&tool.arguments).is_ok()
-                                            && streamable_anthropic_tool_call(tool, &body, profile)
-                                                .is_none())
-                                    {
-                                        continue;
-                                    }
-                                    let tidx = if let Some(tidx) =
-                                        started_tool_block_indexes.get(&tool.index).copied()
-                                    {
-                                        tidx
-                                    } else {
-                                        if !message_started {
-                                            yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
-                                            message_started = true;
-                                        }
-                                        if text_block_open {
-                                            yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":text_block_index}).to_string()));
-                                            text_block_open = false;
-                                        }
-                                        let tidx = emitted_tool_call_blocks;
-                                        yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));
-                                        started_tool_call_indexes.insert(tool.index);
-                                        started_tool_block_indexes.insert(tool.index, tidx);
-                                        emitted_tool_call_blocks = emitted_tool_call_blocks.saturating_add(1);
-                                        if first_tool_emit_ms == 0 {
-                                            first_tool_emit_ms = stream_started.elapsed().as_millis() as u64;
-                                        }
-                                        emitted_downstream_event = true;
-                                        tidx
-                                    };
-                                    let offset =
-                                        tool_argument_offsets.get(&tool.index).copied().unwrap_or(0);
-                                    if tool.arguments.len() > offset
-                                        && tool.arguments.is_char_boundary(offset)
-                                    {
-                                        let delta = &tool.arguments[offset..];
-                                        for chunk in anthropic_tool_json_delta_chunks(delta) {
-                                            yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":tidx,"delta":{"type":"input_json_delta","partial_json":chunk}}).to_string()));
-                                        }
-                                        tool_argument_offsets.insert(tool.index, tool.arguments.len());
-                                        emitted_downstream_event = true;
-                                    }
+                            if let Some(items) = delta.tool_calls {
+                                let had_tool_calls = !tool_calls.is_empty();
+                                merge_tool_deltas(&mut tool_calls, items);
+                                if first_tool_call_ms == 0 && !had_tool_calls && !tool_calls.is_empty() {
+                                    first_tool_call_ms = stream_started.elapsed().as_millis() as u64;
                                 }
                             }
                         }
                     }
-                }
                 if emitted_downstream_event {
                     last_downstream_event = Instant::now();
                 } else if send_idle_ping && last_downstream_event.elapsed() >= idle_ping_interval {
