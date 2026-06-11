@@ -94,6 +94,23 @@ discovered candidate is still rejected by `/v1/chat/completions` or
 enabled. That mode exposes candidates for self-use testing without marking them
 as promoted.
 
+For the user's private dynamic-model test channel, candidate direct exposure is
+an accepted operating mode because end users cannot select the candidate list.
+Use `DYNAMIC_MODEL_PUBLIC_MODE=candidate_canary_or_active` or one of its
+self-use aliases (`self_use`, `self_use_candidates`, `test_channel`). This must
+not be copied to production channel 69 without a separate approval.
+
+Manual probe acceptance:
+
+```text
+POST /admin/models/{model_id}/probe
+```
+
+must require admin auth, share the same probe engine as the background worker,
+work with `DYNAMIC_MODEL_PROBE_ENABLED=false`, and return clear 422 errors for
+`DYNAMIC_MODEL_PROBE_ADAPTER=disabled` or missing `DYNAMIC_MODEL_PROBE_BASE_URL`
+in `http_bounded` mode.
+
 If a previously discovered model disappears from the latest discovery response,
 admin must mark it as `missing` instead of continuing to count it as a current
 candidate. Missing models remain tombstones only and must not be routable.

@@ -75,7 +75,13 @@ impl FromStr for DynamicModelPublicMode {
             "candidate_canary_or_active"
             | "candidate-canary-or-active"
             | "candidate"
-            | "candidates" => Ok(Self::CandidateCanaryOrActive),
+            | "candidates"
+            | "self_use"
+            | "self-use"
+            | "self_use_candidates"
+            | "self-use-candidates"
+            | "test_channel"
+            | "test-channel" => Ok(Self::CandidateCanaryOrActive),
             "canary_or_active" | "canary-or-active" | "canary" => Ok(Self::CanaryOrActive),
             "active_only" | "active-only" | "active" => Ok(Self::ActiveOnly),
             _ => Err(()),
@@ -836,6 +842,22 @@ mod tests {
         for key in keys {
             env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn dynamic_public_mode_accepts_self_use_aliases() {
+        assert_eq!(
+            "self_use".parse::<DynamicModelPublicMode>(),
+            Ok(DynamicModelPublicMode::CandidateCanaryOrActive)
+        );
+        assert_eq!(
+            "test_channel".parse::<DynamicModelPublicMode>(),
+            Ok(DynamicModelPublicMode::CandidateCanaryOrActive)
+        );
+        assert_eq!(
+            "self-use-candidates".parse::<DynamicModelPublicMode>(),
+            Ok(DynamicModelPublicMode::CandidateCanaryOrActive)
+        );
     }
 
     #[test]

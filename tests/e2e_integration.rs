@@ -888,11 +888,128 @@ mod e2e {
         let detail_body: serde_json::Value = detail.json().unwrap();
         assert_eq!(detail_body["id"], "new-candidate-direct-free");
         assert_eq!(detail_body["upstream_id"], "new-candidate-direct-free");
+        let admin_detail = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-candidate-direct-free",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("candidate admin detail");
+        assert_eq!(admin_detail.status(), 200);
+        let admin_detail_body: serde_json::Value = admin_detail.json().unwrap();
+        assert_eq!(admin_detail_body["data"]["state"], "candidate");
+        assert_eq!(admin_detail_body["data"]["probe_required"], true);
+        assert_eq!(admin_detail_body["data"]["auto_promoted"], false);
+        assert_eq!(admin_detail_body["data"]["public"], true);
+        assert_eq!(admin_detail_body["data"]["lifecycle_public"], false);
 
         let paid_detail =
             reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/paid-model", port))
                 .expect("ignored model detail");
         assert_eq!(paid_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_manual_harness_probe_promotes_candidate_without_background_probe() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-manual-harness-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19813,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "harness_all_pass"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate manual candidate: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let unauthorized = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-manual-harness-free/probe",
+                port
+            ))
+            .send()
+            .expect("unauthorized manual probe request");
+        assert_eq!(unauthorized.status(), 401);
+
+        let probe = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-manual-harness-free/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("manual harness probe request");
+        assert_eq!(probe.status(), 200);
+        let probe_body: serde_json::Value = probe.json().unwrap();
+        assert_eq!(probe_body["data"]["id"], "new-manual-harness-free");
+        assert_eq!(probe_body["data"]["final_state"], "canary");
+        assert_eq!(
+            probe_body["data"]["attempted_probe_names"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            probe_body["data"]["failed_probe_name"],
+            serde_json::Value::Null
+        );
+        assert_eq!(probe_body["data"]["current"]["state"], "canary");
+        assert_eq!(probe_body["data"]["current"]["public"], true);
+        assert_eq!(probe_body["data"]["current"]["routable"], true);
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint after manual probe");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "new-manual-harness-free"
+            ]
+        );
 
         stop_server(child, port);
     }
@@ -975,6 +1092,78 @@ mod e2e {
                 "new-harness-probed-free"
             ]
         );
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_manual_http_probe_missing_base_url_is_clear_422() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-manual-missing-base-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19814,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-manual-missing-base-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "candidate" {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not expose manual missing-base candidate");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let probe = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-manual-missing-base-free/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("manual missing-base probe request");
+        assert_eq!(probe.status(), 422);
+        let probe_body: serde_json::Value = probe.json().unwrap();
+        assert!(probe_body["error"]
+            .as_str()
+            .unwrap()
+            .contains("DYNAMIC_MODEL_PROBE_BASE_URL"));
+
+        let probes = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-manual-missing-base-free/probes",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin probes after missing-base manual probe");
+        assert_eq!(probes.status(), 200);
+        let probes_body: serde_json::Value = probes.json().unwrap();
+        assert_eq!(probes_body["data"]["state"], "candidate");
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 0);
 
         stop_server(child, port);
     }

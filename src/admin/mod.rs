@@ -113,6 +113,17 @@ async fn model_probes_h(
     }
     AdminService::model_probes(&st, &model_id)
 }
+async fn model_probe_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    let result = crate::v4::model_probe_runner::run_dynamic_model_probe_once(&st, &model_id).await;
+    AdminService::model_probe_result(&st, result)
+}
 async fn model_promote_h(
     State(st): State<Arc<AppState>>,
     h: HeaderMap,
@@ -393,6 +404,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/models", get(models_h))
         .route("/admin/models/{model_id}", get(model_detail_h))
         .route("/admin/models/{model_id}/probes", get(model_probes_h))
+        .route("/admin/models/{model_id}/probe", post(model_probe_h))
         .route("/admin/models/{model_id}/promote", post(model_promote_h))
         .route("/admin/models/{model_id}/demote", post(model_demote_h))
         .route(

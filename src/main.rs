@@ -47,10 +47,7 @@ use provider::webshare::WebShareProvider;
 use state::AppState;
 use v4::model::ModelRegistry;
 use v4::model_discovery::DynamicModelRegistry;
-use v4::model_probe::{
-    AllPassProbeAdapter, BoundedHttpProbeAdapter, HttpProbeConfig, ModelProbeConfig,
-    ModelProbeEngine, ReqwestBlockingProbeTransport,
-};
+use v4::model_probe_runner::run_dynamic_model_probe_once;
 
 static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
@@ -180,20 +177,7 @@ async fn model_detail_handler(
 }
 
 async fn discover_dynamic_models_once(state: &AppState) {
-    let (
-        enabled,
-        url,
-        timeout_secs,
-        probe_enabled,
-        probe_adapter_mode,
-        probe_max_per_round,
-        probe_success_quorum,
-        probe_failure_quarantine_threshold,
-        probe_timeout_secs,
-        probe_base_url,
-        probe_api_key,
-        probe_max_response_bytes,
-    ) = {
+    let (enabled, url, timeout_secs, probe_enabled, probe_adapter_mode, probe_max_per_round) = {
         let cfg = state.config.read().unwrap();
         (
             cfg.dynamic_model_discovery_enabled,
@@ -202,12 +186,6 @@ async fn discover_dynamic_models_once(state: &AppState) {
             cfg.dynamic_model_probe_enabled,
             cfg.dynamic_model_probe_adapter_mode,
             cfg.dynamic_model_probe_max_per_round,
-            cfg.dynamic_model_probe_success_quorum,
-            cfg.dynamic_model_probe_failure_quarantine_threshold,
-            cfg.dynamic_model_probe_timeout_secs,
-            cfg.dynamic_model_probe_base_url.clone(),
-            cfg.dynamic_model_probe_api_key.clone(),
-            cfg.dynamic_model_probe_max_response_bytes,
         )
     };
     if !enabled {
@@ -270,94 +248,27 @@ async fn discover_dynamic_models_once(state: &AppState) {
                     adapter = %probe_adapter_mode,
                     "dynamic model probe scheduler selected candidate batch"
                 );
-                match probe_adapter_mode {
-                    config::DynamicModelProbeAdapterMode::HarnessAllPass => {
-                        let engine = ModelProbeEngine::new(ModelProbeConfig {
-                            success_quorum: probe_success_quorum,
-                            failure_quarantine_threshold: probe_failure_quarantine_threshold,
-                            ..ModelProbeConfig::default()
-                        });
-                        let adapter = AllPassProbeAdapter;
-                        for model in planned {
-                            match engine.run_required_probes(
-                                &state.dynamic_models,
-                                &model.id,
-                                &adapter,
-                            ) {
-                                Ok(summary) => {
-                                    tracing::info!(
-                                        model = %summary.model_id,
-                                        attempted = summary.attempted_probe_names.len(),
-                                        passed = summary.passed_probe_names.len(),
-                                        final_state = ?summary.final_state,
-                                        "dynamic model harness probe completed"
-                                    );
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        model = %model.id,
-                                        error = ?err,
-                                        "dynamic model harness probe failed"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    config::DynamicModelProbeAdapterMode::HttpBounded => {
-                        if probe_base_url.trim().is_empty() {
-                            tracing::warn!(
-                                "dynamic model http_bounded probe skipped: DYNAMIC_MODEL_PROBE_BASE_URL is empty"
+                for model in planned {
+                    match run_dynamic_model_probe_once(state, &model.id).await {
+                        Ok(summary) => {
+                            tracing::info!(
+                                model = %summary.model_id,
+                                attempted = summary.attempted_probe_names.len(),
+                                passed = summary.passed_probe_names.len(),
+                                final_state = ?summary.final_state,
+                                adapter = %probe_adapter_mode,
+                                "dynamic model probe completed"
                             );
-                        } else {
-                            let registry = state.dynamic_models.clone();
-                            let probe_config = HttpProbeConfig {
-                                base_url: probe_base_url,
-                                api_key: probe_api_key,
-                                timeout_secs: probe_timeout_secs,
-                                max_response_bytes: probe_max_response_bytes,
-                            };
-                            let handle = tokio::task::spawn_blocking(move || {
-                                let engine = ModelProbeEngine::new(ModelProbeConfig {
-                                    success_quorum: probe_success_quorum,
-                                    failure_quarantine_threshold:
-                                        probe_failure_quarantine_threshold,
-                                    ..ModelProbeConfig::default()
-                                });
-                                let adapter = BoundedHttpProbeAdapter::new(
-                                    probe_config,
-                                    ReqwestBlockingProbeTransport,
-                                );
-                                for model in planned {
-                                    match engine.run_required_probes(&registry, &model.id, &adapter)
-                                    {
-                                        Ok(summary) => {
-                                            tracing::info!(
-                                                model = %summary.model_id,
-                                                attempted = summary.attempted_probe_names.len(),
-                                                passed = summary.passed_probe_names.len(),
-                                                final_state = ?summary.final_state,
-                                                "dynamic model http_bounded probe completed"
-                                            );
-                                        }
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                model = %model.id,
-                                                error = ?err,
-                                                "dynamic model http_bounded probe failed"
-                                            );
-                                        }
-                                    }
-                                }
-                            });
-                            if let Err(err) = handle.await {
-                                tracing::warn!(
-                                    error = %err,
-                                    "dynamic model http_bounded probe worker panicked or was cancelled"
-                                );
-                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                model = %model.id,
+                                error = ?err,
+                                adapter = %probe_adapter_mode,
+                                "dynamic model probe failed"
+                            );
                         }
                     }
-                    config::DynamicModelProbeAdapterMode::Disabled => {}
                 }
             }
         }

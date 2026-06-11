@@ -10,7 +10,10 @@ use crate::ledger::{sanitize_json_value, sanitize_text};
 use crate::state::AppState;
 use crate::v4::model::{EffectiveModelRegistry, ModelRegistry};
 use crate::v4::model_discovery::{DiscoveredModel, DiscoveredModelState};
-use crate::v4::model_probe::REQUIRED_PROBE_NAMES;
+use crate::v4::model_probe::{ModelProbeRunSummary, REQUIRED_PROBE_NAMES};
+use crate::v4::model_probe_runner::{
+    probe_error_http_status, probe_error_message, DynamicModelProbeRunError,
+};
 
 pub struct AdminService;
 
@@ -535,6 +538,45 @@ impl AdminService {
             None => Self::error_response(StatusCode::NOT_FOUND, "dynamic model not found"),
         }
     }
+
+    pub fn model_probe_result(
+        state: &AppState,
+        result: Result<ModelProbeRunSummary, DynamicModelProbeRunError>,
+    ) -> Response {
+        match result {
+            Ok(summary) => {
+                let current = state.dynamic_models.get(&summary.model_id).map(|model| {
+                    let (public_mode, discovery) = {
+                        let cfg = state.config.read().unwrap();
+                        (
+                            cfg.dynamic_model_public_mode,
+                            state.dynamic_models.snapshot(),
+                        )
+                    };
+                    let registry = EffectiveModelRegistry::new(public_mode, discovery);
+                    let effectively_public = registry.resolve(&model.id).is_ok();
+                    Self::dynamic_model_detail_payload(
+                        model,
+                        "dynamic_probe_result",
+                        effectively_public,
+                    )
+                });
+                Self::ok_response(json!({
+                    "id": summary.model_id,
+                    "attempted_probe_names": summary.attempted_probe_names,
+                    "passed_probe_names": summary.passed_probe_names,
+                    "failed_probe_name": summary.failed_probe_name,
+                    "final_state": summary.final_state,
+                    "current": current,
+                }))
+            }
+            Err(err) => {
+                let status = probe_error_http_status(&err);
+                Self::error_response(status, probe_error_message(err))
+            }
+        }
+    }
+
     pub fn model_promote(state: &AppState, model_id: &str, target: Option<&str>) -> Response {
         let target_state = match target.unwrap_or("canary") {
             "canary" => DiscoveredModelState::Canary,
