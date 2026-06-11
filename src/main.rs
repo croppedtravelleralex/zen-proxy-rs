@@ -108,7 +108,10 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> String {
 async fn models_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
     let cfg = st.config.read().unwrap();
     let data = if cfg.v4_model_registry_active() {
-        let registry = v4::model::StaticModelRegistry;
+        let registry = v4::model::EffectiveModelRegistry::new(
+            cfg.dynamic_model_public_mode,
+            st.dynamic_models.snapshot(),
+        );
         registry
             .public_models()
             .into_iter()
@@ -132,7 +135,10 @@ async fn model_detail_handler(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let cfg = st.config.read().unwrap();
     let data = if cfg.v4_model_registry_active() {
-        let registry = v4::model::StaticModelRegistry;
+        let registry = v4::model::EffectiveModelRegistry::new(
+            cfg.dynamic_model_public_mode,
+            st.dynamic_models.snapshot(),
+        );
         match registry.resolve(&model_id) {
             Ok(model) => json!({
                 "id": model.public_model,
@@ -422,6 +428,7 @@ async fn main() {
 
     // SIGHUP hot-reload
     {
+        #[cfg(unix)]
         let signal_state = app_state.clone();
         tokio::spawn(async move {
             #[cfg(unix)]

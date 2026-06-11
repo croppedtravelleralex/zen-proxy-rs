@@ -7,8 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveredModelState {
     Candidate,
+    ProbePending,
+    Canary,
+    Active,
     Ignored,
     Missing,
+    Retired,
+    Quarantined,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +26,8 @@ pub struct DiscoveredModel {
     pub last_seen_unix: u64,
     pub probe_required: bool,
     pub auto_promoted: bool,
+    pub public: bool,
+    pub routable: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -119,12 +126,16 @@ impl DynamicModelRegistry {
                     last_seen_unix: now,
                     probe_required: matches!(state, DiscoveredModelState::Candidate),
                     auto_promoted: false,
+                    public: false,
+                    routable: false,
                 });
             entry.state = state;
             entry.reason = reason;
             entry.last_seen_unix = now;
             entry.probe_required = matches!(entry.state, DiscoveredModelState::Candidate);
             entry.auto_promoted = false;
+            entry.public = false;
+            entry.routable = false;
         }
 
         for model in merged.values_mut() {
@@ -135,6 +146,8 @@ impl DynamicModelRegistry {
                         .to_string();
                 model.probe_required = true;
                 model.auto_promoted = false;
+                model.public = false;
+                model.routable = false;
             }
         }
 
@@ -175,6 +188,43 @@ impl DynamicModelRegistry {
             .find(|model| model.id == model_id)
             .cloned()
     }
+
+    pub fn set_model_state(
+        &self,
+        model_id: &str,
+        state: DiscoveredModelState,
+        reason: impl Into<String>,
+    ) -> Option<DiscoveredModel> {
+        let now = now_unix();
+        let mut snapshot = self.inner.write().unwrap();
+        let index = snapshot
+            .models
+            .iter()
+            .position(|model| model.id == model_id)?;
+        {
+            let model = &mut snapshot.models[index];
+            model.state = state;
+            model.reason = reason.into();
+            model.last_seen_unix = now;
+            model.probe_required = matches!(
+                model.state,
+                DiscoveredModelState::Candidate
+                    | DiscoveredModelState::ProbePending
+                    | DiscoveredModelState::Missing
+            );
+            model.auto_promoted = matches!(
+                model.state,
+                DiscoveredModelState::Canary | DiscoveredModelState::Active
+            );
+            model.public = matches!(
+                model.state,
+                DiscoveredModelState::Canary | DiscoveredModelState::Active
+            );
+            model.routable = model.public;
+        }
+        recompute_counts(&mut snapshot);
+        Some(snapshot.models[index].clone())
+    }
 }
 
 fn classify_model(id: &str) -> (DiscoveredModelState, String) {
@@ -200,6 +250,25 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+fn recompute_counts(snapshot: &mut ModelDiscoverySnapshot) {
+    snapshot.discovered_total = snapshot.models.len();
+    snapshot.candidate_total = snapshot
+        .models
+        .iter()
+        .filter(|model| matches!(model.state, DiscoveredModelState::Candidate))
+        .count();
+    snapshot.ignored_total = snapshot
+        .models
+        .iter()
+        .filter(|model| matches!(model.state, DiscoveredModelState::Ignored))
+        .count();
+    snapshot.missing_total = snapshot
+        .models
+        .iter()
+        .filter(|model| matches!(model.state, DiscoveredModelState::Missing))
+        .count();
 }
 
 #[cfg(test)]

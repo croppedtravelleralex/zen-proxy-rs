@@ -8,7 +8,8 @@ use crate::collector::RequestFilter;
 use crate::ledger::{sanitize_json_value, sanitize_text};
 
 use crate::state::AppState;
-use crate::v4::model::{ModelRegistry, StaticModelRegistry};
+use crate::v4::model::{EffectiveModelRegistry, ModelRegistry};
+use crate::v4::model_discovery::DiscoveredModelState;
 
 pub struct AdminService;
 
@@ -180,6 +181,9 @@ impl AdminService {
                 {"method":"GET","path":"/admin/runtime"},
                 {"method":"GET","path":"/admin/models"},
                 {"method":"GET","path":"/admin/models/{model_id}"},
+                {"method":"POST","path":"/admin/models/{model_id}/promote"},
+                {"method":"POST","path":"/admin/models/{model_id}/demote"},
+                {"method":"POST","path":"/admin/models/{model_id}/quarantine"},
                 {"method":"GET","path":"/admin/budget"},
                 {"method":"GET","path":"/admin/budget/nodes"},
                 {"method":"GET","path":"/admin/stats"},
@@ -315,9 +319,15 @@ impl AdminService {
             let cfg = state.config.read().unwrap();
             cfg.v4_model_registry_active()
         };
-        let discovery = state.dynamic_models.snapshot();
+        let (discovery, public_mode) = {
+            let cfg = state.config.read().unwrap();
+            (
+                state.dynamic_models.snapshot(),
+                cfg.dynamic_model_public_mode,
+            )
+        };
         if v4_model_registry_active {
-            let registry = StaticModelRegistry;
+            let registry = EffectiveModelRegistry::new(public_mode, discovery.clone());
             let models: Vec<Value> = registry
                 .public_models()
                 .into_iter()
@@ -335,9 +345,10 @@ impl AdminService {
                 "models": models,
                 "dynamic_discovery": discovery,
                 "safety": {
+                    "dynamic_model_public_mode": public_mode.to_string(),
                     "candidates_are_public": false,
                     "auto_promote": false,
-                    "public_models_source": "static_registry"
+                    "public_models_source": "effective_registry"
                 }
             }))
         } else {
@@ -349,6 +360,7 @@ impl AdminService {
                 ],
                 "dynamic_discovery": discovery,
                 "safety": {
+                    "dynamic_model_public_mode": public_mode.to_string(),
                     "candidates_are_public": false,
                     "auto_promote": false,
                     "public_models_source": "legacy_static"
@@ -362,7 +374,14 @@ impl AdminService {
             cfg.v4_model_registry_active()
         };
         if v4_model_registry_active {
-            let registry = StaticModelRegistry;
+            let (public_mode, discovery) = {
+                let cfg = state.config.read().unwrap();
+                (
+                    cfg.dynamic_model_public_mode,
+                    state.dynamic_models.snapshot(),
+                )
+            };
+            let registry = EffectiveModelRegistry::new(public_mode, discovery);
             match registry.resolve(model_id) {
                 Ok(resolved) => Self::ok_response(json!({
                     "id": resolved.public_model,
@@ -379,7 +398,8 @@ impl AdminService {
                         "reason": model.reason,
                         "probe_required": model.probe_required,
                         "auto_promoted": model.auto_promoted,
-                        "public": false
+                        "public": false,
+                        "routable": false
                     })),
                     None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
                 },
@@ -405,6 +425,67 @@ impl AdminService {
                     None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
                 },
             }
+        }
+    }
+    pub fn model_promote(state: &AppState, model_id: &str, target: Option<&str>) -> Response {
+        let target_state = match target.unwrap_or("canary") {
+            "canary" => DiscoveredModelState::Canary,
+            "active" => DiscoveredModelState::Active,
+            other => {
+                return Self::error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("unsupported promotion target: {other}"),
+                )
+            }
+        };
+        match state.dynamic_models.set_model_state(
+            model_id,
+            target_state,
+            format!("manual admin promotion to {}", target.unwrap_or("canary")),
+        ) {
+            Some(model) => Self::ok_response(json!({
+                "id": model.id,
+                "upstream_id": model.upstream_id,
+                "state": model.state,
+                "public": model.public,
+                "routable": model.routable,
+                "reason": model.reason
+            })),
+            None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
+        }
+    }
+    pub fn model_demote(state: &AppState, model_id: &str) -> Response {
+        match state.dynamic_models.set_model_state(
+            model_id,
+            DiscoveredModelState::Candidate,
+            "manual admin demotion; probe required before exposure",
+        ) {
+            Some(model) => Self::ok_response(json!({
+                "id": model.id,
+                "upstream_id": model.upstream_id,
+                "state": model.state,
+                "public": model.public,
+                "routable": model.routable,
+                "reason": model.reason
+            })),
+            None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
+        }
+    }
+    pub fn model_quarantine(state: &AppState, model_id: &str) -> Response {
+        match state.dynamic_models.set_model_state(
+            model_id,
+            DiscoveredModelState::Quarantined,
+            "manual admin quarantine",
+        ) {
+            Some(model) => Self::ok_response(json!({
+                "id": model.id,
+                "upstream_id": model.upstream_id,
+                "state": model.state,
+                "public": model.public,
+                "routable": model.routable,
+                "reason": model.reason
+            })),
+            None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
         }
     }
     pub fn budget(state: &AppState) -> Response {

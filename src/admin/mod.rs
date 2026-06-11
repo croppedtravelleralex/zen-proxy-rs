@@ -103,6 +103,41 @@ async fn model_detail_h(
     }
     AdminService::model_detail(&st, &model_id)
 }
+async fn model_promote_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(model_id): Path<String>,
+    Json(b): Json<Value>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::model_promote(
+        &st,
+        &model_id,
+        b.get("state").and_then(|value| value.as_str()),
+    )
+}
+async fn model_demote_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::model_demote(&st, &model_id)
+}
+async fn model_quarantine_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::model_quarantine(&st, &model_id)
+}
 async fn requests_h(
     State(st): State<Arc<AppState>>,
     h: HeaderMap,
@@ -347,6 +382,12 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/runtime", get(runtime_h))
         .route("/admin/models", get(models_h))
         .route("/admin/models/{model_id}", get(model_detail_h))
+        .route("/admin/models/{model_id}/promote", post(model_promote_h))
+        .route("/admin/models/{model_id}/demote", post(model_demote_h))
+        .route(
+            "/admin/models/{model_id}/quarantine",
+            post(model_quarantine_h),
+        )
         .route("/admin/budget", get(budget_h))
         .route("/admin/budget/nodes", get(budget_nodes_h))
         .route("/admin/stats", get(stats_h))

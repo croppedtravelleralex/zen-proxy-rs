@@ -468,6 +468,194 @@ mod e2e {
     }
 
     #[test]
+    fn test_dynamic_canary_public_mode_exposes_promoted_models_only() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-opencode-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19791,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let before_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint before promote");
+        let before_body: serde_json::Value = before_resp.json().unwrap();
+        let before_ids: Vec<&str> = before_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            before_ids,
+            vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]
+        );
+
+        let promoted = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-opencode-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "canary"}))
+            .send()
+            .expect("promote dynamic model");
+        assert_eq!(promoted.status(), 200);
+        let promoted_body: serde_json::Value = promoted.json().unwrap();
+        assert_eq!(promoted_body["data"]["state"], "canary");
+        assert_eq!(promoted_body["data"]["public"], true);
+        assert_eq!(promoted_body["data"]["routable"], true);
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint after promote");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "new-opencode-free"
+            ]
+        );
+
+        let detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-opencode-free",
+            port
+        ))
+        .expect("dynamic public model detail");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(detail_body["id"], "new-opencode-free");
+        assert_eq!(detail_body["upstream_id"], "new-opencode-free");
+
+        let paid_detail =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/paid-model", port))
+                .expect("ignored model detail");
+        assert_eq!(paid_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_active_only_mode_excludes_canary_until_active() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-active-only-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19792,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "active_only"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let canary = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-only-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "canary"}))
+            .send()
+            .expect("canary promote dynamic model");
+        assert_eq!(canary.status(), 200);
+
+        let canary_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-active-only-free",
+            port
+        ))
+        .expect("canary detail in active_only mode");
+        assert_eq!(canary_detail.status(), 404);
+
+        let active = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-only-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "active"}))
+            .send()
+            .expect("active promote dynamic model");
+        assert_eq!(active.status(), 200);
+
+        let active_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-active-only-free",
+            port
+        ))
+        .expect("active detail in active_only mode");
+        assert_eq!(active_detail.status(), 200);
+
+        stop_server(child, port);
+    }
+
+    #[test]
     fn test_models_alias_endpoint_v4_mode() {
         let (child, port) =
             start_server_with_env(19797, &[("ZEN_PROVIDER_MODE", "free_model_kernel")]);

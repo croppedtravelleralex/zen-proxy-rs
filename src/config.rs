@@ -38,6 +38,42 @@ impl FromStr for ProviderMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicModelPublicMode {
+    StaticOnly,
+    CanaryOrActive,
+    ActiveOnly,
+}
+
+impl DynamicModelPublicMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StaticOnly => "static_only",
+            Self::CanaryOrActive => "canary_or_active",
+            Self::ActiveOnly => "active_only",
+        }
+    }
+}
+
+impl fmt::Display for DynamicModelPublicMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DynamicModelPublicMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "static_only" | "static-only" | "static" => Ok(Self::StaticOnly),
+            "canary_or_active" | "canary-or-active" | "canary" => Ok(Self::CanaryOrActive),
+            "active_only" | "active-only" | "active" => Ok(Self::ActiveOnly),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactorMode {
     Off,
     Observe,
@@ -271,6 +307,7 @@ pub struct Config {
     pub dynamic_model_discovery_enabled: bool,
     pub dynamic_model_discovery_url: String,
     pub dynamic_model_discovery_interval_secs: u64,
+    pub dynamic_model_public_mode: DynamicModelPublicMode,
     pub node_max_calls_per_window: u64,
     pub node_max_tokens_per_window: u64,
     pub node_max_kb_per_window: u64,
@@ -422,6 +459,10 @@ impl Config {
                 1800u64,
             )
             .max(60),
+            dynamic_model_public_mode: load_env_var(
+                "DYNAMIC_MODEL_PUBLIC_MODE",
+                DynamicModelPublicMode::StaticOnly,
+            ),
             node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
             node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 10_000_000u64),
             node_max_kb_per_window: load_env_var("NODE_MAX_KB_PER_WINDOW", 64 * 1024u64),
@@ -710,6 +751,7 @@ mod tests {
             "DYNAMIC_MODEL_DISCOVERY_ENABLED",
             "DYNAMIC_MODEL_DISCOVERY_URL",
             "DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS",
+            "DYNAMIC_MODEL_PUBLIC_MODE",
             "V4_RETRY_BUDGET_MS",
             "CONNECT_TIMEOUT_SECS",
             "REQUEST_TIMEOUT_SECS",
@@ -789,6 +831,10 @@ mod tests {
             "https://opencode.ai/zen/v1/models"
         );
         assert_eq!(cfg.dynamic_model_discovery_interval_secs, 1800);
+        assert_eq!(
+            cfg.dynamic_model_public_mode,
+            DynamicModelPublicMode::StaticOnly
+        );
         assert_eq!(cfg.v4_retry_budget_ms, 45_000);
         assert_eq!(cfg.connect_timeout_secs, 5);
         assert_eq!(cfg.request_timeout_secs, 120);
@@ -868,6 +914,7 @@ mod tests {
         unsafe { env::set_var("ZEN_PROVIDER_MODE", "free_model_kernel") };
         unsafe { env::set_var("FREE_MODEL_TRUE_FIRST_TOKEN_FRT", "false") };
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
+        unsafe { env::set_var("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active") };
         unsafe { env::set_var("V4_RETRY_BUDGET_MS", "12345") };
         unsafe { env::set_var("CONNECT_TIMEOUT_SECS", "9") };
         unsafe { env::set_var("REQUEST_TIMEOUT_SECS", "600") };
@@ -948,6 +995,10 @@ mod tests {
         assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
         assert!(!cfg.free_model_true_first_token_frt);
         assert!(cfg.v4_model_registry_enabled);
+        assert_eq!(
+            cfg.dynamic_model_public_mode,
+            DynamicModelPublicMode::CanaryOrActive
+        );
         assert_eq!(cfg.v4_retry_budget_ms, 12_345);
         assert_eq!(cfg.connect_timeout_secs, 9);
         assert_eq!(cfg.request_timeout_secs, 600);

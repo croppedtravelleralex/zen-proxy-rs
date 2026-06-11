@@ -24,7 +24,7 @@ use crate::ledger::LedgerEvent;
 use crate::pool::{body_size_bucket, DispatchError, ErrorKind, RequestMeta, ResultKind};
 use crate::state::AppState;
 use crate::v4::context;
-use crate::v4::model::{ModelError, ModelRegistry, StaticModelRegistry};
+use crate::v4::model::{EffectiveModelRegistry, ModelError, ModelRegistry};
 use crate::v4::protocol_guard::{self, GuardPhase};
 
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -114,7 +114,10 @@ pub async fn handle_v4_proxy(
         effective_body_size = context_telemetry.effective_body_bytes,
         "v4 ingress request"
     );
-    let registry = StaticModelRegistry;
+    let registry = EffectiveModelRegistry::new(
+        conf.dynamic_model_public_mode,
+        state.dynamic_models.snapshot(),
+    );
     let resolved = match registry.resolve(&public_model) {
         Ok(resolved) => resolved,
         Err(ModelError::UnknownModel(model)) => {
