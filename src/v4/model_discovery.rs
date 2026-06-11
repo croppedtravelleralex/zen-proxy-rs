@@ -28,6 +28,34 @@ pub struct DiscoveredModel {
     pub auto_promoted: bool,
     pub public: bool,
     pub routable: bool,
+    #[serde(default)]
+    pub last_probe_unix: Option<u64>,
+    #[serde(default)]
+    pub last_success_unix: Option<u64>,
+    #[serde(default)]
+    pub last_failure_unix: Option<u64>,
+    #[serde(default)]
+    pub last_failure_code: Option<String>,
+    #[serde(default)]
+    pub last_failure_message: Option<String>,
+    #[serde(default)]
+    pub probe_attempts_total: u64,
+    #[serde(default)]
+    pub probe_success_total: u64,
+    #[serde(default)]
+    pub probe_failure_total: u64,
+    #[serde(default)]
+    pub consecutive_probe_successes: u64,
+    #[serde(default)]
+    pub consecutive_probe_failures: u64,
+    #[serde(default)]
+    pub missing_rounds: u64,
+    #[serde(default)]
+    pub promotion_reason: Option<String>,
+    #[serde(default)]
+    pub rollback_reason: Option<String>,
+    #[serde(default)]
+    pub retirement_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -128,6 +156,20 @@ impl DynamicModelRegistry {
                     auto_promoted: false,
                     public: false,
                     routable: false,
+                    last_probe_unix: None,
+                    last_success_unix: None,
+                    last_failure_unix: None,
+                    last_failure_code: None,
+                    last_failure_message: None,
+                    probe_attempts_total: 0,
+                    probe_success_total: 0,
+                    probe_failure_total: 0,
+                    consecutive_probe_successes: 0,
+                    consecutive_probe_failures: 0,
+                    missing_rounds: 0,
+                    promotion_reason: None,
+                    rollback_reason: None,
+                    retirement_reason: None,
                 });
             entry.state = state;
             entry.reason = reason;
@@ -136,6 +178,7 @@ impl DynamicModelRegistry {
             entry.auto_promoted = false;
             entry.public = false;
             entry.routable = false;
+            entry.missing_rounds = 0;
         }
 
         for model in merged.values_mut() {
@@ -148,6 +191,7 @@ impl DynamicModelRegistry {
                 model.auto_promoted = false;
                 model.public = false;
                 model.routable = false;
+                model.missing_rounds = model.missing_rounds.saturating_add(1);
             }
         }
 
@@ -196,6 +240,7 @@ impl DynamicModelRegistry {
         reason: impl Into<String>,
     ) -> Option<DiscoveredModel> {
         let now = now_unix();
+        let reason = reason.into();
         let mut snapshot = self.inner.write().unwrap();
         let index = snapshot
             .models
@@ -203,8 +248,9 @@ impl DynamicModelRegistry {
             .position(|model| model.id == model_id)?;
         {
             let model = &mut snapshot.models[index];
+            let previous_state = model.state.clone();
             model.state = state;
-            model.reason = reason.into();
+            model.reason = reason.clone();
             model.last_seen_unix = now;
             model.probe_required = matches!(
                 model.state,
@@ -221,6 +267,115 @@ impl DynamicModelRegistry {
                 DiscoveredModelState::Canary | DiscoveredModelState::Active
             );
             model.routable = model.public;
+            match model.state {
+                DiscoveredModelState::Canary | DiscoveredModelState::Active => {
+                    model.promotion_reason = Some(reason);
+                }
+                DiscoveredModelState::Candidate
+                    if matches!(
+                        previous_state,
+                        DiscoveredModelState::Canary
+                            | DiscoveredModelState::Active
+                            | DiscoveredModelState::Quarantined
+                            | DiscoveredModelState::Retired
+                    ) =>
+                {
+                    model.rollback_reason = Some(reason);
+                }
+                DiscoveredModelState::Retired => {
+                    model.retirement_reason = Some(reason);
+                }
+                _ => {}
+            }
+        }
+        recompute_counts(&mut snapshot);
+        Some(snapshot.models[index].clone())
+    }
+
+    pub fn record_probe_start(&self, model_id: &str) -> Option<DiscoveredModel> {
+        let now = now_unix();
+        let mut snapshot = self.inner.write().unwrap();
+        let index = snapshot
+            .models
+            .iter()
+            .position(|model| model.id == model_id)?;
+        {
+            let model = &mut snapshot.models[index];
+            model.state = DiscoveredModelState::ProbePending;
+            model.reason = "model probe started; awaiting probe result".to_string();
+            model.last_probe_unix = Some(now);
+            model.last_seen_unix = now;
+            model.probe_attempts_total = model.probe_attempts_total.saturating_add(1);
+            model.probe_required = true;
+            model.auto_promoted = false;
+            model.public = false;
+            model.routable = false;
+        }
+        recompute_counts(&mut snapshot);
+        Some(snapshot.models[index].clone())
+    }
+
+    pub fn record_probe_success(
+        &self,
+        model_id: &str,
+        probe_name: impl Into<String>,
+    ) -> Option<DiscoveredModel> {
+        let now = now_unix();
+        let probe_name = probe_name.into();
+        let mut snapshot = self.inner.write().unwrap();
+        let index = snapshot
+            .models
+            .iter()
+            .position(|model| model.id == model_id)?;
+        {
+            let model = &mut snapshot.models[index];
+            model.reason = format!("probe passed: {probe_name}; promotion quorum still required");
+            model.last_probe_unix = Some(now);
+            model.last_success_unix = Some(now);
+            model.last_seen_unix = now;
+            model.last_failure_code = None;
+            model.last_failure_message = None;
+            model.probe_success_total = model.probe_success_total.saturating_add(1);
+            model.consecutive_probe_successes = model.consecutive_probe_successes.saturating_add(1);
+            model.consecutive_probe_failures = 0;
+            model.probe_required = true;
+            model.auto_promoted = false;
+            model.public = false;
+            model.routable = false;
+        }
+        recompute_counts(&mut snapshot);
+        Some(snapshot.models[index].clone())
+    }
+
+    pub fn record_probe_failure(
+        &self,
+        model_id: &str,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Option<DiscoveredModel> {
+        let now = now_unix();
+        let code = code.into();
+        let message = message.into();
+        let mut snapshot = self.inner.write().unwrap();
+        let index = snapshot
+            .models
+            .iter()
+            .position(|model| model.id == model_id)?;
+        {
+            let model = &mut snapshot.models[index];
+            model.reason = format!("probe failed: {code}");
+            model.last_probe_unix = Some(now);
+            model.last_failure_unix = Some(now);
+            model.last_seen_unix = now;
+            model.last_failure_code = Some(code);
+            model.last_failure_message = Some(message);
+            model.probe_failure_total = model.probe_failure_total.saturating_add(1);
+            model.consecutive_probe_failures = model.consecutive_probe_failures.saturating_add(1);
+            model.consecutive_probe_successes = 0;
+            model.probe_required = true;
+            model.auto_promoted = false;
+            model.public = false;
+            model.routable = false;
         }
         recompute_counts(&mut snapshot);
         Some(snapshot.models[index].clone())
@@ -336,5 +491,112 @@ mod tests {
             .iter()
             .filter(|model| matches!(model.state, DiscoveredModelState::Missing))
             .all(|model| model.probe_required && !model.auto_promoted));
+    }
+
+    #[test]
+    fn discovery_counts_consecutive_missing_rounds() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(r#"{"data":[{"id":"mimo-v2.5-free"}]}"#)
+            .unwrap();
+        let missing_once = registry
+            .update_from_opencode_json(r#"{"data":[]}"#)
+            .unwrap();
+        assert_eq!(missing_once.models[0].missing_rounds, 1);
+
+        let missing_twice = registry
+            .update_from_opencode_json(r#"{"data":[]}"#)
+            .unwrap();
+        assert_eq!(missing_twice.models[0].missing_rounds, 2);
+
+        let recovered = registry
+            .update_from_opencode_json(r#"{"data":[{"id":"mimo-v2.5-free"}]}"#)
+            .unwrap();
+        assert_eq!(recovered.models[0].missing_rounds, 0);
+    }
+
+    #[test]
+    fn records_lifecycle_reasons_for_promotion_rollback_and_retirement() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(r#"{"data":[{"id":"mimo-v2.5-free"}]}"#)
+            .unwrap();
+
+        let canary = registry
+            .set_model_state(
+                "mimo-v2.5-free",
+                DiscoveredModelState::Canary,
+                "probe quorum met",
+            )
+            .unwrap();
+        assert_eq!(canary.promotion_reason.as_deref(), Some("probe quorum met"));
+
+        let candidate = registry
+            .set_model_state(
+                "mimo-v2.5-free",
+                DiscoveredModelState::Candidate,
+                "manual rollback after canary failure",
+            )
+            .unwrap();
+        assert_eq!(
+            candidate.rollback_reason.as_deref(),
+            Some("manual rollback after canary failure")
+        );
+
+        let retired = registry
+            .set_model_state(
+                "mimo-v2.5-free",
+                DiscoveredModelState::Retired,
+                "missing beyond grace window",
+            )
+            .unwrap();
+        assert_eq!(
+            retired.retirement_reason.as_deref(),
+            Some("missing beyond grace window")
+        );
+    }
+
+    #[test]
+    fn records_probe_attempt_success_and_failure_telemetry() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(r#"{"data":[{"id":"mimo-v2.5-free"}]}"#)
+            .unwrap();
+
+        let pending = registry
+            .record_probe_start("mimo-v2.5-free")
+            .expect("probe start record");
+        assert_eq!(pending.probe_attempts_total, 1);
+        assert!(pending.last_probe_unix.is_some());
+        assert_eq!(pending.state, DiscoveredModelState::ProbePending);
+
+        let success = registry
+            .record_probe_success("mimo-v2.5-free", "openai_stream_minimal")
+            .expect("probe success record");
+        assert_eq!(success.probe_success_total, 1);
+        assert_eq!(success.consecutive_probe_successes, 1);
+        assert_eq!(success.consecutive_probe_failures, 0);
+        assert!(success.last_success_unix.is_some());
+        assert!(success.last_failure_code.is_none());
+        assert!(success.last_failure_message.is_none());
+
+        let failure = registry
+            .record_probe_failure(
+                "mimo-v2.5-free",
+                "provider_empty_output",
+                "upstream returned no assistant content or tool call",
+            )
+            .expect("probe failure record");
+        assert_eq!(failure.probe_failure_total, 1);
+        assert_eq!(failure.consecutive_probe_successes, 0);
+        assert_eq!(failure.consecutive_probe_failures, 1);
+        assert_eq!(
+            failure.last_failure_code.as_deref(),
+            Some("provider_empty_output")
+        );
+        assert_eq!(
+            failure.last_failure_message.as_deref(),
+            Some("upstream returned no assistant content or tool call")
+        );
     }
 }

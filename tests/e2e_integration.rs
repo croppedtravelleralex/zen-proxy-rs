@@ -447,6 +447,14 @@ mod e2e {
         assert_eq!(detail_body["data"]["public"], false);
         assert_eq!(detail_body["data"]["probe_required"], true);
         assert_eq!(detail_body["data"]["auto_promoted"], false);
+        assert_eq!(detail_body["data"]["probe_attempts_total"], 0);
+        assert_eq!(detail_body["data"]["probe_success_total"], 0);
+        assert_eq!(detail_body["data"]["probe_failure_total"], 0);
+        assert_eq!(detail_body["data"]["consecutive_probe_successes"], 0);
+        assert_eq!(detail_body["data"]["consecutive_probe_failures"], 0);
+        assert!(detail_body["data"]["last_probe_unix"].is_null());
+        assert!(detail_body["data"]["last_success_unix"].is_null());
+        assert!(detail_body["data"]["last_failure_unix"].is_null());
 
         let rejected = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))

@@ -9,7 +9,7 @@ use crate::ledger::{sanitize_json_value, sanitize_text};
 
 use crate::state::AppState;
 use crate::v4::model::{EffectiveModelRegistry, ModelRegistry};
-use crate::v4::model_discovery::DiscoveredModelState;
+use crate::v4::model_discovery::{DiscoveredModel, DiscoveredModelState};
 
 pub struct AdminService;
 
@@ -381,7 +381,24 @@ impl AdminService {
                     state.dynamic_models.snapshot(),
                 )
             };
+            let dynamic_model = discovery
+                .models
+                .iter()
+                .find(|model| model.id == model_id)
+                .cloned();
             let registry = EffectiveModelRegistry::new(public_mode, discovery);
+            if let Some(model) = dynamic_model {
+                let effectively_public = registry.resolve(model_id).is_ok();
+                return Self::ok_response(Self::dynamic_model_detail_payload(
+                    model,
+                    if effectively_public {
+                        "dynamic_public"
+                    } else {
+                        "dynamic_candidate"
+                    },
+                    effectively_public,
+                ));
+            }
             match registry.resolve(model_id) {
                 Ok(resolved) => Self::ok_response(json!({
                     "id": resolved.public_model,
@@ -389,20 +406,7 @@ impl AdminService {
                     "mode": "v4",
                     "endpoints": ["openai_chat_completions", "anthropic_messages"]
                 })),
-                Err(_) => match state.dynamic_models.get(model_id) {
-                    Some(model) => Self::ok_response(json!({
-                        "id": model.id,
-                        "upstream_id": model.upstream_id,
-                        "mode": "dynamic_candidate",
-                        "state": model.state,
-                        "reason": model.reason,
-                        "probe_required": model.probe_required,
-                        "auto_promoted": model.auto_promoted,
-                        "public": false,
-                        "routable": false
-                    })),
-                    None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
-                },
+                Err(_) => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
             }
         } else {
             match model_id {
@@ -412,20 +416,49 @@ impl AdminService {
                     "mode": "legacy"
                 })),
                 _ => match state.dynamic_models.get(model_id) {
-                    Some(model) => Self::ok_response(json!({
-                        "id": model.id,
-                        "upstream_id": model.upstream_id,
-                        "mode": "dynamic_candidate",
-                        "state": model.state,
-                        "reason": model.reason,
-                        "probe_required": model.probe_required,
-                        "auto_promoted": model.auto_promoted,
-                        "public": false
-                    })),
+                    Some(model) => Self::ok_response(Self::dynamic_model_detail_payload(
+                        model,
+                        "dynamic_candidate",
+                        false,
+                    )),
                     None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
                 },
             }
         }
+    }
+
+    fn dynamic_model_detail_payload(
+        model: DiscoveredModel,
+        mode: &'static str,
+        effectively_public: bool,
+    ) -> Value {
+        json!({
+            "id": model.id,
+            "upstream_id": model.upstream_id,
+            "mode": mode,
+            "state": model.state,
+            "reason": model.reason,
+            "probe_required": model.probe_required,
+            "auto_promoted": model.auto_promoted,
+            "public": effectively_public,
+            "routable": effectively_public,
+            "lifecycle_public": model.public,
+            "lifecycle_routable": model.routable,
+            "last_probe_unix": model.last_probe_unix,
+            "last_success_unix": model.last_success_unix,
+            "last_failure_unix": model.last_failure_unix,
+            "last_failure_code": model.last_failure_code,
+            "last_failure_message": model.last_failure_message,
+            "probe_attempts_total": model.probe_attempts_total,
+            "probe_success_total": model.probe_success_total,
+            "probe_failure_total": model.probe_failure_total,
+            "consecutive_probe_successes": model.consecutive_probe_successes,
+            "consecutive_probe_failures": model.consecutive_probe_failures,
+            "missing_rounds": model.missing_rounds,
+            "promotion_reason": model.promotion_reason,
+            "rollback_reason": model.rollback_reason,
+            "retirement_reason": model.retirement_reason,
+        })
     }
     pub fn model_promote(state: &AppState, model_id: &str, target: Option<&str>) -> Response {
         let target_state = match target.unwrap_or("canary") {
