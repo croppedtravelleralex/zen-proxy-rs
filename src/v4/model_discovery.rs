@@ -31,6 +31,8 @@ pub struct DiscoveredModel {
     #[serde(default)]
     pub last_probe_unix: Option<u64>,
     #[serde(default)]
+    pub last_probe_name: Option<String>,
+    #[serde(default)]
     pub last_success_unix: Option<u64>,
     #[serde(default)]
     pub last_failure_unix: Option<u64>,
@@ -48,6 +50,8 @@ pub struct DiscoveredModel {
     pub consecutive_probe_successes: u64,
     #[serde(default)]
     pub consecutive_probe_failures: u64,
+    #[serde(default)]
+    pub passed_probe_names: Vec<String>,
     #[serde(default)]
     pub missing_rounds: u64,
     #[serde(default)]
@@ -157,6 +161,7 @@ impl DynamicModelRegistry {
                     public: false,
                     routable: false,
                     last_probe_unix: None,
+                    last_probe_name: None,
                     last_success_unix: None,
                     last_failure_unix: None,
                     last_failure_code: None,
@@ -166,6 +171,7 @@ impl DynamicModelRegistry {
                     probe_failure_total: 0,
                     consecutive_probe_successes: 0,
                     consecutive_probe_failures: 0,
+                    passed_probe_names: Vec::new(),
                     missing_rounds: 0,
                     promotion_reason: None,
                     rollback_reason: None,
@@ -335,6 +341,7 @@ impl DynamicModelRegistry {
             model.state = DiscoveredModelState::ProbePending;
             model.reason = "model probe started; awaiting probe result".to_string();
             model.last_probe_unix = Some(now);
+            model.last_probe_name = None;
             model.last_seen_unix = now;
             model.probe_attempts_total = model.probe_attempts_total.saturating_add(1);
             model.probe_required = true;
@@ -362,6 +369,7 @@ impl DynamicModelRegistry {
             let model = &mut snapshot.models[index];
             model.reason = format!("probe passed: {probe_name}; promotion quorum still required");
             model.last_probe_unix = Some(now);
+            model.last_probe_name = Some(probe_name.clone());
             model.last_success_unix = Some(now);
             model.last_seen_unix = now;
             model.last_failure_code = None;
@@ -369,6 +377,14 @@ impl DynamicModelRegistry {
             model.probe_success_total = model.probe_success_total.saturating_add(1);
             model.consecutive_probe_successes = model.consecutive_probe_successes.saturating_add(1);
             model.consecutive_probe_failures = 0;
+            if !model
+                .passed_probe_names
+                .iter()
+                .any(|name| name == &probe_name)
+            {
+                model.passed_probe_names.push(probe_name);
+                model.passed_probe_names.sort();
+            }
             model.probe_required = true;
             model.auto_promoted = false;
             model.public = false;
@@ -383,6 +399,7 @@ impl DynamicModelRegistry {
         model_id: &str,
         code: impl Into<String>,
         message: impl Into<String>,
+        probe_name: Option<String>,
     ) -> Option<DiscoveredModel> {
         let now = now_unix();
         let code = code.into();
@@ -396,6 +413,7 @@ impl DynamicModelRegistry {
             let model = &mut snapshot.models[index];
             model.reason = format!("probe failed: {code}");
             model.last_probe_unix = Some(now);
+            model.last_probe_name = probe_name;
             model.last_failure_unix = Some(now);
             model.last_seen_unix = now;
             model.last_failure_code = Some(code);
@@ -750,6 +768,7 @@ mod tests {
                 "already-probed-free",
                 "provider_empty_output",
                 "empty assistant output",
+                None,
             )
             .unwrap();
         registry
@@ -797,6 +816,7 @@ mod tests {
                 "mimo-v2.5-free",
                 "provider_empty_output",
                 "upstream returned no assistant content or tool call",
+                Some("empty_output_guard".to_string()),
             )
             .expect("probe failure record");
         assert_eq!(failure.probe_failure_total, 1);
@@ -809,6 +829,14 @@ mod tests {
         assert_eq!(
             failure.last_failure_message.as_deref(),
             Some("upstream returned no assistant content or tool call")
+        );
+        assert_eq!(
+            failure.last_probe_name.as_deref(),
+            Some("empty_output_guard")
+        );
+        assert_eq!(
+            failure.passed_probe_names,
+            vec!["openai_stream_minimal".to_string()]
         );
     }
 }

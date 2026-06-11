@@ -103,6 +103,16 @@ async fn model_detail_h(
     }
     AdminService::model_detail(&st, &model_id)
 }
+async fn model_probes_h(
+    State(st): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::model_probes(&st, &model_id)
+}
 async fn model_promote_h(
     State(st): State<Arc<AppState>>,
     h: HeaderMap,
@@ -382,6 +392,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/runtime", get(runtime_h))
         .route("/admin/models", get(models_h))
         .route("/admin/models/{model_id}", get(model_detail_h))
+        .route("/admin/models/{model_id}/probes", get(model_probes_h))
         .route("/admin/models/{model_id}/promote", post(model_promote_h))
         .route("/admin/models/{model_id}/demote", post(model_demote_h))
         .route(

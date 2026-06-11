@@ -10,6 +10,7 @@ use crate::ledger::{sanitize_json_value, sanitize_text};
 use crate::state::AppState;
 use crate::v4::model::{EffectiveModelRegistry, ModelRegistry};
 use crate::v4::model_discovery::{DiscoveredModel, DiscoveredModelState};
+use crate::v4::model_probe::REQUIRED_PROBE_NAMES;
 
 pub struct AdminService;
 
@@ -181,6 +182,7 @@ impl AdminService {
                 {"method":"GET","path":"/admin/runtime"},
                 {"method":"GET","path":"/admin/models"},
                 {"method":"GET","path":"/admin/models/{model_id}"},
+                {"method":"GET","path":"/admin/models/{model_id}/probes"},
                 {"method":"POST","path":"/admin/models/{model_id}/promote"},
                 {"method":"POST","path":"/admin/models/{model_id}/demote"},
                 {"method":"POST","path":"/admin/models/{model_id}/quarantine"},
@@ -310,6 +312,8 @@ impl AdminService {
             "data_plane": state.pool_manager.runtime_details(),
             "dynamic_model_probe": {
                 "enabled": cfg.dynamic_model_probe_enabled,
+                "adapter": cfg.dynamic_model_probe_adapter_mode.to_string(),
+                "public_mode": cfg.dynamic_model_public_mode.to_string(),
                 "max_concurrent": cfg.dynamic_model_probe_max_concurrent,
                 "max_per_round": cfg.dynamic_model_probe_max_per_round,
                 "requests_per_interval": cfg.dynamic_model_probe_requests_per_interval,
@@ -448,6 +452,16 @@ impl AdminService {
         mode: &'static str,
         effectively_public: bool,
     ) -> Value {
+        let missing_probe_names = REQUIRED_PROBE_NAMES
+            .iter()
+            .filter(|probe_name| {
+                !model
+                    .passed_probe_names
+                    .iter()
+                    .any(|passed| passed == **probe_name)
+            })
+            .map(|probe_name| (*probe_name).to_string())
+            .collect::<Vec<_>>();
         json!({
             "id": model.id,
             "upstream_id": model.upstream_id,
@@ -461,6 +475,7 @@ impl AdminService {
             "lifecycle_public": model.public,
             "lifecycle_routable": model.routable,
             "last_probe_unix": model.last_probe_unix,
+            "last_probe_name": model.last_probe_name,
             "last_success_unix": model.last_success_unix,
             "last_failure_unix": model.last_failure_unix,
             "last_failure_code": model.last_failure_code,
@@ -470,11 +485,52 @@ impl AdminService {
             "probe_failure_total": model.probe_failure_total,
             "consecutive_probe_successes": model.consecutive_probe_successes,
             "consecutive_probe_failures": model.consecutive_probe_failures,
+            "required_probe_names": REQUIRED_PROBE_NAMES,
+            "passed_probe_names": model.passed_probe_names,
+            "missing_probe_names": missing_probe_names,
             "missing_rounds": model.missing_rounds,
             "promotion_reason": model.promotion_reason,
             "rollback_reason": model.rollback_reason,
             "retirement_reason": model.retirement_reason,
         })
+    }
+    pub fn model_probes(state: &AppState, model_id: &str) -> Response {
+        match state.dynamic_models.get(model_id) {
+            Some(model) => {
+                let missing_probe_names = REQUIRED_PROBE_NAMES
+                    .iter()
+                    .filter(|probe_name| {
+                        !model
+                            .passed_probe_names
+                            .iter()
+                            .any(|passed| passed == **probe_name)
+                    })
+                    .map(|probe_name| (*probe_name).to_string())
+                    .collect::<Vec<_>>();
+                Self::ok_response(json!({
+                    "id": model.id,
+                    "upstream_id": model.upstream_id,
+                    "state": model.state,
+                    "public": model.public,
+                    "routable": model.routable,
+                    "last_probe_unix": model.last_probe_unix,
+                    "last_probe_name": model.last_probe_name,
+                    "last_success_unix": model.last_success_unix,
+                    "last_failure_unix": model.last_failure_unix,
+                    "last_failure_code": model.last_failure_code,
+                    "last_failure_message": model.last_failure_message,
+                    "probe_attempts_total": model.probe_attempts_total,
+                    "probe_success_total": model.probe_success_total,
+                    "probe_failure_total": model.probe_failure_total,
+                    "consecutive_probe_successes": model.consecutive_probe_successes,
+                    "consecutive_probe_failures": model.consecutive_probe_failures,
+                    "required_probe_names": REQUIRED_PROBE_NAMES,
+                    "passed_probe_names": model.passed_probe_names,
+                    "missing_probe_names": missing_probe_names,
+                }))
+            }
+            None => Self::error_response(StatusCode::NOT_FOUND, "dynamic model not found"),
+        }
     }
     pub fn model_promote(state: &AppState, model_id: &str, target: Option<&str>) -> Response {
         let target_state = match target.unwrap_or("canary") {
@@ -1092,9 +1148,11 @@ impl AdminService {
                 "enabled": cfg.dynamic_model_discovery_enabled,
                 "url": sanitize_text(&cfg.dynamic_model_discovery_url),
                 "interval_secs": cfg.dynamic_model_discovery_interval_secs,
+                "public_mode": cfg.dynamic_model_public_mode.to_string(),
                 "auto_promote": false,
                 "probe": {
                     "enabled": cfg.dynamic_model_probe_enabled,
+                    "adapter": cfg.dynamic_model_probe_adapter_mode.to_string(),
                     "max_concurrent": cfg.dynamic_model_probe_max_concurrent,
                     "max_per_round": cfg.dynamic_model_probe_max_per_round,
                     "requests_per_interval": cfg.dynamic_model_probe_requests_per_interval,

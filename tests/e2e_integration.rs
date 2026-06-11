@@ -507,6 +507,39 @@ mod e2e {
         assert!(detail_body["data"]["last_probe_unix"].is_null());
         assert!(detail_body["data"]["last_success_unix"].is_null());
         assert!(detail_body["data"]["last_failure_unix"].is_null());
+        assert_eq!(
+            detail_body["data"]["required_probe_names"]
+                .as_array()
+                .expect("required probes")
+                .len(),
+            8
+        );
+        assert_eq!(
+            detail_body["data"]["missing_probe_names"]
+                .as_array()
+                .expect("missing probes")
+                .len(),
+            8
+        );
+
+        let probes = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-opencode-free/probes",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin dynamic model probes");
+        assert_eq!(probes.status(), 200);
+        let probes_body: serde_json::Value = probes.json().unwrap();
+        assert_eq!(probes_body["data"]["state"], "candidate");
+        assert_eq!(
+            probes_body["data"]["passed_probe_names"]
+                .as_array()
+                .expect("passed probes")
+                .len(),
+            0
+        );
 
         let rejected = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
@@ -632,6 +665,174 @@ mod e2e {
             reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/paid-model", port))
                 .expect("ignored model detail");
         assert_eq!(paid_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_candidate_public_mode_exposes_candidates_for_test_channel() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-candidate-direct-free"},
+                {"id": "paid-model"},
+                {"id": "second-candidate-direct-free"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19808,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 2
+            {
+                assert_eq!(
+                    body["data"]["safety"]["dynamic_model_public_mode"],
+                    "candidate_canary_or_active"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "new-candidate-direct-free",
+                "second-candidate-direct-free"
+            ]
+        );
+
+        let detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-candidate-direct-free",
+            port
+        ))
+        .expect("candidate model detail endpoint");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(detail_body["id"], "new-candidate-direct-free");
+        assert_eq!(detail_body["upstream_id"], "new-candidate-direct-free");
+
+        let paid_detail =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/paid-model", port))
+                .expect("ignored model detail");
+        assert_eq!(paid_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_harness_probe_promotes_candidates_to_canary_in_test_mode() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-harness-probed-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19809,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "harness_all_pass"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probes_body = loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-harness-probed-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "canary" {
+                    break body;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("harness probe did not promote candidate before deadline");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 8);
+        assert_eq!(
+            probes_body["data"]["passed_probe_names"]
+                .as_array()
+                .expect("passed probes")
+                .len(),
+            8
+        );
+        assert_eq!(
+            probes_body["data"]["missing_probe_names"]
+                .as_array()
+                .expect("missing probes")
+                .len(),
+            0
+        );
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "new-harness-probed-free"
+            ]
+        );
 
         stop_server(child, port);
     }

@@ -40,6 +40,7 @@ impl FromStr for ProviderMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicModelPublicMode {
     StaticOnly,
+    CandidateCanaryOrActive,
     CanaryOrActive,
     ActiveOnly,
 }
@@ -48,6 +49,7 @@ impl DynamicModelPublicMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::StaticOnly => "static_only",
+            Self::CandidateCanaryOrActive => "candidate_canary_or_active",
             Self::CanaryOrActive => "canary_or_active",
             Self::ActiveOnly => "active_only",
         }
@@ -66,8 +68,47 @@ impl FromStr for DynamicModelPublicMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "static_only" | "static-only" | "static" => Ok(Self::StaticOnly),
+            "candidate_canary_or_active"
+            | "candidate-canary-or-active"
+            | "candidate"
+            | "candidates" => Ok(Self::CandidateCanaryOrActive),
             "canary_or_active" | "canary-or-active" | "canary" => Ok(Self::CanaryOrActive),
             "active_only" | "active-only" | "active" => Ok(Self::ActiveOnly),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicModelProbeAdapterMode {
+    Disabled,
+    HarnessAllPass,
+}
+
+impl DynamicModelProbeAdapterMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::HarnessAllPass => "harness_all_pass",
+        }
+    }
+}
+
+impl fmt::Display for DynamicModelProbeAdapterMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DynamicModelProbeAdapterMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "disabled" | "off" => Ok(Self::Disabled),
+            "harness_all_pass" | "harness-all-pass" | "synthetic_all_pass" => {
+                Ok(Self::HarnessAllPass)
+            }
             _ => Err(()),
         }
     }
@@ -309,6 +350,7 @@ pub struct Config {
     pub dynamic_model_discovery_interval_secs: u64,
     pub dynamic_model_public_mode: DynamicModelPublicMode,
     pub dynamic_model_probe_enabled: bool,
+    pub dynamic_model_probe_adapter_mode: DynamicModelProbeAdapterMode,
     pub dynamic_model_probe_max_concurrent: usize,
     pub dynamic_model_probe_max_per_round: usize,
     pub dynamic_model_probe_requests_per_interval: usize,
@@ -471,6 +513,10 @@ impl Config {
                 DynamicModelPublicMode::StaticOnly,
             ),
             dynamic_model_probe_enabled: load_env_var("DYNAMIC_MODEL_PROBE_ENABLED", false),
+            dynamic_model_probe_adapter_mode: load_env_var(
+                "DYNAMIC_MODEL_PROBE_ADAPTER",
+                DynamicModelProbeAdapterMode::Disabled,
+            ),
             dynamic_model_probe_max_concurrent: load_env_var(
                 "DYNAMIC_MODEL_PROBE_MAX_CONCURRENT",
                 1usize,
@@ -791,6 +837,7 @@ mod tests {
             "DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS",
             "DYNAMIC_MODEL_PUBLIC_MODE",
             "DYNAMIC_MODEL_PROBE_ENABLED",
+            "DYNAMIC_MODEL_PROBE_ADAPTER",
             "DYNAMIC_MODEL_PROBE_MAX_CONCURRENT",
             "DYNAMIC_MODEL_PROBE_MAX_PER_ROUND",
             "DYNAMIC_MODEL_PROBE_REQUESTS_PER_INTERVAL",
@@ -881,6 +928,10 @@ mod tests {
             DynamicModelPublicMode::StaticOnly
         );
         assert!(!cfg.dynamic_model_probe_enabled);
+        assert_eq!(
+            cfg.dynamic_model_probe_adapter_mode,
+            DynamicModelProbeAdapterMode::Disabled
+        );
         assert_eq!(cfg.dynamic_model_probe_max_concurrent, 1);
         assert_eq!(cfg.dynamic_model_probe_max_per_round, 3);
         assert_eq!(cfg.dynamic_model_probe_requests_per_interval, 20);
@@ -968,6 +1019,7 @@ mod tests {
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
         unsafe { env::set_var("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_ENABLED", "true") };
+        unsafe { env::set_var("DYNAMIC_MODEL_PROBE_ADAPTER", "harness_all_pass") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_MAX_CONCURRENT", "2") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_MAX_PER_ROUND", "4") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_REQUESTS_PER_INTERVAL", "12") };
@@ -1059,6 +1111,10 @@ mod tests {
             DynamicModelPublicMode::CanaryOrActive
         );
         assert!(cfg.dynamic_model_probe_enabled);
+        assert_eq!(
+            cfg.dynamic_model_probe_adapter_mode,
+            DynamicModelProbeAdapterMode::HarnessAllPass
+        );
         assert_eq!(cfg.dynamic_model_probe_max_concurrent, 2);
         assert_eq!(cfg.dynamic_model_probe_max_per_round, 4);
         assert_eq!(cfg.dynamic_model_probe_requests_per_interval, 12);

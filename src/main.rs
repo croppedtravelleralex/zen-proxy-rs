@@ -47,6 +47,7 @@ use provider::webshare::WebShareProvider;
 use state::AppState;
 use v4::model::ModelRegistry;
 use v4::model_discovery::DynamicModelRegistry;
+use v4::model_probe::{AllPassProbeAdapter, ModelProbeConfig, ModelProbeEngine};
 
 static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
@@ -176,14 +177,26 @@ async fn model_detail_handler(
 }
 
 async fn discover_dynamic_models_once(state: &AppState) {
-    let (enabled, url, timeout_secs, probe_enabled, probe_max_per_round) = {
+    let (
+        enabled,
+        url,
+        timeout_secs,
+        probe_enabled,
+        probe_adapter_mode,
+        probe_max_per_round,
+        probe_success_quorum,
+        probe_failure_quarantine_threshold,
+    ) = {
         let cfg = state.config.read().unwrap();
         (
             cfg.dynamic_model_discovery_enabled,
             cfg.dynamic_model_discovery_url.clone(),
             cfg.probe_connect_timeout_secs.max(1),
             cfg.dynamic_model_probe_enabled,
+            cfg.dynamic_model_probe_adapter_mode,
             cfg.dynamic_model_probe_max_per_round,
+            cfg.dynamic_model_probe_success_quorum,
+            cfg.dynamic_model_probe_failure_quarantine_threshold,
         )
     };
     if !enabled {
@@ -243,8 +256,41 @@ async fn discover_dynamic_models_once(state: &AppState) {
                 tracing::info!(
                     planned = planned.len(),
                     max_per_round = probe_max_per_round,
-                    "dynamic model probe scheduler selected candidate batch; real probe adapter disabled in this slice"
+                    adapter = %probe_adapter_mode,
+                    "dynamic model probe scheduler selected candidate batch"
                 );
+                if matches!(
+                    probe_adapter_mode,
+                    config::DynamicModelProbeAdapterMode::HarnessAllPass
+                ) {
+                    let engine = ModelProbeEngine::new(ModelProbeConfig {
+                        success_quorum: probe_success_quorum,
+                        failure_quarantine_threshold: probe_failure_quarantine_threshold,
+                        ..ModelProbeConfig::default()
+                    });
+                    let adapter = AllPassProbeAdapter;
+                    for model in planned {
+                        match engine.run_required_probes(&state.dynamic_models, &model.id, &adapter)
+                        {
+                            Ok(summary) => {
+                                tracing::info!(
+                                    model = %summary.model_id,
+                                    attempted = summary.attempted_probe_names.len(),
+                                    passed = summary.passed_probe_names.len(),
+                                    final_state = ?summary.final_state,
+                                    "dynamic model harness probe completed"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    model = %model.id,
+                                    error = ?err,
+                                    "dynamic model harness probe failed"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         Err(err) => state.dynamic_models.record_error(err),

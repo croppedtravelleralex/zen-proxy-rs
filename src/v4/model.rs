@@ -75,6 +75,14 @@ impl EffectiveModelRegistry {
     pub fn is_dynamic_public(&self, model: &DiscoveredModel) -> bool {
         match self.public_mode {
             DynamicModelPublicMode::StaticOnly => false,
+            DynamicModelPublicMode::CandidateCanaryOrActive => {
+                matches!(
+                    model.state,
+                    DiscoveredModelState::Candidate
+                        | DiscoveredModelState::Canary
+                        | DiscoveredModelState::Active
+                )
+            }
             DynamicModelPublicMode::CanaryOrActive => {
                 matches!(
                     model.state,
@@ -234,6 +242,31 @@ mod tests {
             registry.resolve("new-candidate-free"),
             Err(ModelError::UnknownModel(model)) if model == "new-candidate-free"
         ));
+    }
+
+    #[test]
+    fn effective_registry_can_expose_candidates_for_isolated_test_channels() {
+        let registry = EffectiveModelRegistry::new(
+            DynamicModelPublicMode::CandidateCanaryOrActive,
+            discovered_registry_with_states(),
+        );
+        let ids: Vec<String> = registry
+            .public_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "new-active-free",
+                "new-canary-free",
+                "new-candidate-free"
+            ]
+        );
+        assert!(registry.resolve("new-candidate-free").is_ok());
+        assert!(registry.resolve("paid-model").is_err());
     }
 
     #[test]
