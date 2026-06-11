@@ -83,13 +83,16 @@ dynamic_discovery.ignored_total
 dynamic_discovery.missing_total
 dynamic_discovery.worker_running
 dynamic_discovery.models[]
-safety.candidates_are_public=false
+safety.candidates_are_public=false by default
+safety.candidates_are_public=true only in explicit private candidate_canary_or_active mode
 safety.auto_promote=false
 ```
 
-This admin visibility must not change data-plane routing. A discovered candidate
-is still rejected by `/v1/chat/completions` or `/v1/messages` until a later
-promotion flow marks it public.
+This admin visibility must not change data-plane routing by default. A
+discovered candidate is still rejected by `/v1/chat/completions` or
+`/v1/messages` unless explicit private `candidate_canary_or_active` mode is
+enabled. That mode exposes candidates for self-use testing without marking them
+as promoted.
 
 If a previously discovered model disappears from the latest discovery response,
 admin must mark it as `missing` instead of continuing to count it as a current

@@ -320,6 +320,9 @@ impl AdminService {
                 "success_quorum": cfg.dynamic_model_probe_success_quorum,
                 "failure_quarantine_threshold": cfg.dynamic_model_probe_failure_quarantine_threshold,
                 "timeout_secs": cfg.dynamic_model_probe_timeout_secs,
+                "base_url": sanitize_text(&cfg.dynamic_model_probe_base_url),
+                "api_key_configured": cfg.dynamic_model_probe_api_key.is_some(),
+                "max_response_bytes": cfg.dynamic_model_probe_max_response_bytes,
                 "planned_candidates": planned_probe_candidates,
             },
             "pools": {
@@ -366,7 +369,7 @@ impl AdminService {
                 "dynamic_discovery": discovery,
                 "safety": {
                     "dynamic_model_public_mode": public_mode.to_string(),
-                    "candidates_are_public": false,
+                    "candidates_are_public": public_mode.exposes_candidates(),
                     "auto_promote": false,
                     "public_models_source": "effective_registry"
                 }
@@ -1159,6 +1162,9 @@ impl AdminService {
                     "success_quorum": cfg.dynamic_model_probe_success_quorum,
                     "failure_quarantine_threshold": cfg.dynamic_model_probe_failure_quarantine_threshold,
                     "timeout_secs": cfg.dynamic_model_probe_timeout_secs,
+                    "base_url": sanitize_text(&cfg.dynamic_model_probe_base_url),
+                    "api_key_configured": cfg.dynamic_model_probe_api_key.is_some(),
+                    "max_response_bytes": cfg.dynamic_model_probe_max_response_bytes,
                 }
             },
             "audit": {

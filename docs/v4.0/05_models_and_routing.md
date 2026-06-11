@@ -12,9 +12,11 @@ deepseek-v4-flash-lite
 `GET /v1/models` must return only these two model ids.
 
 V4.108 Phase 1 adds side-channel opencode model discovery. This does not change
-the public model contract. Discovered free-looking models are admin-only
-candidates until a later manual canary/promotion flow proves protocol and
-client compatibility.
+the default public model contract. V4.109 may expose discovered free-looking
+candidates directly only when `DYNAMIC_MODEL_PUBLIC_MODE=candidate_canary_or_active`
+is explicitly enabled for a private self-use/test channel where users cannot
+choose the candidate list. That mode is a test-channel shortcut, not a
+canary/active promotion.
 
 ## Upstream Mapping
 
@@ -55,7 +57,10 @@ public=false
 ```
 
 The admin API may show these candidates. The data plane must still reject an
-unknown candidate model unless it has been promoted by a later, explicit phase.
+unknown candidate model by default. It may route candidates only in explicit
+private `candidate_canary_or_active` mode, and that must still keep
+`probe_required=true` and `auto_promoted=false` until the probe/canary gates
+are actually satisfied.
 
 ## Routing Inputs
 

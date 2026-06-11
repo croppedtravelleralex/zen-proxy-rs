@@ -214,6 +214,100 @@ fn start_mock_models(body: serde_json::Value) -> String {
     format!("http://{addr}/v1/models")
 }
 
+fn start_mock_probe_base() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+
+    std::thread::spawn({
+        let observed = observed.clone();
+        move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                async fn openai_handler(
+                    State(observed): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                    headers: HeaderMap,
+                    Json(body): Json<serde_json::Value>,
+                ) -> impl IntoResponse {
+                    observed.lock().unwrap().push(serde_json::json!({
+                        "path": "/v1/chat/completions",
+                        "probe": headers
+                            .get("x-zen-model-probe")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default(),
+                        "client": headers
+                            .get("x-fmc-client")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default(),
+                        "body": body,
+                    }));
+                    if body
+                        .get("stream")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        return (
+                            [("content-type", "text/event-stream")],
+                            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"probe-ok\"}}]}\n\ndata: [DONE]\n\n",
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "probe-ok"}}]
+                    }))
+                    .into_response()
+                }
+
+                async fn anthropic_handler(
+                    State(observed): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                    headers: HeaderMap,
+                    Json(body): Json<serde_json::Value>,
+                ) -> impl IntoResponse {
+                    observed.lock().unwrap().push(serde_json::json!({
+                        "path": "/v1/messages",
+                        "probe": headers
+                            .get("x-zen-model-probe")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default(),
+                        "body": body,
+                    }));
+                    if body
+                        .get("stream")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        return (
+                            [("content-type", "text/event-stream")],
+                            "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"probe-ok\"}}\n\n",
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "content": [{"type": "text", "text": "probe-ok"}]
+                    }))
+                    .into_response()
+                }
+
+                let app = Router::new()
+                    .route("/v1/chat/completions", post(openai_handler))
+                    .route("/v1/messages", post(anthropic_handler))
+                    .with_state(observed);
+                let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        }
+    });
+
+    (format!("http://{addr}"), observed)
+}
+
 #[cfg(test)]
 mod e2e {
     use super::*;
@@ -709,6 +803,7 @@ mod e2e {
                     body["data"]["safety"]["dynamic_model_public_mode"],
                     "candidate_canary_or_active"
                 );
+                assert_eq!(body["data"]["safety"]["candidates_are_public"], true);
                 break;
             }
             if Instant::now() >= deadline {
@@ -833,6 +928,108 @@ mod e2e {
                 "new-harness-probed-free"
             ]
         );
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_http_bounded_probe_promotes_candidates_to_canary_in_test_mode() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-http-probed-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (probe_base, observed) = start_mock_probe_base();
+        let (child, port) = start_server_with_env(
+            19810,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PROBE_BASE_URL", probe_base.as_str()),
+                ("DYNAMIC_MODEL_PROBE_API_KEY", "probe-key"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probes_body = loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-http-probed-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "canary" {
+                    break body;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("http_bounded probe did not promote candidate before deadline");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 8);
+        assert_eq!(
+            probes_body["data"]["passed_probe_names"]
+                .as_array()
+                .expect("passed probes")
+                .len(),
+            8
+        );
+        assert_eq!(
+            probes_body["data"]["missing_probe_names"]
+                .as_array()
+                .expect("missing probes")
+                .len(),
+            0
+        );
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "new-http-probed-free"
+            ]
+        );
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            7,
+            "metadata probe is local, remaining seven probes should call HTTP"
+        );
+        assert!(seen.iter().any(|item| {
+            item["path"] == "/v1/messages" && item["probe"] == "anthropic_stream_minimal"
+        }));
+        assert!(seen.iter().any(|item| {
+            item["path"] == "/v1/chat/completions"
+                && item["probe"] == "tool_history_minimal"
+                && item["client"] == "claude-code"
+                && item["body"]["messages"][2]["tool_call_id"] == "call_probe_1"
+        }));
+        drop(seen);
 
         stop_server(child, port);
     }

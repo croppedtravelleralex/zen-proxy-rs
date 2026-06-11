@@ -24,6 +24,13 @@ Replace the current hand-built Zen reverse-proxy path in `zen-proxy-rs` with a
 FreeModel kernel integration, without losing proxy rotation or operational
 visibility.
 
+Current active continuation is V4.109 dynamic free-model promotion: keep
+`deepseek-v4-flash` and `deepseek-v4-flash-lite` stable, discover opencode
+free-looking models, allow candidates to be listed only in explicitly
+configured self-use/test channels, and promote dynamic models to canary/active
+only after bounded protocol probes. Do not change NewAPI, ClaudeCode,
+cc-switch, or production channel 69 while doing this work.
+
 Target chain:
 
 ```text
@@ -88,9 +95,12 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
   candidates, but candidates are not public, not routable, and not
   auto-promoted.
 - V4.109 must keep dynamic model hot-plugging behind a lifecycle gate:
-  discovered candidates are public only after probes and only in the configured
-  test/public mode. Production channel 69 must not be changed without explicit
-  approval.
+  discovered candidates can be public/routable immediately only when
+  `DYNAMIC_MODEL_PUBLIC_MODE=candidate_canary_or_active` is explicitly enabled
+  on a private self-use/test channel where users cannot choose those models.
+  That mode does not promote candidates to canary/active and does not apply to
+  production channel 69. In normal canary/active modes, probe gates are still
+  required before public exposure.
 - Model mapping:
   - `deepseek-v4-flash -> deepseek-v4-flash-free`
   - `deepseek-v4-flash-lite -> big-pickle`

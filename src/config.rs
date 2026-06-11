@@ -54,6 +54,10 @@ impl DynamicModelPublicMode {
             Self::ActiveOnly => "active_only",
         }
     }
+
+    pub fn exposes_candidates(self) -> bool {
+        matches!(self, Self::CandidateCanaryOrActive)
+    }
 }
 
 impl fmt::Display for DynamicModelPublicMode {
@@ -83,6 +87,7 @@ impl FromStr for DynamicModelPublicMode {
 pub enum DynamicModelProbeAdapterMode {
     Disabled,
     HarnessAllPass,
+    HttpBounded,
 }
 
 impl DynamicModelProbeAdapterMode {
@@ -90,6 +95,7 @@ impl DynamicModelProbeAdapterMode {
         match self {
             Self::Disabled => "disabled",
             Self::HarnessAllPass => "harness_all_pass",
+            Self::HttpBounded => "http_bounded",
         }
     }
 }
@@ -108,6 +114,9 @@ impl FromStr for DynamicModelProbeAdapterMode {
             "disabled" | "off" => Ok(Self::Disabled),
             "harness_all_pass" | "harness-all-pass" | "synthetic_all_pass" => {
                 Ok(Self::HarnessAllPass)
+            }
+            "http_bounded" | "http-bounded" | "real_http_bounded" | "real-http-bounded" => {
+                Ok(Self::HttpBounded)
             }
             _ => Err(()),
         }
@@ -357,6 +366,9 @@ pub struct Config {
     pub dynamic_model_probe_success_quorum: u64,
     pub dynamic_model_probe_failure_quarantine_threshold: u64,
     pub dynamic_model_probe_timeout_secs: u64,
+    pub dynamic_model_probe_base_url: String,
+    pub dynamic_model_probe_api_key: Option<String>,
+    pub dynamic_model_probe_max_response_bytes: usize,
     pub node_max_calls_per_window: u64,
     pub node_max_tokens_per_window: u64,
     pub node_max_kb_per_window: u64,
@@ -547,6 +559,17 @@ impl Config {
                 30u64,
             )
             .max(1),
+            dynamic_model_probe_base_url: env::var("DYNAMIC_MODEL_PROBE_BASE_URL")
+                .unwrap_or_default(),
+            dynamic_model_probe_api_key: match env::var("DYNAMIC_MODEL_PROBE_API_KEY") {
+                Ok(v) if !v.is_empty() => Some(v),
+                _ => None,
+            },
+            dynamic_model_probe_max_response_bytes: load_env_var(
+                "DYNAMIC_MODEL_PROBE_MAX_RESPONSE_BYTES",
+                64 * 1024usize,
+            )
+            .max(1024),
             node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
             node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 10_000_000u64),
             node_max_kb_per_window: load_env_var("NODE_MAX_KB_PER_WINDOW", 64 * 1024u64),
@@ -844,6 +867,9 @@ mod tests {
             "DYNAMIC_MODEL_PROBE_SUCCESS_QUORUM",
             "DYNAMIC_MODEL_PROBE_FAILURE_QUARANTINE_THRESHOLD",
             "DYNAMIC_MODEL_PROBE_TIMEOUT_SECS",
+            "DYNAMIC_MODEL_PROBE_BASE_URL",
+            "DYNAMIC_MODEL_PROBE_API_KEY",
+            "DYNAMIC_MODEL_PROBE_MAX_RESPONSE_BYTES",
             "V4_RETRY_BUDGET_MS",
             "CONNECT_TIMEOUT_SECS",
             "REQUEST_TIMEOUT_SECS",
@@ -938,6 +964,9 @@ mod tests {
         assert_eq!(cfg.dynamic_model_probe_success_quorum, 2);
         assert_eq!(cfg.dynamic_model_probe_failure_quarantine_threshold, 3);
         assert_eq!(cfg.dynamic_model_probe_timeout_secs, 30);
+        assert_eq!(cfg.dynamic_model_probe_base_url, "");
+        assert!(cfg.dynamic_model_probe_api_key.is_none());
+        assert_eq!(cfg.dynamic_model_probe_max_response_bytes, 64 * 1024);
         assert_eq!(cfg.v4_retry_budget_ms, 45_000);
         assert_eq!(cfg.connect_timeout_secs, 5);
         assert_eq!(cfg.request_timeout_secs, 120);
@@ -1026,6 +1055,9 @@ mod tests {
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_SUCCESS_QUORUM", "3") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_FAILURE_QUARANTINE_THRESHOLD", "5") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_TIMEOUT_SECS", "9") };
+        unsafe { env::set_var("DYNAMIC_MODEL_PROBE_BASE_URL", "http://127.0.0.1:4010") };
+        unsafe { env::set_var("DYNAMIC_MODEL_PROBE_API_KEY", "probe-key") };
+        unsafe { env::set_var("DYNAMIC_MODEL_PROBE_MAX_RESPONSE_BYTES", "32768") };
         unsafe { env::set_var("V4_RETRY_BUDGET_MS", "12345") };
         unsafe { env::set_var("CONNECT_TIMEOUT_SECS", "9") };
         unsafe { env::set_var("REQUEST_TIMEOUT_SECS", "600") };
@@ -1121,6 +1153,12 @@ mod tests {
         assert_eq!(cfg.dynamic_model_probe_success_quorum, 3);
         assert_eq!(cfg.dynamic_model_probe_failure_quarantine_threshold, 5);
         assert_eq!(cfg.dynamic_model_probe_timeout_secs, 9);
+        assert_eq!(cfg.dynamic_model_probe_base_url, "http://127.0.0.1:4010");
+        assert_eq!(
+            cfg.dynamic_model_probe_api_key.as_deref(),
+            Some("probe-key")
+        );
+        assert_eq!(cfg.dynamic_model_probe_max_response_bytes, 32768);
         assert_eq!(cfg.v4_retry_budget_ms, 12_345);
         assert_eq!(cfg.connect_timeout_secs, 9);
         assert_eq!(cfg.request_timeout_secs, 600);
@@ -1202,6 +1240,18 @@ mod tests {
             "ZEN_PROVIDER_MODE",
             "FREE_MODEL_TRUE_FIRST_TOKEN_FRT",
             "V4_MODEL_REGISTRY_ENABLED",
+            "DYNAMIC_MODEL_PUBLIC_MODE",
+            "DYNAMIC_MODEL_PROBE_ENABLED",
+            "DYNAMIC_MODEL_PROBE_ADAPTER",
+            "DYNAMIC_MODEL_PROBE_MAX_CONCURRENT",
+            "DYNAMIC_MODEL_PROBE_MAX_PER_ROUND",
+            "DYNAMIC_MODEL_PROBE_REQUESTS_PER_INTERVAL",
+            "DYNAMIC_MODEL_PROBE_SUCCESS_QUORUM",
+            "DYNAMIC_MODEL_PROBE_FAILURE_QUARANTINE_THRESHOLD",
+            "DYNAMIC_MODEL_PROBE_TIMEOUT_SECS",
+            "DYNAMIC_MODEL_PROBE_BASE_URL",
+            "DYNAMIC_MODEL_PROBE_API_KEY",
+            "DYNAMIC_MODEL_PROBE_MAX_RESPONSE_BYTES",
             "V4_RETRY_BUDGET_MS",
             "CONNECT_TIMEOUT_SECS",
             "REQUEST_TIMEOUT_SECS",
@@ -1277,6 +1327,22 @@ mod tests {
         assert_eq!(cfg.port, 4000);
 
         env::remove_var("PORT");
+    }
+
+    #[test]
+    fn parses_http_bounded_dynamic_model_probe_adapter_mode() {
+        assert_eq!(
+            "http_bounded"
+                .parse::<DynamicModelProbeAdapterMode>()
+                .unwrap(),
+            DynamicModelProbeAdapterMode::HttpBounded
+        );
+        assert_eq!(
+            "real-http-bounded"
+                .parse::<DynamicModelProbeAdapterMode>()
+                .unwrap(),
+            DynamicModelProbeAdapterMode::HttpBounded
+        );
     }
 
     #[test]
