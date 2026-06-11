@@ -53,7 +53,7 @@ the sidecar's own client, not the proxy node selected by `zen-proxy-rs`.
 V4.0 replaces all older documentation. Do not revive archived legacy docs or
 root-level legacy audit reports as active guidance.
 
-Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md), [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md), [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md), and [2026-06-10 Cache Usage And Affinity Alignment](./22_2026-06-10_cache_usage_affinity_alignment.md) before making any claim about panda NewAPI, Hermes, OpenClaw, closeapi, ClaudeCode huge-context behavior, V4.8 acceptance progress, current proxy-pool health, cache usage display, or cache-affinity behavior.
+Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md), [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md), [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md), [2026-06-10 Cache Usage And Affinity Alignment](./22_2026-06-10_cache_usage_affinity_alignment.md), [V4.108 Dynamic Model Discovery Phase 1](./23_v4.108_dynamic_model_discovery_phase1.md), and [V4.109 Dynamic Free-Model Promotion Goal](./24_v4.109_dynamic_model_promotion_goal.md) before making any claim about panda NewAPI, Hermes, OpenClaw, closeapi, ClaudeCode huge-context behavior, V4.8 acceptance progress, current proxy-pool health, cache usage display, cache-affinity behavior, or dynamic free-model discovery/promotion.
 
 ## Required Reading Order
 
@@ -77,6 +77,7 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
 18. [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md)
 19. [2026-06-10 Cache Usage And Affinity Alignment](./22_2026-06-10_cache_usage_affinity_alignment.md)
 20. [V4.108 Dynamic Model Discovery Phase 1](./23_v4.108_dynamic_model_discovery_phase1.md)
+21. [V4.109 Dynamic Free-Model Promotion Goal](./24_v4.109_dynamic_model_promotion_goal.md)
 
 ## Hard Decisions
 
@@ -86,6 +87,10 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
 - V4.108 Phase 1 may discover opencode free-looking models as admin-only
   candidates, but candidates are not public, not routable, and not
   auto-promoted.
+- V4.109 must keep dynamic model hot-plugging behind a lifecycle gate:
+  discovered candidates are public only after probes and only in the configured
+  test/public mode. Production channel 69 must not be changed without explicit
+  approval.
 - Model mapping:
   - `deepseek-v4-flash -> deepseek-v4-flash-free`
   - `deepseek-v4-flash-lite -> big-pickle`
