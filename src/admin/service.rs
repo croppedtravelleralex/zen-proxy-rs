@@ -311,8 +311,12 @@ impl AdminService {
         }))
     }
     pub fn models(state: &AppState) -> Response {
-        let cfg = state.config.read().unwrap();
-        if cfg.v4_model_registry_active() {
+        let v4_model_registry_active = {
+            let cfg = state.config.read().unwrap();
+            cfg.v4_model_registry_active()
+        };
+        let discovery = state.dynamic_models.snapshot();
+        if v4_model_registry_active {
             let registry = StaticModelRegistry;
             let models: Vec<Value> = registry
                 .public_models()
@@ -326,20 +330,38 @@ impl AdminService {
                     })
                 })
                 .collect();
-            Self::ok_response(json!({"mode": "v4", "models": models}))
+            Self::ok_response(json!({
+                "mode": "v4",
+                "models": models,
+                "dynamic_discovery": discovery,
+                "safety": {
+                    "candidates_are_public": false,
+                    "auto_promote": false,
+                    "public_models_source": "static_registry"
+                }
+            }))
         } else {
             Self::ok_response(json!({
                 "mode": "legacy",
                 "models": [
                     {"id":"deepseek-v4-flash","upstream_id":"deepseek-v4-flash"},
                     {"id":"deepseek-v4-pro","upstream_id":"deepseek-v4-pro"}
-                ]
+                ],
+                "dynamic_discovery": discovery,
+                "safety": {
+                    "candidates_are_public": false,
+                    "auto_promote": false,
+                    "public_models_source": "legacy_static"
+                }
             }))
         }
     }
     pub fn model_detail(state: &AppState, model_id: &str) -> Response {
-        let cfg = state.config.read().unwrap();
-        if cfg.v4_model_registry_active() {
+        let v4_model_registry_active = {
+            let cfg = state.config.read().unwrap();
+            cfg.v4_model_registry_active()
+        };
+        if v4_model_registry_active {
             let registry = StaticModelRegistry;
             match registry.resolve(model_id) {
                 Ok(resolved) => Self::ok_response(json!({
@@ -348,7 +370,19 @@ impl AdminService {
                     "mode": "v4",
                     "endpoints": ["openai_chat_completions", "anthropic_messages"]
                 })),
-                Err(_) => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
+                Err(_) => match state.dynamic_models.get(model_id) {
+                    Some(model) => Self::ok_response(json!({
+                        "id": model.id,
+                        "upstream_id": model.upstream_id,
+                        "mode": "dynamic_candidate",
+                        "state": model.state,
+                        "reason": model.reason,
+                        "probe_required": model.probe_required,
+                        "auto_promoted": model.auto_promoted,
+                        "public": false
+                    })),
+                    None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
+                },
             }
         } else {
             match model_id {
@@ -357,7 +391,19 @@ impl AdminService {
                     "upstream_id": model_id,
                     "mode": "legacy"
                 })),
-                _ => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
+                _ => match state.dynamic_models.get(model_id) {
+                    Some(model) => Self::ok_response(json!({
+                        "id": model.id,
+                        "upstream_id": model.upstream_id,
+                        "mode": "dynamic_candidate",
+                        "state": model.state,
+                        "reason": model.reason,
+                        "probe_required": model.probe_required,
+                        "auto_promoted": model.auto_promoted,
+                        "public": false
+                    })),
+                    None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
+                },
             }
         }
     }
@@ -912,6 +958,12 @@ impl AdminService {
             "pool_starvation_retry_after_secs": cfg.pool_starvation_retry_after_secs,
             "zen_provider_mode": cfg.zen_provider_mode.to_string(),
             "v4_model_registry_enabled": cfg.v4_model_registry_enabled,
+            "dynamic_model_discovery": {
+                "enabled": cfg.dynamic_model_discovery_enabled,
+                "url": sanitize_text(&cfg.dynamic_model_discovery_url),
+                "interval_secs": cfg.dynamic_model_discovery_interval_secs,
+                "auto_promote": false,
+            },
             "audit": {
                 "enabled": cfg.audit_log_enabled,
                 "log_dir": sanitize_text(&cfg.audit_log_dir),
@@ -958,7 +1010,12 @@ impl AdminService {
         }))
     }
     pub fn config_reload(state: &AppState) -> Response {
-        *state.config.write().unwrap() = crate::config::Config::from_env();
+        let cfg = crate::config::Config::from_env();
+        state.dynamic_models.set_config(
+            cfg.dynamic_model_discovery_enabled,
+            cfg.dynamic_model_discovery_url.clone(),
+        );
+        *state.config.write().unwrap() = cfg;
         tracing::info!("config reloaded from env");
         Self::ok_status()
     }
@@ -977,6 +1034,9 @@ impl AdminService {
         if cfg.allow_direct_fallback {
             warnings
                 .push("ALLOW_DIRECT_FALLBACK is enabled — requests may bypass proxy pool".into());
+        }
+        if cfg.dynamic_model_discovery_enabled {
+            warnings.push("DYNAMIC_MODEL_DISCOVERY_ENABLED is startup-scoped in Phase 1; restart is required when enabling it from a previously disabled process".into());
         }
         if cfg.context_target_body_mb >= cfg.context_upstream_body_limit_mb {
             warnings.push(

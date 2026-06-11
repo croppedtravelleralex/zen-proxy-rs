@@ -46,6 +46,7 @@ use pool::{DeadPool, NodeRef, Pool, RateLimitedPool, ResultKind};
 use provider::webshare::WebShareProvider;
 use state::AppState;
 use v4::model::ModelRegistry;
+use v4::model_discovery::DynamicModelRegistry;
 
 static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
@@ -166,6 +167,70 @@ async fn model_detail_handler(
         }
     };
     Ok(Json(data))
+}
+
+async fn discover_dynamic_models_once(state: &AppState) {
+    let (enabled, url, timeout_secs) = {
+        let cfg = state.config.read().unwrap();
+        (
+            cfg.dynamic_model_discovery_enabled,
+            cfg.dynamic_model_discovery_url.clone(),
+            cfg.probe_connect_timeout_secs.max(1),
+        )
+    };
+    if !enabled {
+        return;
+    }
+
+    state.dynamic_models.record_attempt();
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            state
+                .dynamic_models
+                .record_error(format!("failed to build discovery client: {err}"));
+            return;
+        }
+    };
+
+    let body = match client.get(&url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                state
+                    .dynamic_models
+                    .record_error(format!("discovery http status {status}"));
+                return;
+            }
+            match resp.text().await {
+                Ok(body) => body,
+                Err(err) => {
+                    state
+                        .dynamic_models
+                        .record_error(format!("failed to read discovery body: {err}"));
+                    return;
+                }
+            }
+        }
+        Err(err) => {
+            state
+                .dynamic_models
+                .record_error(format!("discovery request failed: {err}"));
+            return;
+        }
+    };
+
+    match state.dynamic_models.update_from_opencode_json(&body) {
+        Ok(snapshot) => tracing::info!(
+            candidates = snapshot.candidate_total,
+            ignored = snapshot.ignored_total,
+            "dynamic model discovery updated candidate registry"
+        ),
+        Err(err) => state.dynamic_models.record_error(err),
+    }
 }
 
 async fn shutdown_signal() {
@@ -292,6 +357,10 @@ async fn main() {
 
     let upstream_health = Arc::new(health::UpstreamHealth::new(1000));
     let lanes = Arc::new(LaneLimiter::from_config(&config));
+    let dynamic_models = Arc::new(DynamicModelRegistry::new(
+        config.dynamic_model_discovery_enabled,
+        config.dynamic_model_discovery_url.clone(),
+    ));
 
     let ledger = ledger::LedgerCounters::new();
     ledger.set_events_path(Some(config.ledger_events_path.clone()));
@@ -306,6 +375,7 @@ async fn main() {
         upstream_health,
         lanes,
         ledger,
+        dynamic_models,
         startup_time: Instant::now(),
     });
 
@@ -316,6 +386,25 @@ async fn main() {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 state.collector.persist();
+            }
+        });
+    }
+
+    // Background: side-channel opencode model discovery. This records only
+    // candidate metadata for admin visibility; it does not alter /v1/models or
+    // request model resolution.
+    if config.dynamic_model_discovery_enabled {
+        let state = app_state.clone();
+        state.dynamic_models.set_worker_running(true);
+        tokio::spawn(async move {
+            discover_dynamic_models_once(&state).await;
+            loop {
+                let interval = {
+                    let cfg = state.config.read().unwrap();
+                    cfg.dynamic_model_discovery_interval_secs
+                };
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+                discover_dynamic_models_once(&state).await;
             }
         });
     }

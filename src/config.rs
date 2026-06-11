@@ -268,6 +268,9 @@ pub struct Config {
     pub free_model_claude_code_stream_slow_guard_min_input_tokens: u64,
     pub free_model_claude_code_stream_no_forwardable_retry_secs: u64,
     pub v4_model_registry_enabled: bool,
+    pub dynamic_model_discovery_enabled: bool,
+    pub dynamic_model_discovery_url: String,
+    pub dynamic_model_discovery_interval_secs: u64,
     pub node_max_calls_per_window: u64,
     pub node_max_tokens_per_window: u64,
     pub node_max_kb_per_window: u64,
@@ -411,6 +414,14 @@ impl Config {
             )
             .max(1),
             v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
+            dynamic_model_discovery_enabled: load_env_var("DYNAMIC_MODEL_DISCOVERY_ENABLED", false),
+            dynamic_model_discovery_url: env::var("DYNAMIC_MODEL_DISCOVERY_URL")
+                .unwrap_or_else(|_| format!("{}{}", Self::default_upstream_base(), "/v1/models")),
+            dynamic_model_discovery_interval_secs: load_env_var(
+                "DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS",
+                1800u64,
+            )
+            .max(60),
             node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
             node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 10_000_000u64),
             node_max_kb_per_window: load_env_var("NODE_MAX_KB_PER_WINDOW", 64 * 1024u64),
@@ -513,6 +524,10 @@ impl Config {
             "big-pickle".to_string(),
         );
         m
+    }
+
+    fn default_upstream_base() -> String {
+        "https://opencode.ai/zen".to_string()
     }
 
     pub fn bind_addr(&self) -> String {
@@ -692,6 +707,9 @@ mod tests {
             "ZEN_PROVIDER_MODE",
             "FREE_MODEL_TRUE_FIRST_TOKEN_FRT",
             "V4_MODEL_REGISTRY_ENABLED",
+            "DYNAMIC_MODEL_DISCOVERY_ENABLED",
+            "DYNAMIC_MODEL_DISCOVERY_URL",
+            "DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS",
             "V4_RETRY_BUDGET_MS",
             "CONNECT_TIMEOUT_SECS",
             "REQUEST_TIMEOUT_SECS",
@@ -765,6 +783,12 @@ mod tests {
         assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
         assert!(cfg.free_model_true_first_token_frt);
         assert!(!cfg.v4_model_registry_enabled);
+        assert!(!cfg.dynamic_model_discovery_enabled);
+        assert_eq!(
+            cfg.dynamic_model_discovery_url,
+            "https://opencode.ai/zen/v1/models"
+        );
+        assert_eq!(cfg.dynamic_model_discovery_interval_secs, 1800);
         assert_eq!(cfg.v4_retry_budget_ms, 45_000);
         assert_eq!(cfg.connect_timeout_secs, 5);
         assert_eq!(cfg.request_timeout_secs, 120);

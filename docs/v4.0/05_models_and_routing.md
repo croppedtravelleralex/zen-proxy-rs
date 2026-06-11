@@ -11,6 +11,11 @@ deepseek-v4-flash-lite
 
 `GET /v1/models` must return only these two model ids.
 
+V4.108 Phase 1 adds side-channel opencode model discovery. This does not change
+the public model contract. Discovered free-looking models are admin-only
+candidates until a later manual canary/promotion flow proves protocol and
+client compatibility.
+
 ## Upstream Mapping
 
 ```text
@@ -27,6 +32,30 @@ name should also be recorded for debugging and capacity analysis.
 - Do not expose upstream-only model names directly.
 - Do not let model mapping live in protocol formatting code.
 - Do not inject system prompts for model behavior in V4.0.
+- Do not auto-promote dynamically discovered models into `/v1/models`.
+- Do not apply ClaudeCode/Hermes/OpenClaw behavior policies to a new model until
+  that model has an explicit compatibility profile.
+
+## Dynamic Discovery Candidate Rules
+
+Phase 1 candidate detection is deliberately conservative:
+
+```text
+candidate if id == big-pickle
+candidate if id ends_with "-free"
+ignored otherwise
+```
+
+Every candidate starts as:
+
+```text
+probe_required=true
+auto_promoted=false
+public=false
+```
+
+The admin API may show these candidates. The data plane must still reject an
+unknown candidate model unless it has been promoted by a later, explicit phase.
 
 ## Routing Inputs
 
@@ -63,4 +92,3 @@ FreeModelProviderAdapter
 
 Future providers must be added behind `ProviderAdapter`, not by adding
 provider-specific branches to `proxy.rs`.
-

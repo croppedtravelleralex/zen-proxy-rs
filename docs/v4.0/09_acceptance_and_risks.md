@@ -21,6 +21,7 @@ release gates pass
 | Config | unit tests | `ZEN_PROVIDER_MODE` defaults to legacy; V4 mode can be enabled |
 | Model API | API test | `/v1/models` returns only `deepseek-v4-flash` and `deepseek-v4-flash-lite` |
 | Model Mapping | unit/API tests | flash maps to `deepseek-v4-flash-free`; flash-lite maps to `big-pickle` |
+| Dynamic Discovery Phase 1 | unit/admin tests | discovered free-looking models are candidates only, `probe_required=true`, `auto_promoted=false`, not present in `/v1/models` |
 | OpenAI Non-Stream | mock Zen integration | valid OpenAI response, correct model, usage if available |
 | OpenAI Stream | golden SSE test | valid SSE frames, `[DONE]`, TTFT recorded |
 | Anthropic Non-Stream | mock Zen integration | valid Anthropic message response |
@@ -71,6 +72,51 @@ deepseek-v4-flash-lite
 ```
 
 No upstream-only model ids should appear.
+
+### `GET /admin/models`
+
+V4.108 Phase 1 may expose dynamic discovery metadata for opencode models:
+
+```text
+dynamic_discovery.candidate_total
+dynamic_discovery.ignored_total
+dynamic_discovery.missing_total
+dynamic_discovery.worker_running
+dynamic_discovery.models[]
+safety.candidates_are_public=false
+safety.auto_promote=false
+```
+
+This admin visibility must not change data-plane routing. A discovered candidate
+is still rejected by `/v1/chat/completions` or `/v1/messages` until a later
+promotion flow marks it public.
+
+If a previously discovered model disappears from the latest discovery response,
+admin must mark it as `missing` instead of continuing to count it as a current
+candidate. Missing models remain tombstones only and must not be routable.
+
+## Dynamic Discovery Risks
+
+The risky cases are:
+
+- opencode lists paid or unsupported models alongside free models;
+- a free-looking model supports chat but not tool streaming;
+- a model returns reasoning-only content or malformed tool deltas;
+- discovery probes consume proxy resources and slow production traffic;
+- three panda instances disagree about candidate state.
+
+Phase 1 avoids these risks by not probing aggressively and not promoting
+candidates. Later phases must use a shared state backend or explicit sync before
+multi-instance active promotion.
+
+Rollback for Phase 1:
+
+```text
+DYNAMIC_MODEL_DISCOVERY_ENABLED=false
+```
+
+The public `/v1/models` contract and model resolution remain static, so NewAPI
+channel 69 does not need a configuration rollback.
 
 ### `POST /v1/chat/completions`
 

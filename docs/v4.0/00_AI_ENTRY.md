@@ -76,12 +76,16 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
 17. [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md)
 18. [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md)
 19. [2026-06-10 Cache Usage And Affinity Alignment](./22_2026-06-10_cache_usage_affinity_alignment.md)
+20. [V4.108 Dynamic Model Discovery Phase 1](./23_v4.108_dynamic_model_discovery_phase1.md)
 
 ## Hard Decisions
 
 - Public model list is limited to two names:
   - `deepseek-v4-flash`
   - `deepseek-v4-flash-lite`
+- V4.108 Phase 1 may discover opencode free-looking models as admin-only
+  candidates, but candidates are not public, not routable, and not
+  auto-promoted.
 - Model mapping:
   - `deepseek-v4-flash -> deepseek-v4-flash-free`
   - `deepseek-v4-flash-lite -> big-pickle`

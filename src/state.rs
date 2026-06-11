@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::health::UpstreamHealth;
 use crate::lanes::LaneLimiter;
 use crate::ledger::LedgerCounters;
+use crate::v4::model_discovery::DynamicModelRegistry;
 
 use crate::pool::{DeadPool, Pool, PoolManager, RateLimitedPool};
 use std::sync::{Arc, RwLock};
@@ -15,6 +16,7 @@ pub struct AppState {
     pub upstream_health: Arc<UpstreamHealth>,
     pub lanes: Arc<LaneLimiter>,
     pub ledger: LedgerCounters,
+    pub dynamic_models: Arc<DynamicModelRegistry>,
     pub startup_time: Instant,
     pub dead_pool: Arc<dyn DeadPool>,
     pub ratelimited_pool: Arc<dyn RateLimitedPool>,
