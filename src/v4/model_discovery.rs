@@ -60,6 +60,38 @@ pub struct DiscoveredModel {
     pub rollback_reason: Option<String>,
     #[serde(default)]
     pub retirement_reason: Option<String>,
+    #[serde(default)]
+    pub candidate_requests_total: u64,
+    #[serde(default)]
+    pub candidate_success_total: u64,
+    #[serde(default)]
+    pub candidate_failure_total: u64,
+    #[serde(default)]
+    pub canary_requests_total: u64,
+    #[serde(default)]
+    pub canary_success_total: u64,
+    #[serde(default)]
+    pub canary_failure_total: u64,
+    #[serde(default)]
+    pub active_requests_total: u64,
+    #[serde(default)]
+    pub active_success_total: u64,
+    #[serde(default)]
+    pub active_failure_total: u64,
+    #[serde(default)]
+    pub traffic_empty_output_total: u64,
+    #[serde(default)]
+    pub traffic_decode_error_total: u64,
+    #[serde(default)]
+    pub traffic_protocol_error_total: u64,
+    #[serde(default)]
+    pub last_traffic_unix: Option<u64>,
+    #[serde(default)]
+    pub last_traffic_status: Option<u16>,
+    #[serde(default)]
+    pub last_traffic_failure_kind: Option<String>,
+    #[serde(default)]
+    pub last_traffic_failure_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -176,6 +208,22 @@ impl DynamicModelRegistry {
                     promotion_reason: None,
                     rollback_reason: None,
                     retirement_reason: None,
+                    candidate_requests_total: 0,
+                    candidate_success_total: 0,
+                    candidate_failure_total: 0,
+                    canary_requests_total: 0,
+                    canary_success_total: 0,
+                    canary_failure_total: 0,
+                    active_requests_total: 0,
+                    active_success_total: 0,
+                    active_failure_total: 0,
+                    traffic_empty_output_total: 0,
+                    traffic_decode_error_total: 0,
+                    traffic_protocol_error_total: 0,
+                    last_traffic_unix: None,
+                    last_traffic_status: None,
+                    last_traffic_failure_kind: None,
+                    last_traffic_failure_message: None,
                 });
             merge_seen_model_state(entry, state, reason);
             entry.last_seen_unix = now;
@@ -429,6 +477,136 @@ impl DynamicModelRegistry {
         recompute_counts(&mut snapshot);
         Some(snapshot.models[index].clone())
     }
+
+    pub fn record_traffic_result(
+        &self,
+        model_id: &str,
+        status: u16,
+        failure_kind: impl Into<String>,
+        failure_message: impl Into<String>,
+    ) -> Option<DiscoveredModel> {
+        let now = now_unix();
+        let mut failure_kind = failure_kind.into();
+        let failure_message = failure_message.into();
+        let mut snapshot = self.inner.write().unwrap();
+        let index = snapshot
+            .models
+            .iter()
+            .position(|model| model.id == model_id)?;
+        {
+            let model = &mut snapshot.models[index];
+            if !matches!(
+                model.state,
+                DiscoveredModelState::Candidate
+                    | DiscoveredModelState::Canary
+                    | DiscoveredModelState::Active
+            ) {
+                return Some(model.clone());
+            }
+            if failure_kind.trim().is_empty() && status >= 400 {
+                failure_kind = format!("http_{status}");
+            }
+            let success = status < 400 && failure_kind.trim().is_empty();
+            match model.state {
+                DiscoveredModelState::Candidate => {
+                    model.candidate_requests_total =
+                        model.candidate_requests_total.saturating_add(1);
+                    if success {
+                        model.candidate_success_total =
+                            model.candidate_success_total.saturating_add(1);
+                    } else {
+                        model.candidate_failure_total =
+                            model.candidate_failure_total.saturating_add(1);
+                    }
+                }
+                DiscoveredModelState::Canary => {
+                    model.canary_requests_total = model.canary_requests_total.saturating_add(1);
+                    if success {
+                        model.canary_success_total = model.canary_success_total.saturating_add(1);
+                    } else {
+                        model.canary_failure_total = model.canary_failure_total.saturating_add(1);
+                    }
+                }
+                DiscoveredModelState::Active => {
+                    model.active_requests_total = model.active_requests_total.saturating_add(1);
+                    if success {
+                        model.active_success_total = model.active_success_total.saturating_add(1);
+                    } else {
+                        model.active_failure_total = model.active_failure_total.saturating_add(1);
+                    }
+                }
+                _ => {}
+            }
+            if !success {
+                match classify_traffic_failure(&failure_kind, &failure_message) {
+                    TrafficFailureClass::EmptyOutput => {
+                        model.traffic_empty_output_total =
+                            model.traffic_empty_output_total.saturating_add(1);
+                    }
+                    TrafficFailureClass::Decode => {
+                        model.traffic_decode_error_total =
+                            model.traffic_decode_error_total.saturating_add(1);
+                    }
+                    TrafficFailureClass::Protocol => {
+                        model.traffic_protocol_error_total =
+                            model.traffic_protocol_error_total.saturating_add(1);
+                    }
+                    TrafficFailureClass::Other => {}
+                }
+            }
+            model.last_traffic_unix = Some(now);
+            model.last_traffic_status = Some(status);
+            if success {
+                model.last_traffic_failure_kind = None;
+                model.last_traffic_failure_message = None;
+            } else {
+                model.last_traffic_failure_kind = Some(if failure_kind.trim().is_empty() {
+                    "unknown_failure".to_string()
+                } else {
+                    failure_kind
+                });
+                model.last_traffic_failure_message = Some(failure_message);
+            }
+        }
+        Some(snapshot.models[index].clone())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficFailureClass {
+    EmptyOutput,
+    Decode,
+    Protocol,
+    Other,
+}
+
+fn classify_traffic_failure(kind: &str, message: &str) -> TrafficFailureClass {
+    let material = format!("{kind}\n{message}").to_ascii_lowercase();
+    if material.contains("empty_output")
+        || material.contains("no assistant content")
+        || material.contains("no assistant content or tool call")
+    {
+        return TrafficFailureClass::EmptyOutput;
+    }
+    if material.contains("decode")
+        || material.contains("decoding")
+        || material.contains("failed to parse json")
+        || material.contains("parse json")
+        || material.contains("invalid json")
+    {
+        return TrafficFailureClass::Decode;
+    }
+    if material.contains("provider_invalid_request")
+        || material.contains("invalid_request")
+        || material.contains("missing field tool_call_id")
+        || material.contains("missing field tool_use_id")
+        || material.contains("invalid assistant message")
+        || material.contains("reasoning_content")
+        || material.contains("protocol")
+    {
+        return TrafficFailureClass::Protocol;
+    }
+    TrafficFailureClass::Other
 }
 
 fn classify_model(id: &str) -> (DiscoveredModelState, String) {
@@ -838,5 +1016,99 @@ mod tests {
             failure.passed_probe_names,
             vec!["openai_stream_minimal".to_string()]
         );
+    }
+
+    #[test]
+    fn records_candidate_canary_and_active_traffic_telemetry() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(r#"{"data":[{"id":"mimo-v2.5-free"}]}"#)
+            .unwrap();
+
+        let candidate = registry
+            .record_traffic_result("mimo-v2.5-free", 200, "", "")
+            .unwrap();
+        assert_eq!(candidate.candidate_requests_total, 1);
+        assert_eq!(candidate.candidate_success_total, 1);
+        assert_eq!(candidate.candidate_failure_total, 0);
+        assert_eq!(candidate.canary_requests_total, 0);
+        assert_eq!(candidate.active_requests_total, 0);
+
+        let candidate_failure = registry
+            .record_traffic_result(
+                "mimo-v2.5-free",
+                502,
+                "empty_output",
+                "upstream returned no assistant content or tool call",
+            )
+            .unwrap();
+        assert_eq!(candidate_failure.candidate_requests_total, 2);
+        assert_eq!(candidate_failure.candidate_success_total, 1);
+        assert_eq!(candidate_failure.candidate_failure_total, 1);
+        assert_eq!(candidate_failure.traffic_empty_output_total, 1);
+
+        registry
+            .set_model_state(
+                "mimo-v2.5-free",
+                DiscoveredModelState::Canary,
+                "probe quorum met",
+            )
+            .unwrap();
+        let success = registry
+            .record_traffic_result("mimo-v2.5-free", 200, "", "")
+            .unwrap();
+        assert_eq!(success.canary_requests_total, 1);
+        assert_eq!(success.canary_success_total, 1);
+        assert_eq!(success.canary_failure_total, 0);
+        assert_eq!(success.last_traffic_status, Some(200));
+        assert!(success.last_traffic_failure_kind.is_none());
+
+        let failure = registry
+            .record_traffic_result(
+                "mimo-v2.5-free",
+                502,
+                "empty_output",
+                "upstream returned no assistant content or tool call",
+            )
+            .unwrap();
+        assert_eq!(failure.canary_requests_total, 2);
+        assert_eq!(failure.canary_success_total, 1);
+        assert_eq!(failure.canary_failure_total, 1);
+        assert_eq!(failure.traffic_empty_output_total, 2);
+        assert_eq!(
+            failure.last_traffic_failure_kind.as_deref(),
+            Some("empty_output")
+        );
+
+        registry
+            .set_model_state(
+                "mimo-v2.5-free",
+                DiscoveredModelState::Active,
+                "canary traffic quorum met",
+            )
+            .unwrap();
+        let active_failure = registry
+            .record_traffic_result(
+                "mimo-v2.5-free",
+                400,
+                "provider_invalid_request",
+                "missing field tool_call_id",
+            )
+            .unwrap();
+        assert_eq!(active_failure.active_requests_total, 1);
+        assert_eq!(active_failure.active_failure_total, 1);
+        assert_eq!(active_failure.traffic_protocol_error_total, 1);
+
+        let active_decode = registry
+            .record_traffic_result(
+                "mimo-v2.5-free",
+                500,
+                "stream_decode_error",
+                "error decoding response body",
+            )
+            .unwrap();
+        assert_eq!(active_decode.active_requests_total, 2);
+        assert_eq!(active_decode.active_failure_total, 2);
+        assert_eq!(active_decode.traffic_decode_error_total, 1);
     }
 }

@@ -268,6 +268,7 @@ pub async fn handle_v4_proxy(
                         telemetry.ttft_ms.max(result.upstream_ms),
                     );
                 }
+                record_dynamic_model_traffic_from_telemetry(state, &telemetry);
                 state.collector.record_request(&telemetry);
                 result.response
             };
@@ -339,6 +340,13 @@ pub async fn handle_v4_proxy(
                     protocol_guard: protocol_guard_summary.clone(),
                 });
             }
+            record_dynamic_model_traffic(
+                state,
+                &public_model,
+                err.status.as_u16(),
+                &err.failure_kind,
+                &err.message,
+            );
             let mut response = error_response(err.status, err.message);
             if let Some(retry_after) = err.retry_after_secs {
                 response.headers_mut().insert(
@@ -350,6 +358,62 @@ pub async fn handle_v4_proxy(
             insert_context_headers(response.headers_mut(), &context_telemetry);
             response
         }
+    }
+}
+
+fn record_dynamic_model_traffic_from_telemetry(
+    state: &Arc<AppState>,
+    telemetry: &RequestTelemetry,
+) {
+    record_dynamic_model_traffic(
+        state,
+        &telemetry.public_model,
+        traffic_status_for_telemetry(telemetry),
+        &telemetry.failure_kind,
+        &telemetry.failure_message,
+    );
+}
+
+fn record_dynamic_model_traffic(
+    state: &Arc<AppState>,
+    public_model: &str,
+    status: u16,
+    failure_kind: &str,
+    failure_message: &str,
+) {
+    let normalized_failure_kind = if status == 429 && failure_kind == "rate_limited" {
+        "upstream_429".to_string()
+    } else if failure_kind.trim().is_empty() && status >= 400 {
+        classify_traffic_fallback_failure(status, failure_message)
+    } else {
+        failure_kind.to_string()
+    };
+    state.dynamic_models.record_traffic_result(
+        public_model,
+        status,
+        normalized_failure_kind,
+        failure_message.to_string(),
+    );
+}
+
+fn traffic_status_for_telemetry(telemetry: &RequestTelemetry) -> u16 {
+    if telemetry.failure_kind == "client_gone" {
+        499
+    } else {
+        telemetry.status
+    }
+}
+
+fn classify_traffic_fallback_failure(status: u16, message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("no proxy resources available") {
+        "proxy_pool_exhausted".to_string()
+    } else if lower.contains("circuit open") {
+        "circuit_open".to_string()
+    } else if lower.contains("request exceeds proxy node budget") {
+        "request_too_large".to_string()
+    } else {
+        format!("http_{status}")
     }
 }
 
@@ -1920,6 +1984,7 @@ fn metered_stream_response(
             );
             lease_guard.mark_released();
         }
+        record_dynamic_model_traffic_from_telemetry(&state, &telemetry);
         collector.record_request(&telemetry);
     });
 

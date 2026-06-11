@@ -186,6 +186,7 @@ impl AdminService {
                 {"method":"GET","path":"/admin/models"},
                 {"method":"GET","path":"/admin/models/{model_id}"},
                 {"method":"GET","path":"/admin/models/{model_id}/probes"},
+                {"method":"GET","path":"/admin/models/{model_id}/traffic"},
                 {"method":"POST","path":"/admin/models/{model_id}/promote"},
                 {"method":"POST","path":"/admin/models/{model_id}/demote"},
                 {"method":"POST","path":"/admin/models/{model_id}/quarantine"},
@@ -501,8 +502,77 @@ impl AdminService {
             "promotion_reason": model.promotion_reason,
             "rollback_reason": model.rollback_reason,
             "retirement_reason": model.retirement_reason,
+            "traffic": Self::dynamic_model_traffic_payload(&model),
         })
     }
+
+    fn dynamic_model_traffic_payload(model: &DiscoveredModel) -> Value {
+        let total_requests = model
+            .candidate_requests_total
+            .saturating_add(model.canary_requests_total)
+            .saturating_add(model.active_requests_total);
+        let total_success = model
+            .candidate_success_total
+            .saturating_add(model.canary_success_total)
+            .saturating_add(model.active_success_total);
+        let total_failure = model
+            .candidate_failure_total
+            .saturating_add(model.canary_failure_total)
+            .saturating_add(model.active_failure_total);
+        json!({
+            "candidate_requests_total": model.candidate_requests_total,
+            "candidate_success_total": model.candidate_success_total,
+            "candidate_failure_total": model.candidate_failure_total,
+            "canary_requests_total": model.canary_requests_total,
+            "canary_success_total": model.canary_success_total,
+            "canary_failure_total": model.canary_failure_total,
+            "active_requests_total": model.active_requests_total,
+            "active_success_total": model.active_success_total,
+            "active_failure_total": model.active_failure_total,
+            "requests_total": total_requests,
+            "success_total": total_success,
+            "failure_total": total_failure,
+            "traffic_empty_output_total": model.traffic_empty_output_total,
+            "traffic_decode_error_total": model.traffic_decode_error_total,
+            "traffic_protocol_error_total": model.traffic_protocol_error_total,
+            "last_traffic_unix": model.last_traffic_unix,
+            "last_traffic_status": model.last_traffic_status,
+            "last_traffic_failure_kind": model.last_traffic_failure_kind,
+            "last_traffic_failure_message": model.last_traffic_failure_message,
+        })
+    }
+
+    pub fn model_traffic(state: &AppState, model_id: &str) -> Response {
+        let (public_mode, discovery) = {
+            let cfg = state.config.read().unwrap();
+            (
+                cfg.dynamic_model_public_mode,
+                state.dynamic_models.snapshot(),
+            )
+        };
+        let registry = EffectiveModelRegistry::new(public_mode, discovery.clone());
+        match discovery
+            .models
+            .into_iter()
+            .find(|model| model.id == model_id)
+        {
+            Some(model) => {
+                let effectively_public = registry.resolve(model_id).is_ok();
+                Self::ok_response(json!({
+                    "id": model.id,
+                    "upstream_id": model.upstream_id,
+                    "state": model.state,
+                    "public": effectively_public,
+                    "routable": effectively_public,
+                    "lifecycle_public": model.public,
+                    "lifecycle_routable": model.routable,
+                    "traffic": Self::dynamic_model_traffic_payload(&model),
+                }))
+            }
+            None => Self::error_response(StatusCode::NOT_FOUND, "dynamic model not found"),
+        }
+    }
+
     pub fn model_probes(state: &AppState, model_id: &str) -> Response {
         match state.dynamic_models.get(model_id) {
             Some(model) => {

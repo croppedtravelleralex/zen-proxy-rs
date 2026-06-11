@@ -1564,6 +1564,214 @@ mod e2e {
     }
 
     #[test]
+    fn test_dynamic_canary_traffic_endpoint_tracks_success_and_failure() {
+        let (upstream_base, _) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-traffic-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19817,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let promoted = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-traffic-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "canary"}))
+            .send()
+            .expect("promote dynamic model");
+        assert_eq!(promoted.status(), 200);
+
+        let ok_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-traffic-free",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("successful dynamic canary request");
+        assert_eq!(ok_resp.status(), 200);
+
+        let limited_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-traffic-free",
+                "messages": [{"role": "user", "content": "rate-limit"}],
+                "stream": false
+            }))
+            .send()
+            .expect("rate-limited dynamic canary request");
+        assert_eq!(limited_resp.status(), 429);
+
+        let traffic_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-traffic-free/traffic",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic model traffic endpoint");
+        assert_eq!(traffic_resp.status(), 200);
+        let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
+        let traffic = &traffic_body["data"]["traffic"];
+        assert_eq!(traffic["canary_requests_total"], 2);
+        assert_eq!(traffic["canary_success_total"], 1);
+        assert_eq!(traffic["canary_failure_total"], 1);
+        assert_eq!(traffic["active_requests_total"], 0);
+        assert_eq!(traffic["requests_total"], 2);
+        assert_eq!(traffic["success_total"], 1);
+        assert_eq!(traffic["failure_total"], 1);
+        assert_eq!(traffic["last_traffic_status"], 429);
+        assert_eq!(traffic["last_traffic_failure_kind"], "upstream_429");
+
+        let detail_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-traffic-free",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic model detail");
+        assert_eq!(detail_resp.status(), 200);
+        let detail_body: serde_json::Value = detail_resp.json().unwrap();
+        assert_eq!(detail_body["data"]["traffic"]["canary_requests_total"], 2);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_candidate_public_traffic_endpoint_tracks_direct_self_use() {
+        let (upstream_base, _) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-candidate-traffic-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19818,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                assert_eq!(body["data"]["safety"]["candidates_are_public"], true);
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidate traffic model: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let ok_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-candidate-traffic-free",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("successful dynamic candidate request");
+        assert_eq!(ok_resp.status(), 200);
+
+        let limited_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-candidate-traffic-free",
+                "messages": [{"role": "user", "content": "rate-limit"}],
+                "stream": false
+            }))
+            .send()
+            .expect("rate-limited dynamic candidate request");
+        assert_eq!(limited_resp.status(), 429);
+
+        let traffic_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-candidate-traffic-free/traffic",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic candidate traffic endpoint");
+        assert_eq!(traffic_resp.status(), 200);
+        let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
+        assert_eq!(traffic_body["data"]["state"], "candidate");
+        assert_eq!(traffic_body["data"]["public"], true);
+        assert_eq!(traffic_body["data"]["lifecycle_public"], false);
+        let traffic = &traffic_body["data"]["traffic"];
+        assert_eq!(traffic["candidate_requests_total"], 2);
+        assert_eq!(traffic["candidate_success_total"], 1);
+        assert_eq!(traffic["candidate_failure_total"], 1);
+        assert_eq!(traffic["canary_requests_total"], 0);
+        assert_eq!(traffic["active_requests_total"], 0);
+        assert_eq!(traffic["requests_total"], 2);
+        assert_eq!(traffic["success_total"], 1);
+        assert_eq!(traffic["failure_total"], 1);
+        assert_eq!(traffic["last_traffic_status"], 429);
+        assert_eq!(traffic["last_traffic_failure_kind"], "upstream_429");
+
+        stop_server(child, port);
+    }
+
+    #[test]
     fn test_models_alias_endpoint_v4_mode() {
         let (child, port) =
             start_server_with_env(19797, &[("ZEN_PROVIDER_MODE", "free_model_kernel")]);
