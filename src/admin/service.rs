@@ -302,6 +302,15 @@ impl AdminService {
                 "fail_open": cfg.v43_global_budget_fail_open,
             })).unwrap_or_else(|| json!({"configured": false})),
             "data_plane": state.pool_manager.runtime_details(),
+            "dynamic_model_probe": {
+                "enabled": cfg.dynamic_model_probe_enabled,
+                "max_concurrent": cfg.dynamic_model_probe_max_concurrent,
+                "max_per_round": cfg.dynamic_model_probe_max_per_round,
+                "requests_per_interval": cfg.dynamic_model_probe_requests_per_interval,
+                "success_quorum": cfg.dynamic_model_probe_success_quorum,
+                "failure_quarantine_threshold": cfg.dynamic_model_probe_failure_quarantine_threshold,
+                "timeout_secs": cfg.dynamic_model_probe_timeout_secs,
+            },
             "pools": {
                 "dispatch": p.dispatch_size,
                 "active": p.active_size,
@@ -1077,6 +1086,15 @@ impl AdminService {
                 "url": sanitize_text(&cfg.dynamic_model_discovery_url),
                 "interval_secs": cfg.dynamic_model_discovery_interval_secs,
                 "auto_promote": false,
+                "probe": {
+                    "enabled": cfg.dynamic_model_probe_enabled,
+                    "max_concurrent": cfg.dynamic_model_probe_max_concurrent,
+                    "max_per_round": cfg.dynamic_model_probe_max_per_round,
+                    "requests_per_interval": cfg.dynamic_model_probe_requests_per_interval,
+                    "success_quorum": cfg.dynamic_model_probe_success_quorum,
+                    "failure_quarantine_threshold": cfg.dynamic_model_probe_failure_quarantine_threshold,
+                    "timeout_secs": cfg.dynamic_model_probe_timeout_secs,
+                }
             },
             "audit": {
                 "enabled": cfg.audit_log_enabled,

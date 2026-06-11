@@ -284,6 +284,20 @@ mod e2e {
         let body: serde_json::Value = resp.json().unwrap();
         assert!(body["success"].as_bool().unwrap_or(false));
         assert!(body["data"].is_object());
+        let config_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/config", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/config endpoint");
+        assert_eq!(config_resp.status(), 200);
+        let config_body: serde_json::Value = config_resp.json().unwrap();
+        let probe = &config_body["data"]["dynamic_model_discovery"]["probe"];
+        assert_eq!(probe["enabled"], false);
+        assert_eq!(probe["max_concurrent"], 1);
+        assert_eq!(probe["max_per_round"], 3);
+        assert_eq!(probe["requests_per_interval"], 20);
+        assert_eq!(probe["success_quorum"], 2);
+        assert_eq!(probe["failure_quarantine_threshold"], 3);
         stop_server(child, port);
     }
 
