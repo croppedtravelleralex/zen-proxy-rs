@@ -375,6 +375,11 @@ pub struct Config {
     pub dynamic_model_probe_base_url: String,
     pub dynamic_model_probe_api_key: Option<String>,
     pub dynamic_model_probe_max_response_bytes: usize,
+    pub dynamic_model_active_min_canary_requests: u64,
+    pub dynamic_model_active_min_success_rate_bps: u64,
+    pub dynamic_model_active_max_empty_output_failures: u64,
+    pub dynamic_model_active_max_decode_failures: u64,
+    pub dynamic_model_active_max_protocol_failures: u64,
     pub node_max_calls_per_window: u64,
     pub node_max_tokens_per_window: u64,
     pub node_max_kb_per_window: u64,
@@ -576,6 +581,28 @@ impl Config {
                 64 * 1024usize,
             )
             .max(1024),
+            dynamic_model_active_min_canary_requests: load_env_var(
+                "DYNAMIC_MODEL_ACTIVE_MIN_CANARY_REQUESTS",
+                100u64,
+            )
+            .max(1),
+            dynamic_model_active_min_success_rate_bps: load_env_var(
+                "DYNAMIC_MODEL_ACTIVE_MIN_SUCCESS_RATE_BPS",
+                9_900u64,
+            )
+            .min(10_000),
+            dynamic_model_active_max_empty_output_failures: load_env_var(
+                "DYNAMIC_MODEL_ACTIVE_MAX_EMPTY_OUTPUT_FAILURES",
+                0u64,
+            ),
+            dynamic_model_active_max_decode_failures: load_env_var(
+                "DYNAMIC_MODEL_ACTIVE_MAX_DECODE_FAILURES",
+                0u64,
+            ),
+            dynamic_model_active_max_protocol_failures: load_env_var(
+                "DYNAMIC_MODEL_ACTIVE_MAX_PROTOCOL_FAILURES",
+                0u64,
+            ),
             node_max_calls_per_window: load_env_var("NODE_MAX_CALLS_PER_WINDOW", 100u64),
             node_max_tokens_per_window: load_env_var("NODE_MAX_TOKENS_PER_WINDOW", 10_000_000u64),
             node_max_kb_per_window: load_env_var("NODE_MAX_KB_PER_WINDOW", 64 * 1024u64),
@@ -892,6 +919,11 @@ mod tests {
             "DYNAMIC_MODEL_PROBE_BASE_URL",
             "DYNAMIC_MODEL_PROBE_API_KEY",
             "DYNAMIC_MODEL_PROBE_MAX_RESPONSE_BYTES",
+            "DYNAMIC_MODEL_ACTIVE_MIN_CANARY_REQUESTS",
+            "DYNAMIC_MODEL_ACTIVE_MIN_SUCCESS_RATE_BPS",
+            "DYNAMIC_MODEL_ACTIVE_MAX_EMPTY_OUTPUT_FAILURES",
+            "DYNAMIC_MODEL_ACTIVE_MAX_DECODE_FAILURES",
+            "DYNAMIC_MODEL_ACTIVE_MAX_PROTOCOL_FAILURES",
             "V4_RETRY_BUDGET_MS",
             "CONNECT_TIMEOUT_SECS",
             "REQUEST_TIMEOUT_SECS",
@@ -989,6 +1021,11 @@ mod tests {
         assert_eq!(cfg.dynamic_model_probe_base_url, "");
         assert!(cfg.dynamic_model_probe_api_key.is_none());
         assert_eq!(cfg.dynamic_model_probe_max_response_bytes, 64 * 1024);
+        assert_eq!(cfg.dynamic_model_active_min_canary_requests, 100);
+        assert_eq!(cfg.dynamic_model_active_min_success_rate_bps, 9_900);
+        assert_eq!(cfg.dynamic_model_active_max_empty_output_failures, 0);
+        assert_eq!(cfg.dynamic_model_active_max_decode_failures, 0);
+        assert_eq!(cfg.dynamic_model_active_max_protocol_failures, 0);
         assert_eq!(cfg.v4_retry_budget_ms, 45_000);
         assert_eq!(cfg.connect_timeout_secs, 5);
         assert_eq!(cfg.request_timeout_secs, 120);
@@ -1080,6 +1117,11 @@ mod tests {
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_BASE_URL", "http://127.0.0.1:4010") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_API_KEY", "probe-key") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_MAX_RESPONSE_BYTES", "32768") };
+        unsafe { env::set_var("DYNAMIC_MODEL_ACTIVE_MIN_CANARY_REQUESTS", "12") };
+        unsafe { env::set_var("DYNAMIC_MODEL_ACTIVE_MIN_SUCCESS_RATE_BPS", "9876") };
+        unsafe { env::set_var("DYNAMIC_MODEL_ACTIVE_MAX_EMPTY_OUTPUT_FAILURES", "1") };
+        unsafe { env::set_var("DYNAMIC_MODEL_ACTIVE_MAX_DECODE_FAILURES", "2") };
+        unsafe { env::set_var("DYNAMIC_MODEL_ACTIVE_MAX_PROTOCOL_FAILURES", "3") };
         unsafe { env::set_var("V4_RETRY_BUDGET_MS", "12345") };
         unsafe { env::set_var("CONNECT_TIMEOUT_SECS", "9") };
         unsafe { env::set_var("REQUEST_TIMEOUT_SECS", "600") };
@@ -1181,6 +1223,11 @@ mod tests {
             Some("probe-key")
         );
         assert_eq!(cfg.dynamic_model_probe_max_response_bytes, 32768);
+        assert_eq!(cfg.dynamic_model_active_min_canary_requests, 12);
+        assert_eq!(cfg.dynamic_model_active_min_success_rate_bps, 9_876);
+        assert_eq!(cfg.dynamic_model_active_max_empty_output_failures, 1);
+        assert_eq!(cfg.dynamic_model_active_max_decode_failures, 2);
+        assert_eq!(cfg.dynamic_model_active_max_protocol_failures, 3);
         assert_eq!(cfg.v4_retry_budget_ms, 12_345);
         assert_eq!(cfg.connect_timeout_secs, 9);
         assert_eq!(cfg.request_timeout_secs, 600);
@@ -1274,6 +1321,11 @@ mod tests {
             "DYNAMIC_MODEL_PROBE_BASE_URL",
             "DYNAMIC_MODEL_PROBE_API_KEY",
             "DYNAMIC_MODEL_PROBE_MAX_RESPONSE_BYTES",
+            "DYNAMIC_MODEL_ACTIVE_MIN_CANARY_REQUESTS",
+            "DYNAMIC_MODEL_ACTIVE_MIN_SUCCESS_RATE_BPS",
+            "DYNAMIC_MODEL_ACTIVE_MAX_EMPTY_OUTPUT_FAILURES",
+            "DYNAMIC_MODEL_ACTIVE_MAX_DECODE_FAILURES",
+            "DYNAMIC_MODEL_ACTIVE_MAX_PROTOCOL_FAILURES",
             "V4_RETRY_BUDGET_MS",
             "CONNECT_TIMEOUT_SECS",
             "REQUEST_TIMEOUT_SECS",

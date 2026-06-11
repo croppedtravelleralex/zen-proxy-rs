@@ -79,6 +79,24 @@ pub struct DiscoveredModel {
     #[serde(default)]
     pub active_failure_total: u64,
     #[serde(default)]
+    pub candidate_empty_output_total: u64,
+    #[serde(default)]
+    pub candidate_decode_error_total: u64,
+    #[serde(default)]
+    pub candidate_protocol_error_total: u64,
+    #[serde(default)]
+    pub canary_empty_output_total: u64,
+    #[serde(default)]
+    pub canary_decode_error_total: u64,
+    #[serde(default)]
+    pub canary_protocol_error_total: u64,
+    #[serde(default)]
+    pub active_empty_output_total: u64,
+    #[serde(default)]
+    pub active_decode_error_total: u64,
+    #[serde(default)]
+    pub active_protocol_error_total: u64,
+    #[serde(default)]
     pub traffic_empty_output_total: u64,
     #[serde(default)]
     pub traffic_decode_error_total: u64,
@@ -92,6 +110,43 @@ pub struct DiscoveredModel {
     pub last_traffic_failure_kind: Option<String>,
     #[serde(default)]
     pub last_traffic_failure_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficPromotionPolicy {
+    pub min_canary_requests: u64,
+    pub min_canary_success_rate_bps: u64,
+    pub max_canary_empty_output_failures: u64,
+    pub max_canary_decode_failures: u64,
+    pub max_canary_protocol_failures: u64,
+}
+
+impl Default for TrafficPromotionPolicy {
+    fn default() -> Self {
+        Self {
+            min_canary_requests: 100,
+            min_canary_success_rate_bps: 9_900,
+            max_canary_empty_output_failures: 0,
+            max_canary_decode_failures: 0,
+            max_canary_protocol_failures: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficPromotionDecision {
+    pub eligible: bool,
+    pub reason: String,
+    pub missing_reasons: Vec<String>,
+    pub policy: TrafficPromotionPolicy,
+    pub canary_requests_total: u64,
+    pub canary_success_total: u64,
+    pub canary_failure_total: u64,
+    pub canary_success_rate_bps: u64,
+    pub canary_empty_output_total: u64,
+    pub canary_decode_error_total: u64,
+    pub canary_protocol_error_total: u64,
+    pub needed_canary_requests: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -217,6 +272,15 @@ impl DynamicModelRegistry {
                     active_requests_total: 0,
                     active_success_total: 0,
                     active_failure_total: 0,
+                    candidate_empty_output_total: 0,
+                    candidate_decode_error_total: 0,
+                    candidate_protocol_error_total: 0,
+                    canary_empty_output_total: 0,
+                    canary_decode_error_total: 0,
+                    canary_protocol_error_total: 0,
+                    active_empty_output_total: 0,
+                    active_decode_error_total: 0,
+                    active_protocol_error_total: 0,
                     traffic_empty_output_total: 0,
                     traffic_decode_error_total: 0,
                     traffic_protocol_error_total: 0,
@@ -507,6 +571,11 @@ impl DynamicModelRegistry {
                 failure_kind = format!("http_{status}");
             }
             let success = status < 400 && failure_kind.trim().is_empty();
+            let failure_class = if success {
+                None
+            } else {
+                Some(classify_traffic_failure(&failure_kind, &failure_message))
+            };
             match model.state {
                 DiscoveredModelState::Candidate => {
                     model.candidate_requests_total =
@@ -517,6 +586,12 @@ impl DynamicModelRegistry {
                     } else {
                         model.candidate_failure_total =
                             model.candidate_failure_total.saturating_add(1);
+                        record_stage_failure(
+                            failure_class,
+                            &mut model.candidate_empty_output_total,
+                            &mut model.candidate_decode_error_total,
+                            &mut model.candidate_protocol_error_total,
+                        );
                     }
                 }
                 DiscoveredModelState::Canary => {
@@ -525,6 +600,12 @@ impl DynamicModelRegistry {
                         model.canary_success_total = model.canary_success_total.saturating_add(1);
                     } else {
                         model.canary_failure_total = model.canary_failure_total.saturating_add(1);
+                        record_stage_failure(
+                            failure_class,
+                            &mut model.canary_empty_output_total,
+                            &mut model.canary_decode_error_total,
+                            &mut model.canary_protocol_error_total,
+                        );
                     }
                 }
                 DiscoveredModelState::Active => {
@@ -533,12 +614,18 @@ impl DynamicModelRegistry {
                         model.active_success_total = model.active_success_total.saturating_add(1);
                     } else {
                         model.active_failure_total = model.active_failure_total.saturating_add(1);
+                        record_stage_failure(
+                            failure_class,
+                            &mut model.active_empty_output_total,
+                            &mut model.active_decode_error_total,
+                            &mut model.active_protocol_error_total,
+                        );
                     }
                 }
                 _ => {}
             }
-            if !success {
-                match classify_traffic_failure(&failure_kind, &failure_message) {
+            if let Some(failure_class) = failure_class {
+                match failure_class {
                     TrafficFailureClass::EmptyOutput => {
                         model.traffic_empty_output_total =
                             model.traffic_empty_output_total.saturating_add(1);
@@ -580,6 +667,26 @@ enum TrafficFailureClass {
     Other,
 }
 
+fn record_stage_failure(
+    failure_class: Option<TrafficFailureClass>,
+    empty_output_total: &mut u64,
+    decode_error_total: &mut u64,
+    protocol_error_total: &mut u64,
+) {
+    match failure_class {
+        Some(TrafficFailureClass::EmptyOutput) => {
+            *empty_output_total = empty_output_total.saturating_add(1);
+        }
+        Some(TrafficFailureClass::Decode) => {
+            *decode_error_total = decode_error_total.saturating_add(1);
+        }
+        Some(TrafficFailureClass::Protocol) => {
+            *protocol_error_total = protocol_error_total.saturating_add(1);
+        }
+        Some(TrafficFailureClass::Other) | None => {}
+    }
+}
+
 fn classify_traffic_failure(kind: &str, message: &str) -> TrafficFailureClass {
     let material = format!("{kind}\n{message}").to_ascii_lowercase();
     if material.contains("empty_output")
@@ -607,6 +714,80 @@ fn classify_traffic_failure(kind: &str, message: &str) -> TrafficFailureClass {
         return TrafficFailureClass::Protocol;
     }
     TrafficFailureClass::Other
+}
+
+pub fn evaluate_active_promotion(
+    model: &DiscoveredModel,
+    policy: TrafficPromotionPolicy,
+) -> TrafficPromotionDecision {
+    let canary_success_rate_bps =
+        success_rate_bps(model.canary_success_total, model.canary_requests_total);
+    let mut missing_reasons = Vec::new();
+
+    if !matches!(model.state, DiscoveredModelState::Canary) {
+        missing_reasons.push("state must be canary before active promotion".to_string());
+    }
+    if model.canary_requests_total < policy.min_canary_requests {
+        missing_reasons.push(format!(
+            "canary_requests_total {} < required {}",
+            model.canary_requests_total, policy.min_canary_requests
+        ));
+    }
+    if canary_success_rate_bps < policy.min_canary_success_rate_bps {
+        missing_reasons.push(format!(
+            "canary_success_rate_bps {} < required {}",
+            canary_success_rate_bps, policy.min_canary_success_rate_bps
+        ));
+    }
+    if model.canary_empty_output_total > policy.max_canary_empty_output_failures {
+        missing_reasons.push(format!(
+            "canary_empty_output_total {} > allowed {}",
+            model.canary_empty_output_total, policy.max_canary_empty_output_failures
+        ));
+    }
+    if model.canary_decode_error_total > policy.max_canary_decode_failures {
+        missing_reasons.push(format!(
+            "canary_decode_error_total {} > allowed {}",
+            model.canary_decode_error_total, policy.max_canary_decode_failures
+        ));
+    }
+    if model.canary_protocol_error_total > policy.max_canary_protocol_failures {
+        missing_reasons.push(format!(
+            "canary_protocol_error_total {} > allowed {}",
+            model.canary_protocol_error_total, policy.max_canary_protocol_failures
+        ));
+    }
+
+    let eligible = missing_reasons.is_empty();
+    let reason = if eligible {
+        "canary traffic quorum met".to_string()
+    } else {
+        missing_reasons.join("; ")
+    };
+
+    TrafficPromotionDecision {
+        eligible,
+        reason,
+        missing_reasons,
+        policy,
+        canary_requests_total: model.canary_requests_total,
+        canary_success_total: model.canary_success_total,
+        canary_failure_total: model.canary_failure_total,
+        canary_success_rate_bps,
+        canary_empty_output_total: model.canary_empty_output_total,
+        canary_decode_error_total: model.canary_decode_error_total,
+        canary_protocol_error_total: model.canary_protocol_error_total,
+        needed_canary_requests: policy
+            .min_canary_requests
+            .saturating_sub(model.canary_requests_total),
+    }
+}
+
+fn success_rate_bps(success: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    success.saturating_mul(10_000) / total
 }
 
 fn classify_model(id: &str) -> (DiscoveredModelState, String) {
@@ -1045,6 +1226,7 @@ mod tests {
         assert_eq!(candidate_failure.candidate_requests_total, 2);
         assert_eq!(candidate_failure.candidate_success_total, 1);
         assert_eq!(candidate_failure.candidate_failure_total, 1);
+        assert_eq!(candidate_failure.candidate_empty_output_total, 1);
         assert_eq!(candidate_failure.traffic_empty_output_total, 1);
 
         registry
@@ -1074,6 +1256,7 @@ mod tests {
         assert_eq!(failure.canary_requests_total, 2);
         assert_eq!(failure.canary_success_total, 1);
         assert_eq!(failure.canary_failure_total, 1);
+        assert_eq!(failure.canary_empty_output_total, 1);
         assert_eq!(failure.traffic_empty_output_total, 2);
         assert_eq!(
             failure.last_traffic_failure_kind.as_deref(),
@@ -1097,6 +1280,7 @@ mod tests {
             .unwrap();
         assert_eq!(active_failure.active_requests_total, 1);
         assert_eq!(active_failure.active_failure_total, 1);
+        assert_eq!(active_failure.active_protocol_error_total, 1);
         assert_eq!(active_failure.traffic_protocol_error_total, 1);
 
         let active_decode = registry
@@ -1109,6 +1293,68 @@ mod tests {
             .unwrap();
         assert_eq!(active_decode.active_requests_total, 2);
         assert_eq!(active_decode.active_failure_total, 2);
+        assert_eq!(active_decode.active_decode_error_total, 1);
         assert_eq!(active_decode.traffic_decode_error_total, 1);
+    }
+
+    #[test]
+    fn evaluates_active_promotion_from_canary_traffic_quorum() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(r#"{"data":[{"id":"mimo-v2.5-free"}]}"#)
+            .unwrap();
+        let policy = TrafficPromotionPolicy {
+            min_canary_requests: 2,
+            min_canary_success_rate_bps: 10_000,
+            max_canary_empty_output_failures: 0,
+            max_canary_decode_failures: 0,
+            max_canary_protocol_failures: 0,
+        };
+
+        let candidate = registry.get("mimo-v2.5-free").unwrap();
+        let candidate_decision = evaluate_active_promotion(&candidate, policy);
+        assert!(!candidate_decision.eligible);
+        assert!(candidate_decision
+            .missing_reasons
+            .iter()
+            .any(|reason| reason.contains("state must be canary")));
+
+        registry
+            .set_model_state(
+                "mimo-v2.5-free",
+                DiscoveredModelState::Canary,
+                "probe quorum met",
+            )
+            .unwrap();
+        let one_success = registry
+            .record_traffic_result("mimo-v2.5-free", 200, "", "")
+            .unwrap();
+        let one_success_decision = evaluate_active_promotion(&one_success, policy);
+        assert!(!one_success_decision.eligible);
+        assert_eq!(one_success_decision.needed_canary_requests, 1);
+
+        let two_successes = registry
+            .record_traffic_result("mimo-v2.5-free", 200, "", "")
+            .unwrap();
+        let eligible = evaluate_active_promotion(&two_successes, policy);
+        assert!(eligible.eligible);
+        assert_eq!(eligible.canary_success_rate_bps, 10_000);
+        assert_eq!(eligible.reason, "canary traffic quorum met");
+
+        let decode_failure = registry
+            .record_traffic_result(
+                "mimo-v2.5-free",
+                500,
+                "stream_decode_error",
+                "error decoding response body",
+            )
+            .unwrap();
+        let blocked = evaluate_active_promotion(&decode_failure, policy);
+        assert!(!blocked.eligible);
+        assert_eq!(blocked.canary_decode_error_total, 1);
+        assert!(blocked
+            .missing_reasons
+            .iter()
+            .any(|reason| reason.contains("canary_decode_error_total")));
     }
 }

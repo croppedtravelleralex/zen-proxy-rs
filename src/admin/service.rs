@@ -9,7 +9,9 @@ use crate::ledger::{sanitize_json_value, sanitize_text};
 
 use crate::state::AppState;
 use crate::v4::model::{EffectiveModelRegistry, ModelCompatibilityProfile, ModelRegistry};
-use crate::v4::model_discovery::{DiscoveredModel, DiscoveredModelState};
+use crate::v4::model_discovery::{
+    evaluate_active_promotion, DiscoveredModel, DiscoveredModelState, TrafficPromotionPolicy,
+};
 use crate::v4::model_probe::{ModelProbeRunSummary, REQUIRED_PROBE_NAMES};
 use crate::v4::model_probe_runner::{
     probe_error_http_status, probe_error_message, DynamicModelProbeRunError,
@@ -56,6 +58,32 @@ impl AdminService {
             Json(json!({ "success": false, "error": sanitize_text(&msg.into()) })),
         )
             .into_response()
+    }
+    pub fn error_response_with_data<S: Into<String>>(
+        code: StatusCode,
+        msg: S,
+        data: Value,
+    ) -> Response {
+        (
+            code,
+            Json(json!({
+                "success": false,
+                "error": sanitize_text(&msg.into()),
+                "data": data
+            })),
+        )
+            .into_response()
+    }
+
+    fn active_promotion_policy(state: &AppState) -> TrafficPromotionPolicy {
+        let cfg = state.config.read().unwrap();
+        TrafficPromotionPolicy {
+            min_canary_requests: cfg.dynamic_model_active_min_canary_requests,
+            min_canary_success_rate_bps: cfg.dynamic_model_active_min_success_rate_bps,
+            max_canary_empty_output_failures: cfg.dynamic_model_active_max_empty_output_failures,
+            max_canary_decode_failures: cfg.dynamic_model_active_max_decode_failures,
+            max_canary_protocol_failures: cfg.dynamic_model_active_max_protocol_failures,
+        }
     }
 
     pub fn audit_filter(params: &std::collections::HashMap<String, String>) -> RequestFilter {
@@ -329,6 +357,13 @@ impl AdminService {
                 "max_response_bytes": cfg.dynamic_model_probe_max_response_bytes,
                 "planned_candidates": planned_probe_candidates,
             },
+            "dynamic_model_active_promotion": {
+                "min_canary_requests": cfg.dynamic_model_active_min_canary_requests,
+                "min_success_rate_bps": cfg.dynamic_model_active_min_success_rate_bps,
+                "max_empty_output_failures": cfg.dynamic_model_active_max_empty_output_failures,
+                "max_decode_failures": cfg.dynamic_model_active_max_decode_failures,
+                "max_protocol_failures": cfg.dynamic_model_active_max_protocol_failures,
+            },
             "pools": {
                 "dispatch": p.dispatch_size,
                 "active": p.active_size,
@@ -425,6 +460,7 @@ impl AdminService {
                         "dynamic_candidate"
                     },
                     effectively_public,
+                    Self::active_promotion_policy(state),
                 ));
             }
             match registry.resolve(model_id) {
@@ -449,6 +485,7 @@ impl AdminService {
                         model,
                         "dynamic_candidate",
                         false,
+                        Self::active_promotion_policy(state),
                     )),
                     None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
                 },
@@ -460,7 +497,9 @@ impl AdminService {
         model: DiscoveredModel,
         mode: &'static str,
         effectively_public: bool,
+        active_policy: TrafficPromotionPolicy,
     ) -> Value {
+        let active_promotion = evaluate_active_promotion(&model, active_policy);
         let missing_probe_names = REQUIRED_PROBE_NAMES
             .iter()
             .filter(|probe_name| {
@@ -503,6 +542,7 @@ impl AdminService {
             "rollback_reason": model.rollback_reason,
             "retirement_reason": model.retirement_reason,
             "traffic": Self::dynamic_model_traffic_payload(&model),
+            "active_promotion": active_promotion,
         })
     }
 
@@ -523,12 +563,21 @@ impl AdminService {
             "candidate_requests_total": model.candidate_requests_total,
             "candidate_success_total": model.candidate_success_total,
             "candidate_failure_total": model.candidate_failure_total,
+            "candidate_empty_output_total": model.candidate_empty_output_total,
+            "candidate_decode_error_total": model.candidate_decode_error_total,
+            "candidate_protocol_error_total": model.candidate_protocol_error_total,
             "canary_requests_total": model.canary_requests_total,
             "canary_success_total": model.canary_success_total,
             "canary_failure_total": model.canary_failure_total,
+            "canary_empty_output_total": model.canary_empty_output_total,
+            "canary_decode_error_total": model.canary_decode_error_total,
+            "canary_protocol_error_total": model.canary_protocol_error_total,
             "active_requests_total": model.active_requests_total,
             "active_success_total": model.active_success_total,
             "active_failure_total": model.active_failure_total,
+            "active_empty_output_total": model.active_empty_output_total,
+            "active_decode_error_total": model.active_decode_error_total,
+            "active_protocol_error_total": model.active_protocol_error_total,
             "requests_total": total_requests,
             "success_total": total_success,
             "failure_total": total_failure,
@@ -543,11 +592,19 @@ impl AdminService {
     }
 
     pub fn model_traffic(state: &AppState, model_id: &str) -> Response {
-        let (public_mode, discovery) = {
+        let (public_mode, discovery, active_policy) = {
             let cfg = state.config.read().unwrap();
             (
                 cfg.dynamic_model_public_mode,
                 state.dynamic_models.snapshot(),
+                TrafficPromotionPolicy {
+                    min_canary_requests: cfg.dynamic_model_active_min_canary_requests,
+                    min_canary_success_rate_bps: cfg.dynamic_model_active_min_success_rate_bps,
+                    max_canary_empty_output_failures: cfg
+                        .dynamic_model_active_max_empty_output_failures,
+                    max_canary_decode_failures: cfg.dynamic_model_active_max_decode_failures,
+                    max_canary_protocol_failures: cfg.dynamic_model_active_max_protocol_failures,
+                },
             )
         };
         let registry = EffectiveModelRegistry::new(public_mode, discovery.clone());
@@ -558,6 +615,8 @@ impl AdminService {
         {
             Some(model) => {
                 let effectively_public = registry.resolve(model_id).is_ok();
+                let traffic = Self::dynamic_model_traffic_payload(&model);
+                let active_promotion = evaluate_active_promotion(&model, active_policy);
                 Self::ok_response(json!({
                     "id": model.id,
                     "upstream_id": model.upstream_id,
@@ -566,7 +625,8 @@ impl AdminService {
                     "routable": effectively_public,
                     "lifecycle_public": model.public,
                     "lifecycle_routable": model.routable,
-                    "traffic": Self::dynamic_model_traffic_payload(&model),
+                    "traffic": traffic,
+                    "active_promotion": active_promotion,
                 }))
             }
             None => Self::error_response(StatusCode::NOT_FOUND, "dynamic model not found"),
@@ -632,6 +692,7 @@ impl AdminService {
                         model,
                         "dynamic_probe_result",
                         effectively_public,
+                        Self::active_promotion_policy(state),
                     )
                 });
                 Self::ok_response(json!({
@@ -651,7 +712,8 @@ impl AdminService {
     }
 
     pub fn model_promote(state: &AppState, model_id: &str, target: Option<&str>) -> Response {
-        let target_state = match target.unwrap_or("canary") {
+        let requested_target = target.unwrap_or("canary");
+        let target_state = match requested_target {
             "canary" => DiscoveredModelState::Canary,
             "active" => DiscoveredModelState::Active,
             other => {
@@ -661,19 +723,51 @@ impl AdminService {
                 )
             }
         };
+        let promote_active = matches!(target_state, DiscoveredModelState::Active);
+        let active_decision = if promote_active {
+            let Some(model) = state.dynamic_models.get(model_id) else {
+                return Self::error_response(StatusCode::NOT_FOUND, "model not found");
+            };
+            let decision = evaluate_active_promotion(&model, Self::active_promotion_policy(state));
+            if !decision.eligible {
+                return Self::error_response_with_data(
+                    StatusCode::CONFLICT,
+                    "active promotion traffic quorum not met",
+                    json!({
+                        "id": model.id,
+                        "upstream_id": model.upstream_id,
+                        "state": model.state,
+                        "active_promotion": decision,
+                    }),
+                );
+            }
+            Some(decision)
+        } else {
+            None
+        };
         match state.dynamic_models.set_model_state(
             model_id,
             target_state,
-            format!("manual admin promotion to {}", target.unwrap_or("canary")),
+            if promote_active {
+                "canary traffic quorum met; manual admin promotion to active".to_string()
+            } else {
+                format!("manual admin promotion to {requested_target}")
+            },
         ) {
-            Some(model) => Self::ok_response(json!({
-                "id": model.id,
-                "upstream_id": model.upstream_id,
-                "state": model.state,
-                "public": model.public,
-                "routable": model.routable,
-                "reason": model.reason
-            })),
+            Some(model) => {
+                let promotion_decision = active_decision.unwrap_or_else(|| {
+                    evaluate_active_promotion(&model, Self::active_promotion_policy(state))
+                });
+                Self::ok_response(json!({
+                    "id": model.id,
+                    "upstream_id": model.upstream_id,
+                    "state": model.state,
+                    "public": model.public,
+                    "routable": model.routable,
+                    "reason": model.reason,
+                    "active_promotion": promotion_decision
+                }))
+            }
             None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
         }
     }
@@ -1280,6 +1374,13 @@ impl AdminService {
                     "base_url": sanitize_text(&cfg.dynamic_model_probe_base_url),
                     "api_key_configured": cfg.dynamic_model_probe_api_key.is_some(),
                     "max_response_bytes": cfg.dynamic_model_probe_max_response_bytes,
+                },
+                "active_promotion": {
+                    "min_canary_requests": cfg.dynamic_model_active_min_canary_requests,
+                    "min_success_rate_bps": cfg.dynamic_model_active_min_success_rate_bps,
+                    "max_empty_output_failures": cfg.dynamic_model_active_max_empty_output_failures,
+                    "max_decode_failures": cfg.dynamic_model_active_max_decode_failures,
+                    "max_protocol_failures": cfg.dynamic_model_active_max_protocol_failures,
                 }
             },
             "audit": {

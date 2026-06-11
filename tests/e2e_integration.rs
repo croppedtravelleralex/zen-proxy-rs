@@ -1551,13 +1551,145 @@ mod e2e {
             .json(&serde_json::json!({"state": "active"}))
             .send()
             .expect("active promote dynamic model");
-        assert_eq!(active.status(), 200);
+        assert_eq!(active.status(), 409);
+        let active_blocked_body: serde_json::Value = active.json().unwrap();
+        assert_eq!(
+            active_blocked_body["data"]["active_promotion"]["eligible"],
+            false
+        );
 
         let active_detail = reqwest::blocking::get(format!(
             "http://127.0.0.1:{}/v1/models/new-active-only-free",
             port
         ))
         .expect("active detail in active_only mode");
+        assert_eq!(active_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_active_promotion_requires_canary_traffic_quorum() {
+        let (upstream_base, _) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-active-quorum-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19819,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+                ("DYNAMIC_MODEL_ACTIVE_MIN_CANARY_REQUESTS", "2"),
+                ("DYNAMIC_MODEL_ACTIVE_MIN_SUCCESS_RATE_BPS", "10000"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let canary = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "canary"}))
+            .send()
+            .expect("canary promote dynamic model");
+        assert_eq!(canary.status(), 200);
+
+        let premature_active = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "active"}))
+            .send()
+            .expect("premature active promote dynamic model");
+        assert_eq!(premature_active.status(), 409);
+        let premature_body: serde_json::Value = premature_active.json().unwrap();
+        assert_eq!(
+            premature_body["data"]["active_promotion"]["needed_canary_requests"],
+            2
+        );
+
+        for content in ["hello", "hello again"] {
+            let ok_resp = client
+                .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+                .json(&serde_json::json!({
+                    "model": "new-active-quorum-free",
+                    "messages": [{"role": "user", "content": content}],
+                    "stream": false
+                }))
+                .send()
+                .expect("successful dynamic canary request");
+            assert_eq!(ok_resp.status(), 200);
+        }
+
+        let traffic_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/traffic",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic model traffic endpoint");
+        assert_eq!(traffic_resp.status(), 200);
+        let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
+        assert_eq!(traffic_body["data"]["traffic"]["canary_requests_total"], 2);
+        assert_eq!(traffic_body["data"]["active_promotion"]["eligible"], true);
+        assert_eq!(
+            traffic_body["data"]["active_promotion"]["canary_success_rate_bps"],
+            10000
+        );
+
+        let active = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "active"}))
+            .send()
+            .expect("active promote dynamic model after canary traffic");
+        assert_eq!(active.status(), 200);
+        let active_body: serde_json::Value = active.json().unwrap();
+        assert_eq!(active_body["data"]["state"], "active");
+        assert_eq!(active_body["data"]["active_promotion"]["eligible"], true);
+
+        let active_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-active-quorum-free",
+            port
+        ))
+        .expect("active detail in canary_or_active mode");
         assert_eq!(active_detail.status(), 200);
 
         stop_server(child, port);
