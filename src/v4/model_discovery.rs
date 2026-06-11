@@ -171,14 +171,10 @@ impl DynamicModelRegistry {
                     rollback_reason: None,
                     retirement_reason: None,
                 });
-            entry.state = state;
-            entry.reason = reason;
+            merge_seen_model_state(entry, state, reason);
             entry.last_seen_unix = now;
-            entry.probe_required = matches!(entry.state, DiscoveredModelState::Candidate);
-            entry.auto_promoted = false;
-            entry.public = false;
-            entry.routable = false;
             entry.missing_rounds = 0;
+            sync_lifecycle_flags(entry);
         }
 
         for model in merged.values_mut() {
@@ -192,6 +188,7 @@ impl DynamicModelRegistry {
                 model.public = false;
                 model.routable = false;
                 model.missing_rounds = model.missing_rounds.saturating_add(1);
+                sync_lifecycle_flags(model);
             }
         }
 
@@ -231,6 +228,40 @@ impl DynamicModelRegistry {
             .iter()
             .find(|model| model.id == model_id)
             .cloned()
+    }
+
+    pub fn probe_candidates(&self, max_per_round: usize) -> Vec<DiscoveredModel> {
+        if max_per_round == 0 {
+            return Vec::new();
+        }
+
+        let mut models = self
+            .inner
+            .read()
+            .unwrap()
+            .models
+            .iter()
+            .filter(|model| {
+                matches!(model.state, DiscoveredModelState::Candidate)
+                    && model.probe_required
+                    && !model.public
+                    && !model.routable
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        models.sort_by(|a, b| {
+            a.last_probe_unix
+                .unwrap_or_default()
+                .cmp(&b.last_probe_unix.unwrap_or_default())
+                .then_with(|| {
+                    a.consecutive_probe_failures
+                        .cmp(&b.consecutive_probe_failures)
+                })
+                .then_with(|| a.first_seen_unix.cmp(&b.first_seen_unix))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        models.truncate(max_per_round);
+        models
     }
 
     pub fn set_model_state(
@@ -407,6 +438,57 @@ fn now_unix() -> u64 {
         .unwrap_or_default()
 }
 
+fn merge_seen_model_state(
+    model: &mut DiscoveredModel,
+    classified_state: DiscoveredModelState,
+    classified_reason: String,
+) {
+    match classified_state {
+        DiscoveredModelState::Ignored => {
+            model.state = DiscoveredModelState::Ignored;
+            model.reason = classified_reason;
+        }
+        DiscoveredModelState::Candidate => match model.state {
+            DiscoveredModelState::Ignored | DiscoveredModelState::Missing => {
+                model.state = DiscoveredModelState::Candidate;
+                model.reason = classified_reason;
+            }
+            DiscoveredModelState::Candidate => {
+                model.reason = classified_reason;
+            }
+            DiscoveredModelState::ProbePending
+            | DiscoveredModelState::Canary
+            | DiscoveredModelState::Active
+            | DiscoveredModelState::Retired
+            | DiscoveredModelState::Quarantined => {}
+        },
+        DiscoveredModelState::ProbePending
+        | DiscoveredModelState::Canary
+        | DiscoveredModelState::Active
+        | DiscoveredModelState::Missing
+        | DiscoveredModelState::Retired
+        | DiscoveredModelState::Quarantined => {
+            model.state = classified_state;
+            model.reason = classified_reason;
+        }
+    }
+}
+
+fn sync_lifecycle_flags(model: &mut DiscoveredModel) {
+    model.probe_required = matches!(
+        model.state,
+        DiscoveredModelState::Candidate
+            | DiscoveredModelState::ProbePending
+            | DiscoveredModelState::Missing
+    );
+    model.auto_promoted = matches!(
+        model.state,
+        DiscoveredModelState::Canary | DiscoveredModelState::Active
+    );
+    model.public = model.auto_promoted;
+    model.routable = model.public;
+}
+
 fn recompute_counts(snapshot: &mut ModelDiscoverySnapshot) {
     snapshot.discovered_total = snapshot.models.len();
     snapshot.candidate_total = snapshot
@@ -513,6 +595,8 @@ mod tests {
             .update_from_opencode_json(r#"{"data":[{"id":"mimo-v2.5-free"}]}"#)
             .unwrap();
         assert_eq!(recovered.models[0].missing_rounds, 0);
+        assert_eq!(recovered.models[0].state, DiscoveredModelState::Candidate);
+        assert!(recovered.models[0].probe_required);
     }
 
     #[test]
@@ -554,6 +638,134 @@ mod tests {
             retired.retirement_reason.as_deref(),
             Some("missing beyond grace window")
         );
+    }
+
+    #[test]
+    fn discovery_does_not_reset_verified_or_terminal_states() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(
+                r#"{"data":[{"id":"canary-free"},{"id":"active-free"},{"id":"quarantined-free"},{"id":"retired-free"}]}"#,
+            )
+            .unwrap();
+        registry.set_model_state(
+            "canary-free",
+            DiscoveredModelState::Canary,
+            "probe quorum met",
+        );
+        registry.set_model_state(
+            "active-free",
+            DiscoveredModelState::Active,
+            "canary traffic quorum met",
+        );
+        registry.set_model_state(
+            "quarantined-free",
+            DiscoveredModelState::Quarantined,
+            "hard protocol failure",
+        );
+        registry.set_model_state(
+            "retired-free",
+            DiscoveredModelState::Retired,
+            "missing beyond grace window",
+        );
+
+        let refreshed = registry
+            .update_from_opencode_json(
+                r#"{"data":[{"id":"canary-free"},{"id":"active-free"},{"id":"quarantined-free"},{"id":"retired-free"}]}"#,
+            )
+            .unwrap();
+
+        let model = |id: &str| {
+            refreshed
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .expect("model exists")
+        };
+        assert_eq!(model("canary-free").state, DiscoveredModelState::Canary);
+        assert!(model("canary-free").public);
+        assert!(model("canary-free").routable);
+        assert!(!model("canary-free").probe_required);
+
+        assert_eq!(model("active-free").state, DiscoveredModelState::Active);
+        assert!(model("active-free").public);
+        assert!(model("active-free").routable);
+
+        assert_eq!(
+            model("quarantined-free").state,
+            DiscoveredModelState::Quarantined
+        );
+        assert!(!model("quarantined-free").public);
+        assert!(!model("quarantined-free").probe_required);
+
+        assert_eq!(model("retired-free").state, DiscoveredModelState::Retired);
+        assert!(!model("retired-free").public);
+        assert!(!model("retired-free").probe_required);
+    }
+
+    #[test]
+    fn probe_candidates_are_bounded_and_exclude_non_candidate_states() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(
+                r#"{"data":[{"id":"candidate-a-free"},{"id":"candidate-b-free"},{"id":"candidate-c-free"},{"id":"ignored-paid"},{"id":"canary-free"},{"id":"active-free"},{"id":"quarantined-free"}]}"#,
+            )
+            .unwrap();
+        registry.set_model_state(
+            "canary-free",
+            DiscoveredModelState::Canary,
+            "probe quorum met",
+        );
+        registry.set_model_state(
+            "active-free",
+            DiscoveredModelState::Active,
+            "traffic quorum met",
+        );
+        registry.set_model_state(
+            "quarantined-free",
+            DiscoveredModelState::Quarantined,
+            "hard protocol failure",
+        );
+
+        assert!(registry.probe_candidates(0).is_empty());
+        let candidates = registry.probe_candidates(2);
+        let ids = candidates
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["candidate-a-free", "candidate-b-free"]);
+    }
+
+    #[test]
+    fn probe_candidates_prioritize_never_probed_models() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(
+                r#"{"data":[{"id":"already-probed-free"},{"id":"never-probed-free"}]}"#,
+            )
+            .unwrap();
+        registry.record_probe_start("already-probed-free").unwrap();
+        registry
+            .record_probe_failure(
+                "already-probed-free",
+                "provider_empty_output",
+                "empty assistant output",
+            )
+            .unwrap();
+        registry
+            .set_model_state(
+                "already-probed-free",
+                DiscoveredModelState::Candidate,
+                "retry candidate later",
+            )
+            .unwrap();
+
+        let ids = registry
+            .probe_candidates(2)
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["never-probed-free", "already-probed-free"]);
     }
 
     #[test]

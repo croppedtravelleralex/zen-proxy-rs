@@ -298,6 +298,23 @@ mod e2e {
         assert_eq!(probe["requests_per_interval"], 20);
         assert_eq!(probe["success_quorum"], 2);
         assert_eq!(probe["failure_quarantine_threshold"], 3);
+        let runtime_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/runtime", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/runtime endpoint");
+        assert_eq!(runtime_resp.status(), 200);
+        let runtime_body: serde_json::Value = runtime_resp.json().unwrap();
+        let runtime_probe = &runtime_body["data"]["dynamic_model_probe"];
+        assert_eq!(runtime_probe["enabled"], false);
+        assert_eq!(runtime_probe["max_per_round"], 3);
+        assert_eq!(
+            runtime_probe["planned_candidates"]
+                .as_array()
+                .expect("planned candidates array")
+                .len(),
+            0
+        );
         stop_server(child, port);
     }
 
@@ -397,6 +414,8 @@ mod e2e {
                 ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
                 ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_MAX_PER_ROUND", "2"),
             ],
         );
 
@@ -446,6 +465,25 @@ mod e2e {
         assert_eq!(discovery["missing_total"], 0);
         assert_eq!(admin_body["data"]["safety"]["candidates_are_public"], false);
         assert_eq!(admin_body["data"]["safety"]["auto_promote"], false);
+
+        let runtime_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/runtime", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/runtime endpoint");
+        assert_eq!(runtime_resp.status(), 200);
+        let runtime_body: serde_json::Value = runtime_resp.json().unwrap();
+        let planned = runtime_body["data"]["dynamic_model_probe"]["planned_candidates"]
+            .as_array()
+            .expect("planned candidates");
+        let planned_ids = planned
+            .iter()
+            .filter_map(|model| model.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            planned_ids,
+            vec!["deepseek-v4-flash-free", "new-opencode-free"]
+        );
 
         let detail = client
             .get(format!(

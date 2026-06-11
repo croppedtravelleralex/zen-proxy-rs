@@ -240,6 +240,12 @@ impl AdminService {
     pub fn runtime(state: &AppState) -> Response {
         let cfg = state.config.read().unwrap();
         let p = state.pool_manager.pool_stats();
+        let planned_probe_candidates = state
+            .dynamic_models
+            .probe_candidates(cfg.dynamic_model_probe_max_per_round)
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
         Self::ok_response(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
@@ -310,6 +316,7 @@ impl AdminService {
                 "success_quorum": cfg.dynamic_model_probe_success_quorum,
                 "failure_quarantine_threshold": cfg.dynamic_model_probe_failure_quarantine_threshold,
                 "timeout_secs": cfg.dynamic_model_probe_timeout_secs,
+                "planned_candidates": planned_probe_candidates,
             },
             "pools": {
                 "dispatch": p.dispatch_size,

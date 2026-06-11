@@ -176,12 +176,14 @@ async fn model_detail_handler(
 }
 
 async fn discover_dynamic_models_once(state: &AppState) {
-    let (enabled, url, timeout_secs) = {
+    let (enabled, url, timeout_secs, probe_enabled, probe_max_per_round) = {
         let cfg = state.config.read().unwrap();
         (
             cfg.dynamic_model_discovery_enabled,
             cfg.dynamic_model_discovery_url.clone(),
             cfg.probe_connect_timeout_secs.max(1),
+            cfg.dynamic_model_probe_enabled,
+            cfg.dynamic_model_probe_max_per_round,
         )
     };
     if !enabled {
@@ -230,11 +232,21 @@ async fn discover_dynamic_models_once(state: &AppState) {
     };
 
     match state.dynamic_models.update_from_opencode_json(&body) {
-        Ok(snapshot) => tracing::info!(
-            candidates = snapshot.candidate_total,
-            ignored = snapshot.ignored_total,
-            "dynamic model discovery updated candidate registry"
-        ),
+        Ok(snapshot) => {
+            tracing::info!(
+                candidates = snapshot.candidate_total,
+                ignored = snapshot.ignored_total,
+                "dynamic model discovery updated candidate registry"
+            );
+            if probe_enabled {
+                let planned = state.dynamic_models.probe_candidates(probe_max_per_round);
+                tracing::info!(
+                    planned = planned.len(),
+                    max_per_round = probe_max_per_round,
+                    "dynamic model probe scheduler selected candidate batch; real probe adapter disabled in this slice"
+                );
+            }
+        }
         Err(err) => state.dynamic_models.record_error(err),
     }
 }
