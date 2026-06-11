@@ -214,7 +214,16 @@ fn start_mock_models(body: serde_json::Value) -> String {
     format!("http://{addr}/v1/models")
 }
 
-fn start_mock_probe_base() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+#[derive(Debug, Clone)]
+struct MockProbeResponse {
+    status: axum::http::StatusCode,
+    content_type: &'static str,
+    body: &'static str,
+}
+
+fn start_mock_probe_base_with_overrides(
+    overrides: Vec<(&'static str, MockProbeResponse)>,
+) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::response::IntoResponse;
@@ -222,32 +231,61 @@ fn start_mock_probe_base() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
     use axum::{Json, Router};
 
     let observed = Arc::new(Mutex::new(Vec::new()));
+    let overrides = Arc::new(overrides);
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = std_listener.local_addr().unwrap();
     std_listener.set_nonblocking(true).unwrap();
 
     std::thread::spawn({
         let observed = observed.clone();
+        let overrides = overrides.clone();
         move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
+                type ProbeState = (
+                    Arc<Mutex<Vec<serde_json::Value>>>,
+                    Arc<Vec<(&'static str, MockProbeResponse)>>,
+                );
+
+                fn override_response(
+                    probe: &str,
+                    overrides: &Arc<Vec<(&'static str, MockProbeResponse)>>,
+                ) -> Option<axum::response::Response> {
+                    overrides
+                        .iter()
+                        .find(|(name, _)| *name == probe)
+                        .map(|(_, response)| {
+                            (
+                                response.status,
+                                [("content-type", response.content_type)],
+                                response.body,
+                            )
+                                .into_response()
+                        })
+                }
+
                 async fn openai_handler(
-                    State(observed): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                    State((observed, overrides)): State<ProbeState>,
                     headers: HeaderMap,
                     Json(body): Json<serde_json::Value>,
                 ) -> impl IntoResponse {
+                    let probe = headers
+                        .get("x-zen-model-probe")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
                     observed.lock().unwrap().push(serde_json::json!({
                         "path": "/v1/chat/completions",
-                        "probe": headers
-                            .get("x-zen-model-probe")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default(),
+                        "probe": probe,
                         "client": headers
                             .get("x-fmc-client")
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or_default(),
                         "body": body,
                     }));
+                    if let Some(response) = override_response(&probe, &overrides) {
+                        return response;
+                    }
                     if body
                         .get("stream")
                         .and_then(|value| value.as_bool())
@@ -266,18 +304,23 @@ fn start_mock_probe_base() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
                 }
 
                 async fn anthropic_handler(
-                    State(observed): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                    State((observed, overrides)): State<ProbeState>,
                     headers: HeaderMap,
                     Json(body): Json<serde_json::Value>,
                 ) -> impl IntoResponse {
+                    let probe = headers
+                        .get("x-zen-model-probe")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
                     observed.lock().unwrap().push(serde_json::json!({
                         "path": "/v1/messages",
-                        "probe": headers
-                            .get("x-zen-model-probe")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default(),
+                        "probe": probe,
                         "body": body,
                     }));
+                    if let Some(response) = override_response(&probe, &overrides) {
+                        return response;
+                    }
                     if body
                         .get("stream")
                         .and_then(|value| value.as_bool())
@@ -298,7 +341,7 @@ fn start_mock_probe_base() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
                 let app = Router::new()
                     .route("/v1/chat/completions", post(openai_handler))
                     .route("/v1/messages", post(anthropic_handler))
-                    .with_state(observed);
+                    .with_state((observed, overrides));
                 let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
                 axum::serve(listener, app).await.unwrap();
             });
@@ -306,6 +349,10 @@ fn start_mock_probe_base() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
     });
 
     (format!("http://{addr}"), observed)
+}
+
+fn start_mock_probe_base() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    start_mock_probe_base_with_overrides(Vec::new())
 }
 
 #[cfg(test)]
@@ -1030,6 +1077,150 @@ mod e2e {
                 && item["body"]["messages"][2]["tool_call_id"] == "call_probe_1"
         }));
         drop(seen);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_http_bounded_probe_quarantines_protocol_failure() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-http-bad-tool-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (probe_base, _observed) = start_mock_probe_base_with_overrides(vec![(
+            "tool_history_minimal",
+            MockProbeResponse {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                content_type: "application/json",
+                body: r#"{"error":{"message":"messages[2]: missing field tool_call_id"}}"#,
+            },
+        )]);
+        let (child, port) = start_server_with_env(
+            19811,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PROBE_BASE_URL", probe_base.as_str()),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probes_body = loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-http-bad-tool-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "quarantined" {
+                    break body;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("http_bounded hard protocol failure did not quarantine before deadline");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(
+            probes_body["data"]["last_probe_name"],
+            "tool_history_minimal"
+        );
+        assert_eq!(
+            probes_body["data"]["last_failure_code"],
+            "probe_hard_protocol_error"
+        );
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 6);
+        assert_eq!(probes_body["data"]["probe_failure_total"], 1);
+        assert_eq!(probes_body["data"]["public"], false);
+        assert_eq!(probes_body["data"]["routable"], false);
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert!(!public_ids.contains(&"new-http-bad-tool-free"));
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_http_bounded_probe_missing_base_url_keeps_candidate_hidden() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-http-missing-base-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19812,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probes_body = loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-http-missing-base-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "candidate" {
+                    break body;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not expose candidate probe state before deadline");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 0);
+        assert_eq!(probes_body["data"]["public"], false);
+        assert_eq!(probes_body["data"]["routable"], false);
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]
+        );
 
         stop_server(child, port);
     }

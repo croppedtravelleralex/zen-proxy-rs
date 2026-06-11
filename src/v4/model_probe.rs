@@ -1055,6 +1055,51 @@ mod tests {
     }
 
     #[test]
+    fn http_adapter_hard_fails_invalid_openai_sse() {
+        let registry = registry_with_models();
+        let model = registry.get("good-free").unwrap();
+        let transport = RecordingHttpTransport::new(ProbeHttpResponse {
+            status: 200,
+            content_type: Some("text/event-stream".to_string()),
+            body: "data: {not-json}\n\n".to_string(),
+        });
+        let adapter = BoundedHttpProbeAdapter::new(http_probe_config(), transport);
+
+        match adapter.run_probe(&model, "openai_stream_minimal") {
+            ModelProbeOutcome::Failed(failure) => {
+                assert_eq!(failure.probe_name.as_deref(), Some("openai_stream_minimal"));
+                assert_eq!(failure.code, "probe_invalid_openai_sse");
+                assert!(failure.hard_protocol_failure);
+            }
+            ModelProbeOutcome::Passed => panic!("invalid SSE must hard fail"),
+        }
+    }
+
+    #[test]
+    fn http_adapter_soft_fails_empty_openai_output() {
+        let registry = registry_with_models();
+        let model = registry.get("good-free").unwrap();
+        let transport = RecordingHttpTransport::new(ProbeHttpResponse {
+            status: 200,
+            content_type: Some("application/json".to_string()),
+            body: r#"{"choices":[{"message":{"role":"assistant","content":""}}]}"#.to_string(),
+        });
+        let adapter = BoundedHttpProbeAdapter::new(http_probe_config(), transport);
+
+        match adapter.run_probe(&model, "openai_nonstream_minimal") {
+            ModelProbeOutcome::Failed(failure) => {
+                assert_eq!(
+                    failure.probe_name.as_deref(),
+                    Some("openai_nonstream_minimal")
+                );
+                assert_eq!(failure.code, "provider_empty_output");
+                assert!(!failure.hard_protocol_failure);
+            }
+            ModelProbeOutcome::Passed => panic!("empty output must soft fail"),
+        }
+    }
+
+    #[test]
     fn http_adapter_hard_fails_provider_protocol_errors() {
         let registry = registry_with_models();
         let model = registry.get("good-free").unwrap();
