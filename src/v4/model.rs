@@ -7,17 +7,58 @@ use crate::v4::model_discovery::{DiscoveredModel, DiscoveredModelState, ModelDis
 pub struct ModelInfo {
     pub id: String,
     pub upstream_id: String,
+    pub compatibility_profile: ModelCompatibilityProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelResolution {
     pub public_model: String,
     pub upstream_model: String,
+    pub compatibility_profile: ModelCompatibilityProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
     UnknownModel(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCompatibilityProfile {
+    StaticFlash,
+    StaticFlashLite,
+    DynamicGeneric,
+    DynamicClaudeCodeCompatible,
+    DynamicRestricted,
+}
+
+impl ModelCompatibilityProfile {
+    pub fn for_static(public_model: &str) -> Option<Self> {
+        match public_model {
+            "deepseek-v4-flash" => Some(Self::StaticFlash),
+            "deepseek-v4-flash-lite" => Some(Self::StaticFlashLite),
+            _ => None,
+        }
+    }
+
+    pub fn for_dynamic(model: &DiscoveredModel) -> Self {
+        match model.state {
+            DiscoveredModelState::Quarantined | DiscoveredModelState::Retired => {
+                Self::DynamicRestricted
+            }
+            _ => Self::DynamicGeneric,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StaticFlash => "static_flash",
+            Self::StaticFlashLite => "static_flash_lite",
+            Self::DynamicGeneric => "dynamic_generic",
+            Self::DynamicClaudeCodeCompatible => "dynamic_claudecode_compatible",
+            Self::DynamicRestricted => "dynamic_restricted",
+        }
+    }
 }
 
 pub trait ModelRegistry: Send + Sync {
@@ -42,6 +83,8 @@ impl ModelRegistry for StaticModelRegistry {
             .map(|(public, upstream)| ModelInfo {
                 id: (*public).to_string(),
                 upstream_id: (*upstream).to_string(),
+                compatibility_profile: ModelCompatibilityProfile::for_static(public)
+                    .expect("static model must have a compatibility profile"),
             })
             .collect()
     }
@@ -53,6 +96,8 @@ impl ModelRegistry for StaticModelRegistry {
             .map(|(public, upstream)| ModelResolution {
                 public_model: (*public).to_string(),
                 upstream_model: (*upstream).to_string(),
+                compatibility_profile: ModelCompatibilityProfile::for_static(public)
+                    .expect("static model must have a compatibility profile"),
             })
             .ok_or_else(|| ModelError::UnknownModel(public_model.to_string()))
     }
@@ -113,6 +158,7 @@ impl ModelRegistry for EffectiveModelRegistry {
             models.push(ModelInfo {
                 id: dynamic.id.clone(),
                 upstream_id: dynamic.upstream_id.clone(),
+                compatibility_profile: ModelCompatibilityProfile::for_dynamic(dynamic),
             });
         }
         models
@@ -127,6 +173,7 @@ impl ModelRegistry for EffectiveModelRegistry {
             .map(|model| ModelResolution {
                 public_model: model.id.clone(),
                 upstream_model: model.upstream_id.clone(),
+                compatibility_profile: ModelCompatibilityProfile::for_dynamic(model),
             })
             .ok_or_else(|| ModelError::UnknownModel(public_model.to_string()))
     }
@@ -160,10 +207,24 @@ mod tests {
         );
         assert_eq!(
             registry
+                .resolve("deepseek-v4-flash")
+                .unwrap()
+                .compatibility_profile,
+            ModelCompatibilityProfile::StaticFlash
+        );
+        assert_eq!(
+            registry
                 .resolve("deepseek-v4-flash-lite")
                 .unwrap()
                 .upstream_model,
             "big-pickle"
+        );
+        assert_eq!(
+            registry
+                .resolve("deepseek-v4-flash-lite")
+                .unwrap()
+                .compatibility_profile,
+            ModelCompatibilityProfile::StaticFlashLite
         );
     }
 
@@ -266,6 +327,13 @@ mod tests {
             ]
         );
         assert!(registry.resolve("new-candidate-free").is_ok());
+        assert_eq!(
+            registry
+                .resolve("new-candidate-free")
+                .unwrap()
+                .compatibility_profile,
+            ModelCompatibilityProfile::DynamicGeneric
+        );
         assert!(registry.resolve("paid-model").is_err());
     }
 

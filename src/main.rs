@@ -145,7 +145,8 @@ async fn model_detail_handler(
                 "id": model.public_model,
                 "object": "model",
                 "owned_by": "deepseek",
-                "upstream_id": model.upstream_model
+                "upstream_id": model.upstream_model,
+                "profile": model.compatibility_profile.as_str()
             }),
             Err(_) => {
                 return Err((

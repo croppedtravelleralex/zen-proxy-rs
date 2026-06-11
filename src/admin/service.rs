@@ -8,7 +8,7 @@ use crate::collector::RequestFilter;
 use crate::ledger::{sanitize_json_value, sanitize_text};
 
 use crate::state::AppState;
-use crate::v4::model::{EffectiveModelRegistry, ModelRegistry};
+use crate::v4::model::{EffectiveModelRegistry, ModelCompatibilityProfile, ModelRegistry};
 use crate::v4::model_discovery::{DiscoveredModel, DiscoveredModelState};
 use crate::v4::model_probe::{ModelProbeRunSummary, REQUIRED_PROBE_NAMES};
 use crate::v4::model_probe_runner::{
@@ -361,6 +361,7 @@ impl AdminService {
                     json!({
                         "id": model.id,
                         "upstream_id": model.upstream_id,
+                        "profile": model.compatibility_profile.as_str(),
                         "owned_by": "deepseek",
                         "endpoints": ["openai_chat_completions", "anthropic_messages"]
                     })
@@ -429,6 +430,7 @@ impl AdminService {
                 Ok(resolved) => Self::ok_response(json!({
                     "id": resolved.public_model,
                     "upstream_id": resolved.upstream_model,
+                    "profile": resolved.compatibility_profile.as_str(),
                     "mode": "v4",
                     "endpoints": ["openai_chat_completions", "anthropic_messages"]
                 })),
@@ -473,6 +475,7 @@ impl AdminService {
             "upstream_id": model.upstream_id,
             "mode": mode,
             "state": model.state,
+            "profile": ModelCompatibilityProfile::for_dynamic(&model).as_str(),
             "reason": model.reason,
             "probe_required": model.probe_required,
             "auto_promoted": model.auto_promoted,

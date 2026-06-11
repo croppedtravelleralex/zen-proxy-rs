@@ -888,6 +888,7 @@ mod e2e {
         let detail_body: serde_json::Value = detail.json().unwrap();
         assert_eq!(detail_body["id"], "new-candidate-direct-free");
         assert_eq!(detail_body["upstream_id"], "new-candidate-direct-free");
+        assert_eq!(detail_body["profile"], "dynamic_generic");
         let admin_detail = client
             .get(format!(
                 "http://127.0.0.1:{}/admin/models/new-candidate-direct-free",
@@ -903,11 +904,80 @@ mod e2e {
         assert_eq!(admin_detail_body["data"]["auto_promoted"], false);
         assert_eq!(admin_detail_body["data"]["public"], true);
         assert_eq!(admin_detail_body["data"]["lifecycle_public"], false);
+        assert_eq!(admin_detail_body["data"]["profile"], "dynamic_generic");
 
         let paid_detail =
             reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/paid-model", port))
                 .expect("ignored model detail");
         assert_eq!(paid_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_candidate_public_mode_does_not_inherit_client_specific_profile() {
+        let (upstream_base, observed) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-profile-gated-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19816,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"Task","parameters":{"type":"object","properties":{}}}}
+        ]);
+        let response = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "openclaw")
+            .json(&serde_json::json!({
+                "model": "new-profile-gated-free",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools,
+                "stream": false
+            }))
+            .send()
+            .expect("dynamic candidate profile-gated request");
+        assert_eq!(response.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["model"], "new-profile-gated-free");
+        assert!(seen[0]["body"]["thinking"].is_null());
 
         stop_server(child, port);
     }

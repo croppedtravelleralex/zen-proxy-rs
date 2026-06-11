@@ -24,7 +24,9 @@ use crate::ledger::LedgerEvent;
 use crate::pool::{body_size_bucket, DispatchError, ErrorKind, RequestMeta, ResultKind};
 use crate::state::AppState;
 use crate::v4::context;
-use crate::v4::model::{EffectiveModelRegistry, ModelError, ModelRegistry};
+use crate::v4::model::{
+    EffectiveModelRegistry, ModelCompatibilityProfile, ModelError, ModelRegistry,
+};
 use crate::v4::protocol_guard::{self, GuardPhase};
 
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -176,6 +178,7 @@ pub async fn handle_v4_proxy(
         UpstreamCallContext {
             public_model: &public_model,
             upstream_model: &resolved.upstream_model,
+            compatibility_profile: resolved.compatibility_profile,
             source_client: &source_client,
         },
     )
@@ -667,14 +670,57 @@ fn normalize_source_client(value: &str) -> String {
     }
 }
 
-fn profile_for_openai_request(source_client: &str, request: &ChatRequest) -> ClientProfile {
-    profile_from_source_client(source_client)
+fn profile_for_openai_request(
+    source_client: &str,
+    request: &ChatRequest,
+    compatibility_profile: ModelCompatibilityProfile,
+) -> ClientProfile {
+    let observed = profile_from_source_client(source_client)
         .unwrap_or_else(|| ClientProfile::from_openai(&HeaderMap::new(), request))
+        .effective_for_model(&request.model);
+    apply_model_compatibility_profile(observed, compatibility_profile)
 }
 
-fn profile_for_anthropic_request(source_client: &str, request: &AnthropicRequest) -> ClientProfile {
-    profile_from_source_client(source_client)
+fn profile_for_anthropic_request(
+    source_client: &str,
+    request: &AnthropicRequest,
+    compatibility_profile: ModelCompatibilityProfile,
+) -> ClientProfile {
+    let observed = profile_from_source_client(source_client)
         .unwrap_or_else(|| ClientProfile::from_anthropic(&HeaderMap::new(), request))
+        .effective_for_model(&request.model);
+    apply_model_compatibility_profile(observed, compatibility_profile)
+}
+
+fn apply_model_compatibility_profile(
+    profile: ClientProfile,
+    compatibility_profile: ModelCompatibilityProfile,
+) -> ClientProfile {
+    match compatibility_profile {
+        ModelCompatibilityProfile::StaticFlash => {
+            if matches!(profile.kind, ClientKind::Hermes | ClientKind::OpenClaw) {
+                ClientProfile::unknown()
+            } else {
+                profile
+            }
+        }
+        ModelCompatibilityProfile::StaticFlashLite => {
+            if matches!(profile.kind, ClientKind::ClaudeCode) {
+                ClientProfile::unknown()
+            } else {
+                profile
+            }
+        }
+        ModelCompatibilityProfile::DynamicClaudeCodeCompatible => {
+            if matches!(profile.kind, ClientKind::ClaudeCode) {
+                profile
+            } else {
+                ClientProfile::unknown()
+            }
+        }
+        ModelCompatibilityProfile::DynamicGeneric
+        | ModelCompatibilityProfile::DynamicRestricted => ClientProfile::unknown(),
+    }
 }
 
 fn profile_from_source_client(source_client: &str) -> Option<ClientProfile> {
@@ -752,6 +798,7 @@ struct V4CallError {
 struct UpstreamCallContext<'a> {
     public_model: &'a str,
     upstream_model: &'a str,
+    compatibility_profile: ModelCompatibilityProfile,
     source_client: &'a str,
 }
 
@@ -818,6 +865,7 @@ async fn call_with_retry(
 ) -> Result<V4CallResult, V4CallError> {
     let public_model = call_context.public_model;
     let upstream_model = call_context.upstream_model;
+    let compatibility_profile = call_context.compatibility_profile;
     let source_client = call_context.source_client;
     let base_max = conf.pool_max_retries;
     let empty_upstream_max = conf.v4_empty_upstream_max_retries.max(base_max);
@@ -870,7 +918,8 @@ async fn call_with_retry(
                             format!("invalid OpenAI chat request: {err}"),
                         )
                     })?;
-                let profile = profile_for_openai_request(source_client, &request);
+                let profile =
+                    profile_for_openai_request(source_client, &request, compatibility_profile);
                 kernel
                     .openai_chat_with_profile(&dispatch_result.client, request, profile)
                     .await
@@ -883,7 +932,8 @@ async fn call_with_retry(
                             format!("invalid Anthropic messages request: {err}"),
                         )
                     })?;
-                let profile = profile_for_anthropic_request(source_client, &request);
+                let profile =
+                    profile_for_anthropic_request(source_client, &request, compatibility_profile);
                 kernel
                     .anthropic_messages_with_profile(&dispatch_result.client, request, profile)
                     .await
