@@ -186,6 +186,7 @@ pub async fn handle_anthropic_messages(
         tool_choice,
     };
     let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
+    super::prune_null_optional_upstream_fields(&mut zb);
     let probe_max_tokens = translate::claude_code_low_budget_tool_probe_max_tokens(
         &cr,
         profile.kind == ClientKind::ClaudeCode,

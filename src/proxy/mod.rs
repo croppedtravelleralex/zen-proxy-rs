@@ -118,6 +118,17 @@ pub(crate) fn apply_initial_thinking_policy(
     }
 }
 
+pub(crate) fn prune_null_optional_upstream_fields(body: &mut serde_json::Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    for key in ["tools", "tool_choice"] {
+        if object.get(key).is_some_and(Value::is_null) {
+            object.remove(key);
+        }
+    }
+}
+
 fn is_forced_tool_choice(tool_choice: Option<&serde_json::Value>) -> bool {
     let Some(choice) = tool_choice else {
         return false;

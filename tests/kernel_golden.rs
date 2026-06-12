@@ -26,6 +26,7 @@ struct ObservedRequest {
     extra_header: Option<String>,
     model: Option<String>,
     messages: Option<Value>,
+    tools: Option<Value>,
     tool_choice: Option<Value>,
     thinking: Option<Value>,
     max_tokens_present: bool,
@@ -51,6 +52,7 @@ async fn mock_zen_handler(
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned),
         messages: body.get("messages").cloned(),
+        tools: body.get("tools").cloned(),
         tool_choice: body.get("tool_choice").cloned(),
         thinking: body.get("thinking").cloned(),
         max_tokens_present: body.get("max_tokens").is_some(),
@@ -1960,6 +1962,20 @@ async fn openai_tool_choice_is_forwarded_to_upstream() {
 }
 
 #[tokio::test]
+async fn openai_no_tools_omits_null_tool_choice_before_upstream() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let req = chat_request("north-mini-code-free", "only output OK", false, None);
+
+    let response = kernel.openai_chat(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sent = observed.requests.lock().unwrap();
+    assert!(sent[0].tools.is_none());
+    assert!(sent[0].tool_choice.is_none());
+}
+
+#[tokio::test]
 async fn claude_code_tools_do_not_disable_thinking() {
     let (config, client, observed) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -2221,6 +2237,20 @@ async fn anthropic_tool_choice_is_translated_to_openai_function_choice() {
         Some(&json!({"type":"function","function":{"name":"Task"}}))
     );
     assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+}
+
+#[tokio::test]
+async fn anthropic_no_tools_omits_null_tool_choice_before_upstream() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let req = anthropic_request("north-mini-code-free", "only output OK", false);
+
+    let response = kernel.anthropic_messages(&client, req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sent = observed.requests.lock().unwrap();
+    assert!(sent[0].tools.is_none());
+    assert!(sent[0].tool_choice.is_none());
 }
 
 #[test]
