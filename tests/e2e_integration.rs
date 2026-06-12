@@ -910,6 +910,88 @@ mod e2e {
     }
 
     #[test]
+    fn test_dynamic_public_allowlist_filters_test_channel_models() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "mimo-v2.5-free"},
+                {"id": "nemotron-3-ultra-free"},
+                {"id": "north-mini-code-free"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19809,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+                (
+                    "DYNAMIC_MODEL_PUBLIC_ALLOWLIST",
+                    "mimo-v2.5,nemotron-3-ultra-free",
+                ),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 3
+            {
+                assert_eq!(
+                    body["data"]["safety"]["dynamic_model_public_allowlist"],
+                    serde_json::json!(["mimo-v2.5", "nemotron-3-ultra-free"])
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "mimo-v2.5",
+                "nemotron-3-ultra"
+            ]
+        );
+
+        let blocked_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/north-mini-code",
+            port
+        ))
+        .expect("filtered model detail");
+        assert_eq!(blocked_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
     fn test_dynamic_candidate_public_mode_does_not_inherit_client_specific_profile() {
         let (upstream_base, observed) = start_mock_zen();
         let discovery_url = start_mock_models(serde_json::json!({

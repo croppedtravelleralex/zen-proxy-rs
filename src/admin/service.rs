@@ -381,15 +381,20 @@ impl AdminService {
             let cfg = state.config.read().unwrap();
             cfg.v4_model_registry_active()
         };
-        let (discovery, public_mode) = {
+        let (discovery, public_mode, public_allowlist) = {
             let cfg = state.config.read().unwrap();
             (
                 state.dynamic_models.snapshot(),
                 cfg.dynamic_model_public_mode,
+                cfg.dynamic_model_public_allowlist.clone(),
             )
         };
         if v4_model_registry_active {
-            let registry = EffectiveModelRegistry::new(public_mode, discovery.clone());
+            let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+                public_mode,
+                discovery.clone(),
+                public_allowlist.clone(),
+            );
             let models: Vec<Value> = registry
                 .public_models()
                 .into_iter()
@@ -409,6 +414,7 @@ impl AdminService {
                 "dynamic_discovery": discovery,
                 "safety": {
                     "dynamic_model_public_mode": public_mode.to_string(),
+                    "dynamic_model_public_allowlist": public_allowlist,
                     "candidates_are_public": public_mode.exposes_candidates(),
                     "auto_promote": false,
                     "public_models_source": "effective_registry"
@@ -437,11 +443,12 @@ impl AdminService {
             cfg.v4_model_registry_active()
         };
         if v4_model_registry_active {
-            let (public_mode, discovery) = {
+            let (public_mode, discovery, public_allowlist) = {
                 let cfg = state.config.read().unwrap();
                 (
                     cfg.dynamic_model_public_mode,
                     state.dynamic_models.snapshot(),
+                    cfg.dynamic_model_public_allowlist.clone(),
                 )
             };
             let dynamic_model = discovery
@@ -449,7 +456,11 @@ impl AdminService {
                 .iter()
                 .find(|model| model.id == model_id)
                 .cloned();
-            let registry = EffectiveModelRegistry::new(public_mode, discovery);
+            let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+                public_mode,
+                discovery,
+                public_allowlist,
+            );
             if let Some(model) = dynamic_model {
                 let effectively_public = Self::is_effectively_public_dynamic(&registry, &model);
                 return Self::ok_response(Self::dynamic_model_detail_payload(
@@ -595,10 +606,11 @@ impl AdminService {
     }
 
     pub fn model_traffic(state: &AppState, model_id: &str) -> Response {
-        let (public_mode, discovery, active_policy) = {
+        let (public_mode, public_allowlist, discovery, active_policy) = {
             let cfg = state.config.read().unwrap();
             (
                 cfg.dynamic_model_public_mode,
+                cfg.dynamic_model_public_allowlist.clone(),
                 state.dynamic_models.snapshot(),
                 TrafficPromotionPolicy {
                     min_canary_requests: cfg.dynamic_model_active_min_canary_requests,
@@ -610,7 +622,11 @@ impl AdminService {
                 },
             )
         };
-        let registry = EffectiveModelRegistry::new(public_mode, discovery.clone());
+        let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+            public_mode,
+            discovery.clone(),
+            public_allowlist,
+        );
         match discovery
             .models
             .into_iter()
@@ -690,14 +706,19 @@ impl AdminService {
         match result {
             Ok(summary) => {
                 let current = state.dynamic_models.get(&summary.model_id).map(|model| {
-                    let (public_mode, discovery) = {
+                    let (public_mode, public_allowlist, discovery) = {
                         let cfg = state.config.read().unwrap();
                         (
                             cfg.dynamic_model_public_mode,
+                            cfg.dynamic_model_public_allowlist.clone(),
                             state.dynamic_models.snapshot(),
                         )
                     };
-                    let registry = EffectiveModelRegistry::new(public_mode, discovery);
+                    let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+                        public_mode,
+                        discovery,
+                        public_allowlist,
+                    );
                     let effectively_public = Self::is_effectively_public_dynamic(&registry, &model);
                     Self::dynamic_model_detail_payload(
                         model,
@@ -1382,6 +1403,7 @@ impl AdminService {
                 "url": sanitize_text(&cfg.dynamic_model_discovery_url),
                 "interval_secs": cfg.dynamic_model_discovery_interval_secs,
                 "public_mode": cfg.dynamic_model_public_mode.to_string(),
+                "public_allowlist": cfg.dynamic_model_public_allowlist.clone(),
                 "auto_promote": false,
                 "probe": {
                     "enabled": cfg.dynamic_model_probe_enabled,

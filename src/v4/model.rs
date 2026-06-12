@@ -114,24 +114,36 @@ impl ModelRegistry for StaticModelRegistry {
 pub struct EffectiveModelRegistry {
     public_mode: DynamicModelPublicMode,
     discovery: ModelDiscoverySnapshot,
+    dynamic_public_allowlist: Vec<String>,
 }
 
 impl EffectiveModelRegistry {
     pub fn new(public_mode: DynamicModelPublicMode, discovery: ModelDiscoverySnapshot) -> Self {
+        Self::with_dynamic_public_allowlist(public_mode, discovery, Vec::new())
+    }
+
+    pub fn with_dynamic_public_allowlist(
+        public_mode: DynamicModelPublicMode,
+        discovery: ModelDiscoverySnapshot,
+        dynamic_public_allowlist: Vec<String>,
+    ) -> Self {
         Self {
             public_mode,
             discovery,
+            dynamic_public_allowlist: dedupe_allowlist(dynamic_public_allowlist),
         }
     }
 
     pub fn is_dynamic_public(&self, model: &DiscoveredModel) -> bool {
+        let Some(public_alias) = dynamic_public_alias(&model.id) else {
+            return false;
+        };
         if StaticModelRegistry::is_reserved_public_or_upstream(&model.id)
             || StaticModelRegistry::is_reserved_public_or_upstream(&model.upstream_id)
-            || dynamic_public_alias(&model.id).is_none()
         {
             return false;
         }
-        match self.public_mode {
+        let mode_allows = match self.public_mode {
             DynamicModelPublicMode::StaticOnly => false,
             DynamicModelPublicMode::CandidateCanaryOrActive => {
                 matches!(
@@ -150,7 +162,18 @@ impl EffectiveModelRegistry {
             DynamicModelPublicMode::ActiveOnly => {
                 matches!(model.state, DiscoveredModelState::Active)
             }
-        }
+        };
+        mode_allows && self.dynamic_public_allowlist_allows(model, &public_alias)
+    }
+
+    fn dynamic_public_allowlist_allows(&self, model: &DiscoveredModel, public_alias: &str) -> bool {
+        self.dynamic_public_allowlist.is_empty()
+            || self.dynamic_public_allowlist.iter().any(|allowed| {
+                allowed == public_alias
+                    || allowed == &model.id
+                    || allowed == &model.upstream_id
+                    || dynamic_public_alias(allowed).as_deref() == Some(public_alias)
+            })
     }
 
     fn public_dynamic_models(&self) -> impl Iterator<Item = &DiscoveredModel> {
@@ -205,6 +228,16 @@ fn dynamic_public_alias(upstream_id: &str) -> Option<String> {
         .strip_suffix("-free")
         .filter(|alias| !alias.is_empty())
         .map(str::to_string)
+}
+
+fn dedupe_allowlist(items: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for item in items.into_iter().map(|item| item.trim().to_string()) {
+        if !item.is_empty() && !deduped.contains(&item) {
+            deduped.push(item);
+        }
+    }
+    deduped
 }
 
 #[cfg(test)]
@@ -444,5 +477,68 @@ mod tests {
         assert!(registry.resolve("mimo-v2.5-free").is_err());
         assert!(registry.resolve("deepseek-v4-flash-free").is_err());
         assert!(registry.resolve("big-pickle").is_err());
+    }
+
+    #[test]
+    fn effective_registry_dynamic_allowlist_filters_public_models_and_resolve() {
+        let discovery = DynamicModelRegistry::new(true, "url".into());
+        discovery
+            .update_from_opencode_json(
+                r#"{"data":[{"id":"mimo-v2.5-free"},{"id":"nemotron-3-ultra-free"},{"id":"north-mini-code-free"}]}"#,
+            )
+            .unwrap();
+        let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+            DynamicModelPublicMode::CandidateCanaryOrActive,
+            discovery.snapshot(),
+            vec!["mimo-v2.5".into(), "nemotron-3-ultra-free".into()],
+        );
+        let ids: Vec<String> = registry
+            .public_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "mimo-v2.5",
+                "nemotron-3-ultra"
+            ]
+        );
+        assert_eq!(
+            registry.resolve("nemotron-3-ultra").unwrap().upstream_model,
+            "nemotron-3-ultra-free"
+        );
+        assert!(registry.resolve("north-mini-code").is_err());
+    }
+
+    #[test]
+    fn effective_registry_empty_dynamic_allowlist_preserves_existing_behavior() {
+        let discovery = DynamicModelRegistry::new(true, "url".into());
+        discovery
+            .update_from_opencode_json(
+                r#"{"data":[{"id":"mimo-v2.5-free"},{"id":"nemotron-3-ultra-free"}]}"#,
+            )
+            .unwrap();
+        let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+            DynamicModelPublicMode::CandidateCanaryOrActive,
+            discovery.snapshot(),
+            Vec::new(),
+        );
+        let ids: Vec<String> = registry
+            .public_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-lite",
+                "mimo-v2.5",
+                "nemotron-3-ultra"
+            ]
+        );
     }
 }

@@ -116,9 +116,10 @@ pub async fn handle_v4_proxy(
         effective_body_size = context_telemetry.effective_body_bytes,
         "v4 ingress request"
     );
-    let registry = EffectiveModelRegistry::new(
+    let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
         conf.dynamic_model_public_mode,
         state.dynamic_models.snapshot(),
+        conf.dynamic_model_public_allowlist.clone(),
     );
     let resolved = match registry.resolve(&public_model) {
         Ok(resolved) => resolved,
@@ -382,8 +383,12 @@ fn record_dynamic_model_traffic(
     failure_message: &str,
 ) {
     let model_id = {
-        let public_mode = state.config.read().unwrap().dynamic_model_public_mode;
-        let registry = EffectiveModelRegistry::new(public_mode, state.dynamic_models.snapshot());
+        let cfg = state.config.read().unwrap();
+        let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+            cfg.dynamic_model_public_mode,
+            state.dynamic_models.snapshot(),
+            cfg.dynamic_model_public_allowlist.clone(),
+        );
         registry
             .resolve(public_model)
             .map(|resolved| resolved.upstream_model)

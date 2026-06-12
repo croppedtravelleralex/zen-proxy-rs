@@ -364,6 +364,7 @@ pub struct Config {
     pub dynamic_model_discovery_url: String,
     pub dynamic_model_discovery_interval_secs: u64,
     pub dynamic_model_public_mode: DynamicModelPublicMode,
+    pub dynamic_model_public_allowlist: Vec<String>,
     pub dynamic_model_probe_enabled: bool,
     pub dynamic_model_probe_adapter_mode: DynamicModelProbeAdapterMode,
     pub dynamic_model_probe_max_concurrent: usize,
@@ -535,6 +536,7 @@ impl Config {
                 "DYNAMIC_MODEL_PUBLIC_MODE",
                 DynamicModelPublicMode::StaticOnly,
             ),
+            dynamic_model_public_allowlist: parse_csv_list_env("DYNAMIC_MODEL_PUBLIC_ALLOWLIST"),
             dynamic_model_probe_enabled: load_env_var("DYNAMIC_MODEL_PROBE_ENABLED", false),
             dynamic_model_probe_adapter_mode: load_env_var(
                 "DYNAMIC_MODEL_PROBE_ADAPTER",
@@ -844,6 +846,20 @@ fn parse_proxy_list_env(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn parse_csv_list_env(key: &str) -> Vec<String> {
+    env::var(key)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .map(dedupe_preserving_order)
+        .unwrap_or_default()
+}
+
 fn dedupe_preserving_order(items: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut deduped = Vec::new();
@@ -908,6 +924,7 @@ mod tests {
             "DYNAMIC_MODEL_DISCOVERY_URL",
             "DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS",
             "DYNAMIC_MODEL_PUBLIC_MODE",
+            "DYNAMIC_MODEL_PUBLIC_ALLOWLIST",
             "DYNAMIC_MODEL_PROBE_ENABLED",
             "DYNAMIC_MODEL_PROBE_ADAPTER",
             "DYNAMIC_MODEL_PROBE_MAX_CONCURRENT",
@@ -1007,6 +1024,7 @@ mod tests {
             cfg.dynamic_model_public_mode,
             DynamicModelPublicMode::StaticOnly
         );
+        assert!(cfg.dynamic_model_public_allowlist.is_empty());
         assert!(!cfg.dynamic_model_probe_enabled);
         assert_eq!(
             cfg.dynamic_model_probe_adapter_mode,
@@ -1106,6 +1124,12 @@ mod tests {
         unsafe { env::set_var("FREE_MODEL_TRUE_FIRST_TOKEN_FRT", "false") };
         unsafe { env::set_var("V4_MODEL_REGISTRY_ENABLED", "true") };
         unsafe { env::set_var("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active") };
+        unsafe {
+            env::set_var(
+                "DYNAMIC_MODEL_PUBLIC_ALLOWLIST",
+                " mimo-v2.5, nemotron-3-ultra-free, mimo-v2.5 ",
+            )
+        };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_ENABLED", "true") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_ADAPTER", "harness_all_pass") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_MAX_CONCURRENT", "2") };
@@ -1205,6 +1229,10 @@ mod tests {
         assert_eq!(
             cfg.dynamic_model_public_mode,
             DynamicModelPublicMode::CanaryOrActive
+        );
+        assert_eq!(
+            cfg.dynamic_model_public_allowlist,
+            vec!["mimo-v2.5".to_string(), "nemotron-3-ultra-free".to_string()]
         );
         assert!(cfg.dynamic_model_probe_enabled);
         assert_eq!(
@@ -1310,6 +1338,7 @@ mod tests {
             "FREE_MODEL_TRUE_FIRST_TOKEN_FRT",
             "V4_MODEL_REGISTRY_ENABLED",
             "DYNAMIC_MODEL_PUBLIC_MODE",
+            "DYNAMIC_MODEL_PUBLIC_ALLOWLIST",
             "DYNAMIC_MODEL_PROBE_ENABLED",
             "DYNAMIC_MODEL_PROBE_ADAPTER",
             "DYNAMIC_MODEL_PROBE_MAX_CONCURRENT",

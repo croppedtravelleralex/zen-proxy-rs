@@ -102,12 +102,16 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
   upstream ids ending in `-free` are exposed without the suffix, while the raw
   upstream id remains admin-only. The stable upstream ids
   `deepseek-v4-flash-free` and `big-pickle` are reserved for the two stable
-  aliases and must not be re-exposed as dynamic models. That mode does not
-  promote candidates to canary/active and does not apply to production channel
-  69. In normal canary/active modes, probe gates are still required before
-  public exposure. Active promotion additionally requires canary traffic quorum
-  and an earned `dynamic_claudecode_compatible` profile from the real
-  `http_bounded` probe matrix.
+  aliases and must not be re-exposed as dynamic models. Test instances may also
+  set `DYNAMIC_MODEL_PUBLIC_ALLOWLIST` to the exact sanitized/raw dynamic model
+  ids that passed manual usability checks; when set, dynamic models outside the
+  allowlist are not listed and cannot be resolved even if the public mode would
+  otherwise expose their lifecycle state. That mode does not promote candidates
+  to canary/active and does not apply to production channel 69. In normal
+  canary/active modes, probe gates are still required before public exposure.
+  Active promotion additionally requires canary traffic quorum and an earned
+  `dynamic_claudecode_compatible` profile from the real `http_bounded` probe
+  matrix.
 - Model mapping:
   - `deepseek-v4-flash -> deepseek-v4-flash-free`
   - `deepseek-v4-flash-lite -> big-pickle`
