@@ -46,6 +46,7 @@ impl ModelCompatibilityProfile {
             DiscoveredModelState::Quarantined | DiscoveredModelState::Retired => {
                 Self::DynamicRestricted
             }
+            _ if model.claudecode_compatible => Self::DynamicClaudeCodeCompatible,
             _ => Self::DynamicGeneric,
         }
     }
@@ -335,6 +336,47 @@ mod tests {
             ModelCompatibilityProfile::DynamicGeneric
         );
         assert!(registry.resolve("paid-model").is_err());
+    }
+
+    #[test]
+    fn effective_registry_exposes_earned_claudecode_profile_only_after_mark() {
+        let discovery = DynamicModelRegistry::new(true, "url".into());
+        discovery
+            .update_from_opencode_json(r#"{"data":[{"id":"new-cc-free"}]}"#)
+            .unwrap();
+        discovery
+            .set_model_state(
+                "new-cc-free",
+                DiscoveredModelState::Canary,
+                "probe matrix passed",
+            )
+            .unwrap();
+        let generic = EffectiveModelRegistry::new(
+            DynamicModelPublicMode::CanaryOrActive,
+            discovery.snapshot(),
+        );
+        assert_eq!(
+            generic
+                .resolve("new-cc-free")
+                .unwrap()
+                .compatibility_profile,
+            ModelCompatibilityProfile::DynamicGeneric
+        );
+
+        discovery
+            .mark_claudecode_compatible("new-cc-free", "http_bounded probe matrix passed")
+            .unwrap();
+        let compatible = EffectiveModelRegistry::new(
+            DynamicModelPublicMode::CanaryOrActive,
+            discovery.snapshot(),
+        );
+        assert_eq!(
+            compatible
+                .resolve("new-cc-free")
+                .unwrap()
+                .compatibility_profile,
+            ModelCompatibilityProfile::DynamicClaudeCodeCompatible
+        );
     }
 
     #[test]

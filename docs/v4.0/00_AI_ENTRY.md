@@ -28,8 +28,9 @@ Current active continuation is V4.109 dynamic free-model promotion: keep
 `deepseek-v4-flash` and `deepseek-v4-flash-lite` stable, discover opencode
 free-looking models, allow candidates to be listed only in explicitly
 configured self-use/test channels, and promote dynamic models to canary/active
-only after bounded protocol probes. Do not change NewAPI, ClaudeCode,
-cc-switch, or production channel 69 while doing this work.
+only after bounded protocol probes, canary traffic quorum, and earned
+ClaudeCode compatibility. Do not change NewAPI, ClaudeCode, cc-switch, or
+production channel 69 while doing this work.
 
 Target chain:
 
@@ -100,7 +101,9 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
   on a private self-use/test channel where users cannot choose those models.
   That mode does not promote candidates to canary/active and does not apply to
   production channel 69. In normal canary/active modes, probe gates are still
-  required before public exposure.
+  required before public exposure. Active promotion additionally requires
+  canary traffic quorum and an earned `dynamic_claudecode_compatible` profile
+  from the real `http_bounded` probe matrix.
 - Model mapping:
   - `deepseek-v4-flash -> deepseek-v4-flash-free`
   - `deepseek-v4-flash-lite -> big-pickle`

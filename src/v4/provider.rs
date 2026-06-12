@@ -2519,6 +2519,46 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_claudecode_profile_allows_only_claudecode_client_policy() {
+        let claudecode = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header);
+        let openclaw = ClientProfile::new(ClientKind::OpenClaw, ClientProfileSource::Header);
+        let hermes = ClientProfile::new(ClientKind::Hermes, ClientProfileSource::Header);
+
+        assert_eq!(
+            apply_model_compatibility_profile(
+                claudecode,
+                ModelCompatibilityProfile::DynamicClaudeCodeCompatible
+            )
+            .kind,
+            ClientKind::ClaudeCode
+        );
+        assert_eq!(
+            apply_model_compatibility_profile(
+                openclaw,
+                ModelCompatibilityProfile::DynamicClaudeCodeCompatible
+            )
+            .kind,
+            ClientKind::Unknown
+        );
+        assert_eq!(
+            apply_model_compatibility_profile(
+                hermes,
+                ModelCompatibilityProfile::DynamicClaudeCodeCompatible
+            )
+            .kind,
+            ClientKind::Unknown
+        );
+        assert_eq!(
+            apply_model_compatibility_profile(
+                claudecode,
+                ModelCompatibilityProfile::DynamicGeneric
+            )
+            .kind,
+            ClientKind::Unknown
+        );
+    }
+
+    #[test]
     fn markerless_anthropic_messages_default_to_claude_code() {
         let headers = HeaderMap::new();
         let body = serde_json::json!({

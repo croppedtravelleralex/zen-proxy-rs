@@ -76,7 +76,14 @@ pub async fn run_dynamic_model_probe_once(
                 let engine = ModelProbeEngine::new(probe_config);
                 let adapter =
                     BoundedHttpProbeAdapter::new(http_config, ReqwestBlockingProbeTransport);
-                engine.run_required_probes(&registry, &model_id, &adapter)
+                let summary = engine.run_required_probes(&registry, &model_id, &adapter)?;
+                if http_probe_earned_claudecode_profile(&summary) {
+                    let _ = registry.mark_claudecode_compatible(
+                        &model_id,
+                        "http_bounded probe matrix passed ClaudeCode tool, stream, and format requirements",
+                    );
+                }
+                Ok::<ModelProbeRunSummary, ModelProbeError>(summary)
             })
             .await
             .map_err(|err| DynamicModelProbeRunError::WorkerJoin(err.to_string()))?
@@ -123,6 +130,24 @@ pub fn probe_error_message(error: DynamicModelProbeRunError) -> String {
             format!("dynamic model probe worker failed: {message}")
         }
     }
+}
+
+fn http_probe_earned_claudecode_profile(summary: &ModelProbeRunSummary) -> bool {
+    matches!(
+        summary.final_state,
+        DiscoveredModelState::Canary | DiscoveredModelState::Active
+    ) && [
+        "tool_history_minimal",
+        "openai_stream_minimal",
+        "format_guard",
+    ]
+    .iter()
+    .all(|required| {
+        summary
+            .passed_probe_names
+            .iter()
+            .any(|passed| passed == required)
+    })
 }
 
 fn state_name(state: &DiscoveredModelState) -> &'static str {

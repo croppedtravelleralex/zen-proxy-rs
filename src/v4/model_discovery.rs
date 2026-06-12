@@ -110,6 +110,12 @@ pub struct DiscoveredModel {
     pub last_traffic_failure_kind: Option<String>,
     #[serde(default)]
     pub last_traffic_failure_message: Option<String>,
+    #[serde(default)]
+    pub claudecode_compatible: bool,
+    #[serde(default)]
+    pub claudecode_compatibility_reason: Option<String>,
+    #[serde(default)]
+    pub claudecode_compatibility_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +145,8 @@ pub struct TrafficPromotionDecision {
     pub reason: String,
     pub missing_reasons: Vec<String>,
     pub policy: TrafficPromotionPolicy,
+    pub claudecode_compatible: bool,
+    pub required_claudecode_compatible: bool,
     pub canary_requests_total: u64,
     pub canary_success_total: u64,
     pub canary_failure_total: u64,
@@ -288,6 +296,9 @@ impl DynamicModelRegistry {
                     last_traffic_status: None,
                     last_traffic_failure_kind: None,
                     last_traffic_failure_message: None,
+                    claudecode_compatible: false,
+                    claudecode_compatibility_reason: None,
+                    claudecode_compatibility_unix: None,
                 });
             merge_seen_model_state(entry, state, reason);
             entry.last_seen_unix = now;
@@ -306,6 +317,7 @@ impl DynamicModelRegistry {
                 model.public = false;
                 model.routable = false;
                 model.missing_rounds = model.missing_rounds.saturating_add(1);
+                clear_claudecode_compatibility(model);
                 sync_lifecycle_flags(model);
             }
         }
@@ -416,6 +428,12 @@ impl DynamicModelRegistry {
                 DiscoveredModelState::Canary | DiscoveredModelState::Active
             );
             model.routable = model.public;
+            if !matches!(
+                model.state,
+                DiscoveredModelState::Canary | DiscoveredModelState::Active
+            ) {
+                clear_claudecode_compatibility(model);
+            }
             match model.state {
                 DiscoveredModelState::Canary | DiscoveredModelState::Active => {
                     model.promotion_reason = Some(reason);
@@ -460,6 +478,7 @@ impl DynamicModelRegistry {
             model.auto_promoted = false;
             model.public = false;
             model.routable = false;
+            clear_claudecode_compatibility(model);
         }
         recompute_counts(&mut snapshot);
         Some(snapshot.models[index].clone())
@@ -501,6 +520,7 @@ impl DynamicModelRegistry {
             model.auto_promoted = false;
             model.public = false;
             model.routable = false;
+            clear_claudecode_compatibility(model);
         }
         recompute_counts(&mut snapshot);
         Some(snapshot.models[index].clone())
@@ -537,6 +557,7 @@ impl DynamicModelRegistry {
             model.auto_promoted = false;
             model.public = false;
             model.routable = false;
+            clear_claudecode_compatibility(model);
         }
         recompute_counts(&mut snapshot);
         Some(snapshot.models[index].clone())
@@ -657,6 +678,34 @@ impl DynamicModelRegistry {
         }
         Some(snapshot.models[index].clone())
     }
+
+    pub fn mark_claudecode_compatible(
+        &self,
+        model_id: &str,
+        reason: impl Into<String>,
+    ) -> Option<DiscoveredModel> {
+        let now = now_unix();
+        let reason = reason.into();
+        let mut snapshot = self.inner.write().unwrap();
+        let index = snapshot
+            .models
+            .iter()
+            .position(|model| model.id == model_id)?;
+        {
+            let model = &mut snapshot.models[index];
+            if !matches!(
+                model.state,
+                DiscoveredModelState::Canary | DiscoveredModelState::Active
+            ) {
+                return Some(model.clone());
+            }
+            model.claudecode_compatible = true;
+            model.claudecode_compatibility_reason = Some(reason);
+            model.claudecode_compatibility_unix = Some(now);
+            model.last_seen_unix = now;
+        }
+        Some(snapshot.models[index].clone())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -727,6 +776,12 @@ pub fn evaluate_active_promotion(
     if !matches!(model.state, DiscoveredModelState::Canary) {
         missing_reasons.push("state must be canary before active promotion".to_string());
     }
+    if !model.claudecode_compatible {
+        missing_reasons.push(
+            "claudecode_compatible must be earned by the http_bounded probe matrix before active promotion"
+                .to_string(),
+        );
+    }
     if model.canary_requests_total < policy.min_canary_requests {
         missing_reasons.push(format!(
             "canary_requests_total {} < required {}",
@@ -770,6 +825,8 @@ pub fn evaluate_active_promotion(
         reason,
         missing_reasons,
         policy,
+        claudecode_compatible: model.claudecode_compatible,
+        required_claudecode_compatible: true,
         canary_requests_total: model.canary_requests_total,
         canary_success_total: model.canary_success_total,
         canary_failure_total: model.canary_failure_total,
@@ -864,6 +921,18 @@ fn sync_lifecycle_flags(model: &mut DiscoveredModel) {
     );
     model.public = model.auto_promoted;
     model.routable = model.public;
+    if !matches!(
+        model.state,
+        DiscoveredModelState::Canary | DiscoveredModelState::Active
+    ) {
+        clear_claudecode_compatibility(model);
+    }
+}
+
+fn clear_claudecode_compatibility(model: &mut DiscoveredModel) {
+    model.claudecode_compatible = false;
+    model.claudecode_compatibility_reason = None;
+    model.claudecode_compatibility_unix = None;
 }
 
 fn recompute_counts(snapshot: &mut ModelDiscoverySnapshot) {
@@ -1298,6 +1367,47 @@ mod tests {
     }
 
     #[test]
+    fn claudecode_compatibility_is_earned_and_cleared_by_lifecycle() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(r#"{"data":[{"id":"new-cc-free"}]}"#)
+            .unwrap();
+
+        let candidate = registry
+            .mark_claudecode_compatible("new-cc-free", "should not grant before canary")
+            .unwrap();
+        assert!(!candidate.claudecode_compatible);
+
+        registry
+            .set_model_state(
+                "new-cc-free",
+                DiscoveredModelState::Canary,
+                "probe matrix passed",
+            )
+            .unwrap();
+        let compatible = registry
+            .mark_claudecode_compatible("new-cc-free", "http_bounded probe matrix passed")
+            .unwrap();
+        assert!(compatible.claudecode_compatible);
+        assert_eq!(
+            compatible.claudecode_compatibility_reason.as_deref(),
+            Some("http_bounded probe matrix passed")
+        );
+        assert!(compatible.claudecode_compatibility_unix.is_some());
+
+        let rolled_back = registry
+            .set_model_state(
+                "new-cc-free",
+                DiscoveredModelState::Candidate,
+                "manual rollback",
+            )
+            .unwrap();
+        assert!(!rolled_back.claudecode_compatible);
+        assert!(rolled_back.claudecode_compatibility_reason.is_none());
+        assert!(rolled_back.claudecode_compatibility_unix.is_none());
+    }
+
+    #[test]
     fn evaluates_active_promotion_from_canary_traffic_quorum() {
         let registry = DynamicModelRegistry::new(true, "url".into());
         registry
@@ -1318,6 +1428,10 @@ mod tests {
             .missing_reasons
             .iter()
             .any(|reason| reason.contains("state must be canary")));
+        assert!(candidate_decision
+            .missing_reasons
+            .iter()
+            .any(|reason| reason.contains("claudecode_compatible")));
 
         registry
             .set_model_state(
@@ -1336,10 +1450,23 @@ mod tests {
         let two_successes = registry
             .record_traffic_result("mimo-v2.5-free", 200, "", "")
             .unwrap();
-        let eligible = evaluate_active_promotion(&two_successes, policy);
+        let missing_compatibility = evaluate_active_promotion(&two_successes, policy);
+        assert!(!missing_compatibility.eligible);
+        assert_eq!(missing_compatibility.canary_success_rate_bps, 10_000);
+        assert!(missing_compatibility
+            .missing_reasons
+            .iter()
+            .any(|reason| reason.contains("claudecode_compatible")));
+
+        let compatible = registry
+            .mark_claudecode_compatible("mimo-v2.5-free", "http_bounded probe matrix passed")
+            .unwrap();
+        let eligible = evaluate_active_promotion(&compatible, policy);
         assert!(eligible.eligible);
         assert_eq!(eligible.canary_success_rate_bps, 10_000);
         assert_eq!(eligible.reason, "canary traffic quorum met");
+        assert!(eligible.claudecode_compatible);
+        assert!(eligible.required_claudecode_compatible);
 
         let decode_failure = registry
             .record_traffic_result(

@@ -1061,6 +1061,11 @@ mod e2e {
         assert_eq!(probe_body["data"]["current"]["state"], "canary");
         assert_eq!(probe_body["data"]["current"]["public"], true);
         assert_eq!(probe_body["data"]["current"]["routable"], true);
+        assert_eq!(probe_body["data"]["current"]["profile"], "dynamic_generic");
+        assert_eq!(
+            probe_body["data"]["current"]["claudecode_compatible"],
+            serde_json::Value::Bool(false)
+        );
 
         let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
             .expect("public models endpoint after manual probe");
@@ -1276,7 +1281,9 @@ mod e2e {
                 .expect("admin model probes endpoint");
             if resp.status() == 200 {
                 let body: serde_json::Value = resp.json().unwrap();
-                if body["data"]["state"] == "canary" {
+                if body["data"]["state"] == "canary"
+                    && body["data"]["profile"] == "dynamic_claudecode_compatible"
+                {
                     break body;
                 }
             }
@@ -1300,6 +1307,14 @@ mod e2e {
                 .len(),
             0
         );
+        assert_eq!(
+            probes_body["data"]["claudecode_compatible"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(probes_body["data"]["claudecode_compatibility_reason"]
+            .as_str()
+            .unwrap()
+            .contains("http_bounded probe matrix passed"));
 
         let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
             .expect("public models endpoint");
@@ -1336,6 +1351,121 @@ mod e2e {
                 && item["body"]["messages"][2]["tool_call_id"] == "call_probe_1"
         }));
         drop(seen);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_http_bounded_probe_enables_claudecode_profile_without_openclaw_leakage() {
+        let (upstream_base, observed) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-cc-route-free"}]
+        }));
+        let (probe_base, _) = start_mock_probe_base();
+        let (child, port) = start_server_with_env(
+            19820,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PROBE_BASE_URL", probe_base.as_str()),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-cc-route-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "candidate" {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidate before manual probe");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let probe = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-cc-route-free/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("manual http probe request");
+        assert_eq!(probe.status(), 200);
+        let probe_body: serde_json::Value = probe.json().unwrap();
+        assert_eq!(probe_body["data"]["final_state"], "canary");
+
+        let detail = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-cc-route-free",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin model detail after compatible probe");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(
+            detail_body["data"]["profile"],
+            "dynamic_claudecode_compatible"
+        );
+        assert_eq!(
+            detail_body["data"]["claudecode_compatible"],
+            serde_json::Value::Bool(true)
+        );
+
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"Task","parameters":{"type":"object","properties":{}}}}
+        ]);
+        let claude_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "new-cc-route-free",
+                "messages": [{"role":"user","content":"use task"}],
+                "tools": tools.clone(),
+                "stream": false
+            }))
+            .send()
+            .expect("dynamic claudecode-compatible request");
+        assert_eq!(claude_resp.status(), 200);
+
+        let openclaw_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "openclaw")
+            .json(&serde_json::json!({
+                "model": "new-cc-route-free",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools,
+                "stream": false
+            }))
+            .send()
+            .expect("dynamic openclaw request should not inherit claudecode profile");
+        assert_eq!(openclaw_resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["body"]["model"], "new-cc-route-free");
+        assert_eq!(seen[1]["body"]["model"], "new-cc-route-free");
 
         stop_server(child, port);
     }
@@ -1575,6 +1705,7 @@ mod e2e {
             "object": "list",
             "data": [{"id": "new-active-quorum-free"}]
         }));
+        let (probe_base, _) = start_mock_probe_base();
         let (child, port) = start_server_with_env(
             19819,
             &[
@@ -1585,6 +1716,8 @@ mod e2e {
                 ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
                 ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PROBE_BASE_URL", probe_base.as_str()),
                 ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
                 ("DYNAMIC_MODEL_ACTIVE_MIN_CANARY_REQUESTS", "2"),
                 ("DYNAMIC_MODEL_ACTIVE_MIN_SUCCESS_RATE_BPS", "10000"),
@@ -1616,14 +1749,19 @@ mod e2e {
 
         let canary = client
             .post(format!(
-                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/promote",
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/probe",
                 port
             ))
             .header("x-api-key", "test-key")
-            .json(&serde_json::json!({"state": "canary"}))
             .send()
-            .expect("canary promote dynamic model");
+            .expect("http bounded probe dynamic model");
         assert_eq!(canary.status(), 200);
+        let canary_body: serde_json::Value = canary.json().unwrap();
+        assert_eq!(canary_body["data"]["final_state"], "canary");
+        assert_eq!(
+            canary_body["data"]["current"]["profile"],
+            "dynamic_claudecode_compatible"
+        );
 
         let premature_active = client
             .post(format!(
@@ -1666,6 +1804,10 @@ mod e2e {
         let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
         assert_eq!(traffic_body["data"]["traffic"]["canary_requests_total"], 2);
         assert_eq!(traffic_body["data"]["active_promotion"]["eligible"], true);
+        assert_eq!(
+            traffic_body["data"]["active_promotion"]["claudecode_compatible"],
+            true
+        );
         assert_eq!(
             traffic_body["data"]["active_promotion"]["canary_success_rate_bps"],
             10000
