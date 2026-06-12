@@ -381,6 +381,14 @@ fn record_dynamic_model_traffic(
     failure_kind: &str,
     failure_message: &str,
 ) {
+    let model_id = {
+        let public_mode = state.config.read().unwrap().dynamic_model_public_mode;
+        let registry = EffectiveModelRegistry::new(public_mode, state.dynamic_models.snapshot());
+        registry
+            .resolve(public_model)
+            .map(|resolved| resolved.upstream_model)
+            .unwrap_or_else(|_| public_model.to_string())
+    };
     let normalized_failure_kind = if status == 429 && failure_kind == "rate_limited" {
         "upstream_429".to_string()
     } else if failure_kind.trim().is_empty() && status >= 400 {
@@ -389,7 +397,7 @@ fn record_dynamic_model_traffic(
         failure_kind.to_string()
     };
     state.dynamic_models.record_traffic_result(
-        public_model,
+        &model_id,
         status,
         normalized_failure_kind,
         failure_message.to_string(),

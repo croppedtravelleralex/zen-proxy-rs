@@ -848,6 +848,12 @@ fn success_rate_bps(success: u64, total: u64) -> u64 {
 }
 
 fn classify_model(id: &str) -> (DiscoveredModelState, String) {
+    if is_reserved_static_upstream(id) {
+        return (
+            DiscoveredModelState::Ignored,
+            "reserved upstream for stable public model; not a dynamic candidate".to_string(),
+        );
+    }
     if is_free_candidate(id) {
         (
             DiscoveredModelState::Candidate,
@@ -863,6 +869,10 @@ fn classify_model(id: &str) -> (DiscoveredModelState, String) {
 
 pub fn is_free_candidate(id: &str) -> bool {
     id == "big-pickle" || id.ends_with("-free")
+}
+
+pub fn is_reserved_static_upstream(id: &str) -> bool {
+    matches!(id, "deepseek-v4-flash-free" | "big-pickle")
 }
 
 fn now_unix() -> u64 {
@@ -963,6 +973,8 @@ mod tests {
         assert!(is_free_candidate("deepseek-v4-flash-free"));
         assert!(is_free_candidate("mimo-v2.5-free"));
         assert!(is_free_candidate("big-pickle"));
+        assert!(is_reserved_static_upstream("deepseek-v4-flash-free"));
+        assert!(is_reserved_static_upstream("big-pickle"));
         assert!(!is_free_candidate("gpt-5.5"));
         assert!(!is_free_candidate("claude-sonnet-4-6"));
     }
@@ -972,7 +984,7 @@ mod tests {
         let registry = DynamicModelRegistry::new(true, "https://opencode.ai/zen/v1/models".into());
         let snapshot = registry
             .update_from_opencode_json(
-                r#"{"object":"list","data":[{"id":"deepseek-v4-flash-free"},{"id":"gpt-5.5"},{"id":"big-pickle"}]}"#,
+                r#"{"object":"list","data":[{"id":"mimo-v2.5-free"},{"id":"gpt-5.5"},{"id":"north-mini-code-free"}]}"#,
             )
             .unwrap();
 
@@ -1009,7 +1021,7 @@ mod tests {
             )
             .unwrap();
         let second = registry
-            .update_from_opencode_json(r#"{"data":[{"id":"big-pickle"}]}"#)
+            .update_from_opencode_json(r#"{"data":[{"id":"north-mini-code-free"}]}"#)
             .unwrap();
 
         assert_eq!(second.candidate_total, 1);

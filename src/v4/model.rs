@@ -75,6 +75,12 @@ impl StaticModelRegistry {
         ("deepseek-v4-flash", "deepseek-v4-flash-free"),
         ("deepseek-v4-flash-lite", "big-pickle"),
     ];
+
+    fn is_reserved_public_or_upstream(model_id: &str) -> bool {
+        Self::MODELS
+            .iter()
+            .any(|(public, upstream)| *public == model_id || *upstream == model_id)
+    }
 }
 
 impl ModelRegistry for StaticModelRegistry {
@@ -119,6 +125,12 @@ impl EffectiveModelRegistry {
     }
 
     pub fn is_dynamic_public(&self, model: &DiscoveredModel) -> bool {
+        if StaticModelRegistry::is_reserved_public_or_upstream(&model.id)
+            || StaticModelRegistry::is_reserved_public_or_upstream(&model.upstream_id)
+            || dynamic_public_alias(&model.id).is_none()
+        {
+            return false;
+        }
         match self.public_mode {
             DynamicModelPublicMode::StaticOnly => false,
             DynamicModelPublicMode::CandidateCanaryOrActive => {
@@ -147,17 +159,25 @@ impl EffectiveModelRegistry {
             .iter()
             .filter(|model| self.is_dynamic_public(model))
     }
+
+    fn resolve_dynamic_model(&self, public_model: &str) -> Option<&DiscoveredModel> {
+        self.public_dynamic_models()
+            .find(|model| dynamic_public_alias(&model.id).as_deref() == Some(public_model))
+    }
 }
 
 impl ModelRegistry for EffectiveModelRegistry {
     fn public_models(&self) -> Vec<ModelInfo> {
         let mut models = StaticModelRegistry.public_models();
         for dynamic in self.public_dynamic_models() {
-            if models.iter().any(|model| model.id == dynamic.id) {
+            let Some(public_id) = dynamic_public_alias(&dynamic.id) else {
+                continue;
+            };
+            if models.iter().any(|model| model.id == public_id) {
                 continue;
             }
             models.push(ModelInfo {
-                id: dynamic.id.clone(),
+                id: public_id,
                 upstream_id: dynamic.upstream_id.clone(),
                 compatibility_profile: ModelCompatibilityProfile::for_dynamic(dynamic),
             });
@@ -169,15 +189,22 @@ impl ModelRegistry for EffectiveModelRegistry {
         if let Ok(static_model) = StaticModelRegistry.resolve(public_model) {
             return Ok(static_model);
         }
-        self.public_dynamic_models()
-            .find(|model| model.id == public_model)
+        self.resolve_dynamic_model(public_model)
             .map(|model| ModelResolution {
-                public_model: model.id.clone(),
+                public_model: dynamic_public_alias(&model.id)
+                    .expect("public dynamic model must have a sanitized alias"),
                 upstream_model: model.upstream_id.clone(),
                 compatibility_profile: ModelCompatibilityProfile::for_dynamic(model),
             })
             .ok_or_else(|| ModelError::UnknownModel(public_model.to_string()))
     }
+}
+
+fn dynamic_public_alias(upstream_id: &str) -> Option<String> {
+    upstream_id
+        .strip_suffix("-free")
+        .filter(|alias| !alias.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -292,12 +319,12 @@ mod tests {
             vec![
                 "deepseek-v4-flash",
                 "deepseek-v4-flash-lite",
-                "new-active-free",
-                "new-canary-free"
+                "new-active",
+                "new-canary"
             ]
         );
         assert_eq!(
-            registry.resolve("new-canary-free").unwrap().upstream_model,
+            registry.resolve("new-canary").unwrap().upstream_model,
             "new-canary-free"
         );
         assert!(matches!(
@@ -322,15 +349,15 @@ mod tests {
             vec![
                 "deepseek-v4-flash",
                 "deepseek-v4-flash-lite",
-                "new-active-free",
-                "new-canary-free",
-                "new-candidate-free"
+                "new-active",
+                "new-canary",
+                "new-candidate"
             ]
         );
-        assert!(registry.resolve("new-candidate-free").is_ok());
+        assert!(registry.resolve("new-candidate").is_ok());
         assert_eq!(
             registry
-                .resolve("new-candidate-free")
+                .resolve("new-candidate")
                 .unwrap()
                 .compatibility_profile,
             ModelCompatibilityProfile::DynamicGeneric
@@ -356,10 +383,7 @@ mod tests {
             discovery.snapshot(),
         );
         assert_eq!(
-            generic
-                .resolve("new-cc-free")
-                .unwrap()
-                .compatibility_profile,
+            generic.resolve("new-cc").unwrap().compatibility_profile,
             ModelCompatibilityProfile::DynamicGeneric
         );
 
@@ -371,10 +395,7 @@ mod tests {
             discovery.snapshot(),
         );
         assert_eq!(
-            compatible
-                .resolve("new-cc-free")
-                .unwrap()
-                .compatibility_profile,
+            compatible.resolve("new-cc").unwrap().compatibility_profile,
             ModelCompatibilityProfile::DynamicClaudeCodeCompatible
         );
     }
@@ -392,13 +413,36 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec![
-                "deepseek-v4-flash",
-                "deepseek-v4-flash-lite",
-                "new-active-free"
-            ]
+            vec!["deepseek-v4-flash", "deepseek-v4-flash-lite", "new-active"]
         );
-        assert!(registry.resolve("new-active-free").is_ok());
+        assert!(registry.resolve("new-active").is_ok());
         assert!(registry.resolve("new-canary-free").is_err());
+    }
+
+    #[test]
+    fn effective_registry_desensitizes_free_suffix_and_deduplicates_static_upstreams() {
+        let discovery = DynamicModelRegistry::new(true, "url".into());
+        discovery
+            .update_from_opencode_json(
+                r#"{"data":[{"id":"deepseek-v4-flash-free"},{"id":"big-pickle"},{"id":"mimo-v2.5-free"},{"id":"paid-model"}]}"#,
+            )
+            .unwrap();
+        let registry = EffectiveModelRegistry::new(
+            DynamicModelPublicMode::CandidateCanaryOrActive,
+            discovery.snapshot(),
+        );
+        let models = registry.public_models();
+        let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec!["deepseek-v4-flash", "deepseek-v4-flash-lite", "mimo-v2.5"]
+        );
+        assert_eq!(
+            registry.resolve("mimo-v2.5").unwrap().upstream_model,
+            "mimo-v2.5-free"
+        );
+        assert!(registry.resolve("mimo-v2.5-free").is_err());
+        assert!(registry.resolve("deepseek-v4-flash-free").is_err());
+        assert!(registry.resolve("big-pickle").is_err());
     }
 }

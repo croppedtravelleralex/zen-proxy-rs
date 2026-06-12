@@ -588,7 +588,7 @@ mod e2e {
             if body["data"]["dynamic_discovery"]["candidate_total"]
                 .as_u64()
                 .unwrap_or_default()
-                >= 2
+                >= 1
             {
                 break body;
             }
@@ -601,8 +601,8 @@ mod e2e {
         let discovery = &admin_body["data"]["dynamic_discovery"];
         assert_eq!(discovery["enabled"], true);
         assert_eq!(discovery["worker_running"], true);
-        assert_eq!(discovery["candidate_total"], 2);
-        assert_eq!(discovery["ignored_total"], 1);
+        assert_eq!(discovery["candidate_total"], 1);
+        assert_eq!(discovery["ignored_total"], 2);
         assert_eq!(discovery["missing_total"], 0);
         assert_eq!(admin_body["data"]["safety"]["candidates_are_public"], false);
         assert_eq!(admin_body["data"]["safety"]["auto_promote"], false);
@@ -621,10 +621,7 @@ mod e2e {
             .iter()
             .filter_map(|model| model.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            planned_ids,
-            vec!["deepseek-v4-flash-free", "new-opencode-free"]
-        );
+        assert_eq!(planned_ids, vec!["new-opencode-free"]);
 
         let detail = client
             .get(format!(
@@ -788,18 +785,16 @@ mod e2e {
             vec![
                 "deepseek-v4-flash",
                 "deepseek-v4-flash-lite",
-                "new-opencode-free"
+                "new-opencode"
             ]
         );
 
-        let detail = reqwest::blocking::get(format!(
-            "http://127.0.0.1:{}/v1/models/new-opencode-free",
-            port
-        ))
-        .expect("dynamic public model detail");
+        let detail =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/new-opencode", port))
+                .expect("dynamic public model detail");
         assert_eq!(detail.status(), 200);
         let detail_body: serde_json::Value = detail.json().unwrap();
-        assert_eq!(detail_body["id"], "new-opencode-free");
+        assert_eq!(detail_body["id"], "new-opencode");
         assert_eq!(detail_body["upstream_id"], "new-opencode-free");
 
         let paid_detail =
@@ -874,19 +869,19 @@ mod e2e {
             vec![
                 "deepseek-v4-flash",
                 "deepseek-v4-flash-lite",
-                "new-candidate-direct-free",
-                "second-candidate-direct-free"
+                "new-candidate-direct",
+                "second-candidate-direct"
             ]
         );
 
         let detail = reqwest::blocking::get(format!(
-            "http://127.0.0.1:{}/v1/models/new-candidate-direct-free",
+            "http://127.0.0.1:{}/v1/models/new-candidate-direct",
             port
         ))
         .expect("candidate model detail endpoint");
         assert_eq!(detail.status(), 200);
         let detail_body: serde_json::Value = detail.json().unwrap();
-        assert_eq!(detail_body["id"], "new-candidate-direct-free");
+        assert_eq!(detail_body["id"], "new-candidate-direct");
         assert_eq!(detail_body["upstream_id"], "new-candidate-direct-free");
         assert_eq!(detail_body["profile"], "dynamic_generic");
         let admin_detail = client
@@ -965,7 +960,7 @@ mod e2e {
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .header("x-fmc-client", "openclaw")
             .json(&serde_json::json!({
-                "model": "new-profile-gated-free",
+                "model": "new-profile-gated",
                 "messages": [{"role":"user","content":"use tool"}],
                 "tools": tools,
                 "stream": false
@@ -1082,7 +1077,7 @@ mod e2e {
             vec![
                 "deepseek-v4-flash",
                 "deepseek-v4-flash-lite",
-                "new-manual-harness-free"
+                "new-manual-harness"
             ]
         );
 
@@ -1164,7 +1159,7 @@ mod e2e {
             vec![
                 "deepseek-v4-flash",
                 "deepseek-v4-flash-lite",
-                "new-harness-probed-free"
+                "new-harness-probed"
             ]
         );
 
@@ -1331,7 +1326,7 @@ mod e2e {
             vec![
                 "deepseek-v4-flash",
                 "deepseek-v4-flash-lite",
-                "new-http-probed-free"
+                "new-http-probed"
             ]
         );
 
@@ -1440,7 +1435,7 @@ mod e2e {
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .header("x-fmc-client", "claude-code")
             .json(&serde_json::json!({
-                "model": "new-cc-route-free",
+                "model": "new-cc-route",
                 "messages": [{"role":"user","content":"use task"}],
                 "tools": tools.clone(),
                 "stream": false
@@ -1453,7 +1448,7 @@ mod e2e {
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .header("x-fmc-client", "openclaw")
             .json(&serde_json::json!({
-                "model": "new-cc-route-free",
+                "model": "new-cc-route",
                 "messages": [{"role":"user","content":"use tool"}],
                 "tools": tools,
                 "stream": false
@@ -1666,7 +1661,7 @@ mod e2e {
         assert_eq!(canary.status(), 200);
 
         let canary_detail = reqwest::blocking::get(format!(
-            "http://127.0.0.1:{}/v1/models/new-active-only-free",
+            "http://127.0.0.1:{}/v1/models/new-active-only",
             port
         ))
         .expect("canary detail in active_only mode");
@@ -1689,7 +1684,7 @@ mod e2e {
         );
 
         let active_detail = reqwest::blocking::get(format!(
-            "http://127.0.0.1:{}/v1/models/new-active-only-free",
+            "http://127.0.0.1:{}/v1/models/new-active-only",
             port
         ))
         .expect("active detail in active_only mode");
@@ -1783,7 +1778,7 @@ mod e2e {
             let ok_resp = client
                 .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
                 .json(&serde_json::json!({
-                    "model": "new-active-quorum-free",
+                    "model": "new-active-quorum",
                     "messages": [{"role": "user", "content": content}],
                     "stream": false
                 }))
@@ -1828,7 +1823,7 @@ mod e2e {
         assert_eq!(active_body["data"]["active_promotion"]["eligible"], true);
 
         let active_detail = reqwest::blocking::get(format!(
-            "http://127.0.0.1:{}/v1/models/new-active-quorum-free",
+            "http://127.0.0.1:{}/v1/models/new-active-quorum",
             port
         ))
         .expect("active detail in canary_or_active mode");
@@ -1895,7 +1890,7 @@ mod e2e {
         let ok_resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "new-traffic-free",
+                "model": "new-traffic",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": false
             }))
@@ -1906,7 +1901,7 @@ mod e2e {
         let limited_resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "new-traffic-free",
+                "model": "new-traffic",
                 "messages": [{"role": "user", "content": "rate-limit"}],
                 "stream": false
             }))
@@ -1998,7 +1993,7 @@ mod e2e {
         let ok_resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "new-candidate-traffic-free",
+                "model": "new-candidate-traffic",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": false
             }))
@@ -2009,7 +2004,7 @@ mod e2e {
         let limited_resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "new-candidate-traffic-free",
+                "model": "new-candidate-traffic",
                 "messages": [{"role": "user", "content": "rate-limit"}],
                 "stream": false
             }))

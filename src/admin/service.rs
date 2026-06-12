@@ -451,7 +451,7 @@ impl AdminService {
                 .cloned();
             let registry = EffectiveModelRegistry::new(public_mode, discovery);
             if let Some(model) = dynamic_model {
-                let effectively_public = registry.resolve(model_id).is_ok();
+                let effectively_public = Self::is_effectively_public_dynamic(&registry, &model);
                 return Self::ok_response(Self::dynamic_model_detail_payload(
                     model,
                     if effectively_public {
@@ -617,7 +617,7 @@ impl AdminService {
             .find(|model| model.id == model_id)
         {
             Some(model) => {
-                let effectively_public = registry.resolve(model_id).is_ok();
+                let effectively_public = Self::is_effectively_public_dynamic(&registry, &model);
                 let traffic = Self::dynamic_model_traffic_payload(&model);
                 let active_promotion = evaluate_active_promotion(&model, active_policy);
                 Self::ok_response(json!({
@@ -698,7 +698,7 @@ impl AdminService {
                         )
                     };
                     let registry = EffectiveModelRegistry::new(public_mode, discovery);
-                    let effectively_public = registry.resolve(&model.id).is_ok();
+                    let effectively_public = Self::is_effectively_public_dynamic(&registry, &model);
                     Self::dynamic_model_detail_payload(
                         model,
                         "dynamic_probe_result",
@@ -720,6 +720,16 @@ impl AdminService {
                 Self::error_response(status, probe_error_message(err))
             }
         }
+    }
+
+    fn is_effectively_public_dynamic(
+        registry: &EffectiveModelRegistry,
+        model: &DiscoveredModel,
+    ) -> bool {
+        registry
+            .public_models()
+            .iter()
+            .any(|public| public.upstream_id == model.upstream_id)
     }
 
     pub fn model_promote(state: &AppState, model_id: &str, target: Option<&str>) -> Response {

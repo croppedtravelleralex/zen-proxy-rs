@@ -98,12 +98,16 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
 - V4.109 must keep dynamic model hot-plugging behind a lifecycle gate:
   discovered candidates can be public/routable immediately only when
   `DYNAMIC_MODEL_PUBLIC_MODE=candidate_canary_or_active` is explicitly enabled
-  on a private self-use/test channel where users cannot choose those models.
-  That mode does not promote candidates to canary/active and does not apply to
-  production channel 69. In normal canary/active modes, probe gates are still
-  required before public exposure. Active promotion additionally requires
-  canary traffic quorum and an earned `dynamic_claudecode_compatible` profile
-  from the real `http_bounded` probe matrix.
+  on a private self-use/test channel. Dynamic public names must be sanitized:
+  upstream ids ending in `-free` are exposed without the suffix, while the raw
+  upstream id remains admin-only. The stable upstream ids
+  `deepseek-v4-flash-free` and `big-pickle` are reserved for the two stable
+  aliases and must not be re-exposed as dynamic models. That mode does not
+  promote candidates to canary/active and does not apply to production channel
+  69. In normal canary/active modes, probe gates are still required before
+  public exposure. Active promotion additionally requires canary traffic quorum
+  and an earned `dynamic_claudecode_compatible` profile from the real
+  `http_bounded` probe matrix.
 - Model mapping:
   - `deepseek-v4-flash -> deepseek-v4-flash-free`
   - `deepseek-v4-flash-lite -> big-pickle`
