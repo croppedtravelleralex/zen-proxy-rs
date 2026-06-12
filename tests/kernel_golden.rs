@@ -3475,6 +3475,43 @@ async fn anthropic_stream_missing_reasoning_content_retries_with_disabled_thinki
 }
 
 #[tokio::test]
+async fn claude_code_large_stream_tool_request_disables_thinking_on_first_attempt() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let huge_prompt = format!(
+        "missing-reasoning-content\n{}\nLatest task: write the file.",
+        "old ClaudeCode tool history line\n".repeat(30_000)
+    );
+    let mut request = anthropic_request("deepseek-v4-flash", &huge_prompt, true);
+    request.max_tokens = Some(32_000);
+    request.tools = Some(vec![anthropic_tool(
+        "Write",
+        json!({"file_path": {"type": "string"}, "content": {"type": "string"}}),
+        &["file_path", "content"],
+    )]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer"));
+    assert!(!body.contains("reasoning_content in the thinking mode"));
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].thinking.as_ref(),
+        Some(&json!({"type":"disabled"}))
+    );
+}
+
+#[tokio::test]
 async fn anthropic_stream_missing_reasoning_content_retry_can_emit_tool_call() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);

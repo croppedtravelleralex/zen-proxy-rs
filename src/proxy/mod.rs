@@ -81,9 +81,14 @@ pub(crate) fn apply_initial_thinking_policy(
         request,
         profile.kind == ClientKind::ClaudeCode,
     );
+    let claude_code_large_stream_tool_request = profile.kind == ClientKind::ClaudeCode
+        && request.stream.unwrap_or(false)
+        && !no_tools
+        && shape.estimated_total_tokens >= 80_000;
 
     let should_disable = low_budget_tool_probe
         || claude_code_forced_tool_choice
+        || claude_code_large_stream_tool_request
         || (no_tools
             && low_output_budget
             && (matches!(
@@ -100,6 +105,8 @@ pub(crate) fn apply_initial_thinking_policy(
             "low_budget_tool_probe_disabled"
         } else if claude_code_forced_tool_choice {
             "claude_code_forced_tool_choice_disabled"
+        } else if claude_code_large_stream_tool_request {
+            "claude_code_large_stream_tool_request_disabled"
         } else {
             "low_budget_probe_disabled"
         };
