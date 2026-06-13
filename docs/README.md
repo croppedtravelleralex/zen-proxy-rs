@@ -38,10 +38,12 @@ Start here:
 | [22_2026-06-10_cache_usage_affinity_alignment.md](./v4.0/22_2026-06-10_cache_usage_affinity_alignment.md) | 2026-06-10 V4.107 cache usage merge and medium-context affinity alignment |
 | [23_v4.108_dynamic_model_discovery_phase1.md](./v4.0/23_v4.108_dynamic_model_discovery_phase1.md) | V4.108 side-channel opencode free-model discovery, candidate registry, safety gates, and rollback |
 | [24_v4.109_dynamic_model_promotion_goal.md](./v4.0/24_v4.109_dynamic_model_promotion_goal.md) | V4.109 goal, task plan, state machine, test-channel promotion policy, and strict acceptance for dynamic free-model hot-plugging |
+| [25_2026-06-13_dynamic_model_handoff.md](./v4.0/25_2026-06-13_dynamic_model_handoff.md) | 2026-06-13 stop-state handoff: NewAPI group blockage, real ClaudeCode vs shallow smoke gap, north-mini-code risk, git push note, and restart checklist |
 
 ## AI Maintenance Rule
 
 Future AI work must start from [V4.0 AI Entry](./v4.0/00_AI_ENTRY.md), then check
-the latest operations report before changing code. Runtime facts from ZenProxy
-admin APIs, NewAPI logs, Redis budgets, WAL files, tests, and release builds are
-higher priority than older chat history.
+the latest operations report before changing code. As of 2026-06-13, the latest
+handoff is [2026-06-13 Dynamic Model Handoff](./v4.0/25_2026-06-13_dynamic_model_handoff.md).
+Runtime facts from ZenProxy admin APIs, NewAPI logs, Redis budgets, WAL files,
+tests, and release builds are higher priority than older chat history.
