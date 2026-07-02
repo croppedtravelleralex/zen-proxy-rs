@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NewAPI to ZenProxy request map record",
+  "type": "object",
+  "required": ["run_id", "zen_rid", "join_status", "join_key"],
+  "properties": {
+    "run_id": { "type": "string" },
+    "client_request_id": { "type": "string" },
+    "newapi_request_id": { "type": "string" },
+    "newapi_upstream_request_id": { "type": "string" },
+    "newapi_channel_id": { "type": "string" },
+    "newapi_model": { "type": "string" },
+    "newapi_status": { "type": ["integer", "string"] },
+    "newapi_duration_ms": { "type": ["integer", "number"] },
+    "newapi_created_at": { "type": "string" },
+    "newapi_created_at_ms": { "type": "integer" },
+    "newapi_stream": { "type": "boolean" },
+    "newapi_prompt_tokens": { "type": "integer" },
+    "newapi_completion_tokens": { "type": "integer" },
+    "zen_rid": { "type": "string" },
+    "zen_external_request_id": { "type": "string" },
+    "zen_gateway": { "type": "string" },
+    "zen_gateway_channel_id": { "type": "string" },
+    "zen_model": { "type": "string" },
+    "zen_status": { "type": ["integer", "string"] },
+    "zen_ts_ms": { "type": "integer" },
+    "join_status": {
+      "type": "string",
+      "enum": ["matched", "newapi_only", "zen_only", "ambiguous"]
+    },
+    "join_key": { "type": "string" },
+    "join_delta_ms": { "type": "integer" }
+  }
+}

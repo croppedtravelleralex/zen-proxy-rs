@@ -1,0 +1,28 @@
+[package]
+name = "zen-proxy-rs"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.12", features = ["socks", "stream", "json", "blocking"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["limit", "util"] }
+tower-http = { version = "0.6", features = ["cors", "request-id", "trace", "limit"] }
+hyper = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+futures = "0.3"
+rand = "0.8"
+http = "1"
+tokio-stream = "0.1"
+fastrand = "2"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+redis = "0.27"
+free-model-client-rs = { path = "../free-model-client-rs" }

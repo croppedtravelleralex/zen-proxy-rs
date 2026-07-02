@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ZenProxy test run manifest",
+  "type": "object",
+  "required": ["schema_version", "run_id", "scenario", "environment", "time_window"],
+  "properties": {
+    "schema_version": { "const": "test-records.v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "scenario": { "type": "string", "minLength": 1 },
+    "started_at_ms": { "type": "integer" },
+    "ended_at_ms": { "type": ["integer", "null"] },
+    "environment": {
+      "type": "object",
+      "required": ["zenproxy_base_url", "newapi_base_url"],
+      "properties": {
+        "zenproxy_base_url": { "type": "string" },
+        "newapi_base_url": { "type": "string" },
+        "zenproxy_git_sha": { "type": "string" },
+        "config_profile": { "type": "string" }
+      }
+    },
+    "time_window": {
+      "type": "object",
+      "required": ["from_ms", "to_ms"],
+      "properties": {
+        "from_ms": { "type": "integer" },
+        "to_ms": { "type": "integer" }
+      }
+    }
+  }
+}

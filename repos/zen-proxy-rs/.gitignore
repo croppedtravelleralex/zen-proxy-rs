@@ -1,0 +1,12 @@
+/target
+target-1.86/
+.codex_tmp/
+tmp/
+__pycache__/
+*.pyc
+nodes.json
+.env
+.claude/
+false/
+data/webshare_nodes.json
+test-records/runs/

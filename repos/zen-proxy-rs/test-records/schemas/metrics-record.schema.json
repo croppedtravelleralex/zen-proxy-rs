@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ZenProxy normalized test metric record",
+  "type": "object",
+  "required": ["run_id", "rid", "model", "status", "timings", "protocol_guard", "privacy"],
+  "properties": {
+    "run_id": { "type": "string" },
+    "ts_ms": { "type": "integer" },
+    "rid": { "type": "string" },
+    "external_request_id": { "type": "string" },
+    "model": { "type": "string" },
+    "upstream_model": { "type": "string" },
+    "protocol": { "type": "string" },
+    "stream": { "type": "boolean" },
+    "status": { "type": ["integer", "string"] },
+    "outcome": { "type": "string" },
+    "failure_kind": { "type": "string" },
+    "timings": { "type": "object" },
+    "pool": {
+      "type": "object",
+      "properties": {
+        "selected_node_id": { "type": "string" },
+        "selected_node_url_redacted": {
+          "type": "string",
+          "pattern": "^[^@]*$"
+        },
+        "retry_count": { "type": "integer" },
+        "retry_chain": { "type": "array" }
+      }
+    },
+    "usage": { "type": "object" },
+    "protocol_guard": { "type": "object" },
+    "privacy": {
+      "type": "object",
+      "required": ["raw_body_stored", "redaction_version", "contains_secret"],
+      "properties": {
+        "raw_body_stored": { "type": "boolean" },
+        "redaction_version": { "type": "string" },
+        "contains_secret": { "type": "boolean" }
+      }
+    }
+  }
+}

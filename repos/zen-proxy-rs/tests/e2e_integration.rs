@@ -1,0 +1,3215 @@
+use std::net::TcpListener;
+use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const SERVER_STARTUP_ATTEMPTS: usize = 8;
+const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn sha256_first8(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(input.as_bytes());
+    hex::encode(&hash[..4])
+}
+
+fn start_server(_preferred_port: u16) -> (Child, u16) {
+    start_server_with_env(_preferred_port, &[])
+}
+
+fn start_server_with_env(_preferred_port: u16, envs: &[(&str, &str)]) -> (Child, u16) {
+    let mut last_error = String::new();
+    for _ in 0..SERVER_STARTUP_ATTEMPTS {
+        let port = pick_unused_port();
+        let mut child = spawn_server(port, envs);
+        match wait_for_server(&mut child, port) {
+            Ok(()) => return (child, port),
+            Err(err) => {
+                last_error = err;
+                child.kill().ok();
+                child.wait().ok();
+                let _ = std::fs::remove_file(node_db_path(port));
+            }
+        }
+    }
+
+    panic!("failed to start e2e server after {SERVER_STARTUP_ATTEMPTS} attempts: {last_error}");
+}
+
+fn pick_unused_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve e2e port");
+    listener.local_addr().expect("reserved e2e port").port()
+}
+
+fn node_db_path(port: u16) -> String {
+    format!("/tmp/zen-e2e-{port}.json")
+}
+
+fn spawn_server(port: u16, envs: &[(&str, &str)]) -> Child {
+    let exe = option_env!("CARGO_BIN_EXE_zen-proxy-rs")
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if cfg!(debug_assertions) {
+                format!("{}/target/debug/zen-proxy-rs", env!("CARGO_MANIFEST_DIR"))
+            } else {
+                format!("{}/target/release/zen-proxy-rs", env!("CARGO_MANIFEST_DIR"))
+            }
+        });
+
+    let mut command = Command::new(&exe);
+    command
+        .env("PORT", port.to_string())
+        .env("BIND_ADDRESS", "127.0.0.1")
+        .env("PROXY_TOKEN_MODE", "unlimited")
+        .env("ADMIN_API_KEY", "test-key")
+        .env("NODES_FILE", "/dev/null")
+        .env("NODE_DB_PATH", node_db_path(port));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    command.spawn().expect("failed to start server")
+}
+
+fn wait_for_server(child: &mut Child, port: u16) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+        .map_err(|err| format!("failed to build readiness client: {err}"))?;
+    let url = format!("http://127.0.0.1:{port}/health");
+    let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("failed to poll server process: {err}"))?
+        {
+            return Err(format!(
+                "server exited before readiness on port {port}: {status}"
+            ));
+        }
+
+        let last_error = match client.get(&url).send() {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => format!("readiness returned {}", resp.status()),
+            Err(err) => err.to_string(),
+        };
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for server on port {port}; last readiness error: {last_error}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn stop_server(mut child: Child, port: u16) {
+    child.kill().ok();
+    child.wait().ok();
+    let _ = std::fs::remove_file(node_db_path(port));
+}
+
+fn start_mock_zen() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    use axum::extract::DefaultBodyLimit;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let state = observed.clone();
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            async fn handler(
+                State(observed): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+                headers: axum::http::HeaderMap,
+                Json(body): Json<serde_json::Value>,
+            ) -> impl IntoResponse {
+                observed.lock().unwrap().push(serde_json::json!({
+                    "body": body,
+                    "selected_node_id": headers
+                        .get("x-zen-proxy-selected-node-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default(),
+                    "selected_node_url": headers
+                        .get("x-zen-proxy-selected-node-url")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                }));
+                if body
+                    .get("messages")
+                    .and_then(|messages| messages.as_array())
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message.get("content"))
+                    .and_then(|content| content.as_str())
+                    == Some("rate-limit")
+                {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "60")],
+                        "FreeUsageLimitError",
+                    )
+                        .into_response();
+                }
+                let chunk = serde_json::json!({
+                    "choices": [{"delta": {"content": "zen v4 ok"}}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+                });
+                let body = format!("data: {}\n\ndata: [DONE]\n\n", chunk);
+                (
+                    StatusCode::OK,
+                    [
+                        ("content-type", "text/event-stream"),
+                        ("x-zen-observed-exit-ip", "direct"),
+                    ],
+                    body,
+                )
+                    .into_response()
+            }
+
+            let app = Router::new()
+                .route("/zen/v1/chat/completions", post(handler))
+                .with_state(state)
+                .layer(DefaultBodyLimit::max(8 * 1024 * 1024));
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+
+    (format!("http://{addr}/zen"), observed)
+}
+
+fn start_mock_models(body: serde_json::Value) -> String {
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    let body = Arc::new(body);
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let app = Router::new().route(
+                "/v1/models",
+                get({
+                    let body = body.clone();
+                    move || {
+                        let body = body.clone();
+                        async move { Json((*body).clone()) }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+
+    format!("http://{addr}/v1/models")
+}
+
+#[derive(Debug, Clone)]
+struct MockProbeResponse {
+    status: axum::http::StatusCode,
+    content_type: &'static str,
+    body: &'static str,
+}
+
+fn start_mock_probe_base_with_overrides(
+    overrides: Vec<(&'static str, MockProbeResponse)>,
+) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let overrides = Arc::new(overrides);
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+
+    std::thread::spawn({
+        let observed = observed.clone();
+        let overrides = overrides.clone();
+        move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                type ProbeState = (
+                    Arc<Mutex<Vec<serde_json::Value>>>,
+                    Arc<Vec<(&'static str, MockProbeResponse)>>,
+                );
+
+                fn override_response(
+                    probe: &str,
+                    overrides: &Arc<Vec<(&'static str, MockProbeResponse)>>,
+                ) -> Option<axum::response::Response> {
+                    overrides
+                        .iter()
+                        .find(|(name, _)| *name == probe)
+                        .map(|(_, response)| {
+                            (
+                                response.status,
+                                [("content-type", response.content_type)],
+                                response.body,
+                            )
+                                .into_response()
+                        })
+                }
+
+                async fn openai_handler(
+                    State((observed, overrides)): State<ProbeState>,
+                    headers: HeaderMap,
+                    Json(body): Json<serde_json::Value>,
+                ) -> impl IntoResponse {
+                    let probe = headers
+                        .get("x-zen-model-probe")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    observed.lock().unwrap().push(serde_json::json!({
+                        "path": "/v1/chat/completions",
+                        "probe": probe,
+                        "client": headers
+                            .get("x-fmc-client")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default(),
+                        "body": body,
+                    }));
+                    if let Some(response) = override_response(&probe, &overrides) {
+                        return response;
+                    }
+                    if body
+                        .get("stream")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        return (
+                            [("content-type", "text/event-stream")],
+                            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"probe-ok\"}}]}\n\ndata: [DONE]\n\n",
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": "probe-ok"}}]
+                    }))
+                    .into_response()
+                }
+
+                async fn anthropic_handler(
+                    State((observed, overrides)): State<ProbeState>,
+                    headers: HeaderMap,
+                    Json(body): Json<serde_json::Value>,
+                ) -> impl IntoResponse {
+                    let probe = headers
+                        .get("x-zen-model-probe")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    observed.lock().unwrap().push(serde_json::json!({
+                        "path": "/v1/messages",
+                        "probe": probe,
+                        "body": body,
+                    }));
+                    if let Some(response) = override_response(&probe, &overrides) {
+                        return response;
+                    }
+                    if probe == "claudecode_anthropic_forced_tool" {
+                        return Json(serde_json::json!({
+                            "content": [{
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {
+                                    "command": "printf PROBE_TOOL_OK",
+                                    "description": "Run the probe command."
+                                }
+                            }],
+                            "stop_reason": "tool_use"
+                        }))
+                        .into_response();
+                    }
+                    if body
+                        .get("stream")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        return (
+                            [("content-type", "text/event-stream")],
+                            "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"probe-ok\"}}\n\n",
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "content": [{"type": "text", "text": "probe-ok"}]
+                    }))
+                    .into_response()
+                }
+
+                let app = Router::new()
+                    .route("/v1/chat/completions", post(openai_handler))
+                    .route("/v1/messages", post(anthropic_handler))
+                    .with_state((observed, overrides));
+                let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        }
+    });
+
+    (format!("http://{addr}"), observed)
+}
+
+fn start_mock_probe_base() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    start_mock_probe_base_with_overrides(Vec::new())
+}
+
+#[cfg(test)]
+mod e2e {
+    use super::*;
+
+    #[test]
+    fn test_health() {
+        let (child, port) = start_server(19781);
+        let resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/health", port))
+            .expect("health endpoint");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["status"], "ok");
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_metrics() {
+        let (child, port) =
+            start_server_with_env(19782, &[("PREFERRED_PROXY_URLS", "http://127.0.0.1:7897")]);
+        let resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/metrics", port))
+            .expect("metrics endpoint");
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().unwrap();
+        assert!(
+            text.contains("zen_proxy_requests_total"),
+            "metrics should contain counter"
+        );
+        assert!(
+            text.contains("zen_proxy_pool_size{pool=\"dispatch\"} 1"),
+            "metrics should contain live dispatch pool size: {text}"
+        );
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_index() {
+        let (child, port) = start_server(19783);
+        let resp =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/", port)).expect("index endpoint");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["service"], "zen-proxy-rs");
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_unauthorized() {
+        let (child, port) = start_server(19784);
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/admin/stats", port))
+            .send()
+            .expect("admin/stats endpoint");
+        assert_eq!(resp.status(), 401, "no API key should be rejected");
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_authorized() {
+        let (child, port) = start_server(19785);
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/admin/stats", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/stats endpoint");
+        assert_eq!(resp.status(), 200, "valid API key should be accepted");
+        let body: serde_json::Value = resp.json().unwrap();
+        assert!(body["success"].as_bool().unwrap_or(false));
+        assert!(body["data"].is_object());
+        let config_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/config", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/config endpoint");
+        assert_eq!(config_resp.status(), 200);
+        let config_body: serde_json::Value = config_resp.json().unwrap();
+        let probe = &config_body["data"]["dynamic_model_discovery"]["probe"];
+        assert_eq!(probe["enabled"], false);
+        assert_eq!(probe["max_concurrent"], 1);
+        assert_eq!(probe["max_per_round"], 3);
+        assert_eq!(probe["requests_per_interval"], 20);
+        assert_eq!(probe["success_quorum"], 2);
+        assert_eq!(probe["failure_quarantine_threshold"], 3);
+        let runtime_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/runtime", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/runtime endpoint");
+        assert_eq!(runtime_resp.status(), 200);
+        let runtime_body: serde_json::Value = runtime_resp.json().unwrap();
+        let runtime_probe = &runtime_body["data"]["dynamic_model_probe"];
+        assert_eq!(runtime_probe["enabled"], false);
+        assert_eq!(runtime_probe["max_per_round"], 3);
+        assert_eq!(
+            runtime_probe["planned_candidates"]
+                .as_array()
+                .expect("planned candidates array")
+                .len(),
+            0
+        );
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_models_endpoint() {
+        let (child, port) = start_server(19786);
+        let resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("models endpoint");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["object"], "list");
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["deepseek-v4-flash", "deepseek-v4-pro"]);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_models_endpoint_v4_mode() {
+        let (child, port) =
+            start_server_with_env(19789, &[("ZEN_PROVIDER_MODE", "free_model_kernel")]);
+        let resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("models endpoint");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["object"], "list");
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+
+        let detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/deepseek-v4-flash",
+            port
+        ))
+        .expect("model detail endpoint");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(detail_body["id"], "deepseek-v4-flash");
+        assert_eq!(detail_body["upstream_id"], "deepseek-v4-flash-free");
+
+        let helper_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/claude-haiku-4-5",
+            port
+        ))
+        .expect("ClaudeCode WebFetch helper detail endpoint");
+        assert_eq!(helper_detail.status(), 200);
+        let helper_detail_body: serde_json::Value = helper_detail.json().unwrap();
+        assert_eq!(helper_detail_body["id"], "claude-haiku-4-5");
+        assert_eq!(helper_detail_body["upstream_id"], "deepseek-v4-flash-free");
+        assert_eq!(helper_detail_body["profile"], "static_flash");
+
+        let missing = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/deepseek-v4-pro",
+            port
+        ))
+        .expect("missing model detail endpoint");
+        assert_eq!(missing.status(), 404);
+
+        let client = reqwest::blocking::Client::new();
+        for (probe_name, header, value) in [
+            ("openai", "user-agent", "OpenAI/Python 1.0"),
+            ("anthropic", "anthropic-client", "anthropic-sdk-rust/0.1"),
+        ] {
+            let probe_resp = client
+                .get(format!("http://127.0.0.1:{}/v1/models", port))
+                .header(header, value)
+                .send()
+                .unwrap_or_else(|err| panic!("{probe_name} model probe failed: {err}"));
+            assert_eq!(probe_resp.status(), 200, "{probe_name} model probe");
+            let probe_body: serde_json::Value = probe_resp.json().unwrap();
+            let probe_ids: Vec<&str> = probe_body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|model| model["id"].as_str())
+                .collect();
+            assert_eq!(
+                probe_ids,
+                vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"],
+                "{probe_name} model probe ids"
+            );
+        }
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_discovery_stays_admin_only() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "deepseek-v4-flash-free"},
+                {"id": "new-opencode-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19790,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_MAX_PER_ROUND", "2"),
+            ],
+        );
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let admin_body = loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break body;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate admin candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+
+        let discovery = &admin_body["data"]["dynamic_discovery"];
+        assert_eq!(discovery["enabled"], true);
+        assert_eq!(discovery["worker_running"], true);
+        assert_eq!(discovery["candidate_total"], 1);
+        assert_eq!(discovery["ignored_total"], 2);
+        assert_eq!(discovery["missing_total"], 0);
+        assert_eq!(admin_body["data"]["safety"]["candidates_are_public"], false);
+        assert_eq!(admin_body["data"]["safety"]["auto_promote"], false);
+
+        let runtime_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/runtime", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/runtime endpoint");
+        assert_eq!(runtime_resp.status(), 200);
+        let runtime_body: serde_json::Value = runtime_resp.json().unwrap();
+        let planned = runtime_body["data"]["dynamic_model_probe"]["planned_candidates"]
+            .as_array()
+            .expect("planned candidates");
+        let planned_ids = planned
+            .iter()
+            .filter_map(|model| model.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(planned_ids, vec!["new-opencode-free"]);
+
+        let detail = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-opencode-free",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin dynamic model detail");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(detail_body["data"]["mode"], "dynamic_candidate");
+        assert_eq!(detail_body["data"]["public"], false);
+        assert_eq!(detail_body["data"]["probe_required"], true);
+        assert_eq!(detail_body["data"]["auto_promoted"], false);
+        assert_eq!(detail_body["data"]["probe_attempts_total"], 0);
+        assert_eq!(detail_body["data"]["probe_success_total"], 0);
+        assert_eq!(detail_body["data"]["probe_failure_total"], 0);
+        assert_eq!(detail_body["data"]["consecutive_probe_successes"], 0);
+        assert_eq!(detail_body["data"]["consecutive_probe_failures"], 0);
+        assert!(detail_body["data"]["last_probe_unix"].is_null());
+        assert!(detail_body["data"]["last_success_unix"].is_null());
+        assert!(detail_body["data"]["last_failure_unix"].is_null());
+        assert_eq!(
+            detail_body["data"]["required_probe_names"]
+                .as_array()
+                .expect("required probes")
+                .len(),
+            9
+        );
+        assert_eq!(
+            detail_body["data"]["missing_probe_names"]
+                .as_array()
+                .expect("missing probes")
+                .len(),
+            9
+        );
+
+        let probes = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-opencode-free/probes",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin dynamic model probes");
+        assert_eq!(probes.status(), 200);
+        let probes_body: serde_json::Value = probes.json().unwrap();
+        assert_eq!(probes_body["data"]["state"], "candidate");
+        assert_eq!(
+            probes_body["data"]["passed_probe_names"]
+                .as_array()
+                .expect("passed probes")
+                .len(),
+            0
+        );
+
+        let rejected = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-opencode-free",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("candidate data-plane request");
+        assert_eq!(rejected.status(), 400);
+        let rejected_body: serde_json::Value = rejected.json().unwrap();
+        assert!(rejected_body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsupported V4 model"));
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_canary_public_mode_exposes_promoted_models_only() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-opencode-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19791,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let before_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint before promote");
+        let before_body: serde_json::Value = before_resp.json().unwrap();
+        let before_ids: Vec<&str> = before_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            before_ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
+        );
+
+        let promoted = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-opencode-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "canary"}))
+            .send()
+            .expect("promote dynamic model");
+        assert_eq!(promoted.status(), 200);
+        let promoted_body: serde_json::Value = promoted.json().unwrap();
+        assert_eq!(promoted_body["data"]["state"], "canary");
+        assert_eq!(promoted_body["data"]["public"], true);
+        assert_eq!(promoted_body["data"]["routable"], true);
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint after promote");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "new-opencode"
+            ]
+        );
+
+        let detail =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/new-opencode", port))
+                .expect("dynamic public model detail");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(detail_body["id"], "new-opencode");
+        assert_eq!(detail_body["upstream_id"], "new-opencode-free");
+
+        let paid_detail =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/paid-model", port))
+                .expect("ignored model detail");
+        assert_eq!(paid_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_candidate_public_mode_exposes_candidates_for_test_channel() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-candidate-direct-free"},
+                {"id": "paid-model"},
+                {"id": "second-candidate-direct-free"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19808,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 2
+            {
+                assert_eq!(
+                    body["data"]["safety"]["dynamic_model_public_mode"],
+                    "candidate_canary_or_active"
+                );
+                assert_eq!(body["data"]["safety"]["candidates_are_public"], true);
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "new-candidate-direct",
+                "second-candidate-direct"
+            ]
+        );
+
+        let detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-candidate-direct",
+            port
+        ))
+        .expect("candidate model detail endpoint");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(detail_body["id"], "new-candidate-direct");
+        assert_eq!(detail_body["upstream_id"], "new-candidate-direct-free");
+        assert_eq!(detail_body["profile"], "dynamic_generic");
+        let admin_detail = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-candidate-direct-free",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("candidate admin detail");
+        assert_eq!(admin_detail.status(), 200);
+        let admin_detail_body: serde_json::Value = admin_detail.json().unwrap();
+        assert_eq!(admin_detail_body["data"]["state"], "candidate");
+        assert_eq!(admin_detail_body["data"]["probe_required"], true);
+        assert_eq!(admin_detail_body["data"]["auto_promoted"], false);
+        assert_eq!(admin_detail_body["data"]["public"], true);
+        assert_eq!(admin_detail_body["data"]["lifecycle_public"], false);
+        assert_eq!(admin_detail_body["data"]["profile"], "dynamic_generic");
+
+        let paid_detail =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models/paid-model", port))
+                .expect("ignored model detail");
+        assert_eq!(paid_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_public_allowlist_filters_test_channel_models() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "mimo-v2.5-free"},
+                {"id": "nemotron-3-ultra-free"},
+                {"id": "north-mini-code-free"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19809,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+                (
+                    "DYNAMIC_MODEL_PUBLIC_ALLOWLIST",
+                    "mimo-v2.5,nemotron-3-ultra-free",
+                ),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 3
+            {
+                assert_eq!(
+                    body["data"]["safety"]["dynamic_model_public_allowlist"],
+                    serde_json::json!(["mimo-v2.5", "nemotron-3-ultra-free"])
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "nemotron-3-ultra"
+            ]
+        );
+
+        let hidden_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/north-mini-code",
+            port
+        ))
+        .expect("hidden routable model detail");
+        assert_eq!(hidden_detail.status(), 200);
+        let hidden_body: serde_json::Value = hidden_detail.json().unwrap();
+        assert_eq!(hidden_body["id"], "north-mini-code");
+        assert_eq!(hidden_body["upstream_id"], "north-mini-code-free");
+        assert_eq!(hidden_body["profile"], "dynamic_generic");
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_candidate_public_mode_does_not_inherit_client_specific_profile() {
+        let (upstream_base, observed) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-profile-gated-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19816,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"Task","parameters":{"type":"object","properties":{}}}}
+        ]);
+        let response = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "openclaw")
+            .json(&serde_json::json!({
+                "model": "new-profile-gated",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools,
+                "stream": false
+            }))
+            .send()
+            .expect("dynamic candidate profile-gated request");
+        assert_eq!(response.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["model"], "new-profile-gated-free");
+        assert!(seen[0]["body"]["thinking"].is_null());
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_manual_harness_probe_promotes_candidate_without_background_probe() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-manual-harness-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19813,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "harness_all_pass"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate manual candidate: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let unauthorized = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-manual-harness-free/probe",
+                port
+            ))
+            .send()
+            .expect("unauthorized manual probe request");
+        assert_eq!(unauthorized.status(), 401);
+
+        let probe = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-manual-harness-free/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("manual harness probe request");
+        assert_eq!(probe.status(), 200);
+        let probe_body: serde_json::Value = probe.json().unwrap();
+        assert_eq!(probe_body["data"]["id"], "new-manual-harness-free");
+        assert_eq!(probe_body["data"]["final_state"], "canary");
+        assert_eq!(
+            probe_body["data"]["attempted_probe_names"]
+                .as_array()
+                .unwrap()
+                .len(),
+            9
+        );
+        assert_eq!(
+            probe_body["data"]["failed_probe_name"],
+            serde_json::Value::Null
+        );
+        assert_eq!(probe_body["data"]["current"]["state"], "canary");
+        assert_eq!(probe_body["data"]["current"]["public"], true);
+        assert_eq!(probe_body["data"]["current"]["routable"], true);
+        assert_eq!(probe_body["data"]["current"]["profile"], "dynamic_generic");
+        assert_eq!(
+            probe_body["data"]["current"]["claudecode_compatible"],
+            serde_json::Value::Bool(false)
+        );
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint after manual probe");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "new-manual-harness"
+            ]
+        );
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_harness_probe_promotes_candidates_to_canary_in_test_mode() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-harness-probed-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (child, port) = start_server_with_env(
+            19809,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "harness_all_pass"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probes_body = loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-harness-probed-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "canary" {
+                    break body;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("harness probe did not promote candidate before deadline");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 9);
+        assert_eq!(
+            probes_body["data"]["passed_probe_names"]
+                .as_array()
+                .expect("passed probes")
+                .len(),
+            9
+        );
+        assert_eq!(
+            probes_body["data"]["missing_probe_names"]
+                .as_array()
+                .expect("missing probes")
+                .len(),
+            0
+        );
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "new-harness-probed"
+            ]
+        );
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_manual_http_probe_missing_base_url_is_clear_422() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-manual-missing-base-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19814,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-manual-missing-base-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "candidate" {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not expose manual missing-base candidate");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let probe = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-manual-missing-base-free/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("manual missing-base probe request");
+        assert_eq!(probe.status(), 422);
+        let probe_body: serde_json::Value = probe.json().unwrap();
+        assert!(probe_body["error"]
+            .as_str()
+            .unwrap()
+            .contains("DYNAMIC_MODEL_PROBE_BASE_URL"));
+
+        let probes = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-manual-missing-base-free/probes",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin probes after missing-base manual probe");
+        assert_eq!(probes.status(), 200);
+        let probes_body: serde_json::Value = probes.json().unwrap();
+        assert_eq!(probes_body["data"]["state"], "candidate");
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 0);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_http_bounded_probe_promotes_candidates_to_canary_in_test_mode() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-http-probed-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (probe_base, observed) = start_mock_probe_base();
+        let (child, port) = start_server_with_env(
+            19810,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PROBE_BASE_URL", probe_base.as_str()),
+                ("DYNAMIC_MODEL_PROBE_API_KEY", "probe-key"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probes_body = loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-http-probed-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "canary"
+                    && body["data"]["profile"] == "dynamic_claudecode_compatible"
+                {
+                    break body;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("http_bounded probe did not promote candidate before deadline");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 9);
+        assert_eq!(
+            probes_body["data"]["passed_probe_names"]
+                .as_array()
+                .expect("passed probes")
+                .len(),
+            9
+        );
+        assert_eq!(
+            probes_body["data"]["missing_probe_names"]
+                .as_array()
+                .expect("missing probes")
+                .len(),
+            0
+        );
+        assert_eq!(
+            probes_body["data"]["claudecode_compatible"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(probes_body["data"]["claudecode_compatibility_reason"]
+            .as_str()
+            .unwrap()
+            .contains("http_bounded probe matrix passed"));
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "new-http-probed"
+            ]
+        );
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            8,
+            "metadata probe is local, remaining eight probes should call HTTP"
+        );
+        assert!(seen.iter().any(|item| {
+            item["path"] == "/v1/messages" && item["probe"] == "anthropic_stream_minimal"
+        }));
+        assert!(seen.iter().any(|item| {
+            item["path"] == "/v1/chat/completions"
+                && item["probe"] == "tool_history_minimal"
+                && item["client"] == "claude-code"
+                && item["body"]["messages"][2]["tool_call_id"] == "call_probe_1"
+        }));
+        assert!(seen.iter().any(|item| {
+            item["path"] == "/v1/messages"
+                && item["probe"] == "claudecode_anthropic_forced_tool"
+                && item["body"]["tool_choice"]["name"] == "Bash"
+        }));
+        drop(seen);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_http_bounded_probe_enables_claudecode_profile_without_openclaw_leakage() {
+        let (upstream_base, observed) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-cc-route-free"}]
+        }));
+        let (probe_base, _) = start_mock_probe_base();
+        let (child, port) = start_server_with_env(
+            19820,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PROBE_BASE_URL", probe_base.as_str()),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-cc-route-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "candidate" {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidate before manual probe");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let probe = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-cc-route-free/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("manual http probe request");
+        assert_eq!(probe.status(), 200);
+        let probe_body: serde_json::Value = probe.json().unwrap();
+        assert_eq!(probe_body["data"]["final_state"], "canary");
+
+        let detail = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-cc-route-free",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin model detail after compatible probe");
+        assert_eq!(detail.status(), 200);
+        let detail_body: serde_json::Value = detail.json().unwrap();
+        assert_eq!(
+            detail_body["data"]["profile"],
+            "dynamic_claudecode_compatible"
+        );
+        assert_eq!(
+            detail_body["data"]["claudecode_compatible"],
+            serde_json::Value::Bool(true)
+        );
+
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"Task","parameters":{"type":"object","properties":{}}}}
+        ]);
+        let claude_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "new-cc-route",
+                "messages": [{"role":"user","content":"use task"}],
+                "tools": tools.clone(),
+                "stream": false
+            }))
+            .send()
+            .expect("dynamic claudecode-compatible request");
+        assert_eq!(claude_resp.status(), 200);
+
+        let openclaw_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "openclaw")
+            .json(&serde_json::json!({
+                "model": "new-cc-route",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools,
+                "stream": false
+            }))
+            .send()
+            .expect("dynamic openclaw request should not inherit claudecode profile");
+        assert_eq!(openclaw_resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["body"]["model"], "new-cc-route-free");
+        assert_eq!(seen[1]["body"]["model"], "new-cc-route-free");
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_http_bounded_probe_quarantines_protocol_failure() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "new-http-bad-tool-free"},
+                {"id": "paid-model"}
+            ]
+        }));
+        let (probe_base, _observed) = start_mock_probe_base_with_overrides(vec![(
+            "tool_history_minimal",
+            MockProbeResponse {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                content_type: "application/json",
+                body: r#"{"error":{"message":"messages[2]: missing field tool_call_id"}}"#,
+            },
+        )]);
+        let (child, port) = start_server_with_env(
+            19811,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PROBE_BASE_URL", probe_base.as_str()),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probes_body = loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-http-bad-tool-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "quarantined" {
+                    break body;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("http_bounded hard protocol failure did not quarantine before deadline");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(
+            probes_body["data"]["last_probe_name"],
+            "tool_history_minimal"
+        );
+        assert_eq!(
+            probes_body["data"]["last_failure_code"],
+            "probe_hard_protocol_error"
+        );
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 6);
+        assert_eq!(probes_body["data"]["probe_failure_total"], 1);
+        assert_eq!(probes_body["data"]["public"], false);
+        assert_eq!(probes_body["data"]["routable"], false);
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert!(!public_ids.contains(&"new-http-bad-tool-free"));
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_http_bounded_probe_missing_base_url_keeps_candidate_hidden() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-http-missing-base-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19812,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ENABLED", "true"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probes_body = loop {
+            let resp = client
+                .get(format!(
+                    "http://127.0.0.1:{}/admin/models/new-http-missing-base-free/probes",
+                    port
+                ))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin model probes endpoint");
+            if resp.status() == 200 {
+                let body: serde_json::Value = resp.json().unwrap();
+                if body["data"]["state"] == "candidate" {
+                    break body;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not expose candidate probe state before deadline");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 0);
+        assert_eq!(probes_body["data"]["public"], false);
+        assert_eq!(probes_body["data"]["routable"], false);
+
+        let public_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", port))
+            .expect("public models endpoint");
+        assert_eq!(public_resp.status(), 200);
+        let public_body: serde_json::Value = public_resp.json().unwrap();
+        let public_ids: Vec<&str> = public_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            public_ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
+        );
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_active_only_mode_excludes_canary_until_active() {
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-active-only-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19792,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "active_only"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let canary = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-only-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "canary"}))
+            .send()
+            .expect("canary promote dynamic model");
+        assert_eq!(canary.status(), 200);
+
+        let canary_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-active-only",
+            port
+        ))
+        .expect("canary detail in active_only mode");
+        assert_eq!(canary_detail.status(), 404);
+
+        let active = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-only-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "active"}))
+            .send()
+            .expect("active promote dynamic model");
+        assert_eq!(active.status(), 409);
+        let active_blocked_body: serde_json::Value = active.json().unwrap();
+        assert_eq!(
+            active_blocked_body["data"]["active_promotion"]["eligible"],
+            false
+        );
+
+        let active_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-active-only",
+            port
+        ))
+        .expect("active detail in active_only mode");
+        assert_eq!(active_detail.status(), 404);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_active_promotion_requires_canary_traffic_quorum() {
+        let (upstream_base, _) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-active-quorum-free"}]
+        }));
+        let (probe_base, _) = start_mock_probe_base();
+        let (child, port) = start_server_with_env(
+            19819,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PROBE_ADAPTER", "http_bounded"),
+                ("DYNAMIC_MODEL_PROBE_BASE_URL", probe_base.as_str()),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+                ("DYNAMIC_MODEL_ACTIVE_MIN_CANARY_REQUESTS", "2"),
+                ("DYNAMIC_MODEL_ACTIVE_MIN_SUCCESS_RATE_BPS", "10000"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let canary = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("http bounded probe dynamic model");
+        assert_eq!(canary.status(), 200);
+        let canary_body: serde_json::Value = canary.json().unwrap();
+        assert_eq!(canary_body["data"]["final_state"], "canary");
+        assert_eq!(
+            canary_body["data"]["current"]["profile"],
+            "dynamic_claudecode_compatible"
+        );
+
+        let premature_active = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "active"}))
+            .send()
+            .expect("premature active promote dynamic model");
+        assert_eq!(premature_active.status(), 409);
+        let premature_body: serde_json::Value = premature_active.json().unwrap();
+        assert_eq!(
+            premature_body["data"]["active_promotion"]["needed_canary_requests"],
+            2
+        );
+
+        for content in ["hello", "hello again"] {
+            let ok_resp = client
+                .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+                .json(&serde_json::json!({
+                    "model": "new-active-quorum",
+                    "messages": [{"role": "user", "content": content}],
+                    "stream": false
+                }))
+                .send()
+                .expect("successful dynamic canary request");
+            assert_eq!(ok_resp.status(), 200);
+        }
+
+        let traffic_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/traffic",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic model traffic endpoint");
+        assert_eq!(traffic_resp.status(), 200);
+        let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
+        assert_eq!(traffic_body["data"]["traffic"]["canary_requests_total"], 2);
+        assert_eq!(traffic_body["data"]["active_promotion"]["eligible"], true);
+        assert_eq!(
+            traffic_body["data"]["active_promotion"]["claudecode_compatible"],
+            true
+        );
+        assert_eq!(
+            traffic_body["data"]["active_promotion"]["canary_success_rate_bps"],
+            10000
+        );
+
+        let active = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-active-quorum-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "active"}))
+            .send()
+            .expect("active promote dynamic model after canary traffic");
+        assert_eq!(active.status(), 200);
+        let active_body: serde_json::Value = active.json().unwrap();
+        assert_eq!(active_body["data"]["state"], "active");
+        assert_eq!(active_body["data"]["active_promotion"]["eligible"], true);
+
+        let active_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/new-active-quorum",
+            port
+        ))
+        .expect("active detail in canary_or_active mode");
+        assert_eq!(active_detail.status(), 200);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_canary_traffic_endpoint_tracks_success_and_failure() {
+        let (upstream_base, _) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-traffic-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19817,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidates: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let promoted = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/models/new-traffic-free/promote",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"state": "canary"}))
+            .send()
+            .expect("promote dynamic model");
+        assert_eq!(promoted.status(), 200);
+
+        let ok_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-traffic",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("successful dynamic canary request");
+        assert_eq!(ok_resp.status(), 200);
+
+        let limited_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-traffic",
+                "messages": [{"role": "user", "content": "rate-limit"}],
+                "stream": false
+            }))
+            .send()
+            .expect("rate-limited dynamic canary request");
+        assert_eq!(limited_resp.status(), 429);
+
+        let traffic_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-traffic-free/traffic",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic model traffic endpoint");
+        assert_eq!(traffic_resp.status(), 200);
+        let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
+        let traffic = &traffic_body["data"]["traffic"];
+        assert_eq!(traffic["canary_requests_total"], 2);
+        assert_eq!(traffic["canary_success_total"], 1);
+        assert_eq!(traffic["canary_failure_total"], 1);
+        assert_eq!(traffic["active_requests_total"], 0);
+        assert_eq!(traffic["requests_total"], 2);
+        assert_eq!(traffic["success_total"], 1);
+        assert_eq!(traffic["failure_total"], 1);
+        assert_eq!(traffic["last_traffic_status"], 429);
+        assert_eq!(traffic["last_traffic_failure_kind"], "upstream_429");
+
+        let detail_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-traffic-free",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic model detail");
+        assert_eq!(detail_resp.status(), 200);
+        let detail_body: serde_json::Value = detail_resp.json().unwrap();
+        assert_eq!(detail_body["data"]["traffic"]["canary_requests_total"], 2);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_candidate_public_mode_disables_direct_fallback_by_default() {
+        let (upstream_base, _) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-candidate-no-direct-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19819,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                assert_eq!(body["data"]["safety"]["candidates_are_public"], true);
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate no-direct candidate: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-candidate-no-direct",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("dynamic candidate request without direct fallback");
+        assert_eq!(resp.status(), 503);
+
+        let traffic_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-candidate-no-direct-free/traffic",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic candidate traffic endpoint");
+        assert_eq!(traffic_resp.status(), 200);
+        let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
+        let traffic = &traffic_body["data"]["traffic"];
+        assert_eq!(traffic["candidate_requests_total"], 1);
+        assert_eq!(traffic["candidate_success_total"], 0);
+        assert_eq!(traffic["candidate_failure_total"], 1);
+        assert_eq!(traffic["last_traffic_status"], 503);
+        assert_eq!(traffic["last_traffic_failure_kind"], "proxy_pool_exhausted");
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_dynamic_candidate_public_traffic_endpoint_tracks_direct_self_use() {
+        let (upstream_base, _) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-candidate-traffic-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19818,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                assert_eq!(body["data"]["safety"]["candidates_are_public"], true);
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate candidate traffic model: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let ok_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-candidate-traffic",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("successful dynamic candidate request");
+        assert_eq!(ok_resp.status(), 200);
+
+        let limited_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-candidate-traffic",
+                "messages": [{"role": "user", "content": "rate-limit"}],
+                "stream": false
+            }))
+            .send()
+            .expect("rate-limited dynamic candidate request");
+        assert_eq!(limited_resp.status(), 429);
+
+        let traffic_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-candidate-traffic-free/traffic",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic candidate traffic endpoint");
+        assert_eq!(traffic_resp.status(), 200);
+        let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
+        assert_eq!(traffic_body["data"]["state"], "candidate");
+        assert_eq!(traffic_body["data"]["public"], true);
+        assert_eq!(traffic_body["data"]["lifecycle_public"], false);
+        let traffic = &traffic_body["data"]["traffic"];
+        assert_eq!(traffic["candidate_requests_total"], 2);
+        assert_eq!(traffic["candidate_success_total"], 1);
+        assert_eq!(traffic["candidate_failure_total"], 1);
+        assert_eq!(traffic["canary_requests_total"], 0);
+        assert_eq!(traffic["active_requests_total"], 0);
+        assert_eq!(traffic["requests_total"], 2);
+        assert_eq!(traffic["success_total"], 1);
+        assert_eq!(traffic["failure_total"], 1);
+        assert_eq!(traffic["last_traffic_status"], 429);
+        assert_eq!(traffic["last_traffic_failure_kind"], "upstream_429");
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_models_alias_endpoint_v4_mode() {
+        let (child, port) =
+            start_server_with_env(19797, &[("ZEN_PROVIDER_MODE", "free_model_kernel")]);
+        let resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/models", port))
+            .expect("models alias endpoint");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().unwrap();
+        let ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_openai_and_anthropic_use_free_model_kernel() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19790,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+
+        let openai_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 openai request");
+        assert_eq!(openai_resp.status(), 200);
+        let openai_body: serde_json::Value = openai_resp.json().unwrap();
+        assert_eq!(openai_body["choices"][0]["message"]["content"], "zen v4 ok");
+
+        let anthropic_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 64,
+                "stream": false
+            }))
+            .send()
+            .expect("v4 anthropic request");
+        assert_eq!(anthropic_resp.status(), 200);
+        let anthropic_body: serde_json::Value = anthropic_resp.json().unwrap();
+        assert_eq!(anthropic_body["content"][0]["text"], "zen v4 ok");
+
+        let anthropic_health_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 anthropic health-style request");
+        assert_eq!(anthropic_health_resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen[0]["body"]["model"], "big-pickle");
+        assert_eq!(seen[1]["body"]["model"], "big-pickle");
+        assert_eq!(seen[2]["body"]["model"], "big-pickle");
+        assert!(seen[2]["body"].get("max_tokens").is_none());
+        assert_eq!(seen[0]["selected_node_id"], "direct");
+        assert_eq!(seen[0]["selected_node_url"], "direct");
+
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let items = requests_body["data"].as_array().unwrap();
+        let openai_record = items
+            .iter()
+            .find(|item| item["public_model"] == "big-pickle")
+            .unwrap();
+        assert!(openai_record["rid"].as_str().is_some());
+        assert_eq!(openai_record["upstream_model"], "big-pickle");
+        assert_eq!(openai_record["selected_node_id"], "direct");
+        assert_eq!(openai_record["selected_node_url_redacted"], "direct");
+        assert_eq!(openai_record["observed_exit_ip"], "direct");
+        assert_eq!(openai_record["outcome"], "success");
+        assert_eq!(openai_record["prompt_tokens"], 2);
+        assert_eq!(openai_record["completion_tokens"], 3);
+        assert_eq!(openai_record["total_tokens"], 5);
+        assert!(openai_record["bytes_received"].as_u64().unwrap_or(0) > 0);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_proxy_api_key_accepts_x_api_key_header() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19800,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("PROXY_API_KEY", "sk-dev"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-api-key", "sk-dev")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 openai request with x-api-key");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_ingress_accepts_body_over_axum_default_limit() {
+        let (child, port) = start_server_with_env(
+            19802,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let body = serde_json::json!({
+            "model": "not-a-v4-model",
+            "messages": [{"role": "user", "content": "x".repeat(3 * 1024 * 1024)}],
+            "stream": false
+        })
+        .to_string();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .expect("large invalid v4 request");
+        assert_eq!(resp.status(), 400);
+        let text = resp.text().unwrap();
+        assert!(
+            text.contains("unsupported V4 model"),
+            "large request should reach V4 handler, got {text}"
+        );
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_compactor_trims_large_old_tool_result_before_upstream() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19803,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+                ("ZEN_COMPACTOR_MODE", "enforce"),
+                ("ZEN_ARTIFACT_CACHE_MODE", "off"),
+                ("CONTEXT_COMPACT_BODY_MB", "1"),
+                ("CONTEXT_TARGET_BODY_MB", "1"),
+                ("CONTEXT_LARGE_CHUNK_BYTES", "1024"),
+                ("CONTEXT_PRESERVE_RECENT_MESSAGES", "8"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "old-tool", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]},
+                    {"role": "tool", "content": "x".repeat(2 * 1024 * 1024), "tool_call_id": "old-tool"},
+                    {"role": "assistant", "content": "recent assistant"},
+                    {"role": "user", "content": "latest user"}
+                ],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 compacted openai request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-context-trimmed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-context-action")
+                .and_then(|value| value.to_str().ok()),
+            Some("compact")
+        );
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["model"], "big-pickle");
+        let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
+        assert_eq!(upstream_messages.last().unwrap()["content"], "latest user");
+        let compacted_tool = upstream_messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("paired tool result should remain protocol-shaped");
+        assert!(compacted_tool.contains("ZenProxy context compactor"));
+        assert!(compacted_tool.len() < 16 * 1024);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_flash_input_wall_passes_large_old_tool_result_before_upstream() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19807,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+                ("ZEN_COMPACTOR_MODE", "enforce"),
+                ("ZEN_ARTIFACT_CACHE_MODE", "off"),
+                ("CONTEXT_COMPACT_BODY_MB", "1"),
+                ("CONTEXT_TARGET_BODY_MB", "1"),
+                ("CONTEXT_LARGE_CHUNK_BYTES", "1024"),
+                ("CONTEXT_PRESERVE_RECENT_MESSAGES", "8"),
+                ("CONTEXT_TOKEN_COMPACT", "100"),
+                ("CONTEXT_TOKEN_TARGET", "100"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "old-tool", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]},
+                    {"role": "tool", "content": "x".repeat(2 * 1024 * 1024), "tool_call_id": "old-tool"},
+                    {"role": "assistant", "content": "recent assistant"},
+                    {"role": "user", "content": "y".repeat(2 * 1024)}
+                ],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 flash pass-through openai request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-context-trimmed")
+                .and_then(|value| value.to_str().ok()),
+            Some("false")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-context-action")
+                .and_then(|value| value.to_str().ok()),
+            Some("warn")
+        );
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["model"], "deepseek-v4-flash-free");
+        let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
+        assert_eq!(
+            upstream_messages.last().unwrap()["content"],
+            "y".repeat(2 * 1024)
+        );
+        let tool_content = upstream_messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("paired tool result should remain protocol-shaped");
+        assert!(!tool_content.contains("ZenProxy context compactor"));
+        assert_eq!(tool_content.len(), 2 * 1024 * 1024);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_nonstream_guard_preserves_large_prompt_output_before_upstream() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19805,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "x".repeat(220_000)}],
+                "max_tokens": 4096,
+                "stream": false
+            }))
+            .send()
+            .expect("v4 nonstream guarded request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-zen-nonstream-guard-action")
+                .and_then(|value| value.to_str().ok()),
+            Some("pass")
+        );
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["max_tokens"], 4096);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_nonstream_guard_preserves_huge_prompt_long_output() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19806,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("REQUEST_BODY_LIMIT_MB", "8"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "x".repeat(440_000)}],
+                "max_tokens": 20_000,
+                "stream": false
+            }))
+            .send()
+            .expect("v4 nonstream preserved request");
+        assert_eq!(resp.status(), 200);
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["body"]["max_tokens"], 20_000);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_protocol_guard_repairs_openai_tool_history_before_upstream() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19804,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("PROTOCOL_GUARD_MODE", "repair"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("user-agent", "OpenClaw-test")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role":"assistant","content":null,"tool_calls":[{"id":"call_guard_1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+                    {"role":"tool","content":"file contents"},
+                    {"role":"user","content":"continue"}
+                ],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 protocol guard request");
+        assert_eq!(resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
+        let tool_message = upstream_messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("tool message should remain protocol-shaped");
+        assert_eq!(tool_message["tool_call_id"], "call_guard_1");
+        drop(seen);
+
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let record = requests_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["protocol_guard"]["applied"] == true)
+            .expect("protocol guard telemetry record");
+        assert_eq!(record["protocol_guard"]["source_client"], "openclaw");
+        assert_eq!(record["protocol_guard"]["missing_tool_call_id_count"], 1);
+        assert_eq!(record["protocol_guard"]["post_valid"], true);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_free_model_kernel_propagates_source_client_and_model_profile_policy() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19811,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"Task","parameters":{"type":"object","properties":{}}}}
+        ]);
+
+        let source_client_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-zen-source-client", "openclaw")
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools.clone(),
+                "stream": false
+            }))
+            .send()
+            .expect("source_client profile request");
+        assert_eq!(source_client_resp.status(), 200);
+
+        let flash_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "openclaw")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools.clone(),
+                "stream": false
+            }))
+            .send()
+            .expect("flash model profile request");
+        assert_eq!(flash_resp.status(), 200);
+
+        let lite_claude_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role":"user","content":"use tool"}],
+                "tools": tools.clone(),
+                "stream": false
+            }))
+            .send()
+            .expect("lite claude profile request");
+        assert_eq!(lite_claude_resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0]["body"]["model"], "big-pickle");
+        assert_eq!(
+            seen[0]["body"]["thinking"],
+            serde_json::json!({"type":"disabled"})
+        );
+        assert_eq!(seen[1]["body"]["model"], "deepseek-v4-flash-free");
+        assert!(seen[1]["body"]["thinking"].is_null());
+        assert_eq!(seen[2]["body"]["model"], "big-pickle");
+        assert!(seen[2]["body"]["thinking"].is_null());
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_stream_telemetry_records_bytes_and_usage() {
+        let (upstream_base, _) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19801,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }))
+            .send()
+            .expect("v4 openai stream request");
+        let status = resp.status();
+        let body = resp.text().unwrap();
+        assert_eq!(status, 200, "stream response body: {body}");
+        assert!(body.contains("data: [DONE]"));
+
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let stream_record = requests_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["is_streaming"] == true)
+            .expect("stream telemetry record");
+        assert_eq!(stream_record["prompt_tokens"], 2);
+        assert_eq!(stream_record["completion_tokens"], 3);
+        assert_eq!(stream_record["total_tokens"], 5);
+        assert!(stream_record["bytes_received"].as_u64().unwrap_or(0) > 0);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_upstream_429_returns_retry_after() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19791,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "rate-limit"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 openai rate-limit request");
+        assert_eq!(resp.status(), 429);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("60")
+        );
+        let seen = observed.lock().unwrap();
+        assert_eq!(seen[0]["selected_node_id"], "direct");
+        assert_eq!(seen.len(), 1, "POOL_MAX_RETRIES=0 must not retry");
+        drop(seen);
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let items = requests_body["data"].as_array().unwrap();
+        let rate_limited_record = items
+            .iter()
+            .find(|item| item["status"] == 429)
+            .expect("429 request telemetry");
+        assert_eq!(rate_limited_record["outcome"], "rate_limited");
+        assert_eq!(rate_limited_record["retry_count"], 0);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_transport_failure_returns_bad_gateway() {
+        let (child, port) = start_server_with_env(
+            19792,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", "http://127.0.0.1:9/zen"),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 openai transport-failure request");
+        assert_eq!(resp.status(), 502);
+        let requests_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/requests?limit=10", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin requests endpoint");
+        assert_eq!(requests_resp.status(), 200);
+        let requests_body: serde_json::Value = requests_resp.json().unwrap();
+        let items = requests_body["data"].as_array().unwrap();
+        let failure_record = items
+            .iter()
+            .find(|item| item["status"] == 502)
+            .expect("transport failure request telemetry");
+        assert_eq!(failure_record["outcome"], "transport_error");
+        assert_eq!(failure_record["retry_count"], 0);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_runtime_rollback_uses_same_binary_for_legacy_and_v4() {
+        let (upstream_base, _) = start_mock_zen();
+        let (legacy_child, legacy_port) = start_server(19793);
+        let legacy_resp =
+            reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", legacy_port))
+                .expect("legacy models endpoint");
+        assert_eq!(legacy_resp.status(), 200);
+        let legacy_body: serde_json::Value = legacy_resp.json().unwrap();
+        let legacy_ids: Vec<&str> = legacy_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(legacy_ids, vec!["deepseek-v4-flash", "deepseek-v4-pro"]);
+        stop_server(legacy_child, legacy_port);
+
+        let (v4_child, v4_port) = start_server_with_env(
+            19794,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+            ],
+        );
+        let v4_resp = reqwest::blocking::get(format!("http://127.0.0.1:{}/v1/models", v4_port))
+            .expect("v4 models endpoint");
+        assert_eq!(v4_resp.status(), 200);
+        let v4_body: serde_json::Value = v4_resp.json().unwrap();
+        let v4_ids: Vec<&str> = v4_body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(v4_ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        stop_server(v4_child, v4_port);
+    }
+
+    #[test]
+    fn test_admin_nodes_requires_auth() {
+        let (child, port) = start_server(19787);
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .send()
+            .expect("admin/nodes endpoint");
+        assert_eq!(resp.status(), 401, "no API key should be rejected");
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_nodes_returns_summary() {
+        let (child, port) = start_server(19788);
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin/nodes endpoint");
+        assert_eq!(resp.status(), 200, "valid API key should be accepted");
+        let body: serde_json::Value = resp.json().unwrap();
+        assert!(body["success"].as_bool().unwrap_or(false));
+        assert!(body["data"]["pools"]["total"].is_number());
+        assert_eq!(body["data"]["allow_direct_fallback"], false);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_ready_reports_not_ready_without_nodes() {
+        let (child, port) = start_server(19796);
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/admin/health/ready", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("admin ready endpoint");
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().unwrap();
+        assert_eq!(body["data"]["status"], "not_ready");
+        assert_eq!(body["data"]["details"]["direct_fallback_active"], false);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_read_api_coverage() {
+        let (child, port) = start_server(19798);
+        let client = reqwest::blocking::Client::new();
+        let paths = [
+            "/admin/health",
+            "/admin/health/live",
+            "/admin/routes",
+            "/admin/runtime",
+            "/admin/models",
+            "/admin/models/deepseek-v4-flash",
+            "/admin/budget",
+            "/admin/budget/nodes",
+            "/admin/stats",
+            "/admin/stats/models",
+            "/admin/stats/nodes",
+            "/admin/stats/pools",
+            "/admin/stats/upstream",
+            "/admin/pools",
+            "/admin/pools/dispatch",
+            "/admin/pools/active",
+            "/admin/pools/ratelimited",
+            "/admin/pools/dead",
+            "/admin/fuse",
+            "/admin/requests",
+            "/admin/requests/recent",
+            "/admin/requests/summary",
+            "/admin/requests/timings",
+            "/admin/requests/models",
+            "/admin/requests/nodes",
+            "/admin/events",
+            "/admin/events/recent",
+            "/admin/events/probes",
+            "/admin/ledger",
+            "/admin/ledger/models",
+            "/admin/ledger/keys",
+            "/admin/ledger/streams",
+            "/admin/config",
+            "/admin/config/validation",
+            "/admin/system/uptime",
+            "/admin/system/info",
+            "/admin/requests/export?limit=5",
+        ];
+
+        for path in paths {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .header("x-api-key", "test-key")
+                .send()
+                .unwrap_or_else(|err| panic!("GET {path} failed: {err}"));
+            assert_eq!(resp.status(), 200, "GET {path}");
+        }
+
+        let timings = client
+            .get(format!("http://127.0.0.1:{}/admin/requests/timings", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("request timings endpoint");
+        assert_eq!(timings.status(), 200);
+        let timings_body: serde_json::Value = timings.json().unwrap();
+        let avg = &timings_body["data"]["avg"];
+        assert!(
+            avg.get("protocol_first_byte_ms").is_some(),
+            "timings avg should expose protocol_first_byte_ms"
+        );
+        assert!(avg.get("first_content_token_ms").is_some());
+        assert!(avg.get("first_tool_call_ms").is_some());
+
+        let missing = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/requests/missing-rid",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("request detail missing endpoint");
+        assert_eq!(missing.status(), 404);
+
+        let unknown_pool = client
+            .get(format!("http://127.0.0.1:{}/admin/pools/unknown", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("unknown pool endpoint");
+        assert_eq!(unknown_pool.status(), 404);
+
+        let missing_model = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/not-a-model",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("missing admin model endpoint");
+        assert_eq!(missing_model.status(), 404);
+
+        let budget_nodes = client
+            .get(format!("http://127.0.0.1:{}/admin/budget/nodes", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("budget nodes endpoint");
+        assert_eq!(budget_nodes.status(), 200);
+        let body: serde_json::Value = budget_nodes.json().unwrap();
+        assert!(body["data"]["nodes"].as_array().unwrap().is_empty());
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_admin_write_api_coverage() {
+        let (child, port) = start_server(19799);
+        let client = reqwest::blocking::Client::new();
+
+        let fuse_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/fuse", port))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"open": true}))
+            .send()
+            .expect("fuse set endpoint");
+        assert_eq!(fuse_resp.status(), 200);
+        let fuse_body: serde_json::Value = fuse_resp.json().unwrap();
+        assert_eq!(fuse_body["data"]["fuse"], true);
+
+        let unfuse_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/fuse", port))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"open": false}))
+            .send()
+            .expect("fuse unset endpoint");
+        assert_eq!(unfuse_resp.status(), 200);
+
+        let node_url = "http://127.0.0.1:9";
+        let node_id = sha256_first8(node_url);
+        let add_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({"url": node_url}))
+            .send()
+            .expect("node add endpoint");
+        assert_eq!(add_resp.status(), 200);
+
+        let nodes_resp = client
+            .get(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("nodes endpoint");
+        let nodes_body: serde_json::Value = nodes_resp.json().unwrap();
+        assert_eq!(nodes_body["data"]["pools"]["dispatch"], 1);
+
+        let budget_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/nodes/{}/budget",
+                port, node_id
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("node budget endpoint");
+        assert_eq!(budget_resp.status(), 200);
+        let budget_body: serde_json::Value = budget_resp.json().unwrap();
+        assert_eq!(budget_body["data"]["node_id"], node_id);
+        assert!(budget_body["data"]["local_budget"].is_object());
+
+        let probe_missing_resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/nodes/missing-node/probe",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("node missing probe endpoint");
+        assert_eq!(probe_missing_resp.status(), 404);
+
+        let recover_resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/nodes/{}/recover",
+                port, node_id
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("node recover endpoint");
+        assert_eq!(recover_resp.status(), 200);
+
+        let delete_resp = client
+            .delete(format!("http://127.0.0.1:{}/admin/nodes/{}", port, node_id))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("node delete endpoint");
+        assert_eq!(delete_resp.status(), 200);
+
+        let log_resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/system/log-level/info",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("log level endpoint");
+        assert_eq!(log_resp.status(), 200);
+
+        let reload_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/config/reload", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("config reload endpoint");
+        assert_eq!(reload_resp.status(), 200);
+
+        let probe_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/probe/now", port))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("probe now endpoint");
+        assert_eq!(probe_resp.status(), 200);
+
+        let missing_url_resp = client
+            .post(format!("http://127.0.0.1:{}/admin/nodes", port))
+            .header("x-api-key", "test-key")
+            .json(&serde_json::json!({}))
+            .send()
+            .expect("node add missing url endpoint");
+        assert_eq!(missing_url_resp.status(), 400);
+
+        let invalid_log_resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/system/log-level/nope",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("invalid log level endpoint");
+        assert_eq!(invalid_log_resp.status(), 400);
+
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_without_nodes_and_without_direct_fallback_returns_503() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19795,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("v4 no-resource request");
+        assert_eq!(resp.status(), 503);
+        assert_eq!(observed.lock().unwrap().len(), 0);
+        stop_server(child, port);
+    }
+}
