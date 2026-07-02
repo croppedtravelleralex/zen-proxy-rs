@@ -31,3 +31,9 @@
 - 大型 raw logs、`.codex_tmp/`、测试原始输出、密钥和完整请求/响应不提交。
 - 只提交脱敏摘要、报告、runner 和必要测试。
 
+## Monorepo 规则
+
+- 默认开发入口是 `/home/lenovo/zen-free-model-suite`。
+- 两个子项目是真实目录，不再通过软链接引用旧仓库。
+- 原 `/home/lenovo/free-model-client-rs` 和 `/home/lenovo/zen-proxy-rs` 暂时只作备份/对照，不作为默认修改入口。
+- 顶层暂不作为 Cargo workspace；进入对应子项目目录分别运行 `cargo fmt`、`cargo clippy`、`cargo test`。

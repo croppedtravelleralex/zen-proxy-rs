@@ -4,12 +4,14 @@
 
 ## 项目定位
 
-这个协同项目由两个仓库组成：
+这个协同项目现在由一个总仓库承载两个真实子项目：
 
-- `/home/lenovo/free-model-client-rs`：协议适配内核，负责 OpenAI/Anthropic 请求转换、ClaudeCode 工具历史修复、stream guard、cache usage 透传、request-shape 观测。
-- `/home/lenovo/zen-proxy-rs`：生产代理控制面和数据面，负责模型公开/隐藏路由、proxy node pool、lane、dispatch、global budget、admin/health、NewAPI 后端服务。
+- `/home/lenovo/zen-free-model-suite/repos/free-model-client-rs`：协议适配内核，负责 OpenAI/Anthropic 请求转换、ClaudeCode 工具历史修复、stream guard、cache usage 透传、request-shape 观测。
+- `/home/lenovo/zen-free-model-suite/repos/zen-proxy-rs`：生产代理控制面和数据面，负责模型公开/隐藏路由、proxy node pool、lane、dispatch、global budget、admin/health、NewAPI 后端服务。
 
-统一入口是 `/home/lenovo/zen-free-model-suite`。两个真实仓库仍在原路径，聚合目录只用软链接和文档收束上下文。
+统一入口是 `/home/lenovo/zen-free-model-suite`。两个子项目已经通过 `git subtree` 导入为真实目录，不再使用软链接。原 `/home/lenovo/free-model-client-rs` 与 `/home/lenovo/zen-proxy-rs` 暂时保留为备份/回滚点，不作为默认开发入口。
+
+顶层暂不声明 Cargo workspace。继续分别在两个子项目目录运行 `cargo` 命令，避免结构迁移改变锁文件、依赖解析或生产构建路径。
 
 ## 当前链路
 
@@ -56,6 +58,7 @@ Windows claude.orig.exe
 - 排查并恢复旧 Webshare 代理失效导致的 502/proxy auth 问题。
 - 通过 GitHub 临时 release 中转部署生产 ZenProxy，部署后删除 release/tag。
 - 同步 NewAPI channel 69、models、abilities，恢复 `big-pickle` 公开名。
+- 将 `/home/lenovo/zen-free-model-suite` 升级为真实 monorepo：删除聚合软链接，用 `git subtree` 导入 `free-model-client-rs` 和 `zen-proxy-rs` 历史，降低后续 agent 跨仓上下文损耗。
 
 ## 最近验收
 
@@ -84,4 +87,4 @@ Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；cu
 3. 不把 `--exclude-dynamic-system-prompt-sections` 设为默认；历史 A/B 在本链路降低 cache read pct 且增加 Web 工具错误。
 4. Mimo cache 报告同时写 accepted/rejected 和 `read_tokens / estimated_total_tokens`，不要因缺 miss token 写成 100%。
 5. 生产部署继续用 GitHub 临时 release，中转后删除 release/tag，不用 scp。
-
+6. 后续新工作默认从 `/home/lenovo/zen-free-model-suite` 进入；只有需要回滚或对照历史时再读取两个旧路径。

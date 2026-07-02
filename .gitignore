@@ -1,0 +1,29 @@
+# Build output
+**/target/
+**/target-*/
+
+# Local runtime and temporary files
+.codex_tmp/
+**/.codex_tmp/
+.bun/
+**/.bun/
+tmp/
+**/tmp/
+tmpcc-*/
+**/tmpcc-*/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local env, credentials, and raw logs
+.env
+.env.*
+*.log
+logs/
+**/logs/raw/
+test-records/runs/
+**/test-records/runs/
+
+# Artifact drop zone; keep the directory documented but do not commit raw outputs.
+artifacts/*
+!artifacts/README.md
