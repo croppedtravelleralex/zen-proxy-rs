@@ -4,8 +4,9 @@
 
 1. 先读 `docs/README.md`。
 2. 再读 `docs/02-current-state.md`、`docs/03-roadmap.md`、`docs/04-improvement-backlog.md`。
-3. 如果要改代码，读相关模块，不全仓漫扫。
-4. 如果文档和代码冲突，以代码、配置、测试和真实命令结果为准，并在同一轮修正文档。
+3. 如果接手 ClaudeCode WebSearch/WebFetch、`Failed to parse JSON`、502 或工具参数问题，先读 `docs/reports/2026-06-13-claudecode-web-tool-handoff.md`。
+4. 如果要改代码，读相关模块，不全仓漫扫。
+5. 如果文档和代码冲突，以代码、配置、测试和真实命令结果为准，并在同一轮修正文档。
 
 ## 当前项目边界
 
@@ -28,6 +29,10 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 ## panda NewAPI 测试纪律
 
+- 2026-06-22 起，生产 NewAPI `https://sub2api.closeapi.top/` 可在用户明确要求下变更；dev/new 测试域名是 `https://new.relai.asia/`，不要再使用旧 `new.closeapi.top` 作为当前入口。
+- 如果需要部署生产，按用户要求通过 GitHub 临时 release 上传、远端下载、部署后删除 release；不要用 `scp`，也不要在报告里泄露 token/key/proxy 凭据。
+- 2026-07-02 起，生产 channel 69 公开模型只应包含 `deepseek-v4-flash`、`big-pickle`、`mimo-v2.5`；其它免费模型只能 hidden route。
+- `deepseek-v4-flash-lite` 是旧公开名，已改回 `big-pickle`，NewAPI channel 69 和 ZenProxy public alias 不应再公开旧 lite 名称。
 - base URL 使用 `http://100.69.228.93:8081`，除非用户更新。
 - API key 在报告中必须脱敏。
 - 不要把 token 名当作 API key；例如 NewAPI 日志里的 `token_name=ds` 不是可公开复用的明文 key。
@@ -36,6 +41,19 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 - 测试前清空或禁用代理环境变量，避免走错链路。
 - 报告必须列状态码、耗时、模型、协议类型、错误分类。
 - 不要用本机 `127.0.0.1:8081` 代替 panda。
+- 2026-06-22 复查：WSL `/home/lenovo/.local/bin/claude` 当前是 clawgod launcher，不是 official ClaudeCode；需要 official 验收时优先用 Windows `claude.orig.exe`，并用 panda ingress 日志确认实际 `model=`，不要只信 runner 报告里的命令参数。
+
+## ClaudeCode / cc-switch Mimo 验收纪律
+
+- 当前 Windows cc-switch Claude provider `closedeepseek` 默认把 Anthropic model 字段映射到 `deepseek-v4-flash`；`claude.orig.exe --model mimo-v2.5` 只能证明本地命令参数，不保证远端真实是 Mimo。
+- 需要真实 Mimo ClaudeCode 验收时，使用临时 wrapper 修改当前 Claude provider 的 Anthropic model 字段为 `mimo-v2.5`，运行结束必须在 `finally` 恢复原始 `settings_config`；不得打印 token、headers 或完整 provider JSON。
+- 每轮 Mimo 验收后必须查三项：`PROVIDER_RESTORED` 已打印；cc-switch 当前 Claude provider model 字段已恢复到 DeepSeek；panda ingress/provider 日志出现 `model=mimo-v2.5` / `mimo-v2.5-free`。
+- 旧 `.codex_tmp/run_with_mimo_ccswitch.py` 是历史本地临时 wrapper，2026-07-02 已随 `.codex_tmp/` 清理；如需真实 Mimo ClaudeCode 验收，应按同样原则临时生成、运行后恢复 provider，并且不要提交 wrapper。
+- 2026-07-02 后，用户明确要求 ClaudeCode 验收必须走 `ClaudeCode -> cc-switch -> https://sub2api.closeapi.top`，不能把 Tailscale/panda 内网 URL 当成可交付方案。测试脚本若直接设置 `ANTHROPIC_BASE_URL=https://sub2api.closeapi.top` 会绕过 cc-switch；需要确认当前任务到底是在测 cc-switch 链路还是直连 NewAPI。
+- cc-switch 使用统计里的模型箭头是 `request_model -> provider/upstream model`，例如 `mimo-v2.5 -> mimo-v2.5-free`；NewAPI 使用日志显示的是 channel 69 公开请求模型 `mimo-v2.5`。判断是否同一路请求时优先对 `channel_id=69`、时间、prompt/cache tokens、request id 和 ZenProxy ingress/upstream 日志，不要只看模型名后缀。
+- 不要用 Python urllib 直连 `sub2api.closeapi.top` 判断 ClaudeCode 链路是否被 Cloudflare 挡。2026-07-02 A/B 已确认 `Python-urllib/3.12` UA 会触发 Cloudflare 403/1010，而 curl/no-UA/ClaudeCode-like/Mozilla UA 可到达 NewAPI 鉴权层。
+- Mimo provider 常省略显式 miss tokens；报告 cache 时同时列 accepted/rejected 和 `read_tokens / estimated_total_tokens`，不要把 `read/(read+miss)=100%` 写成真实全量命中。
+- 当前 `prompt_bucket=10k` runner 标签会因 ClaudeCode system/tools envelope 变成远端约 `53k-56.5k` estimated tokens；正式 10k/50k/100k/200k 前先校准 `stable_prefix_bytes`，再启动 50rpm。
 
 ## NewAPI 使用日志导出器纪律
 
@@ -137,6 +155,12 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - 本机到 panda 的 Tailscale/SSH 可能临时抖动：表现为 `scp`/SSH stdin/HTTP taildrop 大文件传输 reset，但短 SSH 和端口检测偶尔正常。遇到时先跑 `tailscale ping` 和 `tailscale netcheck`，优先传 xz 压缩包；不要在服务半重启状态下继续折腾。部署脚本从 PowerShell 调远端 shell 时，避免 `$()` 和 `$var` 被 PowerShell 提前展开，复杂远端脚本用 `bash -s` 且去掉 CRLF。
 - huge stream 日志里若出现 `ClaudeCode huge stream buffered upstream returned empty output`，先按 buffered retry 已兜底处理归类；只有最终裸透给客户端或耗尽重试才算失败。最新输出策略不再通过 `max_tokens` cap 控制长输出，20k/32k 等显式长输出应原样透传给上游。
 - 如果需要临时中止压测，保留已有 `raw-results.jsonl`，再生成 partial summary，不要补写伪造的完成数。
+- 2026-06-22 起，正式 cache 半压测前先跑 `--mode cache-pressure-plan` 生成 manifest/schema；该模式不读取 key、不触网，不代表已经完成生产压测。
+- 正式 cache 半压测报告不能只写 cache hit rate。必须同时写 `protocol_first_byte_ms/first_content_ms/first_tool_call_ms/first_tool_emit_ms/total_ms` 的 P50/P90/P95/P99、token-weighted cache read pct、prefix hash 稳定度、工具质量和错误分类。
+- 10k/50k/100k/200k x 50rpm x 5min 这类生产半压测必须再次得到用户确认；先按 20rpm 校准，健康后再升 50rpm，且不要把模型/桶并行打满。
+- 生成 cache 半压测 prompt 时，所有 per-request 字段、marker、request index、case type 和随机尾部必须放在稳定上下文之后；否则本地和远端 `prefix_4k/32k` 会发散，结果只能作为负样本，不能作为 cache 命中率结论。
+- 2026-06-22 实测：即使用户 prompt 的 `prefix_4k/32k` 稳定，Windows ClaudeCode no-session 独立进程经 cc-switch 后，远端 `prefix_4k/32k` 仍可能高度发散；升压前必须用 ZenProxy journal 验证远端 prefix 稳定，而不是只信本地 prompt hash。
+- ClaudeCode `--exclude-dynamic-system-prompt-sections` 虽然 help 文案提到 prompt-cache reuse，但 2026-06-22 A/B 在本链路中降低 token read_pct 且增加 WebFetch/WebSearch result error；当前不要作为默认压测或生产优化开关。
 - WSL ClaudeCode 当前不能直接作为有效客户端样本：`/home/lenovo/.local/bin/claude` 和 `claude-deepseek-free` 是 clawgod launcher，实际启动 `/root/.clawgod/cli.cjs`，不是 Anthropic ClaudeCode CLI；正式四客户端压测前必须修复或替换。
 - Windows ClaudeCode 经过 cc-switch 时必须先确认 current provider。2026-06-04 发现 current Claude provider 是 `closedeepseek -> https://sub2api.closeapi.top`，不是 `LocalNewapi -> http://127.0.0.1:8081`；普通 Windows 使用记录不能直接归因到 panda NewAPI/ZenProxy。
 - OpenClaw 若输出固定 `HEARTBEAT_OK` 且 stderr 有 local secrets gateway `1006 abnormal closure`，先归类为 OpenClaw 本地 agent/gateway/harness 问题，不要先改 ZenProxy。
@@ -149,9 +173,13 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - V4.98 cache 排查顺序：先比较 `prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash` 是否稳定；若 prefix 稳定但 cache 仍为 0，再查上游 session、代理节点、账号和 provider cache 行为；若 prefix 本身不稳，先定位 ClaudeCode 是否把易变内容放在前缀，而不是直接缩上下文。
 - V4.107 usage/cache 口径排查：如果 provider cache observation 很高但 NewAPI/cc-switch 显示低，先确认线上 hash 是否包含 V4.107。检查 Anthropic final `message_delta.usage` 是否带 `input_tokens`，ZenProxy `StreamMetrics` 是否没有被后续缺字段 usage 帧清零，以及 DeepSeek `prompt_cache_hit_tokens` 是否映射到 `cache_read_input_tokens/cached_tokens`。不得用伪造 cache 字段掩盖真实未命中。
 - V4.107 affinity 排查：32KB+ 流式请求应有 affinity key；同一稳定前缀尾部追加、body size 从中等跨到大桶时 affinity key 不应变化；前缀本身变化时必须变化。若 cache 仍低，继续看 provider/account/session 行为，不要直接裁剪上下文。
+- V4.111 header/cache 稳定化排查：`x-opencode-request` 应按完整规范化上游 body 稳定生成；同一 body 不应随机抖动，不同 body 字段不应复用同一 request id。这个 header 只能影响上游会话/请求形状，不能作为改写正文、工具 schema 或 usage 的入口。
 - ClaudeCode CLI Markdown/表格/代码块/列表显示异常：先抓 raw SSE 和 `source_client`。若新 pid 仍不是 `claude-code`，优先查 profile 识别；若 raw SSE 正确但终端显示错，再归类为 CLI 渲染问题。
 - NewAPI 偶发 `status_code=500, upstream returned no assistant content or tool call`：先按空上游保护排查，不要先改 NewAPI。历史样本曾因流式 `max_tokens` 被 768/1024 cap 后绕过 buffered retry；最新策略已经完全取消输出限制，后续应重点看真实上游空输出、客户端断流、lane/pool 调度或非流式 fallback。
 - Web search 用不了：先分清“模型原生联网搜索”和“客户端工具搜索”。本仓库不自带搜索引擎，只转发 tools/tool_calls/tool results。排查顺序是：请求是否带 `WebSearch/WebFetch` 或 `web_search/web_fetch` 工具定义、模型是否发出 tool call、ZenProxy 是否把上游工具名 canonicalize 回客户端注册名、客户端/工具执行器是否执行联网、工具结果是否回到模型上下文。Hermes/OpenClaw/ClaudeCode 要分开验收。2026-06-04 已确认直连 panda NewAPI 带 `web_search` tool 能返回 tool call；用户截图也证明 Windows ClaudeCode 官方 Claude 路径可真实执行 `WebSearch/WebFetch`。不要再把“某次 ZenProxy 样本没有执行 web 工具”写成 ClaudeCode 不支持 web 工具。
+- 2026-06-13 ClaudeCode WebSearch/WebFetch 交接：本轮 Windows ClaudeCode 真实测试中，WebSearch/WebFetch 参数是完整的；WebSearch 返回空 results，WebFetch 失败于 ClaudeCode 本地安全验证/`claude.ai` 链路。用官方 `claude.orig.cmd` 复测失败一致；WebFetch 失败后 Playwright 能抓页面。因此后续不要先改 ZenProxy 工具参数映射，先验证当前网络、ClaudeCode 内置 Web 工具后端、Cloudflare challenge 和 provider 路径。
+- Windows cc-switch provider 边界：2026-06-13 检查到当前 Windows cc-switch Claude provider 是 `closedeepseek -> https://sub2api.closeapi.top -> deepseek-v4-flash`，不是 panda NewAPI `100.69.228.93:8081`。分析本机 cc-switch FRT/cache/502 前，必须先确认 provider；不要把 cc-switch 本地日志和 panda channel 69 日志混合归因。
+- `API Error: Failed to parse JSON` 新排查纪律：先查同一时间窗口的 ClaudeCode stream-json、cc-switch `proxy_request_logs`、panda NewAPI logs 和 ZenProxy journal。若 cc-switch SQLite 没有 `parse/JSON` 错误文本，但日志里有 `error reading a body from connection`、`Response parse failed: connection error`，优先按连接中断、非 JSON HTML、Cloudflare 502/524 或半截流排查，不要直接归因于 30KB Write、ZenProxy 清空参数或 ClaudeCode 工具 schema。
 - ClaudeCode 工具名大小写/别名：ClaudeCode 注册的是 `WebSearch`、`WebFetch`、`Task` 等真实工具名；如果上游返回 `web_search`、`web_fetch`、`task`，客户端可能不执行。free-model-client-rs 已补 canonicalization 回归，并已部署到 panda stripped hash `0f6cdf6e5cd2dd1946a69707c97591cca865b47178ff63846f04bbdf283f2314`；线上直连 smoke 已验证 `WebSearch` 和 `Task` 工具名。
 - NewAPI 看到 70k-90k input tokens：不要直接判定为 NewAPI 输入墙。先对齐三种口径：ZenProxy `body_size` 是 JSON 字节数；free-model-client-rs `prompt_tokens` 是估算/策略口径；NewAPI/cc-switch usage 是最终账单口径。最新 flash 策略只观测不压缩；如果日志里还看到 `compacted` 或 `capped` 字样，必须先确认是历史日志、lite/其他模型路径，还是旧二进制。
 - Windows ClaudeCode 当前可能先走 cc-switch：检查 `C:\Users\Lenovo\.claude\settings.json` 里的 `ANTHROPIC_BASE_URL`，再查 cc-switch provider。不要把 `ClaudeCode -> cc-switch -> closeapi` 的记录和 `panda NewAPI channel 69 -> ZenProxy` 的记录合并归因。
@@ -175,11 +203,12 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 - base URL、模型、客户端、请求类型。
 - stream/non-stream 拆分。
 - prompt tokens 桶、输出 tokens。
-- TTFT、first_content、总耗时。
+- TTFT、first_content、first_tool_call、first_tool_emit、总耗时，并报告 P50/P90/P95/P99。
 - 工具调用、subagent/Task 调用成功率。
 - 失败状态码、错误分类、重试结果。
 - provider header/body usage 信号和 cache `attempted/accepted/rejected/ignored` 四态。
 - V4.98 prefix hash：`prefix_4k_hash/prefix_32k_hash/prefix_128k_hash/prefix_256k_hash/cache_material_bytes`。
+- token-weighted cache read pct：优先使用 `cache_read_input_tokens/prompt_cache_hit_tokens` 和 `cache_miss_input_tokens/prompt_cache_miss_tokens`；不得用样本数命中率替代 token 命中率。
 - 输出限制取消后的 input/output wall 结果，尤其是 413、超时、空输出、长尾延迟和成本风险。
 - 是否污染用户默认配置。
 
@@ -204,5 +233,5 @@ PANDA_NEWAPI_KEY=<redacted> python3 scripts/panda_pressure_runner.py --mode smok
 
 1. `git status --short` 查看所有改动。
 2. 不提交 `.codex_tmp/`、密钥、临时输出、大型测试产物。
-3. 对 `configured`、`panda`、异常字符文件等未跟踪项先确认来源。
+3. 对新出现的 `configured`、`panda`、异常字符文件等未跟踪项先确认来源；2026-07-02 已清理当时遗留孤儿项。
 4. 文档、测试和代码事实同步后再提交。

@@ -85,10 +85,16 @@ pub(crate) fn apply_initial_thinking_policy(
         && request.stream.unwrap_or(false)
         && !no_tools
         && shape.estimated_total_tokens >= 80_000;
+    let claude_code_tool_heavy_fast_path = profile.kind == ClientKind::ClaudeCode
+        && request.stream.unwrap_or(false)
+        && !no_tools
+        && claude_code_tool_heavy_prefers_disabled_thinking(&request.model)
+        && shape.tool_count >= 32;
 
     let should_disable = low_budget_tool_probe
         || claude_code_forced_tool_choice
         || claude_code_large_stream_tool_request
+        || claude_code_tool_heavy_fast_path
         || (no_tools
             && low_output_budget
             && (matches!(
@@ -105,6 +111,8 @@ pub(crate) fn apply_initial_thinking_policy(
             "low_budget_tool_probe_disabled"
         } else if claude_code_forced_tool_choice {
             "claude_code_forced_tool_choice_disabled"
+        } else if claude_code_tool_heavy_fast_path {
+            "claude_code_tool_heavy_fast_path_disabled"
         } else if claude_code_large_stream_tool_request {
             "claude_code_large_stream_tool_request_disabled"
         } else {
@@ -140,6 +148,51 @@ fn is_forced_tool_choice(tool_choice: Option<&serde_json::Value>) -> bool {
         return false;
     }
     true
+}
+
+pub(crate) fn downgrade_claude_code_forced_tool_choice_for_upstream_model(
+    body: &mut serde_json::Value,
+    request: &mut ChatRequest,
+    profile: ClientProfile,
+    upstream_model: &str,
+) -> Option<&'static str> {
+    if profile.kind != ClientKind::ClaudeCode
+        || !is_forced_tool_choice(request.tool_choice.as_ref())
+        || (!claude_code_forced_tool_choice_requires_auto(&request.model)
+            && !claude_code_forced_tool_choice_requires_auto(upstream_model))
+    {
+        return None;
+    }
+
+    let auto = Value::String("auto".to_string());
+    body["tool_choice"] = auto.clone();
+    request.tool_choice = Some(auto);
+    Some("claude_code_forced_tool_choice_auto")
+}
+
+fn claude_code_forced_tool_choice_requires_auto(model: &str) -> bool {
+    claude_code_mimo_family_model(model)
+}
+
+fn claude_code_tool_heavy_prefers_disabled_thinking(model: &str) -> bool {
+    claude_code_mimo_family_model(model)
+}
+
+fn claude_code_mimo_family_model(model: &str) -> bool {
+    let normalized: String = model
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "mimov25"
+            | "mimov25free"
+            | "northminicode"
+            | "northminicodefree"
+            | "nemotron3ultra"
+            | "nemotron3ultrafree"
+    )
 }
 
 pub(crate) fn reasoning_disabled_retry_body(body: &serde_json::Value) -> serde_json::Value {
@@ -561,6 +614,66 @@ mod tests {
 
         assert_eq!(policy, "keep_default");
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn claude_code_forced_tool_choice_downgrades_to_auto_for_selected_models() {
+        for model in ["mimo-v2.5-free", "north-mini-code", "nemotron-3-ultra-free"] {
+            let mut request = request_with_tool_choice(Some(serde_json::json!({
+                "type": "function",
+                "function": { "name": "Bash" }
+            })));
+            request.model = model.to_string();
+            let mut body = serde_json::json!({
+                "model": model,
+                "tool_choice": request.tool_choice,
+            });
+            let profile = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header);
+
+            let policy = apply_initial_thinking_policy(&mut body, &request, profile);
+            let tool_choice_policy = downgrade_claude_code_forced_tool_choice_for_upstream_model(
+                &mut body,
+                &mut request,
+                profile,
+                model,
+            );
+
+            assert_eq!(policy, "claude_code_forced_tool_choice_disabled");
+            assert_eq!(body["thinking"], serde_json::json!({"type":"disabled"}));
+            assert_eq!(
+                tool_choice_policy,
+                Some("claude_code_forced_tool_choice_auto")
+            );
+            assert_eq!(body["tool_choice"], Value::String("auto".to_string()));
+            assert_eq!(request.tool_choice, Some(Value::String("auto".to_string())));
+        }
+    }
+
+    #[test]
+    fn claude_code_forced_tool_choice_keeps_for_other_models() {
+        let forced = serde_json::json!({
+            "type": "function",
+            "function": { "name": "Bash" }
+        });
+        let mut request = request_with_tool_choice(Some(forced.clone()));
+        request.model = "deepseek-v4-flash-free".to_string();
+        let mut body = serde_json::json!({
+            "model": "deepseek-v4-flash-free",
+            "tool_choice": forced,
+        });
+
+        let tool_choice_policy = downgrade_claude_code_forced_tool_choice_for_upstream_model(
+            &mut body,
+            &mut request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            "deepseek-v4-flash-free",
+        );
+
+        assert_eq!(tool_choice_policy, None);
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({"type":"function","function":{"name":"Bash"}})
+        );
     }
 
     fn provider_invalid_error() -> AppError {

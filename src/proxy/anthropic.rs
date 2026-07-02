@@ -186,8 +186,25 @@ pub async fn handle_anthropic_messages(
         tool_choice,
     };
     let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
+    if let Some(tool_choice_policy) =
+        super::downgrade_claude_code_forced_tool_choice_for_upstream_model(
+            &mut zb,
+            &mut cr,
+            profile,
+            &upstream_model,
+        )
+    {
+        tracing::info!(
+            protocol = "anthropic",
+            model = %cr.model,
+            upstream_model = %upstream_model,
+            source_client = ?profile.kind,
+            tool_choice_policy,
+            "adapted upstream tool_choice policy"
+        );
+    }
     super::prune_null_optional_upstream_fields(&mut zb);
-    let probe_max_tokens = translate::claude_code_low_budget_tool_probe_max_tokens(
+    let probe_max_tokens = translate::claude_code_low_budget_probe_max_tokens(
         &cr,
         profile.kind == ClientKind::ClaudeCode,
     );
@@ -203,7 +220,7 @@ pub async fn handle_anthropic_messages(
             prompt_tokens = shape.estimated_total_tokens,
             message_count = shape.message_count,
             tool_count = shape.tool_count,
-            "raised ClaudeCode low-budget tool probe max_tokens before upstream"
+            "raised ClaudeCode low-budget probe max_tokens before upstream"
         );
         cr.max_tokens = probe_max_tokens;
         if let Some(max_tok) = probe_max_tokens {
@@ -1520,6 +1537,36 @@ async fn handle_stream(
                         "ClaudeCode stream guard upstream fetch failed"
                     );
                     final_stream_error = Some(err.message.clone());
+                    if profile.kind == ClientKind::ClaudeCode
+                        && err.is_rate_limited()
+                        && text.trim().is_empty()
+                        && tool_calls.is_empty()
+                        && !message_started
+                    {
+                        if attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS {
+                            tracing::warn!(
+                                protocol = "anthropic",
+                                model = %body.model,
+                                source_client = ?profile.kind,
+                                prompt_hash,
+                                prompt_hash_hex = %prompt_hash_hex,
+                                attempt = attempts_used,
+                                max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                                next_attempt = attempt + 2,
+                                elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                                "ClaudeCode stream guard retrying after pre-output upstream rate limit"
+                            );
+                            continue;
+                        }
+                        yield Ok(Event::default().event("error").data(serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": "rate_limit_error",
+                                "message": err.message,
+                            }
+                        }).to_string()));
+                        return;
+                    }
                     if super::should_retry_missing_reasoning_content(
                         &err,
                         used_disabled_thinking_retry,

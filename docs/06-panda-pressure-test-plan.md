@@ -1,6 +1,6 @@
 # panda-only 四客户端压测方案
 
-更新时间：2026-06-04
+更新时间：2026-06-22
 
 ## 目标
 
@@ -160,6 +160,65 @@ redaction_ok
 - `zen-proxy-rs` e2e 也覆盖 lite compactor 仍工作：同样的大旧工具结果请求改用 `deepseek-v4-flash-lite` 时返回 `x-zen-context-action=compact`，上游看到 `ZenProxy context compactor` 占位。
 - panda policy-smoke 不能只看 HTTP 200；必须按服务端日志确认 flash/free 没有 `context_action=compact`，lite 的 compactor 保护仍可触发。
 
+## ClaudeCode cache 半压测计划模式
+
+2026-06-22 新增 plan-only 模式，用来先固化半压测矩阵和数据集 schema，不读取 API key、不触网、不产生 `raw-results.jsonl`：
+
+```bash
+cd /home/lenovo/free-model-client-rs
+python3 scripts/panda_pressure_runner.py \
+  --mode cache-pressure-plan \
+  --models deepseek-v4-flash,mimo-v2.5 \
+  --cache-pressure-buckets 10k,50k,100k,200k \
+  --cache-pressure-rpm 50 \
+  --cache-pressure-duration-minutes 5
+```
+
+默认输出：
+
+```text
+cache-pressure-manifest.json
+dataset-schema.json
+analysis-plan.json
+```
+
+执行建议：
+
+1. 不把 8 个场景并行打满；按 `deepseek-v4-flash 10k -> 50k -> 100k -> 200k`，再按 `mimo-v2.5 10k -> 50k -> 100k -> 200k` 顺序跑。
+2. 先用 `20rpm x 5min` 预热和校准；健康后再升到 `50rpm x 5min`。正式 50rpm 生产半压测必须再次得到用户确认。
+3. 每个场景前 60 秒作为 warm-up，报告同时列全窗口和排除 warm-up 后窗口。
+4. 停止条件：`dead > 0`、`dispatch < 90`、NewAPI/ZenProxy 5xx 超过 1%-2%、出现 `no proxy resources`/`lane is saturated`、连续窗口 P95 first real text/tool 超过 30s、工具质量回退。
+5. 质量硬门槛不变：不裁剪上下文、不缩短输出、不伪造 usage、不禁用 WebFetch/WebSearch/Bash、不扩大高风险 disabled-thinking 策略。
+6. 数据集硬门槛：用于 cache 判断的稳定上下文必须出现在所有 per-request marker、index、case type、随机任务和输出 marker 之前；否则本地 prefix hash 会先发散，该轮只能作为负样本。
+7. 报告必须同时列“本地 prompt prefix 稳定度”和“远端 ZenProxy prefix 稳定度”。2026-06-22 已确认二者可能不一致：本地 `prefix_4k/32k_unique=1` 时，Windows ClaudeCode no-session 经 cc-switch 的远端 `prefix_4k/32k` 仍可能发散。
+8. ClaudeCode `--exclude-dynamic-system-prompt-sections` 只能作为单独 A/B 项，不得默认开启；2026-06-22 在本链路下导致 token read_pct 降低和 WebFetch/WebSearch 质量回退。
+
+2026-06-22 DeepSeek 10k/20rpm 校准结果：
+
+| run | local quality | remote token read pct | remote prefix finding | decision |
+|-----|---------------|-----------------------|-----------------------|----------|
+| early-variable-prefix | 98/100 | 28.25% | prefix 高度发散，top `prefix_32k` 组 92.53% | 负样本，不用于稳定前缀结论 |
+| stable-user-prefix | 99/100 | 19.31% | 本地 `prefix_4k/32k=1`，远端仍发散，top `prefix_32k` 组 86.94% | 当前最可信质量基线，但 cache 仍未达标 |
+| stable-user-prefix + `--exclude-dynamic-system-prompt-sections` | 93/100 | 6.07% | prefix 更发散，WebFetch/WebSearch result error 增多 | 不采用 |
+| post-V4.113 shared-prefix | 100/100 | 94.42% | `prefix_4k=1`、`prefix_32k=2`、`prefix_128k=2`；first real P95 3676ms | 受控 shared-prefix 90+ 达成，可作为 DeepSeek 质量/速度正样本 |
+
+以上 DeepSeek 轮次都未见资源池或 JSON parse 类服务级回退。post-V4.113 证明 billing-header strip + shared workspace/project 能把受控 shared-prefix 推到 90+，但不代表全局混合流量已到 90+。
+
+2026-06-22 Mimo true-route 20rpm 校准结果：
+
+| run | local quality | remote cache signal | remote TTFT | decision |
+|-----|---------------|---------------------|-------------|----------|
+| old `PRESSURE_*` template | 99/100 | full window accepted/rejected `162/6`，read/estimated `89.42%`；warm-up 后 `138/5`，read/estimated `91.95%` | warm-up 后 first real P50/P95/P99 `4045/8888/11494ms` | 1 个 text_review 被误判安全注入，模板需改 |
+| `cachebench-v2-safe-label` smoke | 10/10 | accepted/rejected `15/1`，read/estimated `82.6%` | first real P50/P95/P99 `5555/9593/9826ms` | 只证明新模板不再触发 false refusal |
+| `cachebench-v2-safe-label` full | 100/100 | warm-up 后 accepted/rejected `131/8`，read/estimated `91.08%` | warm-up 后 first real P50/P95/P99 `3883/6780/9000ms` | Mimo true-route 20rpm 受控 90+ 达成；仍需 bucket calibration |
+
+Mimo 注意事项：
+
+1. `--model mimo-v2.5` 不能单独证明真实 Mimo；必须用 panda ingress 确认 `model=mimo-v2.5`，provider summary 确认 `mimo-v2.5-free`。
+2. Mimo 当前常不返回显式 miss tokens；报告不能把 `read/(read+miss)=100%` 当成真实命中率，应优先同时列 accepted/rejected 和 `read_tokens / estimated_total_tokens`。
+3. 当前 runner 的 `prompt_bucket=10k` 标签经 ClaudeCode system/tools 后远端实际 P50/P95 estimated tokens 约 `53k/56.5k`；正式 10k/50k/100k/200k 必须先校准每档 `stable_prefix_bytes`。
+4. 下一步仍不建议直接上 50rpm；先做 20rpm 的 bucket calibration 和分桶复测，确认 4004 `dead=1/dispatch=99` 不扩大。
+
 ## 必采集字段
 
 每条记录至少包含：
@@ -188,6 +247,7 @@ timeout_ms
 protocol_first_byte_ms
 first_content_ms
 first_tool_call_ms
+first_tool_emit_ms
 total_ms
 tool_call_count
 tool_success
@@ -196,6 +256,20 @@ subagent_supported
 subagent_observed
 config_mode
 redaction_ok
+prompt_hash
+prompt_bucket
+target_tokens
+request_body_bytes
+prefix_4k_hash
+prefix_32k_hash
+prefix_128k_hash
+prefix_256k_hash
+cache_material_bytes
+cache_observation
+cache_read_input_tokens
+cache_creation_input_tokens
+cache_miss_input_tokens
+cache_token_read_pct
 ```
 
 字段解释：
@@ -203,10 +277,26 @@ redaction_ok
 - `protocol_first_byte_ms`：协议首包，可以是 role delta 或 message_start。
 - `first_content_ms`：第一个真实文字，不能用空 delta 冒充。
 - `first_tool_call_ms`：第一个真实工具调用。
+- `first_tool_emit_ms`：第一个已经向下游释放、可执行的工具调用；如果 direct HTTP 没有额外门控，可等于 `first_tool_call_ms`。
 - `base_url_kind`：只能写 `panda-newapi`，如果出现 `localhost` 或 `wsl-local`，该批次无效。
 - `api_ok`：客户端进程/API 层是否正常完成；如果 API 成功但语义失败，`api_ok=true`、`status=error`、`error_class` 记录语义失败原因。
 - `subagent_supported`：当前 runner 是否能观测该客户端的 Task/subagent 能力；不支持观测时不计入触发率分母。
 - `redaction_ok`：结果文件不含真实 key、完整请求体和完整响应体时才为 true。
+- `prompt_hash` 和 `prefix_*_hash`：只保存哈希，用于判断稳定前缀和 cache material 变化；不得写入原始 prompt。
+- `cache_token_read_pct`：按 token 加权计算，优先使用 `cache_read_input_tokens/prompt_cache_hit_tokens` 与 `cache_miss_input_tokens/prompt_cache_miss_tokens`，不能用样本数冒充 token 命中率。
+
+`summary.json` 必须包含 `observability` 分组摘要，至少按 `model + prompt_bucket + stream + cache_observation` 输出：
+
+```text
+protocol_first_byte_ms p50/p90/p95/p99
+first_content_ms p50/p90/p95/p99
+first_tool_call_ms p50/p90/p95/p99
+first_tool_emit_ms p50/p90/p95/p99
+total_ms p50/p90/p95/p99
+cache token read_pct
+quality pass rate
+error_class counts
+```
 
 ## 错误分类
 
@@ -397,6 +487,11 @@ stream / non-stream：
 | 客户端 | 请求数 | 成功率 | P50 total | P90 total | P99 total | P90 first_content | 工具成功率 | subagent/agent 成功率 | 主要错误 |
 |--------|--------|--------|-----------|-----------|-----------|-------------------|------------|-----------------------|----------|
 
+## cache/TTFT 分桶
+
+| model | bucket | stream | cache_observation | rows | cache token read_pct | p50 first_content/tool | p90 | p95 | p99 | quality pass | errors |
+|-------|--------|--------|-------------------|------|----------------------|------------------------|-----|-----|-----|--------------|--------|
+
 ## 错误明细
 
 | error_class | count | client | 代表 request_id | 处理结论 |
@@ -430,7 +525,7 @@ not_supported：
 
 ## 当前未落地事项
 
-1. 无密钥执行器已在 `scripts/panda_pressure_runner.py`；本轮新增 `policy-smoke/policy-dry` 直接 HTTP 策略 harness。
+1. 无密钥执行器已在 `scripts/panda_pressure_runner.py`；已包含 `policy-smoke/policy-dry` 直接 HTTP 策略 harness 和 `cache-pressure-plan` 计划/数据 schema 模式。
 2. 仍需要在 panda 上按本方案重新跑 policy-smoke、policy-dry、四客户端 smoke、dry run、full run。
-3. 需要把真实结果以脱敏摘要形式写入 `docs/reports/`。
+3. 需要在用户确认后再执行 ClaudeCode cache 半压测，并把真实结果以脱敏摘要形式写入 `docs/reports/`。
 4. 需要在报告后更新 `docs/02-current-state.md`、`docs/03-roadmap.md`、`docs/04-improvement-backlog.md`。

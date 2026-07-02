@@ -40,12 +40,15 @@ pub fn map_upstream_model(model: &str, mappings: &[(String, String)]) -> String 
 pub fn anthropic_to_openai_messages(req: &AnthropicRequest) -> Vec<Message> {
     let mut msgs = Vec::new();
     if let Some(ref sys) = req.system {
-        msgs.push(Message {
-            role: "system".into(),
-            content: sys.clone(),
-            tool_calls: None,
-            tool_call_id: None,
-        });
+        let system_text = anthropic_system_to_openai_text(sys);
+        if !system_text.trim().is_empty() {
+            msgs.push(Message {
+                role: "system".into(),
+                content: Value::String(system_text),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
     }
     for msg in &req.messages {
         msgs.extend(anthropic_message_to_openai_messages(msg));
@@ -357,6 +360,17 @@ pub fn anthropic_content_to_text(content: &Value) -> String {
     }
 }
 
+fn anthropic_system_to_openai_text(content: &Value) -> String {
+    strip_anthropic_billing_header_lines(&anthropic_content_to_text(content))
+}
+
+fn strip_anthropic_billing_header_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("x-anthropic-billing-header:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn anthropic_tools_to_openai(tools: &[ToolDef]) -> Vec<OpenAITool> {
     tools.iter().map(|t| OpenAITool {
         tool_type: "function".into(),
@@ -654,6 +668,40 @@ pub fn claude_code_low_budget_tool_probe_max_tokens(
     body.max_tokens
 }
 
+pub fn claude_code_low_budget_probe_max_tokens(
+    body: &ChatRequest,
+    is_claude_code: bool,
+) -> Option<u64> {
+    let shape = request_shape(body);
+    if is_claude_code_low_budget_tool_probe_shape(body, &shape, is_claude_code)
+        || is_claude_code_low_budget_no_tool_probe_shape(body, &shape, is_claude_code)
+    {
+        return body
+            .max_tokens
+            .map(|max_tokens| max_tokens.max(CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MIN_OUTPUT_TOKENS));
+    }
+    body.max_tokens
+}
+
+fn is_claude_code_low_budget_no_tool_probe_shape(
+    body: &ChatRequest,
+    shape: &RequestShape,
+    is_claude_code: bool,
+) -> bool {
+    if !is_claude_code || body.stream.unwrap_or(false) {
+        return false;
+    }
+    let Some(max_tokens) = body.max_tokens else {
+        return false;
+    };
+    max_tokens <= CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_REQUEST_TOKENS
+        && shape.tool_count == 0
+        && !shape.tool_choice_present
+        && shape.message_count <= 2
+        && shape.last_user_tokens <= 64
+        && shape.estimated_total_tokens <= CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_TOTAL_TOKENS
+}
+
 fn value_shape_tokens(value: &Value) -> u64 {
     match value {
         Value::String(text) => estimate_tokens(text),
@@ -818,7 +866,14 @@ pub fn observe_context(messages: &[Message]) -> StreamContextRepair {
 pub fn model_disables_input_compaction(model: &str) -> bool {
     matches!(
         normalize_model(model).as_str(),
-        "deepseek-v4-flash" | "deepseek-v4-flash-free"
+        "deepseek-v4-flash"
+            | "deepseek-v4-flash-free"
+            | "mimo-v2.5"
+            | "mimo-v2.5-free"
+            | "north-mini-code"
+            | "north-mini-code-free"
+            | "nemotron-3-ultra"
+            | "nemotron-3-ultra-free"
     )
 }
 
@@ -1688,6 +1743,7 @@ pub fn short_no_tool_empty_fallback_text(body: &ChatRequest) -> Option<&'static 
 
     if lower.contains("reply ok")
         || lower.contains("answer ok")
+        || lower.contains("exactly ok")
         || lower.contains("ok only")
         || lower.contains("respond ok")
     {
@@ -1826,6 +1882,18 @@ mod tests {
     }
 
     #[test]
+    fn explicit_smoke_exact_ok_gets_safe_empty_fallback() {
+        let body = request("Reply with exactly OK.", false, Some(16));
+
+        assert!(is_short_no_tool_channel_test_probe(&body));
+        assert_eq!(short_no_tool_empty_fallback_text(&body), Some("ok"));
+        assert_eq!(
+            classify_short_non_stream_request(&body, false),
+            ShortNonStreamRequestKind::ChannelTest
+        );
+    }
+
+    #[test]
     fn explicit_smoke_pong_does_not_fallback_when_too_large() {
         let body = request("reply PONG only", false, Some(256));
 
@@ -1847,6 +1915,21 @@ mod tests {
             classify_short_non_stream_request(&body, false),
             ShortNonStreamRequestKind::UserShortRequest
         );
+    }
+
+    #[test]
+    fn claude_code_quality_models_disable_input_compaction() {
+        for model in [
+            "deepseek-v4-flash",
+            "mimo-v2.5",
+            "mimo-v2.5-free",
+            "north-mini-code",
+            "nemotron-3-ultra-free",
+        ] {
+            assert!(model_disables_input_compaction(model), "{model}");
+        }
+        assert!(!model_disables_input_compaction("deepseek-v4-flash-lite"));
+        assert!(!model_disables_input_compaction("big-pickle"));
     }
 
     #[test]

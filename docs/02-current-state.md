@@ -1,7 +1,137 @@
 # 当前状态
 
-更新时间：2026-06-09
+更新时间：2026-07-02
 分支：`codex/v47-client-split-cache-harness`
+
+## 2026-07-02 channel 69 代理池与 big-pickle 恢复
+
+本轮目标是恢复生产 channel 69 可用性：旧 Webshare 代理已出现 `proxy authorization required`，需要更换为用户提供的新 Webshare 100 代理，并把公开模型名从 `deepseek-v4-flash-lite` 改回 `big-pickle`。
+
+当前生产事实：
+
+1. 新 Webshare 代理文件 `Webshare 100 proxies.txt` 已在 panda 低并发验证：100/100 代理可访问上游 models 接口，100/100 出口国家为 `SG`，并已写入 `/etc/zen-proxy-rs/nodes-prod.json`。
+2. 旧 nodes 备份：`/etc/zen-proxy-rs/nodes-prod.json.bak-20260702-150617-pre-new-webshare`；旧二进制备份：`/opt/zen-proxy-rs/backups/zen-proxy-rs.20260702-150617.pre-webshare-bigpickle`。
+3. `zen-proxy-rs` 已通过 GitHub 临时 release 中转部署到 panda，部署后临时 release 和 tag 已删除；线上 stripped SHA256 为 `f3976687fe229bea87f69f070c57cb15e8da59d7060db577a5cac5f2a53ce95b`。
+4. panda `4001/4002/4004/4000` `/health` 均为 `status=ok`；`4000 /v1/models` 只公开 `deepseek-v4-flash,big-pickle,mimo-v2.5`。
+5. ZenProxy 直连 OpenAI chat smoke：`deepseek-v4-flash`、`big-pickle`、`mimo-v2.5` 非流式和流式均 HTTP 200；旧 `deepseek-v4-flash-lite` 返回 unsupported。
+6. ZenProxy 直连 Anthropic `/v1/messages` 流式 smoke：`big-pickle`、`mimo-v2.5`、`deepseek-v4-flash` 均 HTTP 200；非流式 `/v1/messages` 的短 channel-test 探针仍可能进入 DeepSeek 慢尾，不作为普通 chat 可用性失败。
+7. NewAPI channel 69 `channels.models` 已改为 `deepseek-v4-flash,big-pickle,mimo-v2.5`，`model_mapping` 为空，`status=1` 启用；备份表包括 `closeapi_channel69_backup_20260702_1518_pre_bigpickle`、`closeapi_abilities_channel69_backup_20260702_1542_pre_bigpickle`、`closeapi_models_bigpickle_backup_20260702_1542_pre_bigpickle`、`closeapi_channel69_status_backup_20260702_1601_pre_enable`。
+8. NewAPI `models`/`abilities` 已同步：active `deepseek-v4-flash-lite` 为 0，active `big-pickle` 为 1，channel 69 的 `deepseek-v4-flash,big-pickle,mimo-v2.5` abilities 均启用。
+9. NewAPI `hhhl` 组 token smoke：`/v1/models` 返回目标三模型且不返回旧 lite；`/v1/chat/completions` 对 `deepseek-v4-flash`、`big-pickle`、`mimo-v2.5` 均 HTTP 200；旧 lite 返回 `No available channel`。
+10. NewAPI 管理端单渠道测试 API：`stream=true` 下 `mimo-v2.5` 和 `big-pickle` 成功，`deepseek-v4-flash` 单独重试成功但耗时约 104s。该管理端探针比普通 chat 更容易触发 DeepSeek 短 `/v1/messages` 慢尾，后续不要用它单独代表真实 ClaudeCode 首字。
+11. 2026-07-02 21:10 CST 复查真实 ClaudeCode 公网链路：Windows official `claude.orig.exe` 经过用户当前 cc-switch `127.0.0.1:15721` 和 `https://sub2api.closeapi.top`。`deepseek-v4-flash` Bash/WebFetch/WebSearch x text/json/stream-json 9/9 通过；`mimo-v2.5` 同矩阵 9/9 通过；`big-pickle` Bash/WebFetch/WebSearch stream-json 3/3 通过。
+12. 同窗口 NewAPI channel 69 只有 `type=2` 成功消费记录，模型为公开名 `deepseek-v4-flash`、`mimo-v2.5`、`big-pickle`；cc-switch 显示的是 `request_model -> provider/upstream model`，所以会显示 `mimo-v2.5 -> mimo-v2.5-free`。这是展示层级差异，不是 NewAPI 未走 free 上游。
+13. Cloudflare 1010 根因已用 A/B 验证：`Python-urllib/3.12` UA 访问 `sub2api.closeapi.top` 会触发 403/1010；curl/no-UA/ClaudeCode-like/Mozilla UA 均能到达 NewAPI 鉴权层。后续不要用 Python urllib 直连 sub2api 判断 ClaudeCode/cc-switch 被 Cloudflare 挡。
+
+当前公开模型边界：
+
+1. 生产 channel 69 公开模型只应是 `deepseek-v4-flash`、`big-pickle`、`mimo-v2.5`。
+2. `deepseek-v4-flash-lite` 旧公开名已撤下，不再作为 NewAPI 公开模型或 ZenProxy 静态 public alias。
+3. `north-mini-code`、`nemotron-3-ultra`、`minimax-m3`、`qwen3.6-plus` 仍只做 hidden routing，不加入 NewAPI 公开列表。
+
+## 2026-06-22 cache 稳定化续接状态
+
+当前目标是提高真实 cache 命中率和首字稳定性，不能用裁剪上下文、伪造 usage、缩短输出、隐藏提示词或禁用工具来换速度。
+
+当前用户授权边界：
+
+1. 生产 NewAPI `https://sub2api.closeapi.top/` 现在允许按明确流程变更。
+2. dev/new 测试域名已切到 `https://new.relai.asia/`，不要再使用旧 `new.closeapi.top` 作为当前测试入口。
+3. 2026-07-02 起，生产 channel 69 公开模型只应是 `deepseek-v4-flash`、`big-pickle`、`mimo-v2.5`。
+4. `north-mini-code`、`nemotron-3-ultra`、`minimax-m3`、`qwen3.6-plus` 仍只做 hidden routing，不加入 NewAPI 公开列表。
+
+2026-06-22 08:23 CST panda 只读日志基线：
+
+1. 最近 120 分钟 `deepseek-v4-flash-free` ClaudeCode provider cache observation：accepted 38、rejected 14，accepted token hit 约 `96.94%`；Unknown accepted 7、rejected 3。
+2. 同窗口大请求中，多个会话的 `prefix_4k_hash`/`prefix_32k_hash` 稳定，但 `prefix_128k_hash`、`prefix_256k_hash`、`cache_material_bytes` 随尾部增长变化；这确认优化方向仍是 header/session/request/affinity 稳定化，而不是裁剪上下文。
+3. 最近 24 小时 audit：`deepseek-v4-flash-free` ClaudeCode success 13097 条，token-weighted cache hit 约 `84.26%`；`mimo-v2.5-free` ClaudeCode success 491 条，token-weighted cache hit 约 `18.04%`。
+4. `mimo-v2.5-free` ClaudeCode 24 小时内 affinity 很高但 token hit 低：`50k-100k` 桶 hit 约 `9.29%`、affinity `175/183`；`100k-200k` 桶 hit 约 `5.32%`、affinity `105/105`。说明瓶颈不是完全没有 affinity，而是 provider/session/header/request 口径仍可能把大段 tail 当成新 cache material。
+
+本轮已落地的低风险源码变化：
+
+1. `src/zen/client.rs` 的 `x-opencode-request` 不再随机生成。
+2. `x-opencode-request` 现在由完整规范化上游 body 生成：同一请求体稳定复用，不同请求体字段变化会生成不同 request id。
+3. `x-opencode-session`/`x-opencode-project` 仍按稳定前缀、tools、tool_choice、模型、API key hash 和 TTL 分组，保持长会话亲和。
+4. `zen-proxy-rs/src/v4/provider.rs` 已将 32KB+ cache-affinity 从仅流式扩展到流式和非流式，并把 `source_client` 纳入 affinity key。
+5. 这些变化只影响上游 header 和软节点亲和，不改变 request body、messages、tools、tool_choice、thinking、上下文长度、输出长度或 usage 字段。
+
+本地验证：
+
+1. `free-model-client-rs`：`cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；库测试 132 passed，kernel golden 127 passed。
+2. `zen-proxy-rs`：`cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；unit 194 passed，e2e 44 passed。
+
+2026-06-22 cache/TTFT 数据集 harness 续补：
+
+1. `scripts/panda_pressure_runner.py` 新增 `cache-pressure-plan` plan-only 模式；该模式只写 `cache-pressure-manifest.json`、`dataset-schema.json`、`analysis-plan.json`，不读取 API key、不触网、不写 `raw-results.jsonl`。
+2. runner raw row 新增脱敏 `prompt_hash`、`prefix_4k_hash`、`prefix_32k_hash`、`prefix_128k_hash`、`prefix_256k_hash`、`cache_material_bytes`、`prompt_bucket`、`target_tokens`、`first_tool_emit_ms`、`cache_read_input_tokens`、`cache_miss_input_tokens` 和 `cache_token_read_pct`。
+3. `summary.json` 新增 `observability` 分组：按 `model + prompt_bucket + stream + cache_observation` 输出 `protocol_first_byte_ms`、`first_content_ms`、`first_tool_call_ms`、`first_tool_emit_ms`、`total_ms` 的 P50/P90/P95/P99，同时输出 token-weighted cache read pct、质量通过率和错误计数。
+4. 2026-06-22 已执行 `deepseek-v4-flash` 10k 桶、Windows ClaudeCode 经 cc-switch、`20rpm x 5min` 校准半压测三轮，产物均在 `/tmp/claudecode-cache-pressure-runs/`，只保存脱敏 hashes/timing/status，不保存完整 prompt/stdout/stderr。
+5. 第一轮 `20260622-160200-claudecode-cache-pressure-deepseek-10k-20rpm` 把 request index/marker 放在稳定上下文之前，本地和远端前缀均发散；100 次调用 98 pass，WebSearch 2 timeout。远端 `deepseek-v4-flash-free` provider cache token read_pct 约 `28.25%`，但 top `prefix_32k` 重复组可到约 `92.53%`，可作为“早变前缀负样本”，不能作为稳定前缀 cache 结论。
+6. 修正版 `20260622-161920-claudecode-cache-pressure-deepseek-10k-20rpm-stableprefix` 把变量任务移到 90KB 稳定上下文之后；本地 `prefix_4k/32k_unique=1`，100 次调用 99 pass，唯一失败为 WebSearch timeout。远端仍显示 `prefix_4k/32k` 高度发散，说明 Windows ClaudeCode/cc-switch 请求 envelope 在用户 prompt 之前仍有动态内容；全窗口 token read_pct 约 `19.31%`，去 60 秒 warm-up 后约 `21.29%`，top `prefix_32k` 重复组约 `86.94%`。
+7. A/B 轮 `20260622-163209-claudecode-cache-pressure-deepseek-10k-20rpm-dynsystem` 只新增 ClaudeCode 官方参数 `--exclude-dynamic-system-prompt-sections`；100 次调用 93 pass，失败集中在 WebFetch/WebSearch 和 1 个 text result error。远端 token read_pct 降到约 `6.07%`，`prefix_32k` 更分散；该开关当前不能作为默认优化。
+8. 三轮压测期间 panda 4000/4001/4002/4004 health 均保持 `status=ok`、`dispatch=100`、`dead=0`、`ratelimited=0`。没有看到 `no proxy resources`、`lane is saturated`、`panic`、`Invalid tool parameters`、`Failed to parse JSON` 或 `stream truncated before DONE`。
+9. 当前结论：cache accepted 的远端 first real text/tool 通常更快，但 10k no-session ClaudeCode 独立进程场景的整体 cache read_pct 被动态前缀压低，不能升 50rpm 或扩到 50k/100k/200k 前先解决请求前缀稳定性。
+10. 本地 capture 已定位一类动态前缀：ClaudeCode Anthropic 请求含 `system[0].text = x-anthropic-billing-header: ... cch=<随机>`，且 `metadata.user_id` 每次变化；`metadata.user_id` 不进入 `ChatRequest`，但 billing header system 文本会被转成上游 system message 并进入 cache material。
+11. 本地源码已补低风险规范化：Anthropic system 转 OpenAI messages 时剥离 `x-anthropic-billing-header:` 行，且如果 system 只剩空内容则不发空 system message。该改动不改变 user messages、tools、tool_choice、thinking、max_tokens、上下文长度、输出长度或 usage。
+12. 验证已通过：`free-model-client-rs` `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`；`zen-proxy-rs` `cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`。新增回归确认 billing header 不上游透传，且仅 `cch` 变化不会改变 request prefix/prompt hash。
+13. V4.113 billing-header strip 已按 GitHub 临时 release 中转部署到 panda，线上二进制 SHA256 已确认是 `77dc3f29f6d498c138a5075e7b3cd22ca84209525599d1c93087a0ec99cffac5`，临时 release 已删除。
+14. post-V4.113 DeepSeek 受控复测 `20260622-100933-claudecode-cache-pressure-deepseek-v4-flash-10k-20rpm-post-v4113-sharedprefix-full`：本地 100/100 ok；远端 `deepseek-v4-flash-free` provider filtered accepted/rejected `133/7`，token read_pct `94.42%`；`prefix_4k_unique=1`、`prefix_32k_unique=2`、`prefix_128k_unique=2`；server-side first real text/tool P50/P90/P95/P99 `2195/3055/3676/4725ms`。
+15. DeepSeek 负对照 `per-request workspace` 保留：同档 token read_pct 只有约 `7.27%`，`prefix_32k_unique=100`，证明收益来自稳定 workspace/project/header 前缀，不是统计伪造。
+16. 已固定真实 `mimo-v2.5` ClaudeCode 入口：`--model mimo-v2.5` 单独使用会被当前 cc-switch provider 映射回 DeepSeek，必须临时把当前 Claude provider 的 Anthropic model 字段切到 `mimo-v2.5`，运行后用 `finally` 恢复。该流程已验证 panda ingress 真正出现 `model=mimo-v2.5` / provider `mimo-v2.5-free`。
+17. Mimo full safe-label 复测 `20260622-110328-claudecode-cache-pressure-mimo-v2.5-10k-20rpm-post-v2-safe-label-mimo-full`：本地 100/100 ok，覆盖 Bash/WebFetch/WebSearch x text/json/stream-json；远端 `mimo-v2.5-free` warm-up 后 provider accepted/rejected `131/8`，Mimo 缺显式 miss tokens，按 `read_tokens / estimated_total_tokens` 口径为 `91.08%`；server-side first real text/tool P50/P90/P95/P99 `3883/5966/6780/9000ms`。
+18. Mimo 测试语料已从 `PRESSURE_*` 改成 `CACHEBENCH_*` safe label，并新增 `missing_marker_refusal_like` 分类；旧模板 100 条中 1 条 text_review 被 Mimo 误判成安全注入，safe-label full 100 条未复现。
+19. 当前 `prompt_bucket=10k` 标签不等于远端真实 token 桶：ClaudeCode system/tools envelope 后，远端 `estimated_total_tokens` P50 约 `53k`、P95 约 `56.5k`。正式 10k/50k/100k/200k 矩阵前必须先做 bucket calibration，不能把当前结果写成真实 10k 桶。
+
+生产部署与观察状态：
+
+1. V4.111/V4.112/V4.113 已按 GitHub 临时 release 中转流程部署到 panda 三实例；V4.113 后 4001/4002 `/health` 均 `status=ok`、`dispatch=100`、`dead=0`，4004 观察到既有 `dead=1/dispatch=99` 但未在半压测中继续扩大。
+2. 2026-07-02 后，4000 `/v1/models` 已复查，只公开 `deepseek-v4-flash`、`big-pickle`、`mimo-v2.5`。
+3. 2026-06-22 14:32-15:04 CST post-V4.112 窗口，`deepseek-v4-flash-free` + ClaudeCode provider cache rows 约 528，accepted/rejected 约 `455/73`，token read/miss 约 `27,573,504 / 6,397,125`，read_pct 约 `81.17%`。
+4. 同窗口按 prompt hash 与 stream summary 拆分：stream rows 约 375，read_pct 约 `80.77%`；non-stream/unpaired rows 约 153，read_pct 约 `87.07%`。相比部署前基线，stream 从 `72.29%` 提升明显，non-stream 仍较高但未超过部署前 `92.87%`。
+5. 质量/错误扫描未见 `no proxy resources`、`lane is saturated`、`panic`、`Invalid tool parameters`、`Failed to parse JSON` 或 `stream truncated before DONE`；仍有 `provider_missing_reasoning_content` 和 `reasoning_only_length` 重试，是当前首字/长尾主要瓶颈。
+6. 当前没有足够证据支持继续扩大首跳 disabled-thinking 或裁剪/改写上下文；下一步应先做 bucket calibration、真实 traffic audit 与 20rpm 分桶校准，再决定是否升到 50rpm。
+
+## 2026-06-13 交接状态
+
+用户已要求停止继续测试和修复。本轮只做文档收口，不部署、不改 NewAPI、不改 ClaudeCode、不改 cc-switch，也不继续改运行逻辑。
+
+当时 `git status --short --branch`：
+
+```text
+## codex/v47-client-split-cache-harness
+?? north-mini-code
+```
+
+`north-mini-code` 是未跟踪项，本轮未触碰；后续不要盲删，也不要混入提交。
+
+2026-07-02 补充：该根目录 `north-mini-code` 文件已确认只是残缺 SQL 片段，不是模型配置或源码，已作为孤儿文件清理；当前模型 `north-mini-code` 业务边界仍按 hidden routing 文档执行。
+
+最新调查报告：
+
+```text
+docs/reports/2026-06-13-claudecode-web-tool-handoff.md
+```
+
+关键结论：
+
+1. Windows ClaudeCode 基础工具链 `Bash -> Write -> Read` 真实测试通过，参数完整，没有复现稳定的参数清空。
+2. WebSearch/WebFetch 专项里，`ToolSearch/WebSearch/WebFetch` 工具参数均完整；WebSearch 返回空结果，WebFetch 失败于 ClaudeCode 本地安全验证/`claude.ai` 链路。
+3. WebFetch 失败后模型改用 Playwright 可以抓取 `example.com` 和 Claude Code 文档页面，说明网页访问本身可用，失败点不是页面不可达。
+4. 当前 Windows cc-switch Claude provider 为 `closedeepseek -> https://sub2api.closeapi.top -> deepseek-v4-flash`，不是 panda NewAPI `http://100.69.228.93:8081`；cc-switch 本地日志不能直接当作 panda channel 69 数据。
+5. cc-switch 最近约 2 小时 Claude 记录中 410 条、200 成功 285 条、502 失败 125 条；失败主要是 `Connect`、`SendRequest`、`error sending request for url`，更像连接层/Cloudflare/上游网络问题。
+6. 同窗口成功请求首 token P50 约 15.6s、P90 约 48.6s、P95 约 69.4s；这是真实体感慢尾证据，但不能直接归因到 ZenProxy 参数转换。
+7. 精确查 cc-switch SQLite：`error_message like '%parse%'` 和 `'%JSON%'` 均为 0；但文本日志有 `error reading a body from connection`、`Response parse failed: connection error`，说明用户看到的 `Failed to parse JSON` 大概率是连接中断、非 JSON HTML、Cloudflare 错误页或半截流导致。
+8. panda ZenProxy 当时三实例 active，4000 `/health` 显示 `dispatch=90/dead=0/ratelimited=0`，不是服务没起或节点全死。
+
+本轮测试产物位于本机临时目录，不应提交：
+
+```text
+C:\Users\Lenovo\AppData\Local\Temp\zen_cli_probe_20260612_005541
+C:\Users\Lenovo\AppData\Local\Temp\zen_cli_probe_official_20260612_010110
+C:\Users\Lenovo\AppData\Local\Temp\zen_cli_web_batch_20260612_010559
+```
+
+后续若恢复工作，先按报告里的 request_id / provider / raw stream-json / NewAPI / ZenProxy journal 对齐证据链，不要直接继续堆适配。
 
 ## 代码已确认能力
 
@@ -642,18 +772,41 @@ P1.25 2026-06-10 V4.110 预部署修复包：
 | 部署验收 | 滚动重启 `zen-proxy-rs@1/@2/@3` 时，每个实例均等待 `/health` 达到 `dispatch>=60`、`dead=0` 后再继续；最终 4001/4002/4004/4000 `/health` 均 `status=ok`，`dispatch` 约 85-88，`dead=0`、`ratelimited=0`；4000 `/v1/models` 返回两个 deepseek 模型。panda NewAPI `ds` token smoke：`/v1/models` 可见两个模型，OpenAI 非流式 `只输出 OK` HTTP 200，Anthropic 非流式 `max_tokens=4096` HTTP 200 且返回 `OK`。 |
 | 部署后窗口 | 18:30 CST 后 NewAPI channel 69 共 1727 条记录，`type<>2` 错误 0；`empty_output`、`lane is saturated`、`do request failed`、`bad response status code 500`、`stream truncated`、`provider_missing_reasoning_content` 均为 0；nginx 同窗口 `worker_connections/upstream/reset/connect/recv` 匹配错误 0；ZenProxy 同窗口关键错误匹配 0。 |
 
+P1.26 2026-06-22 V4.111 cache header stabilization:
+
+| 项 | 事实 |
+| --- | --- |
+| 触发 | 用户要求在不裁剪上下文、不伪造 cache usage、不牺牲 ClaudeCode Bash/WebFetch/WebSearch 工具质量的前提下，继续提升 deepseek-v4-flash 和 mimo-v2.5 cache 命中率。 |
+| 修复 | `src/zen/client.rs` 将 `x-opencode-request` 从随机值改为基于完整规范化上游 body 的稳定 ID；相同 body 重试保持 request header 稳定，body 任意字段变化仍生成不同 request。 |
+| 边界 | 不改请求正文、不改工具 schema、不裁剪上下文、不缩输出、不禁用 WebFetch/WebSearch/Bash、不扩展 deepseek-v4-flash-lite 到 ClaudeCode 主线、不伪造 usage。 |
+| 本地验证 | `free-model-client-rs`：`cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 通过；库测试 132 passed，kernel golden 127 passed。`zen-proxy-rs`：`cargo fmt -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`cargo build --release` 通过；unit 194 passed，e2e 44 passed。`scripts/run_claudecode_acceptance.py` 通过 `python3 -m py_compile`。 |
+| 部署 | 2026-06-22 10:12 CST 通过 GitHub 临时 release 中转部署到 panda 三实例；线上 stripped SHA256 `ee6393093d61b9fedd77112db67f093e469cdeceb5b7f9cfdd9c885d7fc2dc38`，xz SHA256 `c8ffdf66797f66023096c6682b965ab054f382e04a254e93797a7027ee863efb`；旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260622-101213.pre-v4111-cache-header-4bb606dc25c7`。临时 release/tag `v4111-cache-header-20260622-1002` 已删除，release not found，仓库 contents `[]`。 |
+| 部署验收 | `zen-proxy-rs@1/@2/@3` active；4001/4002/4004/4000 `/health` 均 `status=ok`、`dispatch=100`、`dead=0`、`ratelimited=0`。4000 `/v1/models` 只公开 `deepseek-v4-flash`、`deepseek-v4-flash-lite`、`mimo-v2.5`。 |
+| 小流量验证 | 直连 ZenProxy OpenAI-compatible 最小 chat：`deepseek-v4-flash` 返回 `OK`；`mimo-v2.5` 返回 `OK` 且 usage 出现 `cache_read_input_tokens=192`。Windows official `claude.orig.exe` bridge smoke 18 项无失败，覆盖 Bash/WebFetch/WebSearch x text/json/stream-json；其中 deepseek 9/9 有效。 |
+| 验收边界 | Windows bridge 的 `mimo-v2.5` 9 项报告为 pass/slow_pass，但 panda ingress 日志显示实际请求仍是 `deepseek-v4-flash`，因此不能计为真实 mimo ClaudeCode 验收。WSL `/home/lenovo/.local/bin/claude` 当前是 clawgod launcher，本轮 WSL deepseek Bash 前两项失败后已中止，也不能作为 official ClaudeCode 证据。 |
+| cache 短窗口 | 部署后 10:12-10:58 CST 窗口，`deepseek-v4-flash-free` + ClaudeCode cache rows 153：accepted 102、rejected 51，token read/miss 约 `2,565,376 / 1,816,886`，read_pct 约 `58.54%`；`50k-100k` 桶 accepted 31/rejected 4，read_pct 约 `81.16%`。`prefix_4k/prefix_32k` 已出现重复稳定组，top 组分别出现 63 次和 30 次；`prefix_128k/prefix_256k` 仍随尾部变化。 |
+| 待观察 | 仍缺同一真实 mimo ClaudeCode 长会话 A/B；需要继续观察生产 channel 69 真实流量中的 mimo accepted/rejected、prefix 稳定度、TTFT/first_content 和工具质量，不能用本轮 Windows bridge 的 mimo 报告替代。11:24 CST 收尾复查 4004 为 `dead=1/dispatch=99`，4001/4002 和 4000 聚合仍 `status=ok`，按池节点健康波动继续观察。 |
+
+P1.27 2026-06-22 V4.112 non-stream cache affinity follow-up:
+
+| 项 | 当前事实 |
+|----|----|
+| 目标 | 在不改 request body、prompt、tools、tool_choice、thinking、max_tokens、输出长度或 usage 的前提下，让 32KB+ 非流式 ClaudeCode 中/大请求也使用已有 cache-affinity 软亲和。 |
+| 生产前基线 | 14:17 CST 只读聚合最近 120 分钟：`deepseek-v4-flash-free` + ClaudeCode stream cache rows 140，accepted/rejected `110/30`，token read_pct `72.29%`；non-stream cache rows 131，accepted/rejected `124/7`，token read_pct `92.87%`。同窗口 ingress `deepseek-v4-flash` + `claude-code` 272 条，其中 non-stream 130、stream 142、32KB+ 240。 |
+| 代码改动 | `zen-proxy-rs/src/v4/provider.rs` 的 affinity key 不再因 `stream=false` 返回空；32KB+ 流式和非流式都会按 `model/path/source_client/client/prefix/tools/tool_choice` 构造软亲和 key。 |
+| 部署 | 2026-06-22 14:32 CST 已通过 GitHub 临时 release 中转部署到 panda 三实例；线上 stripped SHA256 `766eef7f3e51b7eb8e3af57bf058db35da538e1b3fa14074dd3a4f5f789dcbca`，xz SHA256 `739a54ba07783dd0bbb2b697f7e08a13b0568d5cc6fbfdaa6c2f7eeb64a30b88`；旧版备份 `/opt/zen-proxy-rs/backups/zen-proxy-rs.20260622-143230.pre-v4112-cache-affinity-ee6393093d61`。 |
+| 部署验收 | 4001/4002/4004/4000 `/health` 均 `status=ok`、`dispatch=100`、`dead=0`、`ratelimited=0`；线上 binary hash 已确认；4000 `/v1/models` 只公开 `deepseek-v4-flash`、`deepseek-v4-flash-lite`、`mimo-v2.5`。 |
+| 中转清理 | 公开中转 release/tag `v4112-cache-affinity-20260622-1428` 删除后 `release not found`，`croppedtravelleralex/new` contents 为 `[]`；误建在私有源码仓的 `v4112-cache-affinity-20260622-1424` 也已删除并返回 `release not found`。 |
+| 限制 | 当前 shell 环境没有 `ANTHROPIC_API_KEY`，未跑本地 runner 的完整 ClaudeCode smoke；4000 直连假 key 返回 403，不作为模型失败。后续仍需用有效且不泄露的 API key/cc-switch 环境跑 DeepSeek Bash/WebFetch/WebSearch x text/json/stream-json。 |
+
 ## 临时产物归类
 
 | 路径 | 当前归类 | 处理原则 |
 |------|----------|----------|
-| `.codex_tmp/client-matrix/` | 历史客户端矩阵脚本和结果 | 不提交；只提炼无密钥执行器和脱敏摘要。 |
-| `.codex_tmp/hermes-panda-profile/` | Hermes 临时 profile 和状态 | 不提交；可能含会话状态，只保留脱敏结论。 |
-| `.codex_tmp/hermes-panda-home/` | Hermes 临时 HOME | 不提交；如需复测重新生成。 |
-| `.codex_tmp/hermes-tool-smoke/` | Hermes 工具 smoke 工作目录 | 不提交；只作为本地验证痕迹。 |
-| `.codex_tmp/openclaw-panda/` | OpenClaw 临时配置、state、workspace | 不提交；配置中不得把真实 key 写入仓库。 |
-| `configured` | 根目录 0 字节未跟踪文件 | 来源未确认，不删除、不提交。 |
-| `panda` | 根目录 0 字节未跟踪文件 | 来源未确认，不删除、不提交。 |
-| `""` / 异常字符文件 | 根目录 0 字节未跟踪文件 | 来源未确认，不删除、不提交。 |
+| `.codex_tmp/` | 历史客户端矩阵、Hermes/OpenClaw 临时配置、Mimo wrapper、cache audit 脚本等一次性产物 | 2026-07-02 已清理；以后由正式 runner 重新生成，仍不提交。 |
+| `test-records/runs/` | 历史验收和运行证据 | 保留在本地，已加入忽略；报告只提交脱敏摘要。 |
+| `.bun/`、`~/`、`tmpcc-zenprobe-wsl-*` | 本地包缓存或误建临时目录 | 2026-07-02 已清理并加入忽略。 |
+| `north-mini-code`、`""`、`\` | 根目录孤儿/异常文件 | 2026-07-02 已确认并清理；不是业务模型配置。 |
 
 ## 当前风险
 
@@ -661,8 +814,8 @@ P1.25 2026-06-10 V4.110 预部署修复包：
 2. 输出限制和 flash 输入墙完全取消后，上游 413、超时、空输出、延迟和成本风险回到 upstream 与 lane/pool 调度层；必须用真实 panda `policy-smoke/policy-dry` 和后续 dry run 压测确认，不能凭源码测试判定生产安全。
 3. Hermes/OpenClaw 当前测试使用临时环境变量或临时配置，不能误当成用户默认配置已经切换。
 4. OpenClaw 系统 Node 仍是 `v20.20.2`，只有显式使用隔离 Node 22 路径才满足运行要求。
-5. `.codex_tmp/` 里有大量历史测试输出，可能包含敏感信息，默认不提交。
-6. 仓库根目录存在 `configured`、`panda`、`""`、异常字符文件等未跟踪项，提交前必须逐个确认用途，不要盲目删除。
+5. `.codex_tmp/`、异常字符文件和根目录孤儿文件已在 2026-07-02 清理；后续重新生成的临时产物仍不得提交。
+6. 当前保留的 `test-records/runs/` 是本地证据目录，已忽略；不要把原始大日志、密钥、完整请求体或完整响应体加入提交。
 7. 客户端策略隔离和 final-anchor 修复已在代码层落地，panda 本机 source-side huge stream smoke 通过；但真实 ClaudeCode dry run 仍显示 huge_context 语义漂移，不能进入 full run。
 8. panda ZenProxy 三实例健康且池指标正常，但 NewAPI/docker 日志里出现过上游 Cloudflare 502/524、stream JSON 截断和 client_gone，需要在正式报告中和 ZenProxy 指标分开归因。
 9. Windows ClaudeCode 不能从当前 WSL 非交互环境稳定启动时，应归类为测试执行环境问题；不要把它误判成 panda/ZenProxy 链路失败。

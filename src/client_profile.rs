@@ -78,8 +78,26 @@ impl ClientProfile {
                     self
                 }
             }
+            "mimov25" | "mimov25free" | "northminicode" | "northminicodefree"
+            | "nemotron3ultra" | "nemotron3ultrafree" => {
+                if matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw) {
+                    Self::unknown()
+                } else {
+                    self
+                }
+            }
             "deepseekv4flashlite" | "bigpickle" => {
                 if matches!(self.kind, ClientKind::ClaudeCode) {
+                    Self::unknown()
+                } else {
+                    self
+                }
+            }
+            "minimaxm3" | "minimaxm3free" | "qwen36plus" | "qwen36plusfree" => {
+                if matches!(
+                    self.kind,
+                    ClientKind::ClaudeCode | ClientKind::Hermes | ClientKind::OpenClaw
+                ) {
                     Self::unknown()
                 } else {
                     self
@@ -508,6 +526,60 @@ mod tests {
 
             assert_eq!(profile.kind, kind);
             assert!(profile.uses_compat_tool_history());
+        }
+    }
+
+    #[test]
+    fn mimo_family_keeps_claude_code_policy() {
+        for model in [
+            "mimo-v2.5",
+            "mimo-v2.5-free",
+            "north-mini-code",
+            "nemotron-3-ultra-free",
+        ] {
+            let profile = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+                .effective_for_model(model);
+
+            assert_eq!(profile.kind, ClientKind::ClaudeCode, "{model}");
+            assert!(profile.preserves_model_text_exactly(), "{model}");
+        }
+    }
+
+    #[test]
+    fn mimo_family_drops_hermes_openclaw_compat_policy() {
+        for model in ["mimo-v2.5", "north-mini-code-free", "nemotron-3-ultra"] {
+            for kind in [ClientKind::Hermes, ClientKind::OpenClaw] {
+                let profile = ClientProfile::new(kind, ClientProfileSource::Header)
+                    .effective_for_model(model);
+
+                assert_eq!(profile.kind, ClientKind::Unknown, "{model}");
+                assert!(!profile.disables_thinking_for_tool_use(), "{model}");
+                assert!(!profile.uses_compat_tool_history(), "{model}");
+            }
+        }
+    }
+
+    #[test]
+    fn generic_opencode_free_models_drop_deep_client_policies() {
+        for model in [
+            "minimax-m3",
+            "minimax-m3-free",
+            "qwen3.6-plus",
+            "qwen3.6-plus-free",
+        ] {
+            for kind in [
+                ClientKind::ClaudeCode,
+                ClientKind::Hermes,
+                ClientKind::OpenClaw,
+            ] {
+                let profile = ClientProfile::new(kind, ClientProfileSource::Header)
+                    .effective_for_model(model);
+
+                assert_eq!(profile.kind, ClientKind::Unknown, "{model}");
+                assert!(!profile.preserves_model_text_exactly(), "{model}");
+                assert!(!profile.disables_thinking_for_tool_use(), "{model}");
+                assert!(!profile.uses_compat_tool_history(), "{model}");
+            }
         }
     }
 }

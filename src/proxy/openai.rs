@@ -12,6 +12,8 @@ use reqwest::Client;
 use serde_json::Value;
 
 const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
+const DEFAULT_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
+const MIMO_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 5;
 
 pub async fn handle_openai_chat(
     client: &Client,
@@ -145,8 +147,25 @@ pub async fn handle_openai_chat(
         tool_choice: body.tool_choice.clone(),
     };
     let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
+    if let Some(tool_choice_policy) =
+        super::downgrade_claude_code_forced_tool_choice_for_upstream_model(
+            &mut zb,
+            &mut cr,
+            profile,
+            &upstream_model,
+        )
+    {
+        tracing::info!(
+            protocol = "openai",
+            model = %cr.model,
+            upstream_model = %upstream_model,
+            source_client = ?profile.kind,
+            tool_choice_policy,
+            "adapted upstream tool_choice policy"
+        );
+    }
     super::prune_null_optional_upstream_fields(&mut zb);
-    let probe_max_tokens = translate::claude_code_low_budget_tool_probe_max_tokens(
+    let probe_max_tokens = translate::claude_code_low_budget_probe_max_tokens(
         &cr,
         profile.kind == ClientKind::ClaudeCode,
     );
@@ -162,7 +181,7 @@ pub async fn handle_openai_chat(
             prompt_tokens = shape.estimated_total_tokens,
             message_count = shape.message_count,
             tool_count = shape.tool_count,
-            "raised ClaudeCode low-budget tool probe max_tokens before upstream"
+            "raised ClaudeCode low-budget probe max_tokens before upstream"
         );
         cr.max_tokens = probe_max_tokens;
         if let Some(max_tok) = probe_max_tokens {
@@ -617,7 +636,7 @@ async fn handle_oa_stream(
     let body = cr.clone();
     let mut attempt_body = zb.clone();
     let mut used_missing_reasoning_disabled_retry = false;
-    let resp = loop {
+    let initial_resp = loop {
         match crate::zen::client::fetch_zen_stream_with_headers(
             client,
             &config.zen_chat_url,
@@ -642,96 +661,146 @@ async fn handle_oa_stream(
             Err(err) => return Err(err),
         }
     };
-    let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
-    let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
     let true_first_token_frt = config.true_first_token_frt;
+    let client = client.clone();
+    let config = config.clone();
+    let base_body = zb.clone();
     let stream = async_stream::stream! {
-        let mut role_sent = false;
-        if !true_first_token_frt {
-            yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
-            role_sent = true;
-        }
-        let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut markdown_guard = if profile.preserves_model_text_exactly() {
-            None
-        } else {
-            Some(crate::proxy::markdown::MarkdownFenceGuard::new())
-        };
-        let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
-        let mut usage: Option<crate::zen::client::ZenUsage> = None;
-        let mut upstream_finish_reason: Option<String> = None;
-        while let Some(event) = upstream.next().await {
-            let event = match event {
-                Ok(event) => event,
-                Err(err) => {
-                    yield Ok(Event::default().data(serde_json::json!({"error":{"message":err.message}}).to_string()));
-                    yield Ok(Event::default().data("[DONE]"));
-                    return;
-                }
-            };
-            if event.usage.is_some() {
-                usage = event.usage;
-            }
-            if let Some(choices) = event.choices {
-                for choice in choices {
-                    if let Some(reason) = choice.finish_reason.as_deref().filter(|reason| !reason.is_empty()) {
-                        upstream_finish_reason = Some(reason.to_string());
-                    }
-                    let Some(delta) = choice.delta else { continue; };
-                    if let Some(content) = delta.content {
-                        let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
-                            markdown_guard.push(&crate::redact::redact_text(&content))
-                        } else {
-                            content
-                        };
-                        let should_emit =
-                            !content.trim().is_empty()
-                                || (profile.preserves_stream_whitespace() && !content.is_empty());
-                        if should_emit {
-                            if !role_sent {
-                                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
-                                role_sent = true;
-                            }
-                            text.push_str(&content);
-                            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string()));
+        let mut next_resp = Some(initial_resp);
+        let mut attempt_body = attempt_body;
+        let mut used_missing_reasoning_disabled_retry = used_missing_reasoning_disabled_retry;
+        let max_attempts = openai_stream_empty_upstream_attempts(&body);
+        for attempt in 1..=max_attempts {
+            let resp = if let Some(resp) = next_resp.take() {
+                resp
+            } else {
+                loop {
+                    match crate::zen::client::fetch_zen_stream_with_headers(
+                        &client,
+                        &config.zen_chat_url,
+                        &config.zen_api_key,
+                        &attempt_body,
+                        &config.extra_headers,
+                    )
+                    .await
+                    {
+                        Ok(resp) => break resp,
+                        Err(err)
+                            if super::should_retry_missing_reasoning_content(
+                                &err,
+                                used_missing_reasoning_disabled_retry,
+                            ) =>
+                        {
+                            used_missing_reasoning_disabled_retry = true;
+                            attempt_body = super::reasoning_disabled_retry_body(&base_body);
+                            super::log_missing_reasoning_content_retry(
+                                "openai_stream",
+                                &body,
+                                profile,
+                                attempt,
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            yield Ok::<_, Infallible>(Event::default().data(serde_json::json!({"error":{"message":err.message}}).to_string()));
+                            yield Ok(Event::default().data("[DONE]"));
+                            return;
                         }
                     }
-                    if let Some(reasoning_content) = delta.reasoning_content {
-                        reasoning.push_str(&reasoning_content);
-                    }
-                    if let Some(items) = delta.tool_calls {
-                        merge_tool_deltas(&mut tool_calls, items);
-                    }
                 }
-            }
-        }
-        let final_markdown = markdown_guard
-            .as_mut()
-            .map(crate::proxy::markdown::MarkdownFenceGuard::finish)
-            .unwrap_or_default();
-        if !final_markdown.is_empty() {
-            if !role_sent {
+            };
+            let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
+            let mut upstream = Box::pin(crate::zen::client::stream_sse_events(resp.bytes_stream()));
+            let mut role_sent = false;
+            if !true_first_token_frt {
                 yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
                 role_sent = true;
             }
-            text.push_str(&final_markdown);
-            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":final_markdown},"finish_reason":null}]}).to_string()));
-        }
-        if text.trim().is_empty() && tool_calls.is_empty() {
-            if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body) {
-                tracing::warn!(
-                    model = body.model,
-                    source_client = ?profile.kind,
-                    "short channel-test probe received empty upstream; returning local ok"
-                );
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            let mut markdown_guard = if profile.preserves_model_text_exactly() {
+                None
+            } else {
+                Some(crate::proxy::markdown::MarkdownFenceGuard::new())
+            };
+            let mut tool_calls: Vec<crate::zen::client::CollectedToolCall> = Vec::new();
+            let mut usage: Option<crate::zen::client::ZenUsage> = None;
+            let mut upstream_finish_reason: Option<String> = None;
+            let mut stream_error: Option<String> = None;
+            while let Some(event) = upstream.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(err) => {
+                        stream_error = Some(err.message);
+                        break;
+                    }
+                };
+                if event.usage.is_some() {
+                    usage = event.usage;
+                }
+                if let Some(choices) = event.choices {
+                    for choice in choices {
+                        if let Some(reason) = choice.finish_reason.as_deref().filter(|reason| !reason.is_empty()) {
+                            upstream_finish_reason = Some(reason.to_string());
+                        }
+                        let Some(delta) = choice.delta else { continue; };
+                        if let Some(content) = delta.content {
+                            let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
+                                markdown_guard.push(&crate::redact::redact_text(&content))
+                            } else {
+                                content
+                            };
+                            let should_emit =
+                                !content.trim().is_empty()
+                                    || (profile.preserves_stream_whitespace() && !content.is_empty());
+                            if should_emit {
+                                if !role_sent {
+                                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                                    role_sent = true;
+                                }
+                                text.push_str(&content);
+                                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string()));
+                            }
+                        }
+                        if let Some(reasoning_content) = delta.reasoning_content {
+                            reasoning.push_str(&reasoning_content);
+                        }
+                        if let Some(items) = delta.tool_calls {
+                            merge_tool_deltas(&mut tool_calls, items);
+                        }
+                    }
+                }
+            }
+            if let Some(message) = stream_error {
+                if !role_sent && text.trim().is_empty() && tool_calls.is_empty() && attempt < max_attempts {
+                    tracing::warn!(
+                        protocol = "openai",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        attempt,
+                        max_attempts,
+                        error = %message,
+                        "retrying openai stream after pre-output upstream stream error"
+                    );
+                    continue;
+                }
+                yield Ok(Event::default().data(serde_json::json!({"error":{"message":message}}).to_string()));
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
+            let final_markdown = markdown_guard
+                .as_mut()
+                .map(crate::proxy::markdown::MarkdownFenceGuard::finish)
+                .unwrap_or_default();
+            if !final_markdown.is_empty() {
                 if !role_sent {
                     yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
                     role_sent = true;
                 }
-                text.push_str(fallback_text);
-                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":fallback_text},"finish_reason":null}]}).to_string()));
-            } else {
+                text.push_str(&final_markdown);
+                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":final_markdown},"finish_reason":null}]}).to_string()));
+            }
+            if text.trim().is_empty() && tool_calls.is_empty() {
                 let empty_output_class = if !reasoning.trim().is_empty() {
                     if upstream_finish_reason.as_deref() == Some("length") {
                         "reasoning_only_length"
@@ -741,68 +810,129 @@ async fn handle_oa_stream(
                 } else {
                     "empty_output"
                 };
-                tracing::warn!(
-                    protocol = "openai",
-                    model = %body.model,
-                    source_client = ?profile.kind,
-                    empty_output_class,
-                    finish_reason = ?upstream_finish_reason,
-                    reasoning_chars = reasoning.len(),
-                    content_chars = text.len(),
-                    "stream upstream returned no assistant content or tool call"
-                );
-                yield Ok(Event::default().data(serde_json::json!({"error":{"message":format!("upstream returned no assistant content or tool call (class={empty_output_class})")}}).to_string()));
-                yield Ok(Event::default().data("[DONE]"));
-                return;
+                if let Some(ref usage) = usage {
+                    let cache_signals = cache_signals.clone().with_body_usage(Some(usage));
+                    super::log_provider_cache_observation("openai", &body, profile, &cache_signals, attempt, max_attempts);
+                } else {
+                    super::log_provider_cache_observation("openai", &body, profile, &cache_signals, attempt, max_attempts);
+                }
+                if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body) {
+                    tracing::warn!(
+                        model = body.model,
+                        source_client = ?profile.kind,
+                        "short channel-test probe received empty upstream; returning local ok"
+                    );
+                    if !role_sent {
+                        yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                        role_sent = true;
+                    }
+                    text.push_str(fallback_text);
+                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":fallback_text},"finish_reason":null}]}).to_string()));
+                } else if !role_sent && attempt < max_attempts {
+                    tracing::warn!(
+                        protocol = "openai",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        empty_output_class,
+                        finish_reason = ?upstream_finish_reason,
+                        reasoning_chars = reasoning.len(),
+                        content_chars = text.len(),
+                        attempt,
+                        max_attempts,
+                        "retrying openai stream after pre-output empty upstream"
+                    );
+                    continue;
+                } else {
+                    tracing::warn!(
+                        protocol = "openai",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        empty_output_class,
+                        finish_reason = ?upstream_finish_reason,
+                        reasoning_chars = reasoning.len(),
+                        content_chars = text.len(),
+                        "stream upstream returned no assistant content or tool call"
+                    );
+                    yield Ok(Event::default().data(serde_json::json!({"error":{"message":format!("upstream returned no assistant content or tool call (class={empty_output_class})")}}).to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
             }
+            for tool in tool_calls.iter() {
+                if !role_sent {
+                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                    role_sent = true;
+                }
+                let clean_id = tool.id.clone().unwrap_or_else(|| format!("call_{}", tool.index));
+                let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
+                let tc = ToolCall {
+                    id: Some(clean_id),
+                    call_type: "function".into(),
+                    function: ToolFunction {
+                        name: tool.name.clone(),
+                        arguments: tool.arguments.clone(),
+                    },
+                    index: Some(tool.index),
+                };
+                let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
+                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":tool.index,"id":tc.id,"type":"function","function":{"name":tc.function.name,"arguments":tc.function.arguments}}]},"finish_reason":null}]}).to_string()));
+            }
+            let finish_reason = openai_finish_reason(upstream_finish_reason.as_deref(), !tool_calls.is_empty());
+            let mut final_chunk = serde_json::json!({
+                "id": id, "object": "chat.completion.chunk", "created": created,
+                "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+            });
+            if let Some(usage) = usage {
+                let cache_signals = cache_signals.clone().with_body_usage(Some(&usage));
+                super::log_provider_cache_observation("openai", &body, profile, &cache_signals, attempt, max_attempts);
+                let pt = usage.prompt_tokens.unwrap_or_else(|| estimate(&prompt));
+                let ct = usage.completion_tokens.unwrap_or_else(|| if !text.trim().is_empty() { estimate(&text) } else { estimate(&tool_calls.iter().map(|tool| format!("{} {}", tool.name, tool.arguments)).collect::<Vec<_>>().join("\n")).max(1) });
+                let total = usage.total_tokens.unwrap_or(pt + ct);
+                final_chunk["usage"] = serde_json::json!({"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total});
+                if let Some(ref details) = usage.prompt_tokens_details {
+                    final_chunk["usage"]["prompt_tokens_details"] = details.clone();
+                }
+                if let Some(cache_read) = cache_read_tokens(Some(&usage)) {
+                    final_chunk["usage"]["cache_read_input_tokens"] = serde_json::json!(cache_read);
+                }
+                if let Some(cache_creation) = usage.cache_creation_input_tokens {
+                    final_chunk["usage"]["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
+                }
+            } else {
+                super::log_provider_cache_observation("openai", &body, profile, &cache_signals, attempt, max_attempts);
+            }
+            yield Ok(Event::default().data(final_chunk.to_string()));
+            yield Ok(Event::default().data("[DONE]"));
+            return;
         }
-        for tool in tool_calls.iter() {
-            if !role_sent {
-                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
-                role_sent = true;
-            }
-            let clean_id = tool.id.clone().unwrap_or_else(|| format!("call_{}", tool.index));
-            let clean_id = if let Some(pos) = clean_id.find('{') { clean_id[..pos].to_string() } else { clean_id };
-            let tc = ToolCall {
-                id: Some(clean_id),
-                call_type: "function".into(),
-                function: ToolFunction {
-                    name: tool.name.clone(),
-                    arguments: tool.arguments.clone(),
-                },
-                index: Some(tool.index),
-            };
-            let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
-            yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":tool.index,"id":tc.id,"type":"function","function":{"name":tc.function.name,"arguments":tc.function.arguments}}]},"finish_reason":null}]}).to_string()));
-        }
-        let finish_reason = openai_finish_reason(upstream_finish_reason.as_deref(), !tool_calls.is_empty());
-        let mut final_chunk = serde_json::json!({
-            "id": id, "object": "chat.completion.chunk", "created": created,
-            "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-        });
-        if let Some(usage) = usage {
-            let cache_signals = cache_signals.with_body_usage(Some(&usage));
-            super::log_provider_cache_observation("openai", &body, profile, &cache_signals, 1, 1);
-            let pt = usage.prompt_tokens.unwrap_or_else(|| estimate(&prompt));
-            let ct = usage.completion_tokens.unwrap_or_else(|| if !text.trim().is_empty() { estimate(&text) } else { estimate(&tool_calls.iter().map(|tool| format!("{} {}", tool.name, tool.arguments)).collect::<Vec<_>>().join("\n")).max(1) });
-            let total = usage.total_tokens.unwrap_or(pt + ct);
-            final_chunk["usage"] = serde_json::json!({"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total});
-            if let Some(ref details) = usage.prompt_tokens_details {
-                final_chunk["usage"]["prompt_tokens_details"] = details.clone();
-            }
-            if let Some(cache_read) = cache_read_tokens(Some(&usage)) {
-                final_chunk["usage"]["cache_read_input_tokens"] = serde_json::json!(cache_read);
-            }
-            if let Some(cache_creation) = usage.cache_creation_input_tokens {
-                final_chunk["usage"]["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
-            }
-        } else {
-            super::log_provider_cache_observation("openai", &body, profile, &cache_signals, 1, 1);
-        }
-        yield Ok(Event::default().data(final_chunk.to_string()));
+        tracing::warn!(
+            protocol = "openai",
+            model = %body.model,
+            source_client = ?profile.kind,
+            max_attempts,
+            "openai stream exhausted attempts without terminal output"
+        );
+        yield Ok(Event::default().data(serde_json::json!({"error":{"message":"upstream returned no assistant content or tool call (class=empty_output)"}}).to_string()));
         yield Ok(Event::default().data("[DONE]"));
     };
     Ok(Sse::new(stream).into_response())
+}
+
+fn openai_stream_empty_upstream_attempts(cr: &ChatRequest) -> usize {
+    if is_mimo_v25_model(&cr.model) {
+        MIMO_STREAM_EMPTY_UPSTREAM_ATTEMPTS
+    } else {
+        DEFAULT_STREAM_EMPTY_UPSTREAM_ATTEMPTS
+    }
+}
+
+fn is_mimo_v25_model(model: &str) -> bool {
+    let normalized: String = model
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    matches!(normalized.as_str(), "mimov25" | "mimov25free")
 }
 
 fn merge_tool_deltas(

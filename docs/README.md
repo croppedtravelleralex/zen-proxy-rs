@@ -2,6 +2,16 @@
 
 这是本仓库的 AI 维护真相源。对外介绍看根目录 README.md；涉及当前状态、未实现待办、验收记录和后续接手，先读这里。
 
+## 跨仓统一入口
+
+2026-07-02 起，`free-model-client-rs` 与 `/home/lenovo/zen-proxy-rs` 的协同维护入口为：
+
+```text
+/home/lenovo/zen-free-model-suite
+```
+
+该目录通过软链接聚合两个仓库和关键 smoke 产物，不移动真实 git 仓库。跨仓接手优先读 `/home/lenovo/zen-free-model-suite/README.md` 和 `/home/lenovo/zen-free-model-suite/docs/PROJECT_HANDOFF.md`。
+
 ## 阅读顺序
 
 1. docs/02-current-state.md：当前已实现、运行边界、最新验证结果。
@@ -11,7 +21,9 @@
 5. docs/06-panda-pressure-test-plan.md：panda-only 四客户端压测方案和报告模板。
 6. docs/07-client-profile-policy-plan.md：客户端识别、策略隔离和 ClaudeCode 误伤修复方案。
 7. docs/08-newapi-usage-exporter.md：独立 NewAPI 使用日志导出 sidecar。
-8. docs/logs/YYYY/YYYY-MM.md：按时间追加的工作记录。
+8. docs/reports/2026-06-13-claudecode-web-tool-handoff.md：ClaudeCode WebSearch/WebFetch、cc-switch provider、502/parse JSON 调查交接。
+9. docs/reports/2026-07-02-cross-repo-suite-handoff.md：跨仓聚合入口、链路、完成事项、约束和后续建议。
+10. docs/logs/YYYY/YYYY-MM.md：按时间追加的工作记录。
 
 ## 真相来源优先级
 
@@ -52,6 +64,14 @@ free-model-client-rs 当前 panda 联调完成收尾，并进入 panda-only 四�
 
 ## 当前剩余待办
 
+2026-06-13 最新交接状态：
+
+1. 用户已要求停止继续测试/修复，本轮只做文档收口和交接。
+2. Windows ClaudeCode 真实基础工具链 `Bash -> Write -> Read` 已通过，未复现“ZenProxy 清空工具参数”。
+3. WebSearch/WebFetch 专项显示：工具参数完整；WebSearch 返回空结果；WebFetch 失败在 ClaudeCode 本地安全验证/`claude.ai` 链路，不是本轮样本中的工具参数转换错误。
+4. 当前 Windows cc-switch Claude provider 是 `closedeepseek -> https://sub2api.closeapi.top -> deepseek-v4-flash`，不是 panda NewAPI `100.69.228.93:8081`；后续分析必须先确认 provider，不得混用 cc-switch 与 panda channel 69 数据。
+5. 详细交接见 `docs/reports/2026-06-13-claudecode-web-tool-handoff.md`。
+
 P0 已完成但待文档收尾：
 
 1. panda NewAPI OpenAI/Anthropic 最小请求已通过，需要保持记录同步。
@@ -72,7 +92,7 @@ P0 已完成但待文档收尾：
 
 仍需执行：
 
-1. 清理或归类 `.codex_tmp/`、`configured`、`panda`、异常字符文件等未跟踪项。
+1. 2026-07-02 已清理或归类 `.codex_tmp/`、异常字符文件、根目录孤儿文件和本地运行产物；后续若重新生成，继续按 `.gitignore` 与提交前检查处理。
 2. 用有效 `vip` 组 token 复跑 panda-only smoke/dry；不要再用 `sk-dev` 判断 channel 69 状态。
 3. 先处理/复测 dry-run 红旗，不直接启动 4 客户端 x 500 full run。
 4. 针对 huge_context lane、lite 长上下文策略和 Hermes 慢路径做修复或降级，再重新跑 dry run。

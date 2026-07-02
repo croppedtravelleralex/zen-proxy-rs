@@ -34,7 +34,14 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASE_URL = "http://100.69.228.93:8081"
-DEFAULT_MODELS = ("deepseek-v4-flash", "deepseek-v4-flash-lite")
+DEFAULT_MODELS = ("deepseek-v4-flash", "big-pickle")
+CACHE_PRESSURE_DEFAULT_MODELS = ("deepseek-v4-flash", "mimo-v2.5")
+CACHE_PRESSURE_BUCKET_TARGETS = {
+    "10k": 10_000,
+    "50k": 50_000,
+    "100k": 100_000,
+    "200k": 200_000,
+}
 KEY_ENV_NAMES = ("PANDA_NEWAPI_KEY", "NEWAPI_API_KEY", "OPENAI_API_KEY")
 RESULT_PREFIX_LIMIT = 300
 STDERR_PREFIX_LIMIT = 1200
@@ -42,11 +49,27 @@ SUBAGENT_CAPABLE_CLIENTS = {"windows-claudecode", "wsl-claudecode", "wsl-opencla
 _WINDOWS_WORKSPACE_CACHE: dict[str, tuple[Path, Path | PureWindowsPath]] = {}
 _WINDOWS_WORKSPACE_LOCK = threading.Lock()
 POLICY_MODES = {"policy-smoke", "policy-dry"}
+PLAN_ONLY_MODES = {"cache-pressure-plan"}
 PROVIDER_HEADER_NAMES = (
     "x-zen-observed-exit-ip",
     "x-request-id",
     "x-oneapi-request-id",
     "x-requested-with",
+)
+DEFAULT_WSL_CLAUDE_BIN = "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+LATENCY_FIELDS = (
+    "protocol_first_byte_ms",
+    "first_content_ms",
+    "first_tool_call_ms",
+    "first_tool_emit_ms",
+    "total_ms",
+)
+SUMMARY_PERCENTILES = (50, 90, 95, 99)
+PREFIX_HASH_BYTE_SIZES = (
+    ("prefix_4k_hash", 4 * 1024),
+    ("prefix_32k_hash", 32 * 1024),
+    ("prefix_128k_hash", 128 * 1024),
+    ("prefix_256k_hash", 256 * 1024),
 )
 
 
@@ -154,6 +177,153 @@ def percentile(values: list[int], pct: int) -> int | None:
     return ordered[max(0, min(idx, len(ordered) - 1))]
 
 
+def prompt_token_bucket(tokens: int | None) -> str:
+    value = int(tokens or 0)
+    if value < 10_000:
+        return "lt_10k"
+    if value < 50_000:
+        return "10k-50k"
+    if value < 100_000:
+        return "50k-100k"
+    if value < 200_000:
+        return "100k-200k"
+    return "200k_plus"
+
+
+def short_sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()[:16]
+
+
+def prompt_observation_fields(
+    prompt_text: str,
+    prompt_tokens: int | None,
+    target_tokens: int | None = None,
+) -> dict[str, Any]:
+    data = prompt_text.encode("utf-8", errors="ignore")
+    fields: dict[str, Any] = {
+        "prompt_hash": short_sha256_bytes(data),
+        "prompt_bucket": prompt_token_bucket(prompt_tokens),
+        "target_tokens": target_tokens or prompt_tokens,
+        "cache_material_bytes": len(data),
+    }
+    for name, size in PREFIX_HASH_BYTE_SIZES:
+        fields[name] = short_sha256_bytes(data[: min(size, len(data))])
+    return fields
+
+
+def int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def first_int(*values: Any) -> int | None:
+    for value in values:
+        number = int_or_none(value)
+        if number is not None:
+            return number
+    return None
+
+
+def rounded_pct(numerator: int | None, denominator: int | None) -> float | None:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return round((numerator / denominator) * 100.0, 2)
+
+
+def cache_token_fields(
+    usage_values: dict[str, int | None],
+    prompt_tokens: int | None,
+) -> dict[str, Any]:
+    read_tokens = first_int(
+        usage_values.get("usage_cache_read_tokens"),
+        usage_values.get("usage_cached_tokens"),
+    )
+    creation_tokens = first_int(usage_values.get("usage_cache_creation_tokens"))
+    miss_tokens = first_int(usage_values.get("usage_cache_miss_tokens"))
+    input_tokens = first_int(usage_values.get("usage_input_tokens"), prompt_tokens)
+    if miss_tokens is None and input_tokens is not None and read_tokens is not None:
+        miss_tokens = max(0, input_tokens - read_tokens)
+    denominator = None
+    if read_tokens is not None and miss_tokens is not None:
+        denominator = read_tokens + miss_tokens
+    elif input_tokens is not None:
+        denominator = input_tokens
+    return {
+        "cache_read_input_tokens": read_tokens,
+        "cache_creation_input_tokens": creation_tokens,
+        "cache_miss_input_tokens": miss_tokens,
+        "cache_token_read_pct": rounded_pct(read_tokens, denominator),
+    }
+
+
+def latency_percentile_map(rows: list[dict[str, Any]]) -> dict[str, dict[str, int | None]]:
+    result: dict[str, dict[str, int | None]] = {}
+    for field in LATENCY_FIELDS:
+        values = [
+            int(row[field])
+            for row in rows
+            if isinstance(row.get(field), int) and int(row[field]) >= 0
+        ]
+        result[field] = {f"p{pct}": percentile(values, pct) for pct in SUMMARY_PERCENTILES}
+    return result
+
+
+def observability_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    groups: dict[str, dict[str, Any]] = {}
+    summary: dict[str, Any] = {
+        "latency_fields": list(LATENCY_FIELDS),
+        "percentiles": [f"p{pct}" for pct in SUMMARY_PERCENTILES],
+        "latency_ms": latency_percentile_map(rows),
+        "groups": groups,
+    }
+    for row in rows:
+        model = str(row.get("model") or "unknown")
+        bucket = str(row.get("prompt_bucket") or prompt_token_bucket(int_or_none(row.get("prompt_est_tokens"))))
+        stream = "true" if row.get("stream") is True else "false" if row.get("stream") is False else "unknown"
+        cache = str(row.get("cache_observation") or "unknown")
+        key = f"model={model}|bucket={bucket}|stream={stream}|cache={cache}"
+        groups.setdefault(key, {"rows": []})["rows"].append(row)
+    for key, group in list(groups.items()):
+        group_rows = group.pop("rows")
+        read_total = sum(int(row.get("cache_read_input_tokens") or 0) for row in group_rows)
+        miss_total = sum(int(row.get("cache_miss_input_tokens") or 0) for row in group_rows)
+        error_counts: dict[str, int] = {}
+        for row in group_rows:
+            error_class = str(row.get("error_class") or "unknown_error")
+            error_counts[error_class] = error_counts.get(error_class, 0) + 1
+        quality_rows = [
+            row
+            for row in group_rows
+            if row.get("semantic_ok") is not None or row.get("tool_success") is not None
+        ]
+        quality_ok = sum(
+            1
+            for row in quality_rows
+            if row.get("semantic_ok") is not False and row.get("tool_success") is not False
+        )
+        group.update(
+            {
+                "total": len(group_rows),
+                "ok": sum(1 for row in group_rows if row.get("status") == "ok"),
+                "api_ok": sum(1 for row in group_rows if row.get("api_ok")),
+                "quality_total": len(quality_rows),
+                "quality_ok": quality_ok,
+                "quality_pass_rate": rounded_pct(quality_ok, len(quality_rows)),
+                "cache_read_input_tokens": read_total,
+                "cache_miss_input_tokens": miss_total,
+                "cache_token_read_pct": rounded_pct(read_total, read_total + miss_total),
+                "latency_ms": latency_percentile_map(group_rows),
+                "errors": error_counts,
+            }
+        )
+    return summary
+
+
 def env_key() -> tuple[str, str]:
     for name in KEY_ENV_NAMES:
         value = os.environ.get(name)
@@ -256,28 +426,57 @@ def http_exchange(
     started = now_ms()
     req = request.Request(url=url, data=body, headers=headers, method=method)
     opener = request.build_opener(request.ProxyHandler({}))
+    stream_expected = bool(payload.get("stream"))
+    protocol = protocol_for_url(url)
     try:
         with opener.open(req, timeout=timeout_s) as resp:
-            first_ms = now_ms() - started
-            raw = resp.read()
+            header_ms = now_ms() - started
+            first_stream_event_ms = None
+            first_content_ms = None
+            first_tool_call_ms = None
+            if stream_expected:
+                chunks: list[bytes] = []
+                while True:
+                    chunk = resp.readline()
+                    if not chunk:
+                        break
+                    elapsed = now_ms() - started
+                    chunks.append(chunk)
+                    if chunk.strip() and first_stream_event_ms is None:
+                        first_stream_event_ms = elapsed
+                    line = chunk.decode("utf-8", errors="replace")
+                    has_content, has_tool = stream_line_timing_signal(protocol, line)
+                    if has_content and first_content_ms is None:
+                        first_content_ms = elapsed
+                    if has_tool and first_tool_call_ms is None:
+                        first_tool_call_ms = elapsed
+                raw = b"".join(chunks)
+            else:
+                raw = resp.read()
             total_ms = now_ms() - started
             text = raw.decode("utf-8", errors="replace")
             return {
                 "status_code": resp.status,
                 "raw_text": text,
                 "total_ms": total_ms,
-                "protocol_first_byte_ms": first_ms,
+                "protocol_first_byte_ms": first_stream_event_ms or header_ms,
+                "first_content_ms": first_content_ms,
+                "first_tool_call_ms": first_tool_call_ms,
+                "first_tool_emit_ms": first_tool_call_ms,
                 "headers": allowlisted_headers(resp.headers),
             }
     except error.HTTPError as exc:
-        first_ms = now_ms() - started
+        header_ms = now_ms() - started
         raw = exc.read()
         total_ms = now_ms() - started
         return {
             "status_code": exc.code,
             "raw_text": raw.decode("utf-8", errors="replace"),
             "total_ms": total_ms,
-            "protocol_first_byte_ms": first_ms,
+            "protocol_first_byte_ms": header_ms,
+            "first_content_ms": None,
+            "first_tool_call_ms": None,
+            "first_tool_emit_ms": None,
             "headers": allowlisted_headers(exc.headers),
         }
     except Exception as exc:  # noqa: BLE001 - report as classified network error.
@@ -287,6 +486,9 @@ def http_exchange(
             "raw_text": f"{type(exc).__name__}: {exc}",
             "total_ms": total_ms,
             "protocol_first_byte_ms": None,
+            "first_content_ms": None,
+            "first_tool_call_ms": None,
+            "first_tool_emit_ms": None,
             "headers": {},
         }
 
@@ -298,6 +500,41 @@ def allowlisted_headers(headers: Any) -> dict[str, str]:
         if value:
             result[name.lower()] = str(value)[:200]
     return result
+
+
+def protocol_for_url(url: str) -> str:
+    return "anthropic" if "/v1/messages" in url else "openai"
+
+
+def stream_line_timing_signal(protocol: str, line: str) -> tuple[bool, bool]:
+    stripped = line.strip()
+    if not stripped.startswith("data:"):
+        return False, False
+    data = stripped[5:].strip()
+    if not data or data == "[DONE]":
+        return False, False
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError:
+        return False, False
+    if not isinstance(event, dict):
+        return False, False
+    if protocol == "openai":
+        has_content = False
+        has_tool = False
+        for choice in event.get("choices") or []:
+            delta = choice.get("delta") or {}
+            has_content = has_content or bool(delta.get("content"))
+            has_tool = has_tool or bool(delta.get("tool_calls"))
+        return has_content, has_tool
+    event_type = event.get("type")
+    if event_type == "content_block_delta":
+        delta = event.get("delta") or {}
+        return bool(delta.get("text")), False
+    if event_type == "content_block_start":
+        block = event.get("content_block") or {}
+        return False, block.get("type") == "tool_use"
+    return False, False
 
 
 def safe_write_json(path: Path, data: Any) -> None:
@@ -818,7 +1055,7 @@ def classify_process_error(rec: dict[str, Any]) -> str:
     text = f"{rec.get('stderr') or ''}\n{rec.get('stdout') or ''}".lower()
     if "system cpu overloaded" in text or ("503" in text and "overloaded" in text):
         return "upstream_overloaded"
-    if rec.get("timed_out") or "timeout" in text or "timed out" in text:
+    if rec.get("timed_out") or rec.get("returncode") == 124 or "timeout" in text or "timed out" in text:
         return "client_timeout"
     if "401" in text or "403" in text or "unauthorized" in text or "invalid api key" in text:
         return "auth_error"
@@ -1108,20 +1345,32 @@ def usage_number(usage: dict[str, Any] | None, *keys: str) -> int | None:
 
 def usage_numbers(protocol: str, usage: dict[str, Any] | None) -> dict[str, int | None]:
     if protocol == "openai":
-        input_tokens = usage_number(usage, "prompt_tokens")
-        output_tokens = usage_number(usage, "completion_tokens")
+        input_tokens = usage_number(usage, "prompt_tokens", "input_tokens")
+        output_tokens = usage_number(usage, "completion_tokens", "output_tokens")
     else:
-        input_tokens = usage_number(usage, "input_tokens")
-        output_tokens = usage_number(usage, "output_tokens")
-    cached_tokens = usage_number(usage, "prompt_tokens_details.cached_tokens")
-    cache_read = usage_number(usage, "cache_read_input_tokens")
+        input_tokens = usage_number(usage, "input_tokens", "prompt_tokens")
+        output_tokens = usage_number(usage, "output_tokens", "completion_tokens")
+    cached_tokens = usage_number(
+        usage,
+        "prompt_tokens_details.cached_tokens",
+        "prompt_cache_hit_tokens",
+        "cache_read_input_tokens",
+    )
+    cache_read = usage_number(
+        usage,
+        "cache_read_input_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_tokens_details.cached_tokens",
+    )
     cache_creation = usage_number(usage, "cache_creation_input_tokens")
+    cache_miss = usage_number(usage, "cache_miss_input_tokens", "prompt_cache_miss_tokens")
     return {
         "usage_input_tokens": input_tokens,
         "usage_output_tokens": output_tokens,
         "usage_cached_tokens": cached_tokens,
         "usage_cache_read_tokens": cache_read,
         "usage_cache_creation_tokens": cache_creation,
+        "usage_cache_miss_tokens": cache_miss,
     }
 
 
@@ -1134,13 +1383,17 @@ def classify_cache_observation(
     if not cache_attempted:
         return "ignored"
     numbers = usage_numbers("openai", usage)
-    cache_values = [
+    hit_values = [
         numbers.get("usage_cached_tokens"),
         numbers.get("usage_cache_read_tokens"),
+    ]
+    cache_values = [
+        *hit_values,
         numbers.get("usage_cache_creation_tokens"),
+        numbers.get("usage_cache_miss_tokens"),
     ]
     present_values = [value for value in cache_values if value is not None]
-    if any((value or 0) > 0 for value in present_values):
+    if any((value or 0) > 0 for value in hit_values if value is not None):
         return "accepted"
     lower = (raw_text or "").lower()
     if status_code in {400, 422} or (
@@ -1190,21 +1443,39 @@ def model_for_index(models: list[str], idx: int) -> str:
     return models[idx % len(models)]
 
 
-def claude_settings_json(base_url: str, model: str) -> str:
+def no_proxy_for_base_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    host = parsed.hostname or ""
+    entries = ["127.0.0.1", "localhost", "::1"]
+    if host:
+        entries.insert(0, host)
+    if host.startswith("100."):
+        entries.extend(["100.64.0.0/10", "panda"])
+    seen: set[str] = set()
+    return ",".join(entry for entry in entries if entry and not (entry in seen or seen.add(entry)))
+
+
+def claude_settings_json(base_url: str, model: str, api_key: str | None = None) -> str:
+    env = {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_MODEL": model,
+        "ANTHROPIC_SMALL_FAST_MODEL": model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": model,
+        "NO_PROXY": no_proxy_for_base_url(base_url),
+        "no_proxy": no_proxy_for_base_url(base_url),
+    }
+    if api_key:
+        # ClaudeCode may otherwise keep a stale settings-layer x-api-key such as
+        # sk-dev even when ANTHROPIC_AUTH_TOKEN is correct in the process env.
+        env["ANTHROPIC_API_KEY"] = api_key
+        env["ANTHROPIC_AUTH_TOKEN"] = api_key
     return json.dumps(
-        {
-            "env": {
-                "ANTHROPIC_BASE_URL": base_url,
-                "ANTHROPIC_MODEL": model,
-                "ANTHROPIC_SMALL_FAST_MODEL": model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": model,
-            }
-        },
+        {"env": env},
         separators=(",", ":"),
     )
 
@@ -1215,9 +1486,13 @@ def claude_command(
     base_url: str,
     windows: bool = False,
     include_settings: bool = True,
+    api_key: str | None = None,
 ) -> list[str]:
+    claude_bin = os.environ.get("PANDA_WSL_CLAUDE_BIN", DEFAULT_WSL_CLAUDE_BIN)
+    if not windows and os.name != "nt" and not Path(claude_bin).exists():
+        claude_bin = "/home/lenovo/.local/bin/claude"
     base = [
-        "claude" if windows else "/home/lenovo/.local/bin/claude",
+        "claude" if windows else claude_bin,
         "-p",
         "--bare",
         "--model",
@@ -1234,7 +1509,7 @@ def claude_command(
             "--setting-sources",
             "",
             "--settings",
-            claude_settings_json(base_url, model),
+            claude_settings_json(base_url, model, api_key),
         ]
     if case.tools:
         base.extend(
@@ -1264,9 +1539,46 @@ def run_wsl_claudecode(
         "ANTHROPIC_MODEL": model,
         "ANTHROPIC_SMALL_FAST_MODEL": model,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "NO_PROXY": no_proxy_for_base_url(base_url),
+        "no_proxy": no_proxy_for_base_url(base_url),
     }
+    if os.name == "nt":
+        args = claude_command(case, model, base_url, api_key=key)
+        timeout_s = max(1, timeout_ms // 1000)
+        wsl_claude_bin = shlex.quote(args[0])
+        script = (
+            f"cd {shlex.quote(path_for_wsl(workspace))} && "
+            f"[ -x {wsl_claude_bin} ] || "
+            f"(echo 'WSL official ClaudeCode binary not found at {args[0]}' >&2; exit 127) && "
+            f"export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 && "
+            f"export ANTHROPIC_AUTH_TOKEN={shlex.quote(key)} && "
+            f"export ANTHROPIC_API_KEY={shlex.quote(key)} && "
+            f"export ANTHROPIC_BASE_URL={shlex.quote(base_url)} && "
+            f"export ANTHROPIC_MODEL={shlex.quote(model)} && "
+            f"export ANTHROPIC_SMALL_FAST_MODEL={shlex.quote(model)} && "
+            f"export NO_PROXY={shlex.quote(no_proxy_for_base_url(base_url))} && "
+            f"export no_proxy={shlex.quote(no_proxy_for_base_url(base_url))} && "
+            f"cat | timeout {timeout_s}s "
+            + " ".join([wsl_claude_bin, *[shlex.quote(arg) for arg in args[1:]]])
+        )
+        rec = run_process(
+            ["wsl", "-d", "HermesUbuntu", "-u", "lenovo", "bash", "-lc", script],
+            workspace,
+            env,
+            timeout_ms + 5000,
+            prompt_text,
+        )
+        result, usage, tool_count, first_content_offset = extract_claude_stream(rec.get("stdout", ""))
+        rec.update(
+            result=result,
+            usage=usage,
+            tool_call_count=tool_count,
+            first_content_ms=rec.get("first_stdout_ms") if first_content_offset is not None else rec.get("first_stdout_ms"),
+            config_mode="wsl-interop-env-settings",
+        )
+        return rec
     rec = run_process(
-        claude_command(case, model, base_url),
+        claude_command(case, model, base_url, api_key=key),
         workspace,
         env,
         timeout_ms,
@@ -1278,7 +1590,7 @@ def run_wsl_claudecode(
         usage=usage,
         tool_call_count=tool_count,
         first_content_ms=rec.get("first_stdout_ms") if first_content_offset is not None else rec.get("first_stdout_ms"),
-        config_mode="env",
+        config_mode="env-settings",
     )
     return rec
 
@@ -1303,6 +1615,19 @@ def wsl_to_windows_path(path: Path) -> str:
         return proc.stdout.strip()
     except Exception:
         return str(path)
+
+
+def path_for_wsl(path: Path) -> str:
+    text = str(path)
+    prefixes = (
+        "\\\\wsl.localhost\\HermesUbuntu\\",
+        "\\\\wsl$\\HermesUbuntu\\",
+    )
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            suffix = text[len(prefix) :].replace("\\", "/")
+            return "/" + suffix.lstrip("/")
+    return text.replace("\\", "/")
 
 
 def windows_temp_dir_pair() -> tuple[Path, PureWindowsPath]:
@@ -1425,6 +1750,8 @@ def run_windows_claudecode(
         "ANTHROPIC_MODEL": model,
         "ANTHROPIC_SMALL_FAST_MODEL": model,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "NO_PROXY": no_proxy_for_base_url(base_url),
+        "no_proxy": no_proxy_for_base_url(base_url),
     }
     if os.name == "nt":
         claude = shutil.which("claude")
@@ -1439,7 +1766,7 @@ def run_windows_claudecode(
                 "error_class": "config_error",
                 "config_mode": "windows-native",
             }
-        cmd = claude_command(case, model, base_url, windows=True, include_settings=False)
+        cmd = claude_command(case, model, base_url, windows=True, include_settings=True, api_key=key)
         cmd[0] = claude
         rec = run_process(cmd, workspace, env, timeout_ms, prompt_text)
         result, usage, tool_count, first_content_offset = extract_claude_stream(rec.get("stdout", ""))
@@ -1448,7 +1775,7 @@ def run_windows_claudecode(
             usage=usage,
             tool_call_count=tool_count,
             first_content_ms=rec.get("first_stdout_ms") if first_content_offset is not None else rec.get("first_stdout_ms"),
-            config_mode="windows-native-env",
+            config_mode="windows-native-env-settings",
         )
         return rec
     if shutil.which("powershell.exe") is None:
@@ -1476,7 +1803,7 @@ def run_windows_claudecode(
     prompt_path = workspace / f"prompt-{uuid.uuid4().hex}.txt"
     prompt_path.write_text(prompt_text, encoding="utf-8")
     win_prompt = wsl_to_windows_path(prompt_path)
-    args = claude_command(case, model, base_url, windows=True, include_settings=False)
+    args = claude_command(case, model, base_url, windows=True, include_settings=True, api_key=key)
     ps_args = " ".join(powershell_quote(arg) for arg in args[1:])
     ps = (
         powershell_env_assignments(env)
@@ -1501,7 +1828,7 @@ def run_windows_claudecode(
         usage=usage,
         tool_call_count=tool_count,
         first_content_ms=rec.get("first_stdout_ms") if first_content_offset is not None else rec.get("first_stdout_ms"),
-        config_mode="windows-interop-env",
+        config_mode="windows-interop-env-settings",
     )
     return rec
 
@@ -1737,6 +2064,7 @@ def run_case(
         "protocol_first_byte_ms": None,
         "first_content_ms": None,
         "first_tool_call_ms": None,
+        "first_tool_emit_ms": None,
         "total_ms": None,
         "tool_call_count": 0,
         "tool_success": None,
@@ -1748,6 +2076,7 @@ def run_case(
         "result_prefix": "",
         "stderr_prefix": "",
     }
+    base_row.update(prompt_observation_fields(prompt_text, prompt_tokens, prompt_tokens))
     try:
         if client == "wsl-claudecode":
             rec = run_wsl_claudecode(case, model, prompt_text, case_workspace, base_url, key, timeout_ms)
@@ -1779,14 +2108,14 @@ def run_case(
         }
     result = str(rec.get("result") or "")
     semantic_ok = expected_semantic_ok(case, result)
-    embedded_failure = classify_embedded_failure(result, rec)
+    embedded_failure = classify_embedded_failure(result, rec) if rec.get("ok") else None
     api_ok = bool(rec.get("ok")) and embedded_failure is None
-    if embedded_failure:
-        status = "error"
-        error_class = embedded_failure
-    elif not rec.get("ok"):
+    if not rec.get("ok"):
         status = "error"
         error_class = rec.get("error_class") or classify_process_error(rec)
+    elif embedded_failure:
+        status = "error"
+        error_class = embedded_failure
     elif not semantic_ok:
         status = "error"
         error_class = classify_semantic_failure(client, case, result)
@@ -1794,6 +2123,7 @@ def run_case(
         status = "ok"
         error_class = "ok"
     response_bytes = len(result.encode("utf-8", errors="ignore"))
+    usage_values = usage_numbers("openai", rec.get("usage"))
     row = dict(base_row)
     row.update(
         status=status,
@@ -1802,6 +2132,8 @@ def run_case(
         error_class=error_class,
         protocol_first_byte_ms=rec.get("first_stdout_ms"),
         first_content_ms=rec.get("first_content_ms") or rec.get("first_stdout_ms"),
+        first_tool_call_ms=rec.get("first_tool_call_ms"),
+        first_tool_emit_ms=rec.get("first_tool_emit_ms"),
         total_ms=rec.get("total_ms"),
         tool_call_count=rec.get("tool_call_count") or 0,
         tool_success=(semantic_ok if case.tools else None),
@@ -1815,6 +2147,8 @@ def run_case(
         result_prefix=result[:RESULT_PREFIX_LIMIT],
         stderr_prefix=(rec.get("stderr") or "")[-STDERR_PREFIX_LIMIT:],
     )
+    row.update(usage_values)
+    row.update(cache_token_fields(usage_values, prompt_tokens))
     serialized = json.dumps(row, ensure_ascii=False)
     row["redaction_ok"] = key not in serialized and not any(
         os.environ.get(name, "") and os.environ.get(name, "") in serialized for name in KEY_ENV_NAMES
@@ -1862,8 +2196,13 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "semantic_ok": sum(1 for row in client_rows if row.get("semantic_ok")),
             "p50_total_ms": percentile(totals, 50),
             "p90_total_ms": percentile(totals, 90),
+            "p95_total_ms": percentile(totals, 95),
             "p99_total_ms": percentile(totals, 99),
+            "p50_first_content_ms": percentile(firsts, 50),
             "p90_first_content_ms": percentile(firsts, 90),
+            "p95_first_content_ms": percentile(firsts, 95),
+            "p99_first_content_ms": percentile(firsts, 99),
+            "latency_ms": latency_percentile_map(client_rows),
             "tool_total": len(tool_rows),
             "tool_success": sum(1 for row in tool_rows if row.get("tool_success")),
             "subagent_total": len(sub_rows),
@@ -1875,6 +2214,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             error_class = row.get("error_class") or "unknown_error"
             target = summary["by_client"][client]["errors"]
             target[error_class] = target.get(error_class, 0) + 1
+    summary["observability"] = observability_summary(rows)
     summary["failure_samples"] = [
         {
             "request_id": row.get("request_id"),
@@ -2020,6 +2360,13 @@ def run_policy_case(
             and output_est_tokens >= case.expected_min_output_tokens
             and finish_reason not in {"length", "max_tokens"}
         )
+    first_content_ms = exchange.get("first_content_ms")
+    if first_content_ms is None and result:
+        first_content_ms = exchange.get("protocol_first_byte_ms") if case.stream else exchange.get("total_ms")
+    first_tool_call_ms = exchange.get("first_tool_call_ms")
+    if first_tool_call_ms is None and tool_count:
+        first_tool_call_ms = exchange.get("protocol_first_byte_ms") if case.stream else exchange.get("total_ms")
+    first_tool_emit_ms = exchange.get("first_tool_emit_ms") or first_tool_call_ms
     row: dict[str, Any] = {
         "run_id": run_dir.name,
         "request_id": request_id,
@@ -2050,8 +2397,9 @@ def run_policy_case(
         "retry_count": 0,
         "timeout_ms": timeout_ms,
         "protocol_first_byte_ms": exchange.get("protocol_first_byte_ms"),
-        "first_content_ms": exchange.get("protocol_first_byte_ms") if result else None,
-        "first_tool_call_ms": exchange.get("protocol_first_byte_ms") if tool_count else None,
+        "first_content_ms": first_content_ms,
+        "first_tool_call_ms": first_tool_call_ms,
+        "first_tool_emit_ms": first_tool_emit_ms,
         "total_ms": exchange.get("total_ms"),
         "tool_call_count": tool_count,
         "tool_success": None,
@@ -2074,8 +2422,10 @@ def run_policy_case(
         "result_prefix": result[:RESULT_PREFIX_LIMIT],
         "stderr_prefix": raw_text[:STDERR_PREFIX_LIMIT] if not api_ok else "",
     }
+    row.update(prompt_observation_fields(prompt, estimate_tokens(prompt), case.prompt_target_tokens or estimate_tokens(prompt)))
     row.update(shape)
     row.update(usage_values)
+    row.update(cache_token_fields(usage_values, estimate_tokens(prompt)))
     serialized = json.dumps(row, ensure_ascii=False)
     row["redaction_ok"] = key not in serialized and not any(
         os.environ.get(name, "") and os.environ.get(name, "") in serialized for name in KEY_ENV_NAMES
@@ -2137,6 +2487,7 @@ def summarize_policy(rows: list[dict[str, Any]], require_provider_header: bool) 
     summary["cache_requirement_ok"] = any(row.get("cache_attempted") for row in rows) and set(
         summary["by_cache_observation"]
     ).issubset({"attempted", "accepted", "rejected", "ignored"})
+    summary["observability"] = observability_summary(rows)
     summary["failure_samples"] = [
         {
             "request_id": row.get("request_id"),
@@ -2212,6 +2563,205 @@ def run_policy_matrix(
     if not summary["provider_body_usage_requirement_ok"]:
         return 1
     return 0 if summary["policy_ok"] == summary["total"] else 1
+
+
+def parse_cache_pressure_buckets(value: str) -> list[tuple[str, int]]:
+    result: list[tuple[str, int]] = []
+    for raw in value.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if item in CACHE_PRESSURE_BUCKET_TARGETS:
+            result.append((item, CACHE_PRESSURE_BUCKET_TARGETS[item]))
+            continue
+        match = re.fullmatch(r"(\d+)(k)?", item)
+        if not match:
+            raise SystemExit(f"Invalid cache pressure bucket {raw!r}")
+        number = int(match.group(1))
+        target = number * 1000 if match.group(2) else number
+        result.append((f"{number}k" if match.group(2) else str(number), target))
+    if not result:
+        raise SystemExit("At least one cache pressure bucket is required")
+    return result
+
+
+def dataset_schema() -> dict[str, Any]:
+    return {
+        "version": "cache-pressure-dataset-v1",
+        "identity_fields": [
+            "run_id",
+            "request_id",
+            "timestamp",
+            "model",
+            "client",
+            "source_client",
+            "protocol",
+            "stream",
+            "case_type",
+            "prompt_bucket",
+            "target_tokens",
+        ],
+        "shape_fields": [
+            "request_body_bytes",
+            "prompt_est_tokens",
+            "prompt_hash",
+            "prefix_4k_hash",
+            "prefix_32k_hash",
+            "prefix_128k_hash",
+            "prefix_256k_hash",
+            "cache_material_bytes",
+            "request_shape_hash",
+            "request_shape_tool_count",
+            "request_shape_tool_name_classes",
+        ],
+        "latency_fields": list(LATENCY_FIELDS),
+        "cache_fields": [
+            "cache_observation",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_miss_input_tokens",
+            "cache_token_read_pct",
+            "usage_input_tokens",
+            "usage_output_tokens",
+            "usage_cached_tokens",
+            "usage_cache_read_tokens",
+            "usage_cache_creation_tokens",
+            "usage_cache_miss_tokens",
+        ],
+        "quality_fields": [
+            "status",
+            "api_ok",
+            "semantic_ok",
+            "tool_call_count",
+            "tool_success",
+            "subagent_requested",
+            "subagent_observed",
+            "finish_reason",
+            "error_class",
+        ],
+        "retry_and_guard_fields": [
+            "retry_count",
+            "attempts_used",
+            "used_disabled_thinking_retry",
+            "provider_missing_reasoning_content",
+            "reasoning_only_length",
+            "stream_truncated",
+            "client_gone",
+        ],
+        "privacy_policy": [
+            "no raw prompt",
+            "no full response",
+            "no API key",
+            "hash prefix only",
+            "result_prefix/stderr_prefix are bounded and redacted by caller review",
+        ],
+    }
+
+
+def build_cache_pressure_manifest(args: argparse.Namespace) -> dict[str, Any]:
+    models = [item.strip() for item in args.models.split(",") if item.strip()]
+    if not models:
+        models = list(CACHE_PRESSURE_DEFAULT_MODELS)
+    buckets = parse_cache_pressure_buckets(args.cache_pressure_buckets)
+    requests_per_scenario = args.cache_pressure_rpm * args.cache_pressure_duration_minutes
+    scenarios: list[dict[str, Any]] = []
+    order = 0
+    for model in models:
+        for bucket_name, target_tokens in buckets:
+            scenarios.append(
+                {
+                    "order": order,
+                    "model": model,
+                    "bucket": bucket_name,
+                    "target_tokens": target_tokens,
+                    "rpm": args.cache_pressure_rpm,
+                    "duration_minutes": args.cache_pressure_duration_minutes,
+                    "planned_requests": requests_per_scenario,
+                    "warmup_seconds": args.cache_pressure_warmup_seconds,
+                    "measured_window_seconds": max(
+                        0,
+                        args.cache_pressure_duration_minutes * 60
+                        - args.cache_pressure_warmup_seconds,
+                    ),
+                    "client": "claudecode",
+                    "protocol_mix": {
+                        "text": 0.34,
+                        "json": 0.16,
+                        "stream_json": 0.20,
+                        "bash_tool": 0.10,
+                        "webfetch_tool": 0.10,
+                        "websearch_tool": 0.10,
+                    },
+                    "stop_conditions": [
+                        "zenproxy_dead_gt_0",
+                        "dispatch_lt_90",
+                        "newapi_or_zenproxy_5xx_gt_2pct",
+                        "lane_saturated_or_no_proxy_resources",
+                        "p95_first_content_or_tool_gt_30000ms_for_two_windows",
+                        "tool_quality_regression",
+                    ],
+                }
+            )
+            order += 1
+    return {
+        "run_mode": "plan_only",
+        "created_at": time.time(),
+        "base_url_kind": base_url_kind(args.base_url),
+        "models": models,
+        "buckets": [{"name": name, "target_tokens": target} for name, target in buckets],
+        "total_planned_requests": sum(item["planned_requests"] for item in scenarios),
+        "execution_policy": {
+            "sequence": "model_then_bucket",
+            "recommended_start_rpm": min(args.cache_pressure_rpm, 20),
+            "requested_rpm": args.cache_pressure_rpm,
+            "production_requires_explicit_confirmation": True,
+            "do_not_run_all_scenarios_in_parallel": True,
+            "exclude_warmup_from_primary_metrics": True,
+        },
+        "scenarios": scenarios,
+    }
+
+
+def run_cache_pressure_plan(args: argparse.Namespace) -> int:
+    run_dir = (
+        Path(args.run_dir)
+        if args.run_dir
+        else ROOT / ".codex_tmp" / "panda-pressure" / time.strftime("%Y%m%d-%H%M%S-cache-plan")
+    ).resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest = build_cache_pressure_manifest(args)
+    safe_write_json(run_dir / "cache-pressure-manifest.json", manifest)
+    safe_write_json(run_dir / "dataset-schema.json", dataset_schema())
+    safe_write_json(
+        run_dir / "analysis-plan.json",
+        {
+            "version": "cache-pressure-analysis-v1",
+            "primary_grouping": ["model", "prompt_bucket", "stream", "cache_observation"],
+            "required_percentiles": [f"p{pct}" for pct in SUMMARY_PERCENTILES],
+            "latency_fields": list(LATENCY_FIELDS),
+            "primary_cache_metric": "token_weighted_cache_token_read_pct",
+            "quality_gates": [
+                "semantic_ok must not regress",
+                "tool_success must not regress",
+                "WebFetch/WebSearch/Bash remain enabled",
+                "no context trimming or output cap",
+                "no fake cache usage",
+            ],
+            "comparison_windows": ["all_samples", "post_warmup_only"],
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "event": "cache_pressure_plan",
+                "run_dir": str(run_dir),
+                "total_planned_requests": manifest["total_planned_requests"],
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    return 0
 
 
 def run_matrix(args: argparse.Namespace) -> int:
@@ -2370,7 +2920,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["preflight", "smoke", "dry", "full", "policy-smoke", "policy-dry"],
+        choices=[
+            "preflight",
+            "smoke",
+            "dry",
+            "full",
+            "policy-smoke",
+            "policy-dry",
+            "cache-pressure-plan",
+        ],
         default="smoke",
     )
     parser.add_argument(
@@ -2392,11 +2950,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Fail policy modes unless an allowlisted provider header is observed.",
     )
+    parser.add_argument(
+        "--cache-pressure-buckets",
+        default="10k,50k,100k,200k",
+        help="Comma-separated target context buckets for cache-pressure-plan.",
+    )
+    parser.add_argument("--cache-pressure-rpm", type=int, default=20)
+    parser.add_argument("--cache-pressure-duration-minutes", type=int, default=5)
+    parser.add_argument("--cache-pressure-warmup-seconds", type=int, default=60)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.mode in PLAN_ONLY_MODES:
+        return run_cache_pressure_plan(args)
     return run_matrix(args)
 
 

@@ -1,10 +1,10 @@
 use bytes::BytesMut;
 use futures::stream::StreamExt;
-use rand::Rng;
 
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::Deserialize;
+use std::error::Error as StdError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const UA: &str = "opencode/1.15.5 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
@@ -304,18 +304,6 @@ pub struct SseFrame {
     pub data: String,
 }
 
-fn make_id(prefix: &str) -> String {
-    let alphabet: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut rng = rand::thread_rng();
-    let tail: String = (0..26)
-        .map(|_| {
-            let idx = rng.gen_range(0..alphabet.len());
-            alphabet[idx] as char
-        })
-        .collect();
-    format!("{}_{}", prefix, tail)
-}
-
 fn short_hash(input: &str) -> String {
     short_hash_bytes(input.as_bytes())
 }
@@ -331,6 +319,13 @@ fn stable_hash64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn stable_id(prefix: &str, material: &str) -> String {
+    let first = stable_hash64(material.as_bytes());
+    let second = stable_hash64(format!("{material}\x1frequest").as_bytes());
+    let tail = format!("{first:016x}{second:016x}");
+    format!("{}_{}", prefix, &tail[..26])
 }
 
 fn stable_session_id(api_key: &str, body: &serde_json::Value) -> String {
@@ -359,6 +354,10 @@ fn stable_session_id(api_key: &str, body: &serde_json::Value) -> String {
             scope
         ))
     )
+}
+
+fn stable_request_id(body: &serde_json::Value) -> String {
+    stable_id("msg", &component_string(Some(body)))
 }
 
 fn stable_project_id(body: &serde_json::Value) -> String {
@@ -437,7 +436,7 @@ pub fn zen_headers(api_key: &str, body: &serde_json::Value) -> Vec<(String, Stri
         ("user-agent".into(), UA.into()),
         ("x-opencode-client".into(), "cli".into()),
         ("x-opencode-project".into(), stable_project_id(body)),
-        ("x-opencode-request".into(), make_id("msg")),
+        ("x-opencode-request".into(), stable_request_id(body)),
         (
             "x-opencode-session".into(),
             stable_session_id(api_key, body),
@@ -474,7 +473,7 @@ pub async fn fetch_zen_stream_with_headers(
         } else {
             crate::error::AppError::new(
                 axum::http::StatusCode::BAD_GATEWAY,
-                format!("upstream connection error: {e}"),
+                format!("upstream connection error: {}", reqwest_error_summary(&e)),
             )
         }
     })?;
@@ -493,6 +492,57 @@ pub async fn fetch_zen_stream_with_headers(
         ));
     }
     Ok(resp)
+}
+
+fn reqwest_error_summary(err: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    push_error_summary_part(&mut parts, &err.to_string());
+    let mut source = err.source();
+    while let Some(error) = source {
+        push_error_summary_part(&mut parts, &error.to_string());
+        source = error.source();
+    }
+    parts.join("; caused by: ")
+}
+
+fn push_error_summary_part(parts: &mut Vec<String>, text: &str) {
+    let redacted = redact_socks_credentials(text);
+    if redacted.trim().is_empty() || parts.iter().any(|part| part == &redacted) {
+        return;
+    }
+    parts.push(redacted);
+}
+
+fn redact_socks_credentials(input: &str) -> String {
+    let mut output = input.to_string();
+    for scheme in ["socks5h://", "socks5://"] {
+        output = redact_credentials_for_scheme(&output, scheme);
+    }
+    output
+}
+
+fn redact_credentials_for_scheme(input: &str, scheme: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find(scheme) {
+        let (before, after_before) = rest.split_at(pos);
+        out.push_str(before);
+        out.push_str(scheme);
+        let after_scheme = &after_before[scheme.len()..];
+        let authority_end = after_scheme
+            .find(['/', ' ', ')', '(', ',', ';', '"', '\''])
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        if let Some(at_pos) = authority.rfind('@') {
+            out.push_str("***@");
+            out.push_str(&authority[at_pos + 1..]);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &after_scheme[authority_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub async fn collect_stream_text(
@@ -933,9 +983,47 @@ mod tests {
             header_value(&first, "x-opencode-session"),
             header_value(&second, "x-opencode-session")
         );
+        assert_eq!(
+            header_value(&first, "x-opencode-request"),
+            header_value(&second, "x-opencode-request")
+        );
+    }
+
+    #[test]
+    fn opencode_request_changes_when_request_shape_changes() {
+        let first = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"first"}]}),
+        );
+        let second = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"second"}]}),
+        );
+
         assert_ne!(
             header_value(&first, "x-opencode-request"),
             header_value(&second, "x-opencode-request")
+        );
+    }
+
+    #[test]
+    fn opencode_request_changes_when_any_upstream_body_field_changes() {
+        let first = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"same"}],"temperature":0.2}),
+        );
+        let second = zen_headers(
+            "sk-test",
+            &json!({"model":"deepseek-v4-flash-free","messages":[{"role":"user","content":"same"}],"temperature":0.7}),
+        );
+
+        assert_ne!(
+            header_value(&first, "x-opencode-request"),
+            header_value(&second, "x-opencode-request")
+        );
+        assert_eq!(
+            header_value(&first, "x-opencode-session"),
+            header_value(&second, "x-opencode-session")
         );
     }
 
@@ -1027,6 +1115,16 @@ mod tests {
             header_value(&first, "x-opencode-session"),
             header_value(&second, "x-opencode-session")
         );
+    }
+
+    #[test]
+    fn redacts_socks_credentials_in_error_summary() {
+        let text = "proxy socks5h://user:secret@127.0.0.1:1080 failed";
+
+        let redacted = redact_socks_credentials(text);
+
+        assert_eq!(redacted, "proxy socks5h://***@127.0.0.1:1080 failed");
+        assert!(!redacted.contains("user:secret"));
     }
 
     #[test]

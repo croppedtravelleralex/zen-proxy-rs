@@ -36,14 +36,44 @@ impl Config {
             .unwrap_or_else(|_| "deepseek-v4-flash-free".into());
         let flash_lite_upstream = std::env::var("FREE_MODEL_DEEPSEEK_V4_FLASH_LITE_UPSTREAM")
             .unwrap_or_else(|_| "big-pickle".into());
+        let mimo_upstream = std::env::var("FREE_MODEL_MIMO_V2_5_UPSTREAM")
+            .unwrap_or_else(|_| "mimo-v2.5-free".into());
+        let north_upstream = std::env::var("FREE_MODEL_NORTH_MINI_CODE_UPSTREAM")
+            .unwrap_or_else(|_| "north-mini-code-free".into());
+        let nemotron_upstream = std::env::var("FREE_MODEL_NEMOTRON_3_ULTRA_UPSTREAM")
+            .unwrap_or_else(|_| "nemotron-3-ultra-free".into());
+        let minimax_upstream = std::env::var("FREE_MODEL_MINIMAX_M3_UPSTREAM")
+            .unwrap_or_else(|_| "minimax-m3-free".into());
+        let qwen_upstream = std::env::var("FREE_MODEL_QWEN3_6_PLUS_UPSTREAM")
+            .unwrap_or_else(|_| "qwen3.6-plus-free".into());
         let model_mappings = vec![
             ModelMapping {
                 public_name: "deepseek-v4-flash".into(),
                 upstream_name: flash_upstream,
             },
             ModelMapping {
-                public_name: "deepseek-v4-flash-lite".into(),
+                public_name: "big-pickle".into(),
                 upstream_name: flash_lite_upstream,
+            },
+            ModelMapping {
+                public_name: "mimo-v2.5".into(),
+                upstream_name: mimo_upstream,
+            },
+            ModelMapping {
+                public_name: "north-mini-code".into(),
+                upstream_name: north_upstream,
+            },
+            ModelMapping {
+                public_name: "nemotron-3-ultra".into(),
+                upstream_name: nemotron_upstream,
+            },
+            ModelMapping {
+                public_name: "minimax-m3".into(),
+                upstream_name: minimax_upstream,
+            },
+            ModelMapping {
+                public_name: "qwen3.6-plus".into(),
+                upstream_name: qwen_upstream,
             },
         ];
         Self {

@@ -81,7 +81,15 @@ async fn mock_zen_handler(
         .and_then(Value::as_str)
         == Some("disabled");
 
-    if prompt.contains("rate-limit") {
+    if prompt.contains("rate-limit-once") && request_count == 1 {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "60")],
+            "FreeUsageLimitError",
+        )
+            .into_response();
+    }
+    if prompt.contains("rate-limit") && !prompt.contains("rate-limit-once") {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", "60")],
@@ -1601,6 +1609,55 @@ async fn openai_empty_stream_with_tools_reports_empty_output_without_synthetic_t
 }
 
 #[tokio::test]
+async fn openai_stream_exact_ok_empty_upstream_returns_local_ok() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = chat_request(
+        "mimo-v2.5-free",
+        "Reply with exactly OK. empty-upstream",
+        true,
+        None,
+    );
+    request.max_tokens = Some(16);
+
+    let response = kernel.openai_chat(&client, request).await.unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("\"content\":\"ok\""));
+    assert!(!body.contains("upstream returned no assistant content or tool call"));
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn openai_stream_retries_pre_output_empty_upstream_once() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = chat_request("mimo-v2.5-free", "empty-once", true, None);
+    request.max_tokens = Some(64);
+
+    let response = kernel.openai_chat(&client, request).await.unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("golden answer"), "{body}");
+    assert!(!body.contains("upstream returned no assistant content or tool call"));
+    assert_eq!(state.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn openai_mimo_stream_empty_upstream_uses_extended_attempts() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = chat_request("mimo-v2.5-free", "empty-upstream", true, None);
+    request.max_tokens = Some(64);
+
+    let response = kernel.openai_chat(&client, request).await.unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("upstream returned no assistant content or tool call"));
+    assert_eq!(state.requests.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
 async fn anthropic_empty_stream_with_tools_reports_empty_output_without_synthetic_tool_use() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -1624,6 +1681,68 @@ async fn anthropic_empty_stream_with_tools_reports_empty_output_without_syntheti
         .unwrap();
     let body = response_text(response).await;
     assert!(body.contains("upstream returned no assistant content or tool call"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_exact_ok_empty_upstream_returns_local_ok() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "mimo-v2.5-free",
+        "Reply with exactly OK. empty-upstream",
+        true,
+    );
+    request.max_tokens = Some(16);
+
+    let response = kernel.anthropic_messages(&client, request).await.unwrap();
+    let body = response_text(response).await;
+
+    assert!(body.contains("\"text\":\"ok\""));
+    assert!(!body.contains("upstream returned no assistant content or tool call"));
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn anthropic_claude_code_stream_rate_limit_retries_before_error_event() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            anthropic_request("mimo-v2.5-free", "rate-limit", true),
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response_text(response).await;
+    assert!(body.contains("event: error"), "{body}");
+    assert!(body.contains("\"type\":\"rate_limit_error\""), "{body}");
+    assert!(body.contains("upstream provider rate limited"), "{body}");
+    assert!(!body.contains("FreeUsageLimitError"), "{body}");
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn anthropic_claude_code_stream_rate_limit_once_recovers_before_error_event() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            anthropic_request("mimo-v2.5-free", "rate-limit-once", true),
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response_text(response).await;
+    assert!(!body.contains("event: error"), "{body}");
+    assert!(!body.contains("rate_limit_error"), "{body}");
+    assert!(body.contains("golden answer"), "{body}");
+    assert_eq!(state.requests.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -2077,6 +2196,54 @@ async fn claude_code_low_budget_anthropic_tool_probe_disables_thinking_and_raise
 }
 
 #[tokio::test]
+async fn claude_code_low_budget_openai_no_tool_probe_raises_max_tokens() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = chat_request("north-mini-code-free", "reasoning-only-length", false, None);
+    req.max_tokens = Some(16);
+
+    let response = kernel
+        .openai_chat_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer after disabled thinking"));
+    let sent = observed.requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+    assert_eq!(sent[0].max_tokens, Some(64));
+}
+
+#[tokio::test]
+async fn claude_code_low_budget_anthropic_no_tool_probe_raises_max_tokens() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = anthropic_request("north-mini-code-free", "reasoning-only-length", false);
+    req.max_tokens = Some(16);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer after disabled thinking"));
+    let sent = observed.requests.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+    assert_eq!(sent[0].max_tokens, Some(64));
+}
+
+#[tokio::test]
 async fn hermes_tools_keep_compat_thinking_policy() {
     let (config, client, observed) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
@@ -2237,6 +2404,163 @@ async fn anthropic_tool_choice_is_translated_to_openai_function_choice() {
         Some(&json!({"type":"function","function":{"name":"Task"}}))
     );
     assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+}
+
+#[tokio::test]
+async fn anthropic_claude_code_forced_tool_choice_downgrades_to_auto_for_selected_models() {
+    for model in [
+        "mimo-v2.5-free",
+        "north-mini-code-free",
+        "nemotron-3-ultra-free",
+    ] {
+        let (config, client, observed) = spawn_mock_zen().await;
+        let kernel = FreeModelKernel::new(config);
+        let mut req = anthropic_request(model, "Use Bash to run exactly: printf OK", false);
+        req.tools = Some(vec![anthropic_tool(
+            "Bash",
+            json!({
+                "command": {"type": "string"},
+                "description": {"type": "string"}
+            }),
+            &["command"],
+        )]);
+        req.tool_choice = Some(json!({"type":"tool","name":"Bash"}));
+
+        let response = kernel
+            .anthropic_messages_with_profile(
+                &client,
+                req,
+                ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let sent = observed.requests.lock().unwrap();
+        assert_eq!(
+            sent[0].tool_choice.as_ref(),
+            Some(&Value::String("auto".to_string())),
+            "{model} must use auto tool_choice upstream"
+        );
+        assert_eq!(sent[0].thinking.as_ref(), Some(&json!({"type":"disabled"})));
+    }
+}
+
+#[tokio::test]
+async fn anthropic_system_content_blocks_are_normalized_before_upstream() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = anthropic_request("north-mini-code-free", "plain", true);
+    req.max_tokens = Some(32_000);
+    req.system = Some(json!([
+        {"type":"text","text":"ClaudeCode system prompt."},
+        {"type":"text","text":"Use tools carefully.","cache_control":{"type":"ephemeral"}}
+    ]));
+    req.tools = Some(vec![
+        anthropic_tool(
+            "Bash",
+            json!({
+                "command": {"type": "string", "description": "The command to execute"},
+                "timeout": {"type": "number", "description": "Optional timeout in milliseconds"}
+            }),
+            &["command"],
+        ),
+        anthropic_tool(
+            "Edit",
+            json!({
+                "file_path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"}
+            }),
+            &["file_path", "old_string", "new_string"],
+        ),
+        anthropic_tool(
+            "Read",
+            json!({"file_path": {"type": "string"}}),
+            &["file_path"],
+        ),
+    ]);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("golden answer"));
+
+    let sent = observed.requests.lock().unwrap();
+    let messages = sent[0].messages.as_ref().and_then(Value::as_array).unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(
+        messages[0]["content"],
+        json!("ClaudeCode system prompt.\nUse tools carefully.")
+    );
+}
+
+#[test]
+fn anthropic_billing_system_header_is_not_forwarded_upstream() {
+    let mut req = anthropic_request("north-mini-code-free", "plain", true);
+    req.max_tokens = Some(32_000);
+    req.system = Some(json!([
+        {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.119.1e5; cc_entrypoint=sdk-cli; cch=abc12;"},
+        {"type":"text","text":"ClaudeCode stable system prompt."}
+    ]));
+
+    let messages = free_model_client_rs::protocol::translate::anthropic_to_openai_messages(&req);
+
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(
+        messages[0].content,
+        json!("ClaudeCode stable system prompt.")
+    );
+}
+
+#[test]
+fn anthropic_billing_system_header_does_not_change_cache_prefix() {
+    let mut first = anthropic_request("deepseek-v4-flash", "same prompt", true);
+    first.system = Some(json!([
+        {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.119.1e5; cc_entrypoint=sdk-cli; cch=11111;"},
+        {"type":"text","text":"ClaudeCode stable system prompt."}
+    ]));
+    let mut second = first.clone();
+    second.system = Some(json!([
+        {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.119.1e5; cc_entrypoint=sdk-cli; cch=22222;"},
+        {"type":"text","text":"ClaudeCode stable system prompt."}
+    ]));
+
+    let first_messages =
+        free_model_client_rs::protocol::translate::anthropic_to_openai_messages(&first);
+    let second_messages =
+        free_model_client_rs::protocol::translate::anthropic_to_openai_messages(&second);
+
+    let first_shape = free_model_client_rs::protocol::translate::request_shape(&ChatRequest {
+        model: first.model,
+        messages: first_messages,
+        stream: Some(true),
+        max_tokens: first.max_tokens,
+        temperature: None,
+        top_p: None,
+        tools: None,
+        tool_choice: None,
+    });
+    let second_shape = free_model_client_rs::protocol::translate::request_shape(&ChatRequest {
+        model: second.model,
+        messages: second_messages,
+        stream: Some(true),
+        max_tokens: second.max_tokens,
+        temperature: None,
+        top_p: None,
+        tools: None,
+        tool_choice: None,
+    });
+
+    assert_eq!(first_shape.prefix_4k_hash, second_shape.prefix_4k_hash);
+    assert_eq!(first_shape.prefix_32k_hash, second_shape.prefix_32k_hash);
+    assert_eq!(first_shape.prompt_hash, second_shape.prompt_hash);
 }
 
 #[tokio::test]
@@ -3539,6 +3863,51 @@ async fn claude_code_large_stream_tool_request_disables_thinking_on_first_attemp
         requests[0].thinking.as_ref(),
         Some(&json!({"type":"disabled"}))
     );
+}
+
+#[tokio::test]
+async fn mimo_family_tool_heavy_stream_disables_thinking_on_first_attempt() {
+    for model in [
+        "mimo-v2.5-free",
+        "north-mini-code-free",
+        "nemotron-3-ultra-free",
+    ] {
+        let (config, client, state) = spawn_mock_zen().await;
+        let kernel = FreeModelKernel::new(config);
+        let mut request = anthropic_request(model, "missing-reasoning-content", true);
+        request.max_tokens = Some(32_000);
+        request.tools = Some(
+            (0..40)
+                .map(|idx| {
+                    anthropic_tool(
+                        &format!("tool_{idx}"),
+                        json!({"input": {"type": "string"}}),
+                        &["input"],
+                    )
+                })
+                .collect(),
+        );
+
+        let response = kernel
+            .anthropic_messages_with_profile(
+                &client,
+                request,
+                ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "{model}");
+        let body = response_text(response).await;
+        assert!(body.contains("golden answer"), "{model}: {body}");
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{model}");
+        assert_eq!(
+            requests[0].thinking.as_ref(),
+            Some(&json!({"type":"disabled"})),
+            "{model}"
+        );
+    }
 }
 
 #[tokio::test]

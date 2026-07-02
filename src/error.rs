@@ -100,6 +100,11 @@ impl AppError {
     pub fn is_provider_invalid_request(&self) -> bool {
         self.upstream_error_kind == Some(UpstreamErrorKind::ProviderInvalidRequest)
     }
+
+    pub fn is_rate_limited(&self) -> bool {
+        self.status == StatusCode::TOO_MANY_REQUESTS
+            || self.upstream_error_kind == Some(UpstreamErrorKind::RateLimited)
+    }
 }
 
 impl std::fmt::Display for AppError {

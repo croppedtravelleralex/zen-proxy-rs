@@ -29,6 +29,11 @@ cargo build --release
 | `FREE_MODEL_ZEN_API_KEY` | `FREE_MODEL_NEWAPI_KEY` or development placeholder | Compatibility override for the upstream API key |
 | `FREE_MODEL_DEEPSEEK_V4_FLASH_UPSTREAM` | `deepseek-v4-flash-free` | Upstream model for `deepseek-v4-flash` |
 | `FREE_MODEL_DEEPSEEK_V4_FLASH_LITE_UPSTREAM` | `big-pickle` | Upstream model for `deepseek-v4-flash-lite` |
+| `FREE_MODEL_MIMO_V2_5_UPSTREAM` | `mimo-v2.5-free` | Upstream model for `mimo-v2.5` |
+| `FREE_MODEL_NORTH_MINI_CODE_UPSTREAM` | `north-mini-code-free` | Upstream model for `north-mini-code` |
+| `FREE_MODEL_NEMOTRON_3_ULTRA_UPSTREAM` | `nemotron-3-ultra-free` | Upstream model for `nemotron-3-ultra` |
+| `FREE_MODEL_MINIMAX_M3_UPSTREAM` | `minimax-m3-free` | Upstream model for `minimax-m3` |
+| `FREE_MODEL_QWEN3_6_PLUS_UPSTREAM` | `qwen3.6-plus-free` | Upstream model for `qwen3.6-plus` |
 | `FREE_MODEL_REQUIRE_API_KEY` | `true` (set `0` to disable) | Require client auth |
 | `FREE_MODEL_API_KEY` | development placeholder | Client API key; set a real value via env |
 | `FREE_MODEL_TIMEOUT_MS` | `120000` | Upstream timeout (ms) |
@@ -42,6 +47,11 @@ cargo build --release
 |--------------|----------------|
 | `deepseek-v4-flash` | `deepseek-v4-flash-free` |
 | `deepseek-v4-flash-lite` | `big-pickle` |
+| `mimo-v2.5` | `mimo-v2.5-free` |
+| `north-mini-code` | `north-mini-code-free` |
+| `nemotron-3-ultra` | `nemotron-3-ultra-free` |
+| `minimax-m3` | `minimax-m3-free` |
+| `qwen3.6-plus` | `qwen3.6-plus-free` |
 
 ## Endpoints
 
@@ -71,12 +81,9 @@ Client (Claude Code / API)
 - Client auth accepts `Authorization: Bearer ...` and `x-api-key`.
 - Client-specific behavior can be selected with `x-fmc-client`, currently supporting `claude-code`, `hermes`, `openclaw`, `cherrystudio`, `openai-sdk`, `anthropic-sdk`, and `unknown`; automatic inference also checks body markers and tool names.
 - Request bodies default to a 64MB limit via `FREE_MODEL_REQUEST_BODY_LIMIT_MB`.
-- Non-stream responses cap excessive output before upstream:
-  - missing `max_tokens`: 2048
-  - small prompt: max 4096
-  - estimated prompt >= 50k tokens: max 2048
-  - estimated prompt >= 100k tokens: max 1024
-- Stream responses keep explicit `max_tokens` and default to 1024 when omitted.
+- Explicit `max_tokens` values are passed through; missing `max_tokens` is not filled by this proxy.
+- `deepseek-v4-flash`, `mimo-v2.5`, `north-mini-code`, and `nemotron-3-ultra` model families preserve large ClaudeCode context in this proxy instead of applying input compaction.
+- `minimax-m3` and `qwen3.6-plus` are exposed as generic OpenCode free models; they do not opt into ClaudeCode/Hermes/OpenClaw deep compatibility policies.
 - Empty upstream assistant content without tool calls is not converted into fake tool calls.
 - Desensitized request-shape logs record token counts, message/tool counts, request kind, and prompt hash only; raw prompts, request bodies, and API keys are not logged.
 
