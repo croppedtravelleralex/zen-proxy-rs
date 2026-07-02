@@ -162,6 +162,7 @@ pub async fn proxy_handler(
         stream: streaming,
         body_size: body_len,
         affinity_key: String::new(),
+        allow_direct_fallback: true,
     };
 
     let result = proxy_with_retry(

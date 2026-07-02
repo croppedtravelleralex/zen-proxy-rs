@@ -116,10 +116,11 @@ pub async fn handle_v4_proxy(
         effective_body_size = context_telemetry.effective_body_bytes,
         "v4 ingress request"
     );
-    let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+    let registry = EffectiveModelRegistry::with_dynamic_allowlists(
         conf.dynamic_model_public_mode,
         state.dynamic_models.snapshot(),
         conf.dynamic_model_public_allowlist.clone(),
+        conf.dynamic_model_claudecode_compat_allowlist.clone(),
     );
     let resolved = match registry.resolve(&public_model) {
         Ok(resolved) => resolved,
@@ -130,6 +131,12 @@ pub async fn handle_v4_proxy(
             );
         }
     };
+    let dynamic_model = matches!(
+        resolved.compatibility_profile,
+        ModelCompatibilityProfile::DynamicGeneric
+            | ModelCompatibilityProfile::DynamicClaudeCodeCompatible
+            | ModelCompatibilityProfile::DynamicRestricted
+    );
 
     let mut upstream_body = parsed;
     upstream_body["model"] = Value::String(resolved.upstream_model.clone());
@@ -153,11 +160,13 @@ pub async fn handle_v4_proxy(
         affinity_key: build_affinity_key(
             &public_model,
             path,
+            &source_client,
             client_id,
             effective_body_len,
             streaming,
             &upstream_body,
         ),
+        allow_direct_fallback: !dynamic_model || conf.dynamic_model_allow_direct_fallback,
     };
     let request_body_bucket = body_size_bucket(effective_body_len).to_string();
     let request_affinity_key = request_meta.affinity_key.clone();
@@ -384,10 +393,11 @@ fn record_dynamic_model_traffic(
 ) {
     let model_id = {
         let cfg = state.config.read().unwrap();
-        let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+        let registry = EffectiveModelRegistry::with_dynamic_allowlists(
             cfg.dynamic_model_public_mode,
             state.dynamic_models.snapshot(),
             cfg.dynamic_model_public_allowlist.clone(),
+            cfg.dynamic_model_claudecode_compat_allowlist.clone(),
         );
         registry
             .resolve(public_model)
@@ -508,12 +518,13 @@ fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
 fn build_affinity_key(
     public_model: &str,
     path: &str,
+    source_client: &str,
     client_id: &str,
     body_size: u64,
-    streaming: bool,
+    _streaming: bool,
     body: &Value,
 ) -> String {
-    if !streaming || body_size < AFFINITY_MIN_BODY_BYTES {
+    if body_size < AFFINITY_MIN_BODY_BYTES {
         return String::new();
     }
     let client_bucket = if client_id.trim().is_empty() {
@@ -524,9 +535,14 @@ fn build_affinity_key(
     let prefix_hash = affinity_prefix_hash(body);
     let tools_hash = affinity_component_hash(body.get("tools"));
     let tool_choice_hash = affinity_component_hash(body.get("tool_choice"));
+    let source_bucket = if source_client.trim().is_empty() {
+        "unknown"
+    } else {
+        source_client.trim()
+    };
     format!(
-        "{}:{}:{}:p{}:tools{}:choice{}",
-        public_model, path, client_bucket, prefix_hash, tools_hash, tool_choice_hash
+        "{}:{}:{}:{}:p{}:tools{}:choice{}",
+        public_model, path, source_bucket, client_bucket, prefix_hash, tools_hash, tool_choice_hash
     )
 }
 
@@ -788,6 +804,13 @@ fn apply_model_compatibility_profile(
                 profile
             }
         }
+        ModelCompatibilityProfile::StaticMimo => {
+            if matches!(profile.kind, ClientKind::ClaudeCode) {
+                profile
+            } else {
+                ClientProfile::unknown()
+            }
+        }
         ModelCompatibilityProfile::DynamicClaudeCodeCompatible => {
             if matches!(profile.kind, ClientKind::ClaudeCode) {
                 profile
@@ -951,11 +974,21 @@ async fn call_with_retry(
     let mut dispatch_wait_ms = 0u64;
     let mut retry_chain = Vec::new();
     let retry_budget_ms = conf.v4_retry_budget_ms;
+    let mut force_direct_next = false;
 
     for attempt in 0..=empty_upstream_max {
         let dispatch_start = Instant::now();
-        let dispatch_result =
-            dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?;
+        let dispatch_result = if force_direct_next {
+            force_direct_next = false;
+            state.pool_manager.dispatch_direct().map_err(|_| {
+                V4CallError::before_dispatch(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "direct fallback is not available",
+                )
+            })?
+        } else {
+            dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?
+        };
         dispatch_wait_ms =
             dispatch_wait_ms.saturating_add(dispatch_start.elapsed().as_millis() as u64);
 
@@ -1207,6 +1240,14 @@ async fn call_with_retry(
                     },
                     error_type: failure_kind.to_string(),
                 });
+                if conf.allow_direct_fallback
+                    && request_meta.allow_direct_fallback
+                    && node_id != "direct"
+                    && is_direct_fallback_status(status)
+                    && attempt < base_max
+                {
+                    force_direct_next = true;
+                }
                 if attempt >= base_max {
                     let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
                         "rate_limited"
@@ -1357,6 +1398,15 @@ async fn call_with_retry(
                     ));
                 }
                 let max_for_error = max_retries_for_app_error(&err, base_max, empty_upstream_max);
+                let (_, _, error_type) = classify_app_error(&err);
+                if conf.allow_direct_fallback
+                    && request_meta.allow_direct_fallback
+                    && node_id != "direct"
+                    && is_transport_error_type(error_type)
+                    && attempt < max_for_error
+                {
+                    force_direct_next = true;
+                }
                 if attempt >= max_for_error {
                     let (error_kind, outcome, error_type) = classify_app_error(&err);
                     let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
@@ -1597,7 +1647,10 @@ fn result_kind_for_classified_error(error_kind: ErrorKind, error_type: &str) -> 
         return ResultKind::EmptyOutput;
     }
 
-    if is_transport_error_type(error_type) {
+    if matches!(
+        error_type,
+        "timeout" | "connection_refused" | "dns_failure" | "socks_handshake"
+    ) {
         return ResultKind::Error { kind: error_kind };
     }
 
@@ -1614,6 +1667,13 @@ fn is_transport_error_type(error_type: &str) -> bool {
     matches!(
         error_type,
         "timeout" | "network" | "connection_refused" | "dns_failure" | "socks_handshake"
+    )
+}
+
+fn is_direct_fallback_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
     )
 }
 
@@ -1943,6 +2003,7 @@ fn metered_stream_response(
             lease_guard.release(ResultKind::ClientGone, stream_complete_ms);
         } else if let Some(message) = stream_error {
             let error_type = classify_stream_error_message(&message).to_string();
+            let stream_rate_limited = error_type == "upstream_429";
             telemetry.outcome = "stream_error".to_string();
             telemetry.failure_kind = error_type.clone();
             telemetry.failure_message = message;
@@ -1955,11 +2016,36 @@ fn metered_stream_response(
                 outcome: "stream_error".to_string(),
                 error_type,
             });
-            state.pool_manager.report(
-                telemetry.selected_node_id.clone(),
+            let result = if stream_rate_limited {
+                ResultKind::RateLimited
+            } else {
                 ResultKind::SoftFailure {
                     kind: ErrorKind::Other,
-                },
+                }
+            };
+            state.pool_manager.report(
+                telemetry.selected_node_id.clone(),
+                result,
+                stream_complete_ms,
+            );
+            lease_guard.mark_released();
+        } else if metrics.has_rate_limited_error() && !metrics.has_assistant_output() {
+            telemetry.outcome = "rate_limited".to_string();
+            telemetry.failure_kind = "upstream_429".to_string();
+            telemetry.failure_message =
+                "upstream provider rate limited the stream before assistant output".to_string();
+            telemetry.retry_chain.push(RequestAttemptTelemetry {
+                attempt: telemetry.retry_count,
+                node_id: telemetry.selected_node_id.clone(),
+                node_url_redacted: telemetry.selected_node_url_redacted.clone(),
+                status: 429,
+                latency_ms: stream_complete_ms,
+                outcome: "rate_limited".to_string(),
+                error_type: "upstream_429".to_string(),
+            });
+            state.pool_manager.report(
+                telemetry.selected_node_id.clone(),
+                ResultKind::RateLimited,
                 stream_complete_ms,
             );
             lease_guard.mark_released();
@@ -2094,7 +2180,9 @@ fn classify_stream_body_error(err: &axum::Error) -> &'static str {
 
 fn classify_stream_error_message(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("decode") || lower.contains("decoding") {
+    if lower.contains("rate limit") || lower.contains("rate_limit") || lower.contains("429") {
+        "upstream_429"
+    } else if lower.contains("decode") || lower.contains("decoding") {
         "stream_decode_error"
     } else if lower.contains("timeout") || lower.contains("elapsed") {
         "stream_timeout"
@@ -2113,6 +2201,7 @@ struct StreamMetrics {
     completion_text: String,
     tool_output_chunks: u64,
     text_output_chunks: u64,
+    rate_limited_error_chunks: u64,
     buffer: String,
 }
 
@@ -2152,6 +2241,9 @@ impl StreamMetrics {
     }
 
     fn ingest_usage_value(&mut self, path: &str, value: &Value) {
+        if value_has_rate_limit_error(value) {
+            self.rate_limited_error_chunks = self.rate_limited_error_chunks.saturating_add(1);
+        }
         if path == "messages" {
             match value.get("type").and_then(Value::as_str) {
                 Some("content_block_start")
@@ -2325,6 +2417,29 @@ impl StreamMetrics {
     fn has_tool_signal(&self) -> bool {
         self.tool_output_chunks > 0
     }
+
+    fn has_rate_limited_error(&self) -> bool {
+        self.rate_limited_error_chunks > 0
+    }
+}
+
+fn value_has_rate_limit_error(value: &Value) -> bool {
+    let Some(error) = value.get("error") else {
+        return false;
+    };
+    let mut haystack = String::new();
+    for field in ["type", "code", "message"] {
+        if let Some(text) = error.get(field).and_then(Value::as_str) {
+            haystack.push_str(text);
+            haystack.push('\n');
+        }
+    }
+    let lower = haystack.to_ascii_lowercase();
+    lower.contains("rate_limit")
+        || lower.contains("rate limit")
+        || lower.contains("rate-limited")
+        || lower.contains("rate limited")
+        || lower.contains("429")
 }
 
 fn usage_u32(usage: &Value, name: &str) -> u32 {
@@ -2666,7 +2781,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_errors_are_hard_proxy_failures() {
+    fn transport_errors_only_hard_fail_when_proxy_specific() {
         assert!(matches!(
             result_kind_for_classified_error(ErrorKind::Timeout, "timeout"),
             ResultKind::Error {
@@ -2675,7 +2790,7 @@ mod tests {
         ));
         assert!(matches!(
             result_kind_for_classified_error(ErrorKind::Other, "network"),
-            ResultKind::Error {
+            ResultKind::SoftFailure {
                 kind: ErrorKind::Other
             }
         ));
@@ -2684,6 +2799,60 @@ mod tests {
             ResultKind::SoftFailure {
                 kind: ErrorKind::Upstream5xx
             }
+        ));
+    }
+
+    #[test]
+    fn upstream_connection_error_does_not_bury_proxy_node() {
+        let err = AppError {
+            status: StatusCode::BAD_GATEWAY,
+            message: "upstream connection error: error sending request for url (https://opencode.ai/zen/v1/chat/completions)".to_string(),
+            upstream_headers: None,
+            upstream_error_kind: None,
+        };
+
+        let (kind, outcome, error_type) = classify_app_error(&err);
+
+        assert_eq!(kind, ErrorKind::Other);
+        assert_eq!(outcome, "transport_error");
+        assert_eq!(error_type, "network");
+        assert!(matches!(
+            result_kind_for_classified_error(kind, error_type),
+            ResultKind::SoftFailure {
+                kind: ErrorKind::Other
+            }
+        ));
+    }
+
+    #[test]
+    fn socks_rejection_is_hard_proxy_failure() {
+        let err = AppError {
+            status: StatusCode::BAD_GATEWAY,
+            message: "upstream connection error: error sending request for url (https://opencode.ai/zen/v1/chat/completions); caused by: socks5 server rejected credentials".to_string(),
+            upstream_headers: None,
+            upstream_error_kind: None,
+        };
+
+        let (kind, outcome, error_type) = classify_app_error(&err);
+
+        assert_eq!(kind, ErrorKind::SocksHandshake);
+        assert_eq!(outcome, "transport_error");
+        assert_eq!(error_type, "socks_handshake");
+        assert!(matches!(
+            result_kind_for_classified_error(kind, error_type),
+            ResultKind::Error {
+                kind: ErrorKind::SocksHandshake
+            }
+        ));
+    }
+
+    #[test]
+    fn direct_fallback_statuses_cover_proxy_transport_responses() {
+        assert!(is_direct_fallback_status(StatusCode::BAD_GATEWAY));
+        assert!(is_direct_fallback_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(!is_direct_fallback_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(!is_direct_fallback_status(
+            StatusCode::INTERNAL_SERVER_ERROR
         ));
     }
 
@@ -2879,18 +3048,52 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
-    fn affinity_key_is_for_medium_and_large_streaming_requests() {
+    fn affinity_key_is_for_medium_and_large_requests() {
         let body = serde_json::json!({"messages":[{"role":"user","content":"hello"}]});
-        assert!(build_affinity_key("m", "chat/completions", "sk", 10, true, &body).is_empty());
-        assert!(
-            build_affinity_key("m", "chat/completions", "sk", 200_000, false, &body).is_empty()
+        assert!(build_affinity_key(
+            "m",
+            "chat/completions",
+            "claude-code",
+            "sk",
+            10,
+            true,
+            &body
+        )
+        .is_empty());
+        let medium_nonstream_key = build_affinity_key(
+            "m",
+            "chat/completions",
+            "claude-code",
+            "sk",
+            200_000,
+            false,
+            &body,
         );
-        let medium_key = build_affinity_key("m", "chat/completions", "sk", 64_000, true, &body);
-        assert!(medium_key.starts_with("m:chat/completions:"));
+        assert!(medium_nonstream_key.starts_with("m:chat/completions:claude-code:"));
+        assert!(medium_nonstream_key.contains(":p"));
+
+        let medium_key = build_affinity_key(
+            "m",
+            "chat/completions",
+            "claude-code",
+            "sk",
+            64_000,
+            true,
+            &body,
+        );
+        assert!(medium_key.starts_with("m:chat/completions:claude-code:"));
         assert!(medium_key.contains(":p"));
 
-        let key = build_affinity_key("m", "chat/completions", "sk", 200_000, true, &body);
-        assert!(key.starts_with("m:chat/completions:"));
+        let key = build_affinity_key(
+            "m",
+            "chat/completions",
+            "claude-code",
+            "sk",
+            200_000,
+            true,
+            &body,
+        );
+        assert!(key.starts_with("m:chat/completions:claude-code:"));
         assert!(key.contains(":p"));
         assert!(key.contains(":tools"));
         assert!(key.contains(":choice"));
@@ -2915,13 +3118,59 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "tool_choice":"auto"
         });
 
-        let first_key = build_affinity_key("m", "messages", "client", 800_000, true, &first);
-        let second_key = build_affinity_key("m", "messages", "client", 820_000, true, &second);
-        let changed_key =
-            build_affinity_key("m", "messages", "client", 800_000, true, &changed_prefix);
+        let first_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            800_000,
+            true,
+            &first,
+        );
+        let second_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            820_000,
+            true,
+            &second,
+        );
+        let changed_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            800_000,
+            true,
+            &changed_prefix,
+        );
 
         assert_eq!(first_key, second_key);
         assert_ne!(first_key, changed_key);
+    }
+
+    #[test]
+    fn affinity_key_separates_source_clients() {
+        let body = serde_json::json!({
+            "messages":[{"role":"user","content":"a".repeat(80_000)}],
+            "tools":[{"function":{"name":"Read"}}],
+            "tool_choice":"auto"
+        });
+
+        let claude_code_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            180_000,
+            true,
+            &body,
+        );
+        let hermes_key =
+            build_affinity_key("m", "messages", "hermes", "client", 180_000, true, &body);
+
+        assert_ne!(claude_code_key, hermes_key);
     }
 
     #[test]
@@ -2943,10 +3192,33 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "tool_choice":"auto"
         });
 
-        let first_key = build_affinity_key("m", "messages", "client", 180_000, true, &first);
-        let second_key = build_affinity_key("m", "messages", "client", 190_000, true, &second);
-        let changed_key =
-            build_affinity_key("m", "messages", "client", 180_000, true, &changed_prefix);
+        let first_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            180_000,
+            true,
+            &first,
+        );
+        let second_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            190_000,
+            true,
+            &second,
+        );
+        let changed_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            180_000,
+            true,
+            &changed_prefix,
+        );
 
         assert_eq!(first_key, second_key);
         assert_ne!(first_key, changed_key);
@@ -2966,8 +3238,24 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             .unwrap()
             .push(serde_json::json!({"role":"user","content":"x".repeat(120_000)}));
 
-        let first_key = build_affinity_key("m", "messages", "client", 120_000, true, &first);
-        let second_key = build_affinity_key("m", "messages", "client", 280_000, true, &second);
+        let first_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            120_000,
+            true,
+            &first,
+        );
+        let second_key = build_affinity_key(
+            "m",
+            "messages",
+            "claude-code",
+            "client",
+            280_000,
+            true,
+            &second,
+        );
 
         assert_eq!(first_key, second_key);
     }
@@ -3003,7 +3291,46 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             classify_stream_error_message("connection closed before message completed"),
             "stream_connection_error"
         );
+        assert_eq!(
+            classify_stream_error_message("upstream provider rate limited the request"),
+            "upstream_429"
+        );
         assert_eq!(classify_stream_error_message("other"), "stream_error");
+    }
+
+    #[test]
+    fn stream_metrics_detects_anthropic_rate_limit_error_event() {
+        let mut metrics = StreamMetrics::new(UsageCounts::default());
+        metrics.ingest(
+            "messages",
+            &Bytes::from_static(
+                br#"event: error
+data: {"type":"error","error":{"type":"rate_limit_error","message":"upstream provider rate limited the request"}}
+
+"#,
+            ),
+        );
+
+        assert!(metrics.has_rate_limited_error());
+        assert!(!metrics.has_assistant_output());
+    }
+
+    #[test]
+    fn stream_metrics_detects_openai_rate_limit_error_event() {
+        let mut metrics = StreamMetrics::new(UsageCounts::default());
+        metrics.ingest(
+            "chat/completions",
+            &Bytes::from_static(
+                br#"data: {"error":{"message":"upstream provider rate limited the request"}}
+
+data: [DONE]
+
+"#,
+            ),
+        );
+
+        assert!(metrics.has_rate_limited_error());
+        assert!(!metrics.has_assistant_output());
     }
 
     #[tokio::test]

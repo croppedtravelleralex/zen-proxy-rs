@@ -346,6 +346,7 @@ impl AdminService {
                 "enabled": cfg.dynamic_model_probe_enabled,
                 "adapter": cfg.dynamic_model_probe_adapter_mode.to_string(),
                 "public_mode": cfg.dynamic_model_public_mode.to_string(),
+                "claudecode_compat_allowlist": cfg.dynamic_model_claudecode_compat_allowlist.clone(),
                 "max_concurrent": cfg.dynamic_model_probe_max_concurrent,
                 "max_per_round": cfg.dynamic_model_probe_max_per_round,
                 "requests_per_interval": cfg.dynamic_model_probe_requests_per_interval,
@@ -381,19 +382,21 @@ impl AdminService {
             let cfg = state.config.read().unwrap();
             cfg.v4_model_registry_active()
         };
-        let (discovery, public_mode, public_allowlist) = {
+        let (discovery, public_mode, public_allowlist, claudecode_compat_allowlist) = {
             let cfg = state.config.read().unwrap();
             (
                 state.dynamic_models.snapshot(),
                 cfg.dynamic_model_public_mode,
                 cfg.dynamic_model_public_allowlist.clone(),
+                cfg.dynamic_model_claudecode_compat_allowlist.clone(),
             )
         };
         if v4_model_registry_active {
-            let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+            let registry = EffectiveModelRegistry::with_dynamic_allowlists(
                 public_mode,
                 discovery.clone(),
                 public_allowlist.clone(),
+                claudecode_compat_allowlist.clone(),
             );
             let models: Vec<Value> = registry
                 .public_models()
@@ -415,6 +418,7 @@ impl AdminService {
                 "safety": {
                     "dynamic_model_public_mode": public_mode.to_string(),
                     "dynamic_model_public_allowlist": public_allowlist,
+                    "dynamic_model_claudecode_compat_allowlist": claudecode_compat_allowlist,
                     "candidates_are_public": public_mode.exposes_candidates(),
                     "auto_promote": false,
                     "public_models_source": "effective_registry"
@@ -443,12 +447,13 @@ impl AdminService {
             cfg.v4_model_registry_active()
         };
         if v4_model_registry_active {
-            let (public_mode, discovery, public_allowlist) = {
+            let (public_mode, discovery, public_allowlist, claudecode_compat_allowlist) = {
                 let cfg = state.config.read().unwrap();
                 (
                     cfg.dynamic_model_public_mode,
                     state.dynamic_models.snapshot(),
                     cfg.dynamic_model_public_allowlist.clone(),
+                    cfg.dynamic_model_claudecode_compat_allowlist.clone(),
                 )
             };
             let dynamic_model = discovery
@@ -456,13 +461,15 @@ impl AdminService {
                 .iter()
                 .find(|model| model.id == model_id)
                 .cloned();
-            let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+            let registry = EffectiveModelRegistry::with_dynamic_allowlists(
                 public_mode,
                 discovery,
                 public_allowlist,
+                claudecode_compat_allowlist,
             );
             if let Some(model) = dynamic_model {
                 let effectively_public = Self::is_effectively_public_dynamic(&registry, &model);
+                let effective_profile = Self::dynamic_model_effective_profile(&registry, &model);
                 return Self::ok_response(Self::dynamic_model_detail_payload(
                     model,
                     if effectively_public {
@@ -471,6 +478,7 @@ impl AdminService {
                         "dynamic_candidate"
                     },
                     effectively_public,
+                    effective_profile,
                     Self::active_promotion_policy(state),
                 ));
             }
@@ -493,9 +501,10 @@ impl AdminService {
                 })),
                 _ => match state.dynamic_models.get(model_id) {
                     Some(model) => Self::ok_response(Self::dynamic_model_detail_payload(
-                        model,
+                        model.clone(),
                         "dynamic_candidate",
                         false,
+                        ModelCompatibilityProfile::for_dynamic(&model),
                         Self::active_promotion_policy(state),
                     )),
                     None => Self::error_response(StatusCode::NOT_FOUND, "model not found"),
@@ -508,6 +517,7 @@ impl AdminService {
         model: DiscoveredModel,
         mode: &'static str,
         effectively_public: bool,
+        effective_profile: ModelCompatibilityProfile,
         active_policy: TrafficPromotionPolicy,
     ) -> Value {
         let active_promotion = evaluate_active_promotion(&model, active_policy);
@@ -526,7 +536,7 @@ impl AdminService {
             "upstream_id": model.upstream_id,
             "mode": mode,
             "state": model.state,
-            "profile": ModelCompatibilityProfile::for_dynamic(&model).as_str(),
+            "profile": effective_profile.as_str(),
             "claudecode_compatible": model.claudecode_compatible,
             "claudecode_compatibility_reason": model.claudecode_compatibility_reason,
             "claudecode_compatibility_unix": model.claudecode_compatibility_unix,
@@ -606,11 +616,12 @@ impl AdminService {
     }
 
     pub fn model_traffic(state: &AppState, model_id: &str) -> Response {
-        let (public_mode, public_allowlist, discovery, active_policy) = {
+        let (public_mode, public_allowlist, claudecode_compat_allowlist, discovery, active_policy) = {
             let cfg = state.config.read().unwrap();
             (
                 cfg.dynamic_model_public_mode,
                 cfg.dynamic_model_public_allowlist.clone(),
+                cfg.dynamic_model_claudecode_compat_allowlist.clone(),
                 state.dynamic_models.snapshot(),
                 TrafficPromotionPolicy {
                     min_canary_requests: cfg.dynamic_model_active_min_canary_requests,
@@ -622,10 +633,11 @@ impl AdminService {
                 },
             )
         };
-        let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+        let registry = EffectiveModelRegistry::with_dynamic_allowlists(
             public_mode,
             discovery.clone(),
             public_allowlist,
+            claudecode_compat_allowlist,
         );
         match discovery
             .models
@@ -634,13 +646,14 @@ impl AdminService {
         {
             Some(model) => {
                 let effectively_public = Self::is_effectively_public_dynamic(&registry, &model);
+                let effective_profile = Self::dynamic_model_effective_profile(&registry, &model);
                 let traffic = Self::dynamic_model_traffic_payload(&model);
                 let active_promotion = evaluate_active_promotion(&model, active_policy);
                 Self::ok_response(json!({
                     "id": model.id,
                     "upstream_id": model.upstream_id,
                     "state": model.state,
-                    "profile": ModelCompatibilityProfile::for_dynamic(&model).as_str(),
+                    "profile": effective_profile.as_str(),
                     "claudecode_compatible": model.claudecode_compatible,
                     "claudecode_compatibility_reason": model.claudecode_compatibility_reason,
                     "claudecode_compatibility_unix": model.claudecode_compatibility_unix,
@@ -706,24 +719,29 @@ impl AdminService {
         match result {
             Ok(summary) => {
                 let current = state.dynamic_models.get(&summary.model_id).map(|model| {
-                    let (public_mode, public_allowlist, discovery) = {
+                    let (public_mode, public_allowlist, claudecode_compat_allowlist, discovery) = {
                         let cfg = state.config.read().unwrap();
                         (
                             cfg.dynamic_model_public_mode,
                             cfg.dynamic_model_public_allowlist.clone(),
+                            cfg.dynamic_model_claudecode_compat_allowlist.clone(),
                             state.dynamic_models.snapshot(),
                         )
                     };
-                    let registry = EffectiveModelRegistry::with_dynamic_public_allowlist(
+                    let registry = EffectiveModelRegistry::with_dynamic_allowlists(
                         public_mode,
                         discovery,
                         public_allowlist,
+                        claudecode_compat_allowlist,
                     );
                     let effectively_public = Self::is_effectively_public_dynamic(&registry, &model);
+                    let effective_profile =
+                        Self::dynamic_model_effective_profile(&registry, &model);
                     Self::dynamic_model_detail_payload(
                         model,
                         "dynamic_probe_result",
                         effectively_public,
+                        effective_profile,
                         Self::active_promotion_policy(state),
                     )
                 });
@@ -751,6 +769,18 @@ impl AdminService {
             .public_models()
             .iter()
             .any(|public| public.upstream_id == model.upstream_id)
+    }
+
+    fn dynamic_model_effective_profile(
+        registry: &EffectiveModelRegistry,
+        model: &DiscoveredModel,
+    ) -> ModelCompatibilityProfile {
+        registry
+            .public_models()
+            .into_iter()
+            .find(|public| public.upstream_id == model.upstream_id)
+            .map(|public| public.compatibility_profile)
+            .unwrap_or_else(|| ModelCompatibilityProfile::for_dynamic(model))
     }
 
     pub fn model_promote(state: &AppState, model_id: &str, target: Option<&str>) -> Response {

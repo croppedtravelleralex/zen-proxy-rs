@@ -99,7 +99,7 @@ where
                     .ok_or(DispatchError::NoResource)
             })
             .or_else(|_| {
-                if self.allow_direct_fallback {
+                if self.allow_direct_fallback && req.allow_direct_fallback {
                     Ok((
                         NodeRef {
                             id: DIRECT_NODE_ID.to_string(),
@@ -135,6 +135,25 @@ where
         })
     }
 
+    fn dispatch_direct(&self) -> Result<DispatchResult, DispatchError> {
+        if self.fuse.load(Ordering::Acquire) || !self.allow_direct_fallback {
+            return Err(DispatchError::NoResource);
+        }
+
+        let node = NodeRef {
+            id: DIRECT_NODE_ID.to_string(),
+            url: DIRECT_NODE_URL.to_string(),
+        };
+
+        Ok(DispatchResult {
+            node,
+            client: self.transport.direct_client(),
+            url: DIRECT_NODE_URL.to_string(),
+            affinity_hit: false,
+            affinity_node_id: String::new(),
+        })
+    }
+
     fn dispatch_sticky(
         &self,
         meta: &RequestMeta,
@@ -145,7 +164,7 @@ where
         }
         self.dispatch.preflight(meta)?;
         if node_id == DIRECT_NODE_ID {
-            return self.dispatch(meta);
+            return self.dispatch_direct();
         }
 
         // 先尝试粘滞获取指定节点
@@ -488,6 +507,7 @@ mod tests {
             stream: false,
             body_size: 128,
             affinity_key: String::new(),
+            allow_direct_fallback: true,
         };
         let dispatched = manager.dispatch(&meta).unwrap();
         manager.report(dispatched.node.id.clone(), ResultKind::EmptyOutput, 1500);
@@ -525,6 +545,7 @@ mod tests {
             stream: true,
             body_size: 350_000,
             affinity_key: String::new(),
+            allow_direct_fallback: true,
         };
         let dispatched = manager.dispatch(&meta).unwrap();
         manager.report(
@@ -569,6 +590,7 @@ mod tests {
             stream: true,
             body_size: 128,
             affinity_key: String::new(),
+            allow_direct_fallback: true,
         };
         let dispatched = manager.dispatch(&meta).unwrap();
         manager.report(
@@ -582,6 +604,73 @@ mod tests {
         assert_eq!(active.available(), 0);
         assert_eq!(dead.available(), 1);
         assert_eq!(dispatch.available(), 0);
+    }
+
+    #[test]
+    fn direct_dispatch_is_available_only_when_fallback_enabled() {
+        let disabled = PoolManagerImpl::new(
+            Arc::new(DispatchPool::new()),
+            Arc::new(ActivePool::new()),
+            Arc::new(RateLimitedPoolImpl::new()),
+            Arc::new(DeadPoolImpl::new()),
+            Arc::new(DefaultCollector::new()),
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
+            false,
+        );
+        assert!(matches!(
+            disabled.dispatch_direct(),
+            Err(DispatchError::NoResource)
+        ));
+
+        let enabled = PoolManagerImpl::new(
+            Arc::new(DispatchPool::new()),
+            Arc::new(ActivePool::new()),
+            Arc::new(RateLimitedPoolImpl::new()),
+            Arc::new(DeadPoolImpl::new()),
+            Arc::new(DefaultCollector::new()),
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
+            true,
+        );
+        let direct = enabled.dispatch_direct().unwrap();
+        assert_eq!(direct.node.id, "direct");
+        assert_eq!(direct.url, "direct");
+    }
+
+    #[test]
+    fn request_can_disable_direct_fallback_even_when_manager_allows_it() {
+        let manager = PoolManagerImpl::new(
+            Arc::new(DispatchPool::new()),
+            Arc::new(ActivePool::new()),
+            Arc::new(RateLimitedPoolImpl::new()),
+            Arc::new(DeadPoolImpl::new()),
+            Arc::new(DefaultCollector::new()),
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
+            true,
+        );
+        let meta = RequestMeta {
+            model: "mimo-v2.5".to_string(),
+            stream: false,
+            body_size: 128,
+            affinity_key: String::new(),
+            allow_direct_fallback: false,
+        };
+
+        assert!(matches!(
+            manager.dispatch(&meta),
+            Err(DispatchError::NoResource)
+        ));
     }
 
     #[test]
@@ -613,6 +702,7 @@ mod tests {
             stream: false,
             body_size: 128,
             affinity_key: String::new(),
+            allow_direct_fallback: true,
         };
         let dispatched = manager.dispatch(&meta).unwrap();
         assert_eq!(

@@ -321,6 +321,20 @@ fn start_mock_probe_base_with_overrides(
                     if let Some(response) = override_response(&probe, &overrides) {
                         return response;
                     }
+                    if probe == "claudecode_anthropic_forced_tool" {
+                        return Json(serde_json::json!({
+                            "content": [{
+                                "type": "tool_use",
+                                "name": "Bash",
+                                "input": {
+                                    "command": "printf PROBE_TOOL_OK",
+                                    "description": "Run the probe command."
+                                }
+                            }],
+                            "stop_reason": "tool_use"
+                        }))
+                        .into_response();
+                    }
                     if body
                         .get("stream")
                         .and_then(|value| value.as_bool())
@@ -492,7 +506,7 @@ mod e2e {
             .iter()
             .filter_map(|model| model["id"].as_str())
             .collect();
-        assert_eq!(ids, vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]);
+        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
 
         let detail = reqwest::blocking::get(format!(
             "http://127.0.0.1:{}/v1/models/deepseek-v4-flash",
@@ -503,6 +517,17 @@ mod e2e {
         let detail_body: serde_json::Value = detail.json().unwrap();
         assert_eq!(detail_body["id"], "deepseek-v4-flash");
         assert_eq!(detail_body["upstream_id"], "deepseek-v4-flash-free");
+
+        let helper_detail = reqwest::blocking::get(format!(
+            "http://127.0.0.1:{}/v1/models/claude-haiku-4-5",
+            port
+        ))
+        .expect("ClaudeCode WebFetch helper detail endpoint");
+        assert_eq!(helper_detail.status(), 200);
+        let helper_detail_body: serde_json::Value = helper_detail.json().unwrap();
+        assert_eq!(helper_detail_body["id"], "claude-haiku-4-5");
+        assert_eq!(helper_detail_body["upstream_id"], "deepseek-v4-flash-free");
+        assert_eq!(helper_detail_body["profile"], "static_flash");
 
         let missing = reqwest::blocking::get(format!(
             "http://127.0.0.1:{}/v1/models/deepseek-v4-pro",
@@ -531,7 +556,7 @@ mod e2e {
                 .collect();
             assert_eq!(
                 probe_ids,
-                vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"],
+                vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"],
                 "{probe_name} model probe ids"
             );
         }
@@ -572,7 +597,7 @@ mod e2e {
             .collect();
         assert_eq!(
             public_ids,
-            vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
         );
 
         let client = reqwest::blocking::Client::new();
@@ -650,14 +675,14 @@ mod e2e {
                 .as_array()
                 .expect("required probes")
                 .len(),
-            8
+            9
         );
         assert_eq!(
             detail_body["data"]["missing_probe_names"]
                 .as_array()
                 .expect("missing probes")
                 .len(),
-            8
+            9
         );
 
         let probes = client
@@ -752,7 +777,7 @@ mod e2e {
             .collect();
         assert_eq!(
             before_ids,
-            vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
         );
 
         let promoted = client
@@ -784,7 +809,8 @@ mod e2e {
             public_ids,
             vec![
                 "deepseek-v4-flash",
-                "deepseek-v4-flash-lite",
+                "big-pickle",
+                "mimo-v2.5",
                 "new-opencode"
             ]
         );
@@ -868,7 +894,8 @@ mod e2e {
             public_ids,
             vec![
                 "deepseek-v4-flash",
-                "deepseek-v4-flash-lite",
+                "big-pickle",
+                "mimo-v2.5",
                 "new-candidate-direct",
                 "second-candidate-direct"
             ]
@@ -975,18 +1002,22 @@ mod e2e {
             public_ids,
             vec![
                 "deepseek-v4-flash",
-                "deepseek-v4-flash-lite",
+                "big-pickle",
                 "mimo-v2.5",
                 "nemotron-3-ultra"
             ]
         );
 
-        let blocked_detail = reqwest::blocking::get(format!(
+        let hidden_detail = reqwest::blocking::get(format!(
             "http://127.0.0.1:{}/v1/models/north-mini-code",
             port
         ))
-        .expect("filtered model detail");
-        assert_eq!(blocked_detail.status(), 404);
+        .expect("hidden routable model detail");
+        assert_eq!(hidden_detail.status(), 200);
+        let hidden_body: serde_json::Value = hidden_detail.json().unwrap();
+        assert_eq!(hidden_body["id"], "north-mini-code");
+        assert_eq!(hidden_body["upstream_id"], "north-mini-code-free");
+        assert_eq!(hidden_body["profile"], "dynamic_generic");
 
         stop_server(child, port);
     }
@@ -1005,6 +1036,7 @@ mod e2e {
                 ("UPSTREAM_BASE", upstream_base.as_str()),
                 ("POOL_MAX_RETRIES", "0"),
                 ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
                 ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
@@ -1129,7 +1161,7 @@ mod e2e {
                 .as_array()
                 .unwrap()
                 .len(),
-            8
+            9
         );
         assert_eq!(
             probe_body["data"]["failed_probe_name"],
@@ -1158,7 +1190,8 @@ mod e2e {
             public_ids,
             vec![
                 "deepseek-v4-flash",
-                "deepseek-v4-flash-lite",
+                "big-pickle",
+                "mimo-v2.5",
                 "new-manual-harness"
             ]
         );
@@ -1210,13 +1243,13 @@ mod e2e {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        assert_eq!(probes_body["data"]["probe_attempts_total"], 8);
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 9);
         assert_eq!(
             probes_body["data"]["passed_probe_names"]
                 .as_array()
                 .expect("passed probes")
                 .len(),
-            8
+            9
         );
         assert_eq!(
             probes_body["data"]["missing_probe_names"]
@@ -1240,7 +1273,8 @@ mod e2e {
             public_ids,
             vec![
                 "deepseek-v4-flash",
-                "deepseek-v4-flash-lite",
+                "big-pickle",
+                "mimo-v2.5",
                 "new-harness-probed"
             ]
         );
@@ -1369,13 +1403,13 @@ mod e2e {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        assert_eq!(probes_body["data"]["probe_attempts_total"], 8);
+        assert_eq!(probes_body["data"]["probe_attempts_total"], 9);
         assert_eq!(
             probes_body["data"]["passed_probe_names"]
                 .as_array()
                 .expect("passed probes")
                 .len(),
-            8
+            9
         );
         assert_eq!(
             probes_body["data"]["missing_probe_names"]
@@ -1407,7 +1441,8 @@ mod e2e {
             public_ids,
             vec![
                 "deepseek-v4-flash",
-                "deepseek-v4-flash-lite",
+                "big-pickle",
+                "mimo-v2.5",
                 "new-http-probed"
             ]
         );
@@ -1415,8 +1450,8 @@ mod e2e {
         let seen = observed.lock().unwrap();
         assert_eq!(
             seen.len(),
-            7,
-            "metadata probe is local, remaining seven probes should call HTTP"
+            8,
+            "metadata probe is local, remaining eight probes should call HTTP"
         );
         assert!(seen.iter().any(|item| {
             item["path"] == "/v1/messages" && item["probe"] == "anthropic_stream_minimal"
@@ -1426,6 +1461,11 @@ mod e2e {
                 && item["probe"] == "tool_history_minimal"
                 && item["client"] == "claude-code"
                 && item["body"]["messages"][2]["tool_call_id"] == "call_probe_1"
+        }));
+        assert!(seen.iter().any(|item| {
+            item["path"] == "/v1/messages"
+                && item["probe"] == "claudecode_anthropic_forced_tool"
+                && item["body"]["tool_choice"]["name"] == "Bash"
         }));
         drop(seen);
 
@@ -1447,6 +1487,7 @@ mod e2e {
                 ("UPSTREAM_BASE", upstream_base.as_str()),
                 ("POOL_MAX_RETRIES", "0"),
                 ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
                 ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
@@ -1685,7 +1726,7 @@ mod e2e {
             .collect();
         assert_eq!(
             public_ids,
-            vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
         );
 
         stop_server(child, port);
@@ -1790,6 +1831,7 @@ mod e2e {
                 ("UPSTREAM_BASE", upstream_base.as_str()),
                 ("POOL_MAX_RETRIES", "0"),
                 ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
                 ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
@@ -1928,6 +1970,7 @@ mod e2e {
                 ("UPSTREAM_BASE", upstream_base.as_str()),
                 ("POOL_MAX_RETRIES", "0"),
                 ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
                 ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
@@ -2028,6 +2071,82 @@ mod e2e {
     }
 
     #[test]
+    fn test_dynamic_candidate_public_mode_disables_direct_fallback_by_default() {
+        let (upstream_base, _) = start_mock_zen();
+        let discovery_url = start_mock_models(serde_json::json!({
+            "object": "list",
+            "data": [{"id": "new-candidate-no-direct-free"}]
+        }));
+        let (child, port) = start_server_with_env(
+            19819,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
+                ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
+                ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
+                ("DYNAMIC_MODEL_PUBLIC_MODE", "candidate_canary_or_active"),
+            ],
+        );
+
+        let client = reqwest::blocking::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = client
+                .get(format!("http://127.0.0.1:{}/admin/models", port))
+                .header("x-api-key", "test-key")
+                .send()
+                .expect("admin models endpoint");
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = resp.json().unwrap();
+            if body["data"]["dynamic_discovery"]["candidate_total"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+            {
+                assert_eq!(body["data"]["safety"]["candidates_are_public"], true);
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("dynamic discovery did not populate no-direct candidate: {body}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "new-candidate-no-direct",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .send()
+            .expect("dynamic candidate request without direct fallback");
+        assert_eq!(resp.status(), 503);
+
+        let traffic_resp = client
+            .get(format!(
+                "http://127.0.0.1:{}/admin/models/new-candidate-no-direct-free/traffic",
+                port
+            ))
+            .header("x-api-key", "test-key")
+            .send()
+            .expect("dynamic candidate traffic endpoint");
+        assert_eq!(traffic_resp.status(), 200);
+        let traffic_body: serde_json::Value = traffic_resp.json().unwrap();
+        let traffic = &traffic_body["data"]["traffic"];
+        assert_eq!(traffic["candidate_requests_total"], 1);
+        assert_eq!(traffic["candidate_success_total"], 0);
+        assert_eq!(traffic["candidate_failure_total"], 1);
+        assert_eq!(traffic["last_traffic_status"], 503);
+        assert_eq!(traffic["last_traffic_failure_kind"], "proxy_pool_exhausted");
+
+        stop_server(child, port);
+    }
+
+    #[test]
     fn test_dynamic_candidate_public_traffic_endpoint_tracks_direct_self_use() {
         let (upstream_base, _) = start_mock_zen();
         let discovery_url = start_mock_models(serde_json::json!({
@@ -2041,6 +2160,7 @@ mod e2e {
                 ("UPSTREAM_BASE", upstream_base.as_str()),
                 ("POOL_MAX_RETRIES", "0"),
                 ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_ENABLED", "true"),
                 ("DYNAMIC_MODEL_DISCOVERY_URL", discovery_url.as_str()),
                 ("DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS", "60"),
@@ -2136,7 +2256,7 @@ mod e2e {
             .iter()
             .filter_map(|model| model["id"].as_str())
             .collect();
-        assert_eq!(ids, vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]);
+        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
         stop_server(child, port);
     }
 
@@ -2157,7 +2277,7 @@ mod e2e {
         let openai_resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash-lite",
+                "model": "big-pickle",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": false
             }))
@@ -2170,7 +2290,7 @@ mod e2e {
         let anthropic_resp = client
             .post(format!("http://127.0.0.1:{}/v1/messages", port))
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash-lite",
+                "model": "big-pickle",
                 "messages": [{"role": "user", "content": "hello"}],
                 "max_tokens": 64,
                 "stream": false
@@ -2184,7 +2304,7 @@ mod e2e {
         let anthropic_health_resp = client
             .post(format!("http://127.0.0.1:{}/v1/messages", port))
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash-lite",
+                "model": "big-pickle",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": false
             }))
@@ -2210,7 +2330,7 @@ mod e2e {
         let items = requests_body["data"].as_array().unwrap();
         let openai_record = items
             .iter()
-            .find(|item| item["public_model"] == "deepseek-v4-flash-lite")
+            .find(|item| item["public_model"] == "big-pickle")
             .unwrap();
         assert!(openai_record["rid"].as_str().is_some());
         assert_eq!(openai_record["upstream_model"], "big-pickle");
@@ -2308,7 +2428,7 @@ mod e2e {
         let resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash-lite",
+                "model": "big-pickle",
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "old-tool", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]},
                     {"role": "tool", "content": "x".repeat(2 * 1024 * 1024), "tool_call_id": "old-tool"},
@@ -2565,7 +2685,7 @@ mod e2e {
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .header("x-zen-source-client", "openclaw")
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash-lite",
+                "model": "big-pickle",
                 "messages": [{"role":"user","content":"use tool"}],
                 "tools": tools.clone(),
                 "stream": false
@@ -2591,7 +2711,7 @@ mod e2e {
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .header("x-fmc-client", "claude-code")
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash-lite",
+                "model": "big-pickle",
                 "messages": [{"role":"user","content":"use tool"}],
                 "tools": tools.clone(),
                 "stream": false
@@ -2630,7 +2750,7 @@ mod e2e {
         let resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
             .json(&serde_json::json!({
-                "model": "deepseek-v4-flash-lite",
+                "model": "big-pickle",
                 "messages": [{"role": "user", "content": "hello"}],
                 "stream": true
             }))
@@ -2785,7 +2905,7 @@ mod e2e {
             .iter()
             .filter_map(|model| model["id"].as_str())
             .collect();
-        assert_eq!(v4_ids, vec!["deepseek-v4-flash", "deepseek-v4-flash-lite"]);
+        assert_eq!(v4_ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
         stop_server(v4_child, v4_port);
     }
 

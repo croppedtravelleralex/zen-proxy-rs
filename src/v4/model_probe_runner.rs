@@ -138,6 +138,7 @@ fn http_probe_earned_claudecode_profile(summary: &ModelProbeRunSummary) -> bool 
         DiscoveredModelState::Canary | DiscoveredModelState::Active
     ) && [
         "tool_history_minimal",
+        "claudecode_anthropic_forced_tool",
         "openai_stream_minimal",
         "format_guard",
     ]

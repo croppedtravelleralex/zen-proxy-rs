@@ -3,6 +3,20 @@
 This documentation set is the only active design baseline for `zen-proxy-rs`.
 Older design documents were removed to avoid stale architecture guidance.
 
+## Cross-Repository Entry
+
+As of 2026-07-02, the coordinated maintenance entry for `zen-proxy-rs` and
+`/home/lenovo/free-model-client-rs` is:
+
+```text
+/home/lenovo/zen-free-model-suite
+```
+
+That directory uses symlinks and handoff documents only. It does not move the
+real git repositories. For cross-repo continuation, read
+`/home/lenovo/zen-free-model-suite/README.md` and
+`/home/lenovo/zen-free-model-suite/docs/PROJECT_HANDOFF.md` first.
+
 ## Active Entry
 
 Start here:
@@ -39,11 +53,12 @@ Start here:
 | [23_v4.108_dynamic_model_discovery_phase1.md](./v4.0/23_v4.108_dynamic_model_discovery_phase1.md) | V4.108 side-channel opencode free-model discovery, candidate registry, safety gates, and rollback |
 | [24_v4.109_dynamic_model_promotion_goal.md](./v4.0/24_v4.109_dynamic_model_promotion_goal.md) | V4.109 goal, task plan, state machine, test-channel promotion policy, and strict acceptance for dynamic free-model hot-plugging |
 | [25_2026-06-13_dynamic_model_handoff.md](./v4.0/25_2026-06-13_dynamic_model_handoff.md) | 2026-06-13 stop-state handoff: NewAPI group blockage, real ClaudeCode vs shallow smoke gap, north-mini-code risk, git push note, and restart checklist |
+| [26_2026-06-14_claudecode_production_prep.md](./v4.0/26_2026-06-14_claudecode_production_prep.md) | 2026-06-14 ClaudeCode dynamic-model production prep, repeatable acceptance runner, helper alias rationale, gates, and rollback |
 
 ## AI Maintenance Rule
 
 Future AI work must start from [V4.0 AI Entry](./v4.0/00_AI_ENTRY.md), then check
-the latest operations report before changing code. As of 2026-06-13, the latest
-handoff is [2026-06-13 Dynamic Model Handoff](./v4.0/25_2026-06-13_dynamic_model_handoff.md).
+the latest operations report before changing code. As of 2026-06-14, the latest
+handoff is [2026-06-14 ClaudeCode Production Prep](./v4.0/26_2026-06-14_claudecode_production_prep.md).
 Runtime facts from ZenProxy admin APIs, NewAPI logs, Redis budgets, WAL files,
 tests, and release builds are higher priority than older chat history.

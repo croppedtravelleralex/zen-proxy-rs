@@ -323,6 +323,7 @@ mod tests {
             stream: true,
             body_size: 128,
             affinity_key: String::new(),
+            allow_direct_fallback: true,
         }
     }
 

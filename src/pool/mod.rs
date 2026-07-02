@@ -88,6 +88,7 @@ pub struct RequestMeta {
     pub stream: bool,
     pub body_size: u64,
     pub affinity_key: String,
+    pub allow_direct_fallback: bool,
 }
 
 impl RequestMeta {
@@ -174,6 +175,7 @@ pub trait Pool: Send + Sync {
 
 pub trait PoolManager: Send + Sync {
     fn dispatch(&self, req: &RequestMeta) -> Result<DispatchResult, DispatchError>;
+    fn dispatch_direct(&self) -> Result<DispatchResult, DispatchError>;
     fn dispatch_sticky(
         &self,
         meta: &RequestMeta,

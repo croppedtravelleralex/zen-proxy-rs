@@ -59,8 +59,8 @@ test-records/schemas/
 
 Generated run output under `test-records/runs/` is intentionally ignored and
 must not be committed. The legacy local build directory `target-1.86/` is also
-ignored for new files, but any files already tracked there require a separate
-index cleanup outside this documentation update.
+ignored for new files; 2026-07-02 cleanup removed the previously tracked build
+artifacts from the index.
 
 ## Collection Script
 
@@ -217,6 +217,111 @@ test-records/runs/<run_id>/client-acceptance.md
 Recorded evidence is limited to command shape, status/exit code, timing, byte
 counts, hashes, and redacted diagnostics. API keys, Bearer tokens, prompts,
 full completions, and tool outputs are not stored.
+
+## ClaudeCode Dynamic-Model Acceptance
+
+Use the ClaudeCode runner for the V4.109 dynamic ClaudeCode profile matrix:
+
+```bash
+python3 scripts/run_claudecode_acceptance.py
+```
+
+Default mode is dry-run. It discovers the Windows official ClaudeCode binary
+and WSL clawgod launcher, then prints the planned matrix without calling the
+models.
+
+Coverage:
+
+```text
+smoke: Bash + WebFetch + WebSearch
+core: local ClaudeCode tools, excluding WebFetch/WebSearch/Task
+full: 27 default base tool scenarios x text/json/stream-json = 81 cases
+```
+
+With the default three target models and Windows + WSL platforms, full dry-run
+plans 486 matrix items. Default tool names covered by the full suite are Bash,
+Read, Glob, Grep, Write, Edit, MultiEdit, TodoWrite, NotebookRead,
+NotebookEdit, WebFetch, WebSearch, and Task. `LS` is retained only as an
+explicit diagnostic case because ClaudeCode 2.1.143 did not register an LS tool
+schema for `--tools LS`, `--tools Ls`, or `--tools ls` in print mode.
+Write/Edit/MultiEdit/NotebookEdit run in a temporary workspace and include
+post-run file checks. For core/full file-tool execution, prefer
+`--permission-mode bypassPermissions`; the workspace is temporary and this
+avoids non-interactive permission prompts being mistaken for model failures.
+
+Execute a quick WSL-only Bash smoke:
+
+```bash
+ANTHROPIC_API_KEY="[runtime env]" python3 scripts/run_claudecode_acceptance.py \
+  --execute \
+  --platform wsl \
+  --suite smoke \
+  --output-formats json \
+  --models mimo-v2.5 north-mini-code nemotron-3-ultra \
+  --base-url https://new.closeapi.top
+```
+
+Execute the Windows official ClaudeCode matrix from Windows PowerShell so the
+Windows CLI runs on its native host:
+
+```powershell
+cd \\wsl.localhost\HermesUbuntu\home\lenovo\zen-proxy-rs
+$env:ANTHROPIC_API_KEY = "[runtime env]"
+py scripts\run_claudecode_acceptance.py `
+  --execute `
+  --platform windows `
+  --suite full `
+  --permission-mode bypassPermissions `
+  --models mimo-v2.5 north-mini-code nemotron-3-ultra `
+  --base-url https://new.closeapi.top `
+  --timeout 300
+```
+
+Execute the WSL clawgod matrix from WSL:
+
+```bash
+cd /home/lenovo/zen-proxy-rs
+ANTHROPIC_API_KEY="[runtime env]" python3 scripts/run_claudecode_acceptance.py \
+  --execute \
+  --platform wsl \
+  --suite full \
+  --permission-mode bypassPermissions \
+  --models mimo-v2.5 north-mini-code nemotron-3-ultra \
+  --base-url https://new.closeapi.top \
+  --timeout 300
+```
+
+The runner writes:
+
+```text
+test-records/runs/<run_id>/claudecode-acceptance.md
+test-records/runs/<run_id>/claudecode-acceptance.json
+```
+
+Recorded evidence is limited to command shape, exit/status, timing, byte
+counts, hashes, expected-marker checks, output format, inferred tool-call
+count, workspace check results, and ClaudeCode turn metadata. API keys, raw
+prompts, raw completions, and tool outputs are not stored. WSL clawgod runs with
+a temporary `$HOME/.clawgod/provider.json`, so the user's global clawgod
+provider is not modified.
+
+ClaudeCode WebFetch/WebSearch are local client tools in this runner, so
+`usage.server_tool_use.*` can stay zero. The runner relies on `num_turns >= 2`,
+final markers, and workspace checks for tool-execution evidence.
+
+The runner refuses execute mode against `sub2api.closeapi.top` unless
+`--allow-production-base-url` is explicitly passed. Production use still
+requires separate user approval.
+
+When the runner itself is started from WSL, Windows platform cases are skipped
+by default and make execute mode return non-zero. When the runner is started
+from Windows, WSL platform cases are also skipped by default. This prevents
+interop calls from being mistaken for native ClaudeCode acceptance runs.
+
+Do not use ClaudeCode `--bare` for WebFetch/WebSearch acceptance. It can hide
+those tools from ClaudeCode. The runner instead isolates mutable user state with
+temporary Windows `USERPROFILE` or WSL `HOME` while keeping the normal tool
+surface available.
 
 Local WSL discovery on 2026-05-27 found:
 

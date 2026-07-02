@@ -365,6 +365,8 @@ pub struct Config {
     pub dynamic_model_discovery_interval_secs: u64,
     pub dynamic_model_public_mode: DynamicModelPublicMode,
     pub dynamic_model_public_allowlist: Vec<String>,
+    pub dynamic_model_claudecode_compat_allowlist: Vec<String>,
+    pub dynamic_model_allow_direct_fallback: bool,
     pub dynamic_model_probe_enabled: bool,
     pub dynamic_model_probe_adapter_mode: DynamicModelProbeAdapterMode,
     pub dynamic_model_probe_max_concurrent: usize,
@@ -537,6 +539,13 @@ impl Config {
                 DynamicModelPublicMode::StaticOnly,
             ),
             dynamic_model_public_allowlist: parse_csv_list_env("DYNAMIC_MODEL_PUBLIC_ALLOWLIST"),
+            dynamic_model_claudecode_compat_allowlist: parse_csv_list_env(
+                "DYNAMIC_MODEL_CLAUDECODE_COMPAT_ALLOWLIST",
+            ),
+            dynamic_model_allow_direct_fallback: load_env_var(
+                "DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK",
+                false,
+            ),
             dynamic_model_probe_enabled: load_env_var("DYNAMIC_MODEL_PROBE_ENABLED", false),
             dynamic_model_probe_adapter_mode: load_env_var(
                 "DYNAMIC_MODEL_PROBE_ADAPTER",
@@ -702,10 +711,7 @@ impl Config {
             "deepseek-v4-flash".to_string(),
             "deepseek-v4-flash-free".to_string(),
         );
-        m.insert(
-            "deepseek-v4-flash-lite".to_string(),
-            "big-pickle".to_string(),
-        );
+        m.insert("big-pickle".to_string(), "big-pickle".to_string());
         m
     }
 
@@ -925,6 +931,8 @@ mod tests {
             "DYNAMIC_MODEL_DISCOVERY_INTERVAL_SECS",
             "DYNAMIC_MODEL_PUBLIC_MODE",
             "DYNAMIC_MODEL_PUBLIC_ALLOWLIST",
+            "DYNAMIC_MODEL_CLAUDECODE_COMPAT_ALLOWLIST",
+            "DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK",
             "DYNAMIC_MODEL_PROBE_ENABLED",
             "DYNAMIC_MODEL_PROBE_ADAPTER",
             "DYNAMIC_MODEL_PROBE_MAX_CONCURRENT",
@@ -1025,6 +1033,7 @@ mod tests {
             DynamicModelPublicMode::StaticOnly
         );
         assert!(cfg.dynamic_model_public_allowlist.is_empty());
+        assert!(!cfg.dynamic_model_allow_direct_fallback);
         assert!(!cfg.dynamic_model_probe_enabled);
         assert_eq!(
             cfg.dynamic_model_probe_adapter_mode,
@@ -1130,6 +1139,13 @@ mod tests {
                 " mimo-v2.5, nemotron-3-ultra-free, mimo-v2.5 ",
             )
         };
+        unsafe {
+            env::set_var(
+                "DYNAMIC_MODEL_CLAUDECODE_COMPAT_ALLOWLIST",
+                " mimo-v2.5, north-mini-code-free, mimo-v2.5 ",
+            )
+        };
+        unsafe { env::set_var("DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK", "true") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_ENABLED", "true") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_ADAPTER", "harness_all_pass") };
         unsafe { env::set_var("DYNAMIC_MODEL_PROBE_MAX_CONCURRENT", "2") };
@@ -1234,6 +1250,11 @@ mod tests {
             cfg.dynamic_model_public_allowlist,
             vec!["mimo-v2.5".to_string(), "nemotron-3-ultra-free".to_string()]
         );
+        assert_eq!(
+            cfg.dynamic_model_claudecode_compat_allowlist,
+            vec!["mimo-v2.5".to_string(), "north-mini-code-free".to_string()]
+        );
+        assert!(cfg.dynamic_model_allow_direct_fallback);
         assert!(cfg.dynamic_model_probe_enabled);
         assert_eq!(
             cfg.dynamic_model_probe_adapter_mode,
@@ -1339,6 +1360,8 @@ mod tests {
             "V4_MODEL_REGISTRY_ENABLED",
             "DYNAMIC_MODEL_PUBLIC_MODE",
             "DYNAMIC_MODEL_PUBLIC_ALLOWLIST",
+            "DYNAMIC_MODEL_CLAUDECODE_COMPAT_ALLOWLIST",
+            "DYNAMIC_MODEL_ALLOW_DIRECT_FALLBACK",
             "DYNAMIC_MODEL_PROBE_ENABLED",
             "DYNAMIC_MODEL_PROBE_ADAPTER",
             "DYNAMIC_MODEL_PROBE_MAX_CONCURRENT",
@@ -1456,10 +1479,7 @@ mod tests {
             cfg.model_mapping.get("deepseek-v4-flash").unwrap(),
             "deepseek-v4-flash-free"
         );
-        assert_eq!(
-            cfg.model_mapping.get("deepseek-v4-flash-lite").unwrap(),
-            "big-pickle"
-        );
+        assert_eq!(cfg.model_mapping.get("big-pickle").unwrap(), "big-pickle");
         assert_eq!(cfg.model_mapping.len(), 2);
     }
 

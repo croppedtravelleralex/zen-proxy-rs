@@ -109,10 +109,11 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> String {
 async fn models_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
     let cfg = st.config.read().unwrap();
     let data = if cfg.v4_model_registry_active() {
-        let registry = v4::model::EffectiveModelRegistry::with_dynamic_public_allowlist(
+        let registry = v4::model::EffectiveModelRegistry::with_dynamic_allowlists(
             cfg.dynamic_model_public_mode,
             st.dynamic_models.snapshot(),
             cfg.dynamic_model_public_allowlist.clone(),
+            cfg.dynamic_model_claudecode_compat_allowlist.clone(),
         );
         registry
             .public_models()
@@ -137,10 +138,11 @@ async fn model_detail_handler(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let cfg = st.config.read().unwrap();
     let data = if cfg.v4_model_registry_active() {
-        let registry = v4::model::EffectiveModelRegistry::with_dynamic_public_allowlist(
+        let registry = v4::model::EffectiveModelRegistry::with_dynamic_allowlists(
             cfg.dynamic_model_public_mode,
             st.dynamic_models.snapshot(),
             cfg.dynamic_model_public_allowlist.clone(),
+            cfg.dynamic_model_claudecode_compat_allowlist.clone(),
         );
         match registry.resolve(&model_id) {
             Ok(model) => json!({

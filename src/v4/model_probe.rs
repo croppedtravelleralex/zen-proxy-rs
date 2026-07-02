@@ -12,6 +12,7 @@ pub const REQUIRED_PROBE_NAMES: &[&str] = &[
     "anthropic_nonstream_minimal",
     "anthropic_stream_minimal",
     "tool_history_minimal",
+    "claudecode_anthropic_forced_tool",
     "empty_output_guard",
     "format_guard",
 ];
@@ -294,6 +295,14 @@ fn build_probe_request(
                 openai_tool_history_body(&model.upstream_id),
             )
         }
+        "claudecode_anthropic_forced_tool" => {
+            headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
+            headers.push(("x-fmc-client".to_string(), "claude-code".to_string()));
+            (
+                "/v1/messages",
+                anthropic_forced_bash_tool_body(&model.upstream_id),
+            )
+        }
         "empty_output_guard" => (
             "/v1/chat/completions",
             openai_guard_body(
@@ -394,6 +403,32 @@ fn openai_tool_history_body(model: &str) -> Value {
     })
 }
 
+fn anthropic_forced_bash_tool_body(model: &str) -> Value {
+    json!({
+        "model": model,
+        "stream": false,
+        "max_tokens": 128,
+        "temperature": 0,
+        "messages": [{
+            "role": "user",
+            "content": "Use the Bash tool to run exactly: printf PROBE_TOOL_OK"
+        }],
+        "tools": [{
+            "name": "Bash",
+            "description": "Run a shell command.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"}
+                },
+                "required": ["command"]
+            }
+        }],
+        "tool_choice": {"type": "tool", "name": "Bash"}
+    })
+}
+
 fn classify_probe_response(probe_name: &str, response: &ProbeHttpResponse) -> ModelProbeOutcome {
     if !(200..300).contains(&response.status) {
         return ModelProbeOutcome::Failed(classify_http_error(response).for_probe(probe_name));
@@ -402,6 +437,7 @@ fn classify_probe_response(probe_name: &str, response: &ProbeHttpResponse) -> Mo
     let outcome = match probe_name {
         "openai_stream_minimal" => classify_openai_stream_body(&response.body),
         "anthropic_stream_minimal" => classify_anthropic_stream_body(&response.body),
+        "claudecode_anthropic_forced_tool" => classify_anthropic_forced_tool_body(&response.body),
         "anthropic_nonstream_minimal" => classify_anthropic_json_body(&response.body),
         "openai_nonstream_minimal"
         | "tool_history_minimal"
@@ -518,6 +554,38 @@ fn classify_anthropic_json_body(body: &str) -> Result<(), ModelProbeFailure> {
         Err(ModelProbeFailure::soft(
             "provider_empty_output",
             "Anthropic response had no content block",
+        ))
+    }
+}
+
+fn classify_anthropic_forced_tool_body(body: &str) -> Result<(), ModelProbeFailure> {
+    let value: Value = serde_json::from_str(body).map_err(|err| {
+        ModelProbeFailure::hard_protocol(
+            "probe_invalid_anthropic_json",
+            format!("invalid Anthropic JSON response: {err}"),
+        )
+    })?;
+    let Some(tool_use) = value
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("tool_use")
+                    && item.get("name").and_then(Value::as_str) == Some("Bash")
+            })
+        })
+    else {
+        return Err(ModelProbeFailure::hard_protocol(
+            "provider_missing_forced_tool_use",
+            "Anthropic ClaudeCode forced Bash probe did not return Bash tool_use",
+        ));
+    };
+    if has_non_empty_string(tool_use.pointer("/input/command")) {
+        Ok(())
+    } else {
+        Err(ModelProbeFailure::hard_protocol(
+            "provider_incomplete_forced_tool_input",
+            "Anthropic ClaudeCode forced Bash probe returned missing or empty command",
         ))
     }
 }
@@ -852,6 +920,7 @@ mod tests {
                 "anthropic_nonstream_minimal".to_string(),
                 "anthropic_stream_minimal".to_string(),
                 "tool_history_minimal".to_string(),
+                "claudecode_anthropic_forced_tool".to_string(),
                 "empty_output_guard".to_string(),
                 "format_guard".to_string()
             ]
@@ -882,7 +951,7 @@ mod tests {
         assert!(engine.required_probes_passed(&promoted));
         assert_eq!(
             promoted.promotion_reason.as_deref(),
-            Some("probe matrix passed: 8 required probes, 8 consecutive successes")
+            Some("probe matrix passed: 9 required probes, 9 consecutive successes")
         );
     }
 
@@ -1035,6 +1104,61 @@ mod tests {
         assert_eq!(body["model"], "good-free");
         assert_eq!(body["messages"][2]["role"], "tool");
         assert_eq!(body["messages"][2]["tool_call_id"], "call_probe_1");
+    }
+
+    #[test]
+    fn http_adapter_builds_claudecode_anthropic_forced_tool_probe() {
+        let registry = registry_with_models();
+        let model = registry.get("good-free").unwrap();
+        let transport = RecordingHttpTransport::new(ProbeHttpResponse {
+            status: 200,
+            content_type: Some("application/json".to_string()),
+            body: r#"{"content":[{"type":"tool_use","name":"Bash","input":{"command":"printf PROBE_TOOL_OK"}}],"stop_reason":"tool_use"}"#.to_string(),
+        });
+        let requests = transport.requests.clone();
+        let adapter = BoundedHttpProbeAdapter::new(http_probe_config(), transport);
+
+        let outcome = adapter.run_probe(&model, "claudecode_anthropic_forced_tool");
+        assert_eq!(outcome, ModelProbeOutcome::Passed);
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let request = &captured[0];
+        assert_eq!(request.method, "POST");
+        assert!(request.url.ends_with("/v1/messages"));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(key, value)| key == "x-fmc-client" && value == "claude-code"));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(key, value)| key == "anthropic-version" && value == "2023-06-01"));
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(body["model"], "good-free");
+        assert_eq!(body["tool_choice"]["name"], "Bash");
+        assert_eq!(body["tools"][0]["name"], "Bash");
+    }
+
+    #[test]
+    fn claudecode_anthropic_forced_tool_probe_requires_command_input() {
+        let response = ProbeHttpResponse {
+            status: 200,
+            content_type: Some("application/json".to_string()),
+            body: r#"{"content":[{"type":"tool_use","name":"Bash","input":{}}],"stop_reason":"tool_use"}"#.to_string(),
+        };
+
+        match classify_probe_response("claudecode_anthropic_forced_tool", &response) {
+            ModelProbeOutcome::Failed(failure) => {
+                assert_eq!(
+                    failure.probe_name.as_deref(),
+                    Some("claudecode_anthropic_forced_tool")
+                );
+                assert_eq!(failure.code, "provider_incomplete_forced_tool_input");
+                assert!(failure.hard_protocol_failure);
+            }
+            ModelProbeOutcome::Passed => panic!("empty Bash command must fail probe"),
+        }
     }
 
     #[test]

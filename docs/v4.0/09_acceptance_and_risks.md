@@ -138,6 +138,33 @@ DYNAMIC_MODEL_DISCOVERY_ENABLED=false
 The public `/v1/models` contract and model resolution remain static, so NewAPI
 channel 69 does not need a configuration rollback.
 
+## ClaudeCode Dynamic-Model Production Gate
+
+The V4.109 ClaudeCode test path may use an isolated service with:
+
+```text
+NODES_FILE=/dev/null
+ALLOW_DIRECT_FALLBACK=true
+```
+
+That proves model/protocol behavior only. It does not prove the production
+proxy-pool path.
+
+Before any dynamic ClaudeCode model is promoted to production:
+
+```text
+ALLOW_DIRECT_FALLBACK=false
+NODES_FILE=/opt/zen-proxy-rs/nodes.json or the current production node file
+Windows and WSL ClaudeCode acceptance pass on the dev/test route
+bounded production canary passes through real proxy nodes
+deepseek-v4-flash and deepseek-v4-flash-lite regressions are zero
+```
+
+The hidden `claude-haiku-4-5` helper alias may be required for ClaudeCode
+WebFetch/WebSearch/helper calls, but it is a routing helper, not a new user
+model. If NewAPI cannot hide it from users, use a ClaudeCode-specific
+production route or accept the visibility tradeoff explicitly.
+
 ### `POST /v1/chat/completions`
 
 Required cases:

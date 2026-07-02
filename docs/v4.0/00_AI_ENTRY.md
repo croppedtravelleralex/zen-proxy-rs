@@ -61,7 +61,7 @@ the sidecar's own client, not the proxy node selected by `zen-proxy-rs`.
 V4.0 replaces all older documentation. Do not revive archived legacy docs or
 root-level legacy audit reports as active guidance.
 
-Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md), [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md), [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md), [2026-06-10 Cache Usage And Affinity Alignment](./22_2026-06-10_cache_usage_affinity_alignment.md), [V4.108 Dynamic Model Discovery Phase 1](./23_v4.108_dynamic_model_discovery_phase1.md), [V4.109 Dynamic Free-Model Promotion Goal](./24_v4.109_dynamic_model_promotion_goal.md), and [2026-06-13 Dynamic Model Handoff](./25_2026-06-13_dynamic_model_handoff.md) before making any claim about panda NewAPI, Hermes, OpenClaw, closeapi, ClaudeCode huge-context behavior, V4.8 acceptance progress, current proxy-pool health, cache usage display, cache-affinity behavior, or dynamic free-model discovery/promotion.
+Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md), [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md), [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md), [2026-06-10 Cache Usage And Affinity Alignment](./22_2026-06-10_cache_usage_affinity_alignment.md), [V4.108 Dynamic Model Discovery Phase 1](./23_v4.108_dynamic_model_discovery_phase1.md), [V4.109 Dynamic Free-Model Promotion Goal](./24_v4.109_dynamic_model_promotion_goal.md), [2026-06-13 Dynamic Model Handoff](./25_2026-06-13_dynamic_model_handoff.md), and [2026-06-14 ClaudeCode Production Prep](./26_2026-06-14_claudecode_production_prep.md) before making any claim about panda NewAPI, Hermes, OpenClaw, closeapi, ClaudeCode huge-context behavior, V4.8 acceptance progress, current proxy-pool health, cache usage display, cache-affinity behavior, or dynamic free-model discovery/promotion.
 
 ## Required Reading Order
 
@@ -87,6 +87,7 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
 20. [V4.108 Dynamic Model Discovery Phase 1](./23_v4.108_dynamic_model_discovery_phase1.md)
 21. [V4.109 Dynamic Free-Model Promotion Goal](./24_v4.109_dynamic_model_promotion_goal.md)
 22. [2026-06-13 Dynamic Model Handoff](./25_2026-06-13_dynamic_model_handoff.md)
+23. [2026-06-14 ClaudeCode Production Prep](./26_2026-06-14_claudecode_production_prep.md)
 
 ## Hard Decisions
 
@@ -330,5 +331,5 @@ For operations analysis, use sources in this order:
 
 - `test-records/runs/` is intentionally ignored because it contains generated
   acceptance evidence packages.
-- `target-1.86/` is now ignored for future local build artifacts, but files
-  already tracked under that directory still need a separate index cleanup.
+- `target-1.86/` is ignored for future local build artifacts. 2026-07-02
+  cleanup removed the previously tracked build artifacts from the index.

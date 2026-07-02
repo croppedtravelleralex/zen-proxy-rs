@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const CANDIDATE_TRAFFIC_QUARANTINE_FAILURES: u64 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveredModelState {
@@ -597,6 +599,7 @@ impl DynamicModelRegistry {
             } else {
                 Some(classify_traffic_failure(&failure_kind, &failure_message))
             };
+            let mut quarantine_unproven_candidate = false;
             match model.state {
                 DiscoveredModelState::Candidate => {
                     model.candidate_requests_total =
@@ -613,6 +616,9 @@ impl DynamicModelRegistry {
                             &mut model.candidate_decode_error_total,
                             &mut model.candidate_protocol_error_total,
                         );
+                        quarantine_unproven_candidate = model.candidate_success_total == 0
+                            && model.candidate_failure_total
+                                >= CANDIDATE_TRAFFIC_QUARANTINE_FAILURES;
                     }
                 }
                 DiscoveredModelState::Canary => {
@@ -675,7 +681,24 @@ impl DynamicModelRegistry {
                 });
                 model.last_traffic_failure_message = Some(failure_message);
             }
+            if quarantine_unproven_candidate {
+                model.state = DiscoveredModelState::Quarantined;
+                model.reason = format!(
+                    "traffic quarantine: unproven candidate reached {CANDIDATE_TRAFFIC_QUARANTINE_FAILURES} traffic failures; last_failure={}",
+                    model
+                        .last_traffic_failure_kind
+                        .as_deref()
+                        .unwrap_or("unknown_failure")
+                );
+                model.last_seen_unix = now;
+                model.probe_required = false;
+                model.auto_promoted = false;
+                model.public = false;
+                model.routable = false;
+                clear_claudecode_compatibility(model);
+            }
         }
+        recompute_counts(&mut snapshot);
         Some(snapshot.models[index].clone())
     }
 
@@ -1376,6 +1399,80 @@ mod tests {
         assert_eq!(active_decode.active_failure_total, 2);
         assert_eq!(active_decode.active_decode_error_total, 1);
         assert_eq!(active_decode.traffic_decode_error_total, 1);
+    }
+
+    #[test]
+    fn repeated_candidate_traffic_failures_quarantine_unproven_candidate() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(r#"{"data":[{"id":"north-mini-code-free"}]}"#)
+            .unwrap();
+
+        for expected_failures in 1..CANDIDATE_TRAFFIC_QUARANTINE_FAILURES {
+            let model = registry
+                .record_traffic_result(
+                    "north-mini-code-free",
+                    429,
+                    "upstream_429",
+                    "upstream provider rate limited the request",
+                )
+                .unwrap();
+            assert_eq!(model.state, DiscoveredModelState::Candidate);
+            assert_eq!(model.candidate_success_total, 0);
+            assert_eq!(model.candidate_failure_total, expected_failures);
+        }
+
+        let quarantined = registry
+            .record_traffic_result(
+                "north-mini-code-free",
+                429,
+                "upstream_429",
+                "upstream provider rate limited the request",
+            )
+            .unwrap();
+
+        assert_eq!(quarantined.state, DiscoveredModelState::Quarantined);
+        assert_eq!(
+            quarantined.candidate_failure_total,
+            CANDIDATE_TRAFFIC_QUARANTINE_FAILURES
+        );
+        assert!(!quarantined.probe_required);
+        assert!(!quarantined.public);
+        assert!(!quarantined.routable);
+        assert_eq!(
+            quarantined.last_traffic_failure_kind.as_deref(),
+            Some("upstream_429")
+        );
+        assert!(quarantined.reason.contains("traffic quarantine"));
+    }
+
+    #[test]
+    fn candidate_with_prior_success_is_not_quarantined_by_later_traffic_failures() {
+        let registry = DynamicModelRegistry::new(true, "url".into());
+        registry
+            .update_from_opencode_json(r#"{"data":[{"id":"nemotron-3-ultra-free"}]}"#)
+            .unwrap();
+        registry
+            .record_traffic_result("nemotron-3-ultra-free", 200, "", "")
+            .unwrap();
+
+        let mut latest = None;
+        for _ in 0..CANDIDATE_TRAFFIC_QUARANTINE_FAILURES {
+            latest = registry.record_traffic_result(
+                "nemotron-3-ultra-free",
+                502,
+                "transport_error",
+                "upstream connection error",
+            );
+        }
+        let model = latest.unwrap();
+
+        assert_eq!(model.state, DiscoveredModelState::Candidate);
+        assert_eq!(model.candidate_success_total, 1);
+        assert_eq!(
+            model.candidate_failure_total,
+            CANDIDATE_TRAFFIC_QUARANTINE_FAILURES
+        );
     }
 
     #[test]

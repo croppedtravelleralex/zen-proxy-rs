@@ -5,7 +5,6 @@ use std::sync::LazyLock;
 pub static MODEL_MAPPING: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
     HashMap::from([
         ("deepseek-v4-flash", "big-pickle"),
-        ("deepseek-v4-flash-lite", "big-pickle-nothinking"),
         ("deepseek-v4-pro", "deepseek-v4-flash-free"),
         ("deepseek-v4-pro-lite", "deepseek-v4-flash-nothinking"),
     ])

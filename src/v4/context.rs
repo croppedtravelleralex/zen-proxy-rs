@@ -996,7 +996,7 @@ mod tests {
         let cfg = test_config(CompactorMode::Observe);
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "deepseek-v4-flash-lite",
+            "model": "big-pickle",
             "messages": [
                 {"role": "tool", "content": big},
                 {"role": "user", "content": "latest"}
@@ -1048,7 +1048,7 @@ mod tests {
         let cfg = test_config(CompactorMode::Enforce);
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "deepseek-v4-flash-lite",
+            "model": "big-pickle",
             "messages": [
                 {"role": "tool", "content": big},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1076,7 +1076,7 @@ mod tests {
         cfg.context_preserve_recent_messages = 8;
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "deepseek-v4-flash-lite",
+            "model": "big-pickle",
             "messages": [
                 {"role": "tool", "content": big, "tool_call_id": "old-tool"},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1103,7 +1103,7 @@ mod tests {
             "x".repeat(2 * MIB)
         );
         let body = json!({
-            "model": "deepseek-v4-flash-lite",
+            "model": "big-pickle",
             "messages": [
                 {"role": "tool", "content": big, "tool_call_id": "old-tool"},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1126,7 +1126,7 @@ mod tests {
         cfg.context_token_target = 100;
         cfg.context_token_compact = 100;
         let body = json!({
-            "model": "deepseek-v4-flash-lite",
+            "model": "big-pickle",
             "messages": [
                 {"role": "user", "content": "x".repeat(2 * 1024)}
             ]
@@ -1144,7 +1144,7 @@ mod tests {
         cfg.context_token_target = 1_000;
         cfg.context_token_compact = 100;
         let body = json!({
-            "model": "deepseek-v4-flash-lite",
+            "model": "big-pickle",
             "messages": [
                 {"role": "user", "content": "x".repeat(2 * MIB)},
                 {"role": "assistant", "content": "old assistant"},

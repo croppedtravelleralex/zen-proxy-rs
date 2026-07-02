@@ -870,6 +870,7 @@ impl Pool for DispatchPool {
             stream: false,
             body_size: 1,
             affinity_key: String::new(),
+            allow_direct_fallback: true,
         })
     }
 
@@ -1090,6 +1091,7 @@ mod tests {
             stream: true,
             body_size,
             affinity_key: String::new(),
+            allow_direct_fallback: true,
         }
     }
 
