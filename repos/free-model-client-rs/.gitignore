@@ -1,0 +1,9 @@
+target/
+.bun/
+.codex_tmp/
+__pycache__/
+*.pyc
+test-records/runs/
+tmp/
+tmpcc-zenprobe-wsl-*/
+~/
