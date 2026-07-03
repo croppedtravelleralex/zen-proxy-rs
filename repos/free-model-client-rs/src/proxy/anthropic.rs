@@ -506,6 +506,23 @@ async fn handle_non_stream(
                     );
                     last_empty = true;
                     last_empty_class = Some(super::OutputClass::ReasoningOnly);
+                    if let Some(fallback_text) = mimo_internal_probe_empty_fallback_text(
+                        cr,
+                        short_request_kind,
+                        &request_shape,
+                    ) {
+                        tracing::warn!(
+                            model = cr.model,
+                            source_client = ?profile.kind,
+                            short_request_kind = short_request_kind.as_str(),
+                            prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
+                            prompt_tokens = request_shape.estimated_total_tokens,
+                            message_count = request_shape.message_count,
+                            max_tokens = ?request_shape.max_tokens,
+                            "Mimo internal probe received no forwardable output; returning local ok"
+                        );
+                        return Ok(local_non_stream_fallback_response(cr, fallback_text));
+                    }
                     if profile.kind == ClientKind::ClaudeCode && !used_reasoning_enrich_retry {
                         used_reasoning_enrich_retry = true;
                         attempt_body = super::reasoning_retry_body(zb, profile);
@@ -546,6 +563,24 @@ async fn handle_non_stream(
                 if output_class.should_retry_with_enriched_reasoning(profile)
                     && !used_reasoning_enrich_retry
                 {
+                    if let Some(fallback_text) = mimo_internal_probe_empty_fallback_text(
+                        cr,
+                        short_request_kind,
+                        &request_shape,
+                    ) {
+                        tracing::warn!(
+                            model = cr.model,
+                            source_client = ?profile.kind,
+                            short_request_kind = short_request_kind.as_str(),
+                            empty_output_class = output_class.as_str(),
+                            prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
+                            prompt_tokens = request_shape.estimated_total_tokens,
+                            message_count = request_shape.message_count,
+                            max_tokens = ?request_shape.max_tokens,
+                            "Mimo internal probe received empty upstream output; returning local ok"
+                        );
+                        return Ok(local_non_stream_fallback_response(cr, fallback_text));
+                    }
                     used_reasoning_enrich_retry = true;
                     attempt_body = super::reasoning_retry_body(zb, profile);
                     tracing::warn!(
@@ -817,21 +852,47 @@ fn non_stream_empty_fallback_text(
     request_shape: &translate::RequestShape,
 ) -> Option<&'static str> {
     translate::short_no_tool_empty_fallback_text(body).or_else(|| {
-        if is_mimo_v25_model(&body.model)
-            && request_shape.tool_count == 0
-            && !request_shape.tool_choice_present
-            && matches!(
-                short_request_kind,
-                translate::ShortNonStreamRequestKind::HealthProbe
-                    | translate::ShortNonStreamRequestKind::ChannelTest
-                    | translate::ShortNonStreamRequestKind::InternalClaudeCodeProbe
-            )
-        {
-            Some("ok")
-        } else {
-            None
-        }
+        mimo_internal_probe_empty_fallback_text(body, short_request_kind, request_shape)
     })
+}
+
+fn mimo_internal_probe_empty_fallback_text(
+    body: &ChatRequest,
+    short_request_kind: translate::ShortNonStreamRequestKind,
+    request_shape: &translate::RequestShape,
+) -> Option<&'static str> {
+    if translate::short_no_tool_empty_fallback_text(body).is_some() {
+        return None;
+    }
+    if is_mimo_v25_model(&body.model)
+        && request_shape.tool_count == 0
+        && !request_shape.tool_choice_present
+        && matches!(
+            short_request_kind,
+            translate::ShortNonStreamRequestKind::HealthProbe
+                | translate::ShortNonStreamRequestKind::ChannelTest
+                | translate::ShortNonStreamRequestKind::InternalClaudeCodeProbe
+        )
+    {
+        Some("ok")
+    } else {
+        None
+    }
+}
+
+fn local_non_stream_fallback_response(body: &ChatRequest, fallback_text: &str) -> Response {
+    let prompt = translate::build_prompt_text(&body.messages);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    text_resp(
+        ts,
+        &body.model,
+        fallback_text,
+        estimate(&prompt),
+        estimate(fallback_text).max(1),
+    )
 }
 
 fn is_mimo_v25_model(model: &str) -> bool {

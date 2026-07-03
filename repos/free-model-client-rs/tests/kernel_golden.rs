@@ -1933,7 +1933,7 @@ async fn anthropic_claude_code_explicit_smoke_truncated_empty_returns_pass() {
 async fn anthropic_mimo_internal_probe_with_system_empty_upstream_returns_ok() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let mut request = anthropic_request("mimo-v2.5-free", "empty-upstream", false);
+    let mut request = anthropic_request("mimo-v2.5-free", "reasoning-only", false);
     request.system = Some(Value::String(
         "You are a channel health checker.".to_string(),
     ));
@@ -1950,7 +1950,7 @@ async fn anthropic_mimo_internal_probe_with_system_empty_upstream_returns_ok() {
 
     let body = response_text(response).await;
     assert!(body.contains("\"text\":\"ok\""), "{body}");
-    assert_eq!(state.requests.lock().unwrap().len(), 3);
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
