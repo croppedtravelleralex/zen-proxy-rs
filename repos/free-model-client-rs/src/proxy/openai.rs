@@ -132,10 +132,6 @@ pub async fn handle_openai_chat(
         );
     }
     let tools = body.tools.clone().unwrap_or_default();
-    let mut zb = serde_json::json!({"model":upstream_model,"messages":body.messages,"stream":true,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":body.tool_choice});
-    if let Some(max_tok) = max_tok {
-        zb["max_tokens"] = serde_json::json!(max_tok);
-    }
     let mut cr = ChatRequest {
         model: model.clone(),
         messages: body.messages.clone(),
@@ -146,6 +142,11 @@ pub async fn handle_openai_chat(
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice: body.tool_choice.clone(),
     };
+    let icp_package =
+        super::build_icp_upstream_package(&cr, &upstream_model, profile, &config.zen_api_key);
+    let mut zb = icp_package.body;
+    let zen_headers = super::zen_session_headers(&icp_package.identity);
+    let upstream_headers = super::merge_extra_headers(&config.extra_headers, &zen_headers);
     let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
     if let Some(tool_choice_policy) =
         super::downgrade_claude_code_forced_tool_choice_for_upstream_model(
@@ -229,9 +230,9 @@ pub async fn handle_openai_chat(
         ));
     }
     if body.stream.unwrap_or(false) {
-        handle_oa_stream(client, config, &cr, &zb, profile).await
+        handle_oa_stream(client, config, &cr, &zb, profile, &upstream_headers).await
     } else {
-        handle_oa_non_stream(client, config, &cr, &zb, profile, repair).await
+        handle_oa_non_stream(client, config, &cr, &zb, profile, repair, &upstream_headers).await
     }
 }
 
@@ -242,6 +243,7 @@ async fn handle_oa_non_stream(
     zb: &Value,
     profile: ClientProfile,
     tool_history_repair: translate::ToolHistoryRepair,
+    upstream_headers: &[(String, String)],
 ) -> Result<Response, AppError> {
     let mut observed_exit_ip = None;
     let request_shape = translate::request_shape(cr);
@@ -250,9 +252,9 @@ async fn handle_oa_non_stream(
     let (collected, content) = {
         let mut last_empty = false;
         let mut last_empty_class = None;
-        let mut used_reasoning_disabled_retry = false;
-        let mut used_missing_reasoning_disabled_retry = false;
-        let mut used_provider_invalid_disabled_retry = false;
+        let mut used_reasoning_enrich_retry = false;
+        let mut used_missing_reasoning_enrich_retry = false;
+        let mut used_provider_invalid_enrich_retry = false;
         let mut used_provider_invalid_text_retry = false;
         let mut attempt_body = zb.clone();
         let mut output = None;
@@ -262,7 +264,7 @@ async fn handle_oa_non_stream(
                 &config.zen_chat_url,
                 &config.zen_api_key,
                 &attempt_body,
-                &config.extra_headers,
+                &upstream_headers,
             )
             .await
             {
@@ -270,11 +272,11 @@ async fn handle_oa_non_stream(
                 Err(err)
                     if super::should_retry_missing_reasoning_content(
                         &err,
-                        used_missing_reasoning_disabled_retry,
+                        used_missing_reasoning_enrich_retry,
                     ) =>
                 {
-                    used_missing_reasoning_disabled_retry = true;
-                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    used_missing_reasoning_enrich_retry = true;
+                    attempt_body = super::reasoning_retry_body(zb, profile);
                     super::log_missing_reasoning_content_retry("openai", cr, profile, attempt + 1);
                     continue;
                 }
@@ -284,12 +286,12 @@ async fn handle_oa_non_stream(
                         cr,
                         profile,
                         tool_history_repair,
-                        used_provider_invalid_disabled_retry,
+                        used_provider_invalid_enrich_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
-                            super::ProviderInvalidRetryMode::DisableThinking => {
-                                used_provider_invalid_disabled_retry = true;
+                            super::ProviderInvalidRetryMode::EnrichReasoning => {
+                                used_provider_invalid_enrich_retry = true;
                             }
                             super::ProviderInvalidRetryMode::TextOnly => {
                                 used_provider_invalid_text_retry = true;
@@ -338,23 +340,24 @@ async fn handle_oa_non_stream(
                     NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
                     &collected,
                 );
-                if output_class.should_retry_with_disabled_thinking()
-                    && !used_reasoning_disabled_retry
+                if output_class.should_retry_with_enriched_reasoning(profile)
+                    && !used_reasoning_enrich_retry
                 {
-                    used_reasoning_disabled_retry = true;
-                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    used_reasoning_enrich_retry = true;
+                    attempt_body = super::reasoning_retry_body(zb, profile);
                     tracing::warn!(
                         protocol = "openai",
                         model = %cr.model,
                         source_client = ?profile.kind,
                         empty_output_class = output_class.as_str(),
                         attempt = attempt + 1,
-                        "retrying reasoning-only output with disabled thinking"
+                        "retrying reasoning-only output with reasoning enrichment"
                     );
                     continue;
                 }
                 continue;
             }
+            super::record_collected_reasoning_for_request(cr, &collected.reasoning);
             output = Some((collected, content));
             break;
         }
@@ -596,10 +599,21 @@ fn append_openai_usage_metadata(
     if let Some(cache_creation) = usage.cache_creation_input_tokens {
         usage_json["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
     }
+    if let Some(cache_miss) = cache_miss_tokens(Some(usage)) {
+        usage_json["cache_miss_input_tokens"] = serde_json::json!(cache_miss);
+    }
 }
 
 fn cache_read_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> Option<u64> {
     usage.and_then(crate::zen::client::ZenUsage::cache_read_tokens)
+}
+
+fn cache_miss_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> Option<u64> {
+    usage.and_then(|usage| {
+        usage
+            .cache_miss_input_tokens
+            .or(usage.prompt_cache_miss_tokens)
+    })
 }
 
 fn with_observed_exit_ip(
@@ -620,10 +634,12 @@ async fn handle_oa_stream(
     cr: &ChatRequest,
     zb: &Value,
     profile: ClientProfile,
+    upstream_headers: &[(String, String)],
 ) -> Result<Response, AppError> {
     use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
 
+    let upstream_headers: Vec<(String, String)> = upstream_headers.to_vec();
     let model = cr.model.clone();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -635,14 +651,14 @@ async fn handle_oa_stream(
     let prompt = translate::build_prompt_text(&cr.messages);
     let body = cr.clone();
     let mut attempt_body = zb.clone();
-    let mut used_missing_reasoning_disabled_retry = false;
+    let mut used_missing_reasoning_enrich_retry = false;
     let initial_resp = loop {
         match crate::zen::client::fetch_zen_stream_with_headers(
             client,
             &config.zen_chat_url,
             &config.zen_api_key,
             &attempt_body,
-            &config.extra_headers,
+            &upstream_headers,
         )
         .await
         {
@@ -650,11 +666,11 @@ async fn handle_oa_stream(
             Err(err)
                 if super::should_retry_missing_reasoning_content(
                     &err,
-                    used_missing_reasoning_disabled_retry,
+                    used_missing_reasoning_enrich_retry,
                 ) =>
             {
-                used_missing_reasoning_disabled_retry = true;
-                attempt_body = super::reasoning_disabled_retry_body(zb);
+                used_missing_reasoning_enrich_retry = true;
+                attempt_body = super::reasoning_retry_body(zb, profile);
                 super::log_missing_reasoning_content_retry("openai_stream", cr, profile, 1);
                 continue;
             }
@@ -668,7 +684,7 @@ async fn handle_oa_stream(
     let stream = async_stream::stream! {
         let mut next_resp = Some(initial_resp);
         let mut attempt_body = attempt_body;
-        let mut used_missing_reasoning_disabled_retry = used_missing_reasoning_disabled_retry;
+        let mut used_missing_reasoning_enrich_retry = used_missing_reasoning_enrich_retry;
         let max_attempts = openai_stream_empty_upstream_attempts(&body);
         for attempt in 1..=max_attempts {
             let resp = if let Some(resp) = next_resp.take() {
@@ -680,7 +696,7 @@ async fn handle_oa_stream(
                         &config.zen_chat_url,
                         &config.zen_api_key,
                         &attempt_body,
-                        &config.extra_headers,
+                        &upstream_headers,
                     )
                     .await
                     {
@@ -688,11 +704,11 @@ async fn handle_oa_stream(
                         Err(err)
                             if super::should_retry_missing_reasoning_content(
                                 &err,
-                                used_missing_reasoning_disabled_retry,
+                                used_missing_reasoning_enrich_retry,
                             ) =>
                         {
-                            used_missing_reasoning_disabled_retry = true;
-                            attempt_body = super::reasoning_disabled_retry_body(&base_body);
+                            used_missing_reasoning_enrich_retry = true;
+                            attempt_body = super::reasoning_retry_body(&base_body, profile);
                             super::log_missing_reasoning_content_retry(
                                 "openai_stream",
                                 &body,
@@ -897,6 +913,9 @@ async fn handle_oa_stream(
                 }
                 if let Some(cache_creation) = usage.cache_creation_input_tokens {
                     final_chunk["usage"]["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
+                }
+                if let Some(cache_miss) = cache_miss_tokens(Some(&usage)) {
+                    final_chunk["usage"]["cache_miss_input_tokens"] = serde_json::json!(cache_miss);
                 }
             } else {
                 super::log_provider_cache_observation("openai", &body, profile, &cache_signals, attempt, max_attempts);

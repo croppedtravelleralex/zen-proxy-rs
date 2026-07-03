@@ -299,6 +299,7 @@ mod tests {
                 content: Value::String(prompt.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             stream: Some(false),
             max_tokens: None,

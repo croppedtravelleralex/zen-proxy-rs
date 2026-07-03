@@ -88,6 +88,18 @@ where
             return Err(DispatchError::NoResource);
         }
         self.dispatch.preflight(req)?;
+
+        if !req.session_id.is_empty() && !req.upstream_model.is_empty() {
+            if let Some(node_id) = session_pin::lookup(&req.upstream_model, &req.session_id) {
+                if let Ok(result) = self.dispatch_sticky(req, &node_id) {
+                    return Ok(DispatchResult {
+                        session_pin_hit: true,
+                        ..result
+                    });
+                }
+            }
+        }
+
         let (node, affinity_hit, affinity_node_id) = self
             .dispatch
             .try_acquire_affinity(req)
@@ -117,6 +129,9 @@ where
             self.active.add(node.clone());
 
             self.nodes.insert(node.clone());
+            if !req.session_id.is_empty() && !req.upstream_model.is_empty() {
+                session_pin::record(&req.upstream_model, &req.session_id, &node.id);
+            }
         }
 
         let url = node.url.clone();
@@ -132,6 +147,7 @@ where
             url,
             affinity_hit,
             affinity_node_id,
+            session_pin_hit: false,
         })
     }
 
@@ -151,6 +167,7 @@ where
             url: DIRECT_NODE_URL.to_string(),
             affinity_hit: false,
             affinity_node_id: String::new(),
+            session_pin_hit: false,
         })
     }
 
@@ -180,6 +197,7 @@ where
                 url,
                 affinity_hit: false,
                 affinity_node_id: String::new(),
+                session_pin_hit: false,
             });
         }
         // 回退到普通 dispatch
@@ -504,6 +522,8 @@ mod tests {
 
         let meta = RequestMeta {
             model: "deepseek-v4-flash".to_string(),
+            upstream_model: "deepseek-v4-flash-free".to_string(),
+            session_id: String::new(),
             stream: false,
             body_size: 128,
             affinity_key: String::new(),
@@ -542,6 +562,8 @@ mod tests {
 
         let meta = RequestMeta {
             model: "deepseek-v4-flash".to_string(),
+            upstream_model: "deepseek-v4-flash-free".to_string(),
+            session_id: String::new(),
             stream: true,
             body_size: 350_000,
             affinity_key: String::new(),
@@ -587,6 +609,8 @@ mod tests {
 
         let meta = RequestMeta {
             model: "deepseek-v4-flash".to_string(),
+            upstream_model: "deepseek-v4-flash-free".to_string(),
+            session_id: String::new(),
             stream: true,
             body_size: 128,
             affinity_key: String::new(),
@@ -661,6 +685,8 @@ mod tests {
         );
         let meta = RequestMeta {
             model: "mimo-v2.5".to_string(),
+            upstream_model: "mimo-v2.5-free".to_string(),
+            session_id: String::new(),
             stream: false,
             body_size: 128,
             affinity_key: String::new(),
@@ -699,6 +725,8 @@ mod tests {
 
         let meta = RequestMeta {
             model: "deepseek-v4-flash".to_string(),
+            upstream_model: "deepseek-v4-flash-free".to_string(),
+            session_id: String::new(),
             stream: false,
             body_size: 128,
             affinity_key: String::new(),

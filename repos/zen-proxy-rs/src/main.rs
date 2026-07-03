@@ -372,6 +372,16 @@ async fn main() {
     }
     tracing::info!(count = node_urls.len(), "nodes added to dispatch pool");
 
+    let session_pin_redis = std::env::var("CCP_SESSION_PIN_REDIS_URL")
+        .ok()
+        .or_else(|| config.global_budget_redis_url.clone());
+    crate::pool::session_pin::configure(session_pin_redis.clone());
+    if session_pin_redis.is_some() {
+        tracing::info!("CCP session pin Redis backend enabled");
+    } else {
+        tracing::info!("CCP session pin using in-memory backend");
+    }
+
     let default_collector = Arc::new(DefaultCollector::new());
     {
         let json_backend = JsonBackend::new("/tmp/zen-proxy-snapshot.json");

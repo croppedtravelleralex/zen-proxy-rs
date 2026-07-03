@@ -62,6 +62,28 @@ pub struct RequestTelemetry {
     pub cache_creation_input_tokens: u32,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    #[serde(default)]
+    pub cache_miss_input_tokens: u32,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub usk: String,
+    #[serde(default)]
+    pub icp_scope: String,
+    #[serde(default)]
+    pub prefix_32k_hash: String,
+    #[serde(default)]
+    pub prefix_drift: bool,
+    #[serde(default)]
+    pub session_pin_hit: bool,
+    #[serde(default)]
+    pub thinking_policy: String,
+    #[serde(default)]
+    pub prompt_cache_key: String,
+    #[serde(default)]
+    pub provider_cache_observation: String,
+    #[serde(default)]
+    pub warmup_state: String,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     #[serde(default)]

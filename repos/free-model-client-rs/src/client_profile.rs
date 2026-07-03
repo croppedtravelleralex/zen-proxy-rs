@@ -71,13 +71,7 @@ impl ClientProfile {
     pub fn effective_for_model(self, model: &str) -> Self {
         let normalized = normalize(model);
         match normalized.as_str() {
-            "deepseekv4flash" | "deepseekv4flashfree" => {
-                if matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw) {
-                    Self::unknown()
-                } else {
-                    self
-                }
-            }
+            "deepseekv4flash" | "deepseekv4flashfree" => self,
             "mimov25" | "mimov25free" | "northminicode" | "northminicodefree"
             | "nemotron3ultra" | "nemotron3ultrafree" => {
                 if matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw) {
@@ -86,13 +80,14 @@ impl ClientProfile {
                     self
                 }
             }
-            "deepseekv4flashlite" | "bigpickle" => {
+            "deepseekv4flashlite" => {
                 if matches!(self.kind, ClientKind::ClaudeCode) {
                     Self::unknown()
                 } else {
                     self
                 }
             }
+            "bigpickle" => self,
             "minimaxm3" | "minimaxm3free" | "qwen36plus" | "qwen36plusfree" => {
                 if matches!(
                     self.kind,
@@ -356,6 +351,7 @@ mod tests {
                 content: Value::String("use tool".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             stream: Some(true),
             max_tokens: None,
@@ -489,14 +485,14 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_flash_drops_hermes_openclaw_compat_policy() {
+    fn deepseek_flash_keeps_hermes_openclaw_compat_policy() {
         for kind in [ClientKind::Hermes, ClientKind::OpenClaw] {
             let profile = ClientProfile::new(kind, ClientProfileSource::Header)
                 .effective_for_model("deepseek-v4-flash");
 
-            assert_eq!(profile.kind, ClientKind::Unknown);
-            assert!(!profile.disables_thinking_for_tool_use());
-            assert!(!profile.uses_compat_tool_history());
+            assert_eq!(profile.kind, kind);
+            assert!(profile.disables_thinking_for_tool_use());
+            assert!(profile.uses_compat_tool_history());
         }
     }
 
@@ -516,6 +512,15 @@ mod tests {
 
         assert_eq!(profile.kind, ClientKind::Unknown);
         assert!(!profile.preserves_model_text_exactly());
+    }
+
+    #[test]
+    fn big_pickle_keeps_claude_code_policy() {
+        let profile = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+            .effective_for_model("big-pickle");
+
+        assert_eq!(profile.kind, ClientKind::ClaudeCode);
+        assert!(profile.preserves_model_text_exactly());
     }
 
     #[test]

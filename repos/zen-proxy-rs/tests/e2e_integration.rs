@@ -108,6 +108,18 @@ fn stop_server(mut child: Child, port: u16) {
     let _ = std::fs::remove_file(node_db_path(port));
 }
 
+fn message_content_text(content: &serde_json::Value) -> Option<&str> {
+    match content {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .rev()
+            .find_map(|item| item.get("text").and_then(serde_json::Value::as_str)),
+        serde_json::Value::Object(object) => object.get("text").and_then(serde_json::Value::as_str),
+        _ => None,
+    }
+}
+
 fn start_mock_zen() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
     use axum::extract::DefaultBodyLimit;
     use axum::extract::State;
@@ -2457,7 +2469,10 @@ mod e2e {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0]["body"]["model"], "big-pickle");
         let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
-        assert_eq!(upstream_messages.last().unwrap()["content"], "latest user");
+        assert_eq!(
+            message_content_text(&upstream_messages.last().unwrap()["content"]),
+            Some("latest user")
+        );
         let compacted_tool = upstream_messages
             .iter()
             .find(|message| message["role"] == "tool")
@@ -2723,10 +2738,7 @@ mod e2e {
         let seen = observed.lock().unwrap();
         assert_eq!(seen.len(), 3);
         assert_eq!(seen[0]["body"]["model"], "big-pickle");
-        assert_eq!(
-            seen[0]["body"]["thinking"],
-            serde_json::json!({"type":"disabled"})
-        );
+        assert!(seen[0]["body"]["thinking"].is_null());
         assert_eq!(seen[1]["body"]["model"], "deepseek-v4-flash-free");
         assert!(seen[1]["body"]["thinking"].is_null());
         assert_eq!(seen[2]["body"]["model"], "big-pickle");

@@ -3,9 +3,12 @@ pub mod markdown;
 pub mod openai;
 pub mod sse;
 
+use crate::canonical;
+use crate::ccp::{self, CcpFlags, UskContext};
 use crate::client_profile::{ClientKind, ClientProfile};
 use crate::error::AppError;
 use crate::protocol::{translate, types::ChatRequest};
+use crate::thinking_manifest;
 use crate::zen::client::{CollectedStream, ProviderCacheSignals};
 use serde_json::{json, Value};
 
@@ -32,7 +35,12 @@ impl OutputClass {
     }
 
     pub(crate) const fn should_retry_with_disabled_thinking(self) -> bool {
-        matches!(self, Self::ReasoningOnlyLength)
+        false
+    }
+
+    pub(crate) fn should_retry_with_enriched_reasoning(self, profile: ClientProfile) -> bool {
+        thinking_manifest::preserves_thinking_on_retry(profile)
+            && matches!(self, Self::ReasoningOnly | Self::ReasoningOnlyLength)
     }
 }
 
@@ -57,73 +65,7 @@ pub(crate) fn apply_initial_thinking_policy(
     request: &ChatRequest,
     profile: ClientProfile,
 ) -> &'static str {
-    if profile.disables_thinking_for_tool_use() {
-        return if translate::disable_thinking_for_tool_use(body) {
-            "compat_tool_use_disabled"
-        } else {
-            "compat_tool_use_keep_existing"
-        };
-    }
-
-    let shape = translate::request_shape(request);
-    let short_kind = translate::classify_short_non_stream_request(
-        request,
-        profile.kind == ClientKind::ClaudeCode,
-    );
-    let low_output_budget = request
-        .max_tokens
-        .is_some_and(|max_tokens| max_tokens <= 512);
-    let no_tools = shape.tool_count == 0 && !shape.tool_choice_present;
-    let tiny_prompt = shape.estimated_total_tokens <= 512;
-    let claude_code_forced_tool_choice = profile.kind == ClientKind::ClaudeCode
-        && is_forced_tool_choice(request.tool_choice.as_ref());
-    let low_budget_tool_probe = translate::is_claude_code_low_budget_tool_probe(
-        request,
-        profile.kind == ClientKind::ClaudeCode,
-    );
-    let claude_code_large_stream_tool_request = profile.kind == ClientKind::ClaudeCode
-        && request.stream.unwrap_or(false)
-        && !no_tools
-        && shape.estimated_total_tokens >= 80_000;
-    let claude_code_tool_heavy_fast_path = profile.kind == ClientKind::ClaudeCode
-        && request.stream.unwrap_or(false)
-        && !no_tools
-        && claude_code_tool_heavy_prefers_disabled_thinking(&request.model)
-        && shape.tool_count >= 32;
-
-    let should_disable = low_budget_tool_probe
-        || claude_code_forced_tool_choice
-        || claude_code_large_stream_tool_request
-        || claude_code_tool_heavy_fast_path
-        || (no_tools
-            && low_output_budget
-            && (matches!(
-                short_kind,
-                translate::ShortNonStreamRequestKind::HealthProbe
-                    | translate::ShortNonStreamRequestKind::ChannelTest
-                    | translate::ShortNonStreamRequestKind::InternalClaudeCodeProbe
-            ) || (request.stream.unwrap_or(false)
-                && profile.kind == ClientKind::ClaudeCode
-                && tiny_prompt)));
-
-    if should_disable && translate::set_thinking_disabled_if_absent(body) {
-        return if low_budget_tool_probe {
-            "low_budget_tool_probe_disabled"
-        } else if claude_code_forced_tool_choice {
-            "claude_code_forced_tool_choice_disabled"
-        } else if claude_code_tool_heavy_fast_path {
-            "claude_code_tool_heavy_fast_path_disabled"
-        } else if claude_code_large_stream_tool_request {
-            "claude_code_large_stream_tool_request_disabled"
-        } else {
-            "low_budget_probe_disabled"
-        };
-    }
-    if body.get("thinking").is_some() {
-        "keep_existing"
-    } else {
-        "keep_default"
-    }
+    thinking_manifest::apply_thinking_manifest(body, request, profile)
 }
 
 pub(crate) fn prune_null_optional_upstream_fields(body: &mut serde_json::Value) {
@@ -156,18 +98,8 @@ pub(crate) fn downgrade_claude_code_forced_tool_choice_for_upstream_model(
     profile: ClientProfile,
     upstream_model: &str,
 ) -> Option<&'static str> {
-    if profile.kind != ClientKind::ClaudeCode
-        || !is_forced_tool_choice(request.tool_choice.as_ref())
-        || (!claude_code_forced_tool_choice_requires_auto(&request.model)
-            && !claude_code_forced_tool_choice_requires_auto(upstream_model))
-    {
-        return None;
-    }
-
-    let auto = Value::String("auto".to_string());
-    body["tool_choice"] = auto.clone();
-    request.tool_choice = Some(auto);
-    Some("claude_code_forced_tool_choice_auto")
+    let _ = (body, request, profile, upstream_model);
+    None
 }
 
 fn claude_code_forced_tool_choice_requires_auto(model: &str) -> bool {
@@ -195,15 +127,135 @@ fn claude_code_mimo_family_model(model: &str) -> bool {
     )
 }
 
+pub(crate) fn client_kind_label(profile: ClientProfile) -> &'static str {
+    match profile.kind {
+        ClientKind::ClaudeCode => "claude-code",
+        ClientKind::Hermes => "hermes",
+        ClientKind::OpenClaw => "openclaw",
+        ClientKind::CherryStudio => "cherrystudio",
+        ClientKind::AnthropicSdk => "anthropic-sdk",
+        ClientKind::OpenAiSdk => "openai-sdk",
+        ClientKind::Unknown => "unknown",
+    }
+}
+
+pub(crate) fn api_key_bucket(api_key: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    api_key.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+pub(crate) fn build_icp_upstream_package(
+    request: &ChatRequest,
+    upstream_model: &str,
+    profile: ClientProfile,
+    api_key: &str,
+) -> canonical::IcpUpstreamPackage {
+    let session_scope = session_scope_for_request(request);
+    let flags = CcpFlags::from_env();
+    canonical::prepare_icp_upstream_request(
+        request,
+        &session_scope,
+        upstream_model,
+        &UskContext {
+            api_key_id: &api_key_bucket(api_key),
+            public_model: &request.model,
+            upstream_model,
+            source_client: client_kind_label(profile),
+        },
+        &flags,
+    )
+}
+
+pub(crate) fn zen_session_headers(identity: &ccp::IcpIdentity) -> Vec<(String, String)> {
+    vec![
+        ("x-opencode-session".into(), identity.zen_session_id.clone()),
+        ("x-opencode-project".into(), "global".into()),
+    ]
+}
+
+pub(crate) fn merge_extra_headers(
+    base: &[(String, String)],
+    extra: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged = base.to_vec();
+    merged.extend(extra.iter().cloned());
+    merged
+}
+
+pub(crate) fn session_scope_from_upstream_body(body: &Value) -> String {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let messages_key = body
+        .get("messages")
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_default();
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    messages_key.hash(&mut hasher);
+    format!("{model}:{:016x}", hasher.finish())
+}
+
+pub(crate) fn session_scope_for_request(request: &ChatRequest) -> String {
+    let shape = translate::request_shape(request);
+    format!("{}:{:016x}", request.model, shape.prompt_hash)
+}
+
+pub(crate) fn record_collected_reasoning_for_request(request: &ChatRequest, reasoning: &str) {
+    if reasoning.trim().is_empty() {
+        return;
+    }
+    let scope = session_scope_for_request(request);
+    let assistant_index = request
+        .messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .count();
+    canonical::record_collected_reasoning(&scope, assistant_index, reasoning);
+}
+
 pub(crate) fn reasoning_disabled_retry_body(body: &serde_json::Value) -> serde_json::Value {
-    let mut retry = body.clone();
-    retry["thinking"] = json!({"type":"disabled"});
-    retry
+    thinking_manifest::reasoning_enriched_retry_body(body)
+}
+
+pub(crate) fn reasoning_retry_body(
+    body: &serde_json::Value,
+    profile: ClientProfile,
+) -> serde_json::Value {
+    if thinking_manifest::preserves_thinking_on_retry(profile) {
+        let mut retry = body.clone();
+        let session_scope = session_scope_from_upstream_body(&retry);
+        if let Some(messages) = retry.get_mut("messages").and_then(Value::as_array_mut) {
+            let mut typed = messages
+                .iter()
+                .filter_map(|value| {
+                    serde_json::from_value::<crate::protocol::types::Message>(value.clone()).ok()
+                })
+                .collect::<Vec<_>>();
+            canonical::enrich_messages_with_reasoning_mode(
+                &mut typed,
+                &session_scope,
+                canonical::ReasoningEnrichMode::CurrentTurnOnly,
+            );
+            *messages = typed
+                .into_iter()
+                .map(|message| canonical::message_to_upstream_json(&message))
+                .collect();
+        }
+        retry
+    } else {
+        reasoning_disabled_retry_body(body)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderInvalidRetryMode {
-    DisableThinking,
+    EnrichReasoning,
     TextOnly,
 }
 
@@ -214,7 +266,7 @@ impl ProviderInvalidRetryMode {
 
     const fn as_str(self) -> &'static str {
         match self {
-            Self::DisableThinking => "disable_thinking",
+            Self::EnrichReasoning => "enrich_reasoning",
             Self::TextOnly => "text_only",
         }
     }
@@ -232,7 +284,7 @@ pub(crate) fn provider_invalid_tool_history_retry_mode(
     request: &ChatRequest,
     profile: ClientProfile,
     repair: translate::ToolHistoryRepair,
-    used_disabled_thinking_retry: bool,
+    used_enriched_retry: bool,
     used_text_only_retry: bool,
 ) -> Option<ProviderInvalidRetryMode> {
     if !(err.is_provider_invalid_request() || err.is_missing_reasoning_content())
@@ -240,8 +292,8 @@ pub(crate) fn provider_invalid_tool_history_retry_mode(
     {
         return None;
     }
-    if !used_disabled_thinking_retry {
-        return Some(ProviderInvalidRetryMode::DisableThinking);
+    if profile.kind == ClientKind::ClaudeCode && !used_enriched_retry {
+        return Some(ProviderInvalidRetryMode::EnrichReasoning);
     }
     if !used_text_only_retry {
         return Some(ProviderInvalidRetryMode::TextOnly);
@@ -253,7 +305,16 @@ pub(crate) fn provider_invalid_tool_history_retry_body(
     body: &Value,
     mode: ProviderInvalidRetryMode,
 ) -> (Value, ProviderInvalidRetryStats) {
-    let mut retry = reasoning_disabled_retry_body(body);
+    let mut retry = match mode {
+        ProviderInvalidRetryMode::EnrichReasoning => reasoning_retry_body(
+            body,
+            ClientProfile::new(
+                ClientKind::ClaudeCode,
+                crate::client_profile::ClientProfileSource::Unknown,
+            ),
+        ),
+        ProviderInvalidRetryMode::TextOnly => body.clone(),
+    };
     let sanitized_tools = sanitize_upstream_tools(&mut retry);
     let compacted_user_messages = compact_large_user_messages_for_retry(&mut retry);
     if mode.strips_tools() {
@@ -378,9 +439,9 @@ fn compact_text_for_provider_invalid_retry(text: &str) -> String {
 
 pub(crate) fn should_retry_missing_reasoning_content(
     err: &AppError,
-    used_disabled_thinking_retry: bool,
+    used_reasoning_retry: bool,
 ) -> bool {
-    err.is_missing_reasoning_content() && !used_disabled_thinking_retry
+    err.is_missing_reasoning_content() && !used_reasoning_retry
 }
 
 pub(crate) fn log_provider_invalid_tool_history_retry(
@@ -428,7 +489,7 @@ pub(crate) fn log_missing_reasoning_content_retry(
         prompt_tokens = shape.estimated_total_tokens,
         message_count = shape.message_count,
         tool_count = shape.tool_count,
-        "retrying upstream missing reasoning_content error with disabled thinking"
+        "retrying upstream missing reasoning_content error with reasoning enrichment"
     );
 }
 
@@ -562,6 +623,7 @@ mod tests {
                 content: Value::String("call the selected tool".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             stream: Some(true),
             max_tokens: Some(512),
@@ -573,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_forced_tool_choice_disables_thinking() {
+    fn claude_code_forced_tool_choice_keeps_thinking_enabled() {
         let request = request_with_tool_choice(Some(serde_json::json!({
             "type": "function",
             "function": { "name": "Write" }
@@ -585,8 +647,8 @@ mod tests {
             ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
         );
 
-        assert_eq!(policy, "claude_code_forced_tool_choice_disabled");
-        assert_eq!(body["thinking"], serde_json::json!({"type":"disabled"}));
+        assert_eq!(policy, "claude_code_production_default_enabled");
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
@@ -599,7 +661,7 @@ mod tests {
             ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
         );
 
-        assert_eq!(policy, "keep_default");
+        assert_eq!(policy, "claude_code_production_default_enabled");
         assert!(body.get("thinking").is_none());
     }
 
@@ -617,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_forced_tool_choice_downgrades_to_auto_for_selected_models() {
+    fn claude_code_forced_tool_choice_keeps_tool_choice_for_selected_models() {
         for model in ["mimo-v2.5-free", "north-mini-code", "nemotron-3-ultra-free"] {
             let mut request = request_with_tool_choice(Some(serde_json::json!({
                 "type": "function",
@@ -638,14 +700,13 @@ mod tests {
                 model,
             );
 
-            assert_eq!(policy, "claude_code_forced_tool_choice_disabled");
-            assert_eq!(body["thinking"], serde_json::json!({"type":"disabled"}));
+            assert_eq!(policy, "claude_code_production_default_enabled");
+            assert!(body.get("thinking").is_none());
+            assert_eq!(tool_choice_policy, None);
             assert_eq!(
-                tool_choice_policy,
-                Some("claude_code_forced_tool_choice_auto")
+                body["tool_choice"],
+                serde_json::json!({"type":"function","function":{"name":"Bash"}})
             );
-            assert_eq!(body["tool_choice"], Value::String("auto".to_string()));
-            assert_eq!(request.tool_choice, Some(Value::String("auto".to_string())));
         }
     }
 
@@ -694,12 +755,14 @@ mod tests {
                     content: Value::String("x".repeat(14 * 1024)),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "user".to_string(),
                     content: Value::String("now continue".to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
             stream: Some(false),
@@ -738,11 +801,11 @@ mod tests {
             false,
         );
 
-        assert_eq!(mode, Some(ProviderInvalidRetryMode::DisableThinking));
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
     }
 
     #[test]
-    fn provider_invalid_retry_body_sanitizes_without_stripping_tools_first() {
+    fn provider_invalid_retry_body_enriches_without_disabling_thinking() {
         let request = repaired_claude_code_nonstream_tool_request();
         let body = serde_json::json!({
             "messages": request.messages,
@@ -753,10 +816,10 @@ mod tests {
 
         let (retry, stats) = provider_invalid_tool_history_retry_body(
             &body,
-            ProviderInvalidRetryMode::DisableThinking,
+            ProviderInvalidRetryMode::EnrichReasoning,
         );
 
-        assert_eq!(retry["thinking"], serde_json::json!({"type":"disabled"}));
+        assert_eq!(retry["thinking"], serde_json::json!({"type":"enabled"}));
         assert!(retry["tools"].is_array());
         assert_eq!(
             retry["tools"][0]["function"]["parameters"]["type"],
@@ -808,6 +871,6 @@ mod tests {
             false,
         );
 
-        assert_eq!(mode, Some(ProviderInvalidRetryMode::DisableThinking));
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
     }
 }

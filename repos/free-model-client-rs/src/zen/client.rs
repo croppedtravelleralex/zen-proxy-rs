@@ -60,6 +60,7 @@ pub struct ZenUsage {
     pub prompt_tokens_details: Option<serde_json::Value>,
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
+    pub cache_miss_input_tokens: Option<u64>,
     pub prompt_cache_hit_tokens: Option<u64>,
     pub prompt_cache_miss_tokens: Option<u64>,
 }
@@ -82,6 +83,7 @@ impl ZenUsage {
         self.cache_creation_input_tokens.is_some()
             || self.cache_read_input_tokens.is_some()
             || self.prompt_cached_tokens().is_some()
+            || self.cache_miss_input_tokens.is_some()
             || self.prompt_cache_miss_tokens.is_some()
     }
 }
@@ -192,7 +194,9 @@ impl ProviderCacheSignals {
         self.body_cache_read_input_tokens = usage.cache_read_tokens();
         self.body_cache_creation_input_tokens = usage.cache_creation_input_tokens;
         self.body_cached_tokens = usage.prompt_cached_tokens();
-        self.body_cache_miss_input_tokens = usage.prompt_cache_miss_tokens;
+        self.body_cache_miss_input_tokens = usage
+            .cache_miss_input_tokens
+            .or(usage.prompt_cache_miss_tokens);
         self
     }
 
@@ -858,6 +862,7 @@ mod tests {
             prompt_tokens_details: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_miss_input_tokens: None,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: None,
         };
@@ -879,6 +884,7 @@ mod tests {
             prompt_tokens_details: Some(json!({"cached_tokens": 22})),
             cache_creation_input_tokens: Some(11),
             cache_read_input_tokens: None,
+            cache_miss_input_tokens: None,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: None,
         };
@@ -919,6 +925,7 @@ mod tests {
             prompt_tokens_details: Some(json!({"cached_tokens": 0})),
             cache_creation_input_tokens: Some(0),
             cache_read_input_tokens: Some(0),
+            cache_miss_input_tokens: None,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: None,
         };
@@ -939,6 +946,7 @@ mod tests {
             prompt_tokens_details: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_miss_input_tokens: None,
             prompt_cache_hit_tokens: Some(22),
             prompt_cache_miss_tokens: Some(8),
         };
@@ -961,6 +969,7 @@ mod tests {
             prompt_tokens_details: None,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_miss_input_tokens: None,
             prompt_cache_hit_tokens: Some(0),
             prompt_cache_miss_tokens: Some(30),
         };

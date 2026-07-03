@@ -169,12 +169,8 @@ pub async fn handle_anthropic_messages(
             .as_ref()
             .map(translate::anthropic_tool_choice_to_openai)
     };
-    let has_tools = !tools.is_empty();
     let tool_count = tools.len();
-    let mut zb = serde_json::json!({"model":upstream_model,"messages":msgs,"stream":true,"temperature":body.temperature,"tools":if tools.is_empty(){Value::Null}else{serde_json::to_value(&tools).unwrap_or_default()},"tool_choice":tool_choice});
-    if let Some(max_tok) = max_tok {
-        zb["max_tokens"] = serde_json::json!(max_tok);
-    }
+    let has_tools = !tools.is_empty();
     let mut cr = ChatRequest {
         model: model.clone(),
         messages: msgs,
@@ -185,6 +181,13 @@ pub async fn handle_anthropic_messages(
         tools: if tools.is_empty() { None } else { Some(tools) },
         tool_choice,
     };
+    let icp_package =
+        super::build_icp_upstream_package(&cr, &upstream_model, profile, &config.zen_api_key);
+    let mut zb = icp_package.body;
+    let zen_headers = super::zen_session_headers(&icp_package.identity);
+    let upstream_headers = super::merge_extra_headers(&config.extra_headers, &zen_headers);
+    let mut request_config = config.clone();
+    request_config.extra_headers = upstream_headers;
     let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
     if let Some(tool_choice_policy) =
         super::downgrade_claude_code_forced_tool_choice_for_upstream_model(
@@ -266,6 +269,7 @@ pub async fn handle_anthropic_messages(
                 output_tokens,
                 0,
                 0,
+                0,
                 "end_turn".to_string(),
                 &cr,
                 profile,
@@ -328,7 +332,7 @@ pub async fn handle_anthropic_messages(
         }
         handle_stream(
             client,
-            config,
+            &request_config,
             &cr,
             &zb,
             profile,
@@ -337,7 +341,7 @@ pub async fn handle_anthropic_messages(
         )
         .await
     } else {
-        handle_non_stream(client, config, &cr, &zb, profile, repair).await
+        handle_non_stream(client, &request_config, &cr, &zb, profile, repair).await
     }
 }
 
@@ -399,9 +403,9 @@ async fn handle_non_stream(
         let mut last_empty = false;
         let mut last_empty_class = None;
         let mut last_incomplete_tool_arguments = false;
-        let mut used_reasoning_disabled_retry = false;
-        let mut used_missing_reasoning_disabled_retry = false;
-        let mut used_provider_invalid_disabled_retry = false;
+        let mut used_reasoning_enrich_retry = false;
+        let mut used_missing_reasoning_enrich_retry = false;
+        let mut used_provider_invalid_enrich_retry = false;
         let mut used_provider_invalid_text_retry = false;
         let mut attempt_body = zb.clone();
         let mut output = None;
@@ -420,11 +424,11 @@ async fn handle_non_stream(
                 Err(err)
                     if super::should_retry_missing_reasoning_content(
                         &err,
-                        used_missing_reasoning_disabled_retry,
+                        used_missing_reasoning_enrich_retry,
                     ) =>
                 {
-                    used_missing_reasoning_disabled_retry = true;
-                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    used_missing_reasoning_enrich_retry = true;
+                    attempt_body = super::reasoning_retry_body(zb, profile);
                     super::log_missing_reasoning_content_retry(
                         "anthropic",
                         cr,
@@ -439,12 +443,12 @@ async fn handle_non_stream(
                         cr,
                         profile,
                         tool_history_repair,
-                        used_provider_invalid_disabled_retry,
+                        used_provider_invalid_enrich_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
-                            super::ProviderInvalidRetryMode::DisableThinking => {
-                                used_provider_invalid_disabled_retry = true;
+                            super::ProviderInvalidRetryMode::EnrichReasoning => {
+                                used_provider_invalid_enrich_retry = true;
                             }
                             super::ProviderInvalidRetryMode::TextOnly => {
                                 used_provider_invalid_text_retry = true;
@@ -502,9 +506,9 @@ async fn handle_non_stream(
                     );
                     last_empty = true;
                     last_empty_class = Some(super::OutputClass::ReasoningOnly);
-                    if profile.kind == ClientKind::ClaudeCode && !used_reasoning_disabled_retry {
-                        used_reasoning_disabled_retry = true;
-                        attempt_body = super::reasoning_disabled_retry_body(zb);
+                    if profile.kind == ClientKind::ClaudeCode && !used_reasoning_enrich_retry {
+                        used_reasoning_enrich_retry = true;
+                        attempt_body = super::reasoning_retry_body(zb, profile);
                         tracing::warn!(
                             protocol = "anthropic",
                             model = %cr.model,
@@ -539,11 +543,11 @@ async fn handle_non_stream(
                     NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
                     &collected,
                 );
-                if output_class.should_retry_with_disabled_thinking()
-                    && !used_reasoning_disabled_retry
+                if output_class.should_retry_with_enriched_reasoning(profile)
+                    && !used_reasoning_enrich_retry
                 {
-                    used_reasoning_disabled_retry = true;
-                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    used_reasoning_enrich_retry = true;
+                    attempt_body = super::reasoning_retry_body(zb, profile);
                     tracing::warn!(
                         protocol = "anthropic",
                         model = %cr.model,
@@ -569,9 +573,9 @@ async fn handle_non_stream(
                     finish_reason = ?collected.finish_reason,
                     "ClaudeCode non-stream guard received only incomplete tool calls"
                 );
-                if profile.kind == ClientKind::ClaudeCode && !used_reasoning_disabled_retry {
-                    used_reasoning_disabled_retry = true;
-                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                if profile.kind == ClientKind::ClaudeCode && !used_reasoning_enrich_retry {
+                    used_reasoning_enrich_retry = true;
+                    attempt_body = super::reasoning_retry_body(zb, profile);
                     tracing::warn!(
                         protocol = "anthropic",
                         model = %cr.model,
@@ -582,6 +586,7 @@ async fn handle_non_stream(
                 }
                 continue;
             }
+            super::record_collected_reasoning_for_request(cr, &collected.reasoning);
             output = Some((collected, content));
             break;
         }
@@ -847,6 +852,7 @@ fn text_resp_with_usage(
             "input_tokens": input_tokens,
             "cache_creation_input_tokens": cache_creation_tokens(usage),
             "cache_read_input_tokens": cache_read_tokens(usage),
+            "cache_miss_input_tokens": cache_miss_tokens(usage),
             "output_tokens": output_tokens
         }
     }))
@@ -873,6 +879,7 @@ fn tool_resp_with_usage(
             "input_tokens": input_tokens,
             "cache_creation_input_tokens": cache_creation_tokens(usage),
             "cache_read_input_tokens": cache_read_tokens(usage),
+            "cache_miss_input_tokens": cache_miss_tokens(usage),
             "output_tokens": output_tokens
         }
     }))
@@ -888,6 +895,16 @@ fn cache_creation_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
 fn cache_read_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
     usage
         .and_then(crate::zen::client::ZenUsage::cache_read_tokens)
+        .unwrap_or(0)
+}
+
+fn cache_miss_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
+    usage
+        .and_then(|usage| {
+            usage
+                .cache_miss_input_tokens
+                .or(usage.prompt_cache_miss_tokens)
+        })
         .unwrap_or(0)
 }
 
@@ -1447,8 +1464,8 @@ async fn handle_stream(
         let mut last_downstream_event = Instant::now();
         let mut idle_ping_count = 0_u64;
         let mut attempts_used = 0_usize;
-        let mut used_disabled_thinking_retry = false;
-        let mut used_provider_invalid_disabled_retry = false;
+        let mut used_enrich_reasoning_retry = false;
+        let mut used_provider_invalid_enrich_retry = false;
         let mut used_provider_invalid_text_retry = false;
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -1569,10 +1586,10 @@ async fn handle_stream(
                     }
                     if super::should_retry_missing_reasoning_content(
                         &err,
-                        used_disabled_thinking_retry,
+                        used_enrich_reasoning_retry,
                     ) {
-                        used_disabled_thinking_retry = true;
-                        attempt_body = super::reasoning_disabled_retry_body(&base_body);
+                        used_enrich_reasoning_retry = true;
+                        attempt_body = super::reasoning_retry_body(&base_body, profile);
                         super::log_missing_reasoning_content_retry(
                             "anthropic",
                             &body,
@@ -1586,12 +1603,12 @@ async fn handle_stream(
                         &body,
                         profile,
                         tool_history_repair,
-                        used_provider_invalid_disabled_retry,
+                        used_provider_invalid_enrich_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
-                            super::ProviderInvalidRetryMode::DisableThinking => {
-                                used_provider_invalid_disabled_retry = true;
+                            super::ProviderInvalidRetryMode::EnrichReasoning => {
+                                used_provider_invalid_enrich_retry = true;
                             }
                             super::ProviderInvalidRetryMode::TextOnly => {
                                 used_provider_invalid_text_retry = true;
@@ -1869,11 +1886,11 @@ async fn handle_stream(
                         && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
                     {
                         if attempt + 2 == CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
-                            && !used_disabled_thinking_retry
+                            && !used_enrich_reasoning_retry
                             && body.tools.as_ref().is_some_and(|tools| !tools.is_empty())
                         {
-                            used_disabled_thinking_retry = true;
-                            attempt_body = super::reasoning_disabled_retry_body(&base_body);
+                            used_enrich_reasoning_retry = true;
+                            attempt_body = super::reasoning_retry_body(&base_body, profile);
                             tracing::warn!(
                                 protocol = "anthropic",
                                 model = %body.model,
@@ -1898,11 +1915,11 @@ async fn handle_stream(
             }
             if retry_attempt {
                 if attempt + 2 == CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
-                    && !used_disabled_thinking_retry
+                    && !used_enrich_reasoning_retry
                     && body.tools.as_ref().is_some_and(|tools| !tools.is_empty())
                 {
-                    used_disabled_thinking_retry = true;
-                    attempt_body = super::reasoning_disabled_retry_body(&base_body);
+                    used_enrich_reasoning_retry = true;
+                    attempt_body = super::reasoning_retry_body(&base_body, profile);
                     tracing::warn!(
                         protocol = "anthropic",
                         model = %body.model,
@@ -2121,6 +2138,7 @@ async fn handle_stream(
             .as_ref()
             .and_then(crate::zen::client::ZenUsage::cache_read_tokens)
             .unwrap_or(0);
+        let cache_miss = cache_miss_tokens(usage.as_ref());
         let cache_signals = cache_signals.with_body_usage(usage.as_ref());
         super::log_provider_cache_observation("anthropic", &body, profile, &cache_signals, attempts_used, CLAUDE_CODE_STREAM_GUARD_ATTEMPTS);
         tracing::info!(
@@ -2131,7 +2149,7 @@ async fn handle_stream(
             prompt_hash_hex = %prompt_hash_hex,
             attempts_used,
             retry_count = attempts_used.saturating_sub(1),
-            used_disabled_thinking_retry,
+            used_enrich_reasoning_retry,
             completed_upstream,
             final_stream_error = ?final_stream_error,
             finish_reason = ?upstream_finish_reason,
@@ -2155,13 +2173,14 @@ async fn handle_stream(
             output_tokens,
             cache_creation_input_tokens = cache_creation,
             cache_read_input_tokens = cache_read,
+            cache_miss_input_tokens = cache_miss,
             cache_observation = cache_signals.status().as_str(),
             initial_fetch_timeout_secs = initial_fetch_timeout.map(|timeout| timeout.as_secs()).unwrap_or(0),
             slow_guard_min_input_tokens,
             no_forwardable_retry_after_secs = no_forwardable_retry_after.as_secs(),
             "ClaudeCode stream guard completion summary"
         );
-        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"input_tokens":input_tokens,"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read}}).to_string()));
+        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"input_tokens":input_tokens,"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read,"cache_miss_input_tokens":cache_miss}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
     Ok(Sse::new(stream).into_response())
@@ -2178,9 +2197,9 @@ async fn handle_buffered_claude_code_huge_stream(
 ) -> Result<Response, AppError> {
     let exact_output_literal = translate::exact_output_literal_from_messages(&cr.messages);
     let mut attempt_body = zb.clone();
-    let mut used_reasoning_disabled_retry = false;
-    let mut used_missing_reasoning_disabled_retry = false;
-    let mut used_provider_invalid_disabled_retry = false;
+    let mut used_reasoning_enrich_retry = false;
+    let mut used_missing_reasoning_enrich_retry = false;
+    let mut used_provider_invalid_enrich_retry = false;
     let mut used_provider_invalid_text_retry = false;
 
     for attempt in 0..CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
@@ -2203,10 +2222,10 @@ async fn handle_buffered_claude_code_huge_stream(
                 );
                 if super::should_retry_missing_reasoning_content(
                     &err,
-                    used_missing_reasoning_disabled_retry,
+                    used_missing_reasoning_enrich_retry,
                 ) {
-                    used_missing_reasoning_disabled_retry = true;
-                    attempt_body = super::reasoning_disabled_retry_body(zb);
+                    used_missing_reasoning_enrich_retry = true;
+                    attempt_body = super::reasoning_retry_body(zb, profile);
                     super::log_missing_reasoning_content_retry(
                         "anthropic_buffered",
                         cr,
@@ -2220,12 +2239,12 @@ async fn handle_buffered_claude_code_huge_stream(
                     cr,
                     profile,
                     tool_history_repair,
-                    used_provider_invalid_disabled_retry,
+                    used_provider_invalid_enrich_retry,
                     used_provider_invalid_text_retry,
                 ) {
                     match mode {
-                        super::ProviderInvalidRetryMode::DisableThinking => {
-                            used_provider_invalid_disabled_retry = true;
+                        super::ProviderInvalidRetryMode::EnrichReasoning => {
+                            used_provider_invalid_enrich_retry = true;
                         }
                         super::ProviderInvalidRetryMode::TextOnly => {
                             used_provider_invalid_text_retry = true;
@@ -2289,10 +2308,11 @@ async fn handle_buffered_claude_code_huge_stream(
                 CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
                 &collected,
             );
-            if output_class.should_retry_with_disabled_thinking() && !used_reasoning_disabled_retry
+            if output_class.should_retry_with_enriched_reasoning(profile)
+                && !used_reasoning_enrich_retry
             {
-                used_reasoning_disabled_retry = true;
-                attempt_body = super::reasoning_disabled_retry_body(zb);
+                used_reasoning_enrich_retry = true;
+                attempt_body = super::reasoning_retry_body(zb, profile);
                 tracing::warn!(
                     protocol = "anthropic_buffered",
                     model = %cr.model,
@@ -2322,6 +2342,7 @@ async fn handle_buffered_claude_code_huge_stream(
                     estimate(fallback_text).max(1),
                     0,
                     0,
+                    0,
                     "end_turn".to_string(),
                     cr,
                     profile,
@@ -2346,6 +2367,7 @@ async fn handle_buffered_claude_code_huge_stream(
                         estimate(literal).max(1),
                         0,
                         0,
+                        0,
                         "end_turn".to_string(),
                         cr,
                         profile,
@@ -2365,9 +2387,9 @@ async fn handle_buffered_claude_code_huge_stream(
                 finish_reason = ?collected.finish_reason,
                 "ClaudeCode buffered stream guard received only incomplete tool calls"
             );
-            if profile.kind == ClientKind::ClaudeCode && !used_reasoning_disabled_retry {
-                used_reasoning_disabled_retry = true;
-                attempt_body = super::reasoning_disabled_retry_body(zb);
+            if profile.kind == ClientKind::ClaudeCode && !used_reasoning_enrich_retry {
+                used_reasoning_enrich_retry = true;
+                attempt_body = super::reasoning_retry_body(zb, profile);
                 tracing::warn!(
                     protocol = "anthropic_buffered",
                     model = %cr.model,
@@ -2417,6 +2439,7 @@ async fn handle_buffered_claude_code_huge_stream(
             .as_ref()
             .and_then(crate::zen::client::ZenUsage::cache_read_tokens)
             .unwrap_or(0);
+        let cache_miss = cache_miss_tokens(collected.usage.as_ref());
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2431,6 +2454,7 @@ async fn handle_buffered_claude_code_huge_stream(
             output_tokens,
             cache_creation,
             cache_read,
+            cache_miss,
             anthropic_stop_reason(collected.finish_reason.as_deref(), has_tool_calls).to_string(),
             cr,
             profile,
@@ -2450,6 +2474,7 @@ fn anthropic_buffered_stream_resp(
     output_tokens: u64,
     cache_creation: u64,
     cache_read: u64,
+    cache_miss: u64,
     stop_reason: String,
     body: &ChatRequest,
     profile: ClientProfile,
@@ -2497,7 +2522,7 @@ fn anthropic_buffered_stream_resp(
             }
         }
         let stop_reason = if emitted_tool_blocks == 0 { stop_reason } else { "tool_use".to_string() };
-        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"input_tokens":input_tokens,"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read}}).to_string()));
+        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"input_tokens":input_tokens,"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read,"cache_miss_input_tokens":cache_miss}}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
     Sse::new(stream).into_response()
@@ -2636,6 +2661,7 @@ mod tests {
                 content: Value::String("test".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             stream: Some(true),
             max_tokens: None,
@@ -2861,6 +2887,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };
@@ -2893,6 +2920,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };
@@ -2925,6 +2953,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };
@@ -2959,6 +2988,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };
@@ -2992,6 +3022,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };
@@ -3031,12 +3062,14 @@ mod tests {
                         index: Some(0),
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "tool".to_string(),
                     content: Value::String("PING_OK".to_string()),
                     tool_calls: None,
                     tool_call_id: Some("call_bash_done".to_string()),
+                    reasoning_content: None,
                 },
                 Message {
                     role: "user".to_string(),
@@ -3045,6 +3078,7 @@ mod tests {
                     ),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
             ..body
@@ -3085,6 +3119,7 @@ mod tests {
                         index: Some(0),
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "user".to_string(),
@@ -3093,6 +3128,7 @@ mod tests {
                     ),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
             ..body
@@ -3128,6 +3164,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };
@@ -3161,6 +3198,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };
@@ -3194,6 +3232,7 @@ mod tests {
                 content: Value::String("Read the relevant file.".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };
@@ -3224,6 +3263,7 @@ mod tests {
                 content: Value::String("Use Read when appropriate.".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             ..body
         };

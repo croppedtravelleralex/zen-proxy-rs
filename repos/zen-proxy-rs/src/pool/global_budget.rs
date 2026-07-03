@@ -320,6 +320,8 @@ mod tests {
     fn meta() -> RequestMeta {
         RequestMeta {
             model: "deepseek-v4-flash".to_string(),
+            upstream_model: "deepseek-v4-flash-free".to_string(),
+            session_id: String::new(),
             stream: true,
             body_size: 128,
             affinity_key: String::new(),

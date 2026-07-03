@@ -41,6 +41,7 @@ impl ProbePeriod {
                     content: Value::String("Reply exactly: OK".to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 }],
                 stream: Some(false),
                 max_tokens: Some(32),

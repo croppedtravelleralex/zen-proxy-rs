@@ -6,6 +6,7 @@ pub mod manager;
 pub mod node_registry;
 pub mod probe_period;
 pub mod ratelimited;
+pub mod session_pin;
 pub mod transport;
 
 use std::fmt::Debug;
@@ -53,6 +54,7 @@ pub struct DispatchResult {
     pub url: String,
     pub affinity_hit: bool,
     pub affinity_node_id: String,
+    pub session_pin_hit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +87,8 @@ impl PoolStats {
 #[derive(Debug, Clone)]
 pub struct RequestMeta {
     pub model: String,
+    pub upstream_model: String,
+    pub session_id: String,
     pub stream: bool,
     pub body_size: u64,
     pub affinity_key: String,

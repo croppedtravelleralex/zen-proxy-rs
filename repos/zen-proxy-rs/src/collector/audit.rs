@@ -71,6 +71,7 @@ impl AuditStore {
         if let Some(current) = guard.as_mut() {
             let line = serde_json::to_string(tele).unwrap_or_default();
             writeln!(current.writer, "{line}")?;
+            current.writer.flush()?;
         }
         Ok(())
     }

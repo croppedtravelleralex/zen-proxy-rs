@@ -47,6 +47,7 @@ pub fn anthropic_to_openai_messages(req: &AnthropicRequest) -> Vec<Message> {
                 content: Value::String(system_text),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
     }
@@ -229,12 +230,14 @@ fn anthropic_message_to_openai_messages(msg: &AnthropicMessage) -> Vec<Message> 
             content: Value::String(anthropic_content_to_text(&msg.content)),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }],
     }
 }
 
 fn anthropic_assistant_to_openai_message(content: &Value) -> Message {
     let mut text_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
     let mut tool_calls = Vec::new();
 
     if let Value::Array(blocks) = content {
@@ -244,6 +247,17 @@ fn anthropic_assistant_to_openai_message(content: &Value) -> Message {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                         if !text.is_empty() {
                             text_parts.push(text.to_string());
+                        }
+                    }
+                }
+                Some("thinking") => {
+                    if let Some(text) = block
+                        .get("thinking")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| block.get("text").and_then(|v| v.as_str()))
+                    {
+                        if !text.is_empty() {
+                            reasoning_parts.push(text.to_string());
                         }
                     }
                 }
@@ -284,6 +298,11 @@ fn anthropic_assistant_to_openai_message(content: &Value) -> Message {
             Some(tool_calls)
         },
         tool_call_id: None,
+        reasoning_content: if reasoning_parts.is_empty() {
+            None
+        } else {
+            Some(reasoning_parts.join("\n"))
+        },
     }
 }
 
@@ -294,6 +313,7 @@ fn anthropic_user_to_openai_messages(content: &Value) -> Vec<Message> {
             content: Value::String(anthropic_content_to_text(content)),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
     };
 
@@ -319,6 +339,7 @@ fn anthropic_user_to_openai_messages(content: &Value) -> Vec<Message> {
                         .get("tool_use_id")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
+                    reasoning_content: None,
                 });
             }
             _ => {}
@@ -331,6 +352,7 @@ fn anthropic_user_to_openai_messages(content: &Value) -> Vec<Message> {
             content: Value::String(user_text.join("\n")),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
     messages
@@ -868,6 +890,7 @@ pub fn model_disables_input_compaction(model: &str) -> bool {
         normalize_model(model).as_str(),
         "deepseek-v4-flash"
             | "deepseek-v4-flash-free"
+            | "big-pickle"
             | "mimo-v2.5"
             | "mimo-v2.5-free"
             | "north-mini-code"
@@ -931,6 +954,7 @@ pub fn compact_claude_code_huge_session_context(
         content: Value::String(summary),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
     compacted.extend(recent_messages);
     *messages = compacted;
@@ -1215,6 +1239,7 @@ pub fn append_latest_user_anchor_message(messages: &mut Vec<Message>, max_chars:
         content: Value::String(content),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
     true
 }
@@ -1238,6 +1263,7 @@ pub fn reduce_to_exact_output_anchor_message(
         )),
         tool_calls: None,
         tool_call_id: None,
+                reasoning_content: None,
     });
     true
 }
@@ -1768,6 +1794,7 @@ mod tests {
             content: Value::String(content.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -1929,7 +1956,7 @@ mod tests {
             assert!(model_disables_input_compaction(model), "{model}");
         }
         assert!(!model_disables_input_compaction("deepseek-v4-flash-lite"));
-        assert!(!model_disables_input_compaction("big-pickle"));
+        assert!(model_disables_input_compaction("big-pickle"));
     }
 
     #[test]

@@ -32,8 +32,7 @@ use crate::v4::protocol_guard::{self, GuardPhase};
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 const STREAM_DOWNSTREAM_SEND_TIMEOUT_SECS: u64 = 30;
 const AFFINITY_MIN_BODY_BYTES: u64 = 32 * 1024;
-const AFFINITY_MEDIUM_PREFIX_BYTES: usize = 32 * 1024;
-const AFFINITY_LARGE_PREFIX_BYTES: usize = 256 * 1024;
+const AFFINITY_MIN_BODY_BYTES_CLAUDE_CODE: u64 = 16 * 1024;
 
 pub async fn handle_v4_proxy(
     state: &Arc<AppState>,
@@ -153,12 +152,40 @@ pub async fn handle_v4_proxy(
         .original_body_bytes
         .saturating_sub(effective_body_len);
 
+    let (usk, icp_scope, prefix_32k_hash, session_id) = resolve_session_identity(
+        &upstream_body,
+        &public_model,
+        &resolved.upstream_model,
+        &source_client,
+        client_id,
+    );
+    let session_id = if session_id.is_empty() {
+        extract_header(headers, "x-opencode-session")
+            .or_else(|| {
+                if client_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(client_id.to_string())
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        session_id
+    };
+
+    let ccp_snap_preflight =
+        build_ccp_audit_snap_preflight(&session_id, &usk, &icp_scope, &prefix_32k_hash);
+    let thinking_policy = infer_thinking_policy(&upstream_body);
+
     let request_meta = RequestMeta {
         model: public_model.clone(),
+        upstream_model: resolved.upstream_model.clone(),
+        session_id,
         stream: streaming,
         body_size: effective_body_len,
         affinity_key: build_affinity_key(
             &public_model,
+            &resolved.upstream_model,
             path,
             &source_client,
             client_id,
@@ -204,6 +231,14 @@ pub async fn handle_v4_proxy(
                 timings.first_chunk_ms = timings.first_chunk_ms.max(result.ttft_ms.unwrap_or(0));
                 timings.protocol_first_byte_ms = timings.first_chunk_ms;
             }
+            let ccp_snap = build_ccp_audit_snap(
+                &ccp_snap_preflight.session_id,
+                &ccp_snap_preflight.usk,
+                &ccp_snap_preflight.icp_scope,
+                &ccp_snap_preflight.prefix_32k_hash,
+                &result.usage,
+                &thinking_policy,
+            );
             let telemetry = RequestTelemetry {
                 rid: result.request_id.clone(),
                 ts: chrono::Utc::now().timestamp_millis(),
@@ -247,6 +282,17 @@ pub async fn handle_v4_proxy(
                 cached_tokens: result.usage.cached_tokens,
                 cache_creation_input_tokens: result.usage.cache_creation_input_tokens,
                 cache_read_input_tokens: result.usage.cache_read_input_tokens,
+                cache_miss_input_tokens: ccp_snap.cache_miss_input_tokens,
+                session_id: ccp_snap.session_id,
+                usk: ccp_snap.usk,
+                icp_scope: ccp_snap.icp_scope,
+                prefix_32k_hash: ccp_snap.prefix_32k_hash,
+                prefix_drift: ccp_snap.prefix_drift,
+                session_pin_hit: result.session_pin_hit,
+                thinking_policy: ccp_snap.thinking_policy,
+                prompt_cache_key: ccp_snap.prompt_cache_key,
+                provider_cache_observation: ccp_snap.provider_cache_observation,
+                warmup_state: ccp_snap.warmup_state,
                 bytes_sent: effective_body_len,
                 bytes_received: result.body_bytes_len,
                 failure_kind: String::new(),
@@ -341,6 +387,17 @@ pub async fn handle_v4_proxy(
                     cached_tokens: 0,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
+                    cache_miss_input_tokens: 0,
+                    session_id: ccp_snap_preflight.session_id.clone(),
+                    usk: ccp_snap_preflight.usk.clone(),
+                    icp_scope: ccp_snap_preflight.icp_scope.clone(),
+                    prefix_32k_hash: ccp_snap_preflight.prefix_32k_hash.clone(),
+                    prefix_drift: ccp_snap_preflight.prefix_drift,
+                    session_pin_hit: false,
+                    thinking_policy: thinking_policy.clone(),
+                    prompt_cache_key: ccp_snap_preflight.prompt_cache_key.clone(),
+                    provider_cache_observation: String::new(),
+                    warmup_state: ccp_snap_preflight.warmup_state.clone(),
                     bytes_sent: effective_body_len,
                     bytes_received: 0,
                     failure_kind: err.failure_kind.clone(),
@@ -517,6 +574,7 @@ fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
 
 fn build_affinity_key(
     public_model: &str,
+    upstream_model: &str,
     path: &str,
     source_client: &str,
     client_id: &str,
@@ -524,7 +582,17 @@ fn build_affinity_key(
     _streaming: bool,
     body: &Value,
 ) -> String {
-    if body_size < AFFINITY_MIN_BODY_BYTES {
+    if crate::pool::session_pin::is_mimo_family(public_model)
+        || crate::pool::session_pin::is_mimo_family(upstream_model)
+    {
+        return String::new();
+    }
+    let min_bytes = if source_client.trim() == "claude-code" {
+        AFFINITY_MIN_BODY_BYTES_CLAUDE_CODE
+    } else {
+        AFFINITY_MIN_BODY_BYTES
+    };
+    if body_size < min_bytes {
         return String::new();
     }
     let client_bucket = if client_id.trim().is_empty() {
@@ -532,48 +600,204 @@ fn build_affinity_key(
     } else {
         LedgerEvent::short_hash(client_id)
     };
-    let prefix_hash = affinity_prefix_hash(body);
-    let tools_hash = affinity_component_hash(body.get("tools"));
-    let tool_choice_hash = affinity_component_hash(body.get("tool_choice"));
     let source_bucket = if source_client.trim().is_empty() {
         "unknown"
     } else {
         source_client.trim()
     };
+    let usk_ctx = free_model_client_rs::ccp::UskContext {
+        api_key_id: &client_bucket,
+        public_model,
+        upstream_model,
+        source_client: source_bucket,
+    };
+    if let Some(identity) =
+        free_model_client_rs::ccp::compute_icp_identity_from_body(body, &usk_ctx)
+    {
+        return free_model_client_rs::ccp::affinity_key_from_identity(
+            &identity,
+            path,
+            &client_bucket,
+        );
+    }
     format!(
-        "{}:{}:{}:{}:p{}:tools{}:choice{}",
-        public_model, path, source_bucket, client_bucket, prefix_hash, tools_hash, tool_choice_hash
+        "{}:{}:{}:{}:{}",
+        upstream_model, public_model, path, source_bucket, client_bucket
     )
 }
 
-fn affinity_prefix_hash(body: &Value) -> String {
-    let material = body
-        .get("messages")
-        .and_then(|messages| serde_json::to_vec(messages).ok())
-        .unwrap_or_default();
-    let prefix_len = material.len().min(affinity_prefix_bytes(material.len()));
-    short_hash_bytes(&material[..prefix_len])
+fn resolve_session_identity(
+    body: &Value,
+    public_model: &str,
+    upstream_model: &str,
+    source_client: &str,
+    client_id: &str,
+) -> (String, String, String, String) {
+    let client_bucket = if client_id.trim().is_empty() {
+        "anon".to_string()
+    } else {
+        LedgerEvent::short_hash(client_id)
+    };
+    let source_bucket = if source_client.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        source_client.trim().to_string()
+    };
+    let usk_ctx = free_model_client_rs::ccp::UskContext {
+        api_key_id: &client_bucket,
+        public_model,
+        upstream_model,
+        source_client: &source_bucket,
+    };
+    if let Some(identity) =
+        free_model_client_rs::ccp::compute_icp_identity_from_body(body, &usk_ctx)
+    {
+        return (
+            identity.usk.clone(),
+            identity.icp_scope.clone(),
+            format!("{:016x}", identity.prefix_32k_hash),
+            identity.zen_session_id.clone(),
+        );
+    }
+    (String::new(), String::new(), String::new(), client_bucket)
 }
 
-fn affinity_prefix_bytes(material_len: usize) -> usize {
-    if material_len <= AFFINITY_LARGE_PREFIX_BYTES {
-        AFFINITY_MEDIUM_PREFIX_BYTES
+#[derive(Debug, Clone)]
+struct CcpAuditSnap {
+    session_id: String,
+    usk: String,
+    icp_scope: String,
+    prefix_32k_hash: String,
+    prefix_drift: bool,
+    prompt_cache_key: String,
+    cache_miss_input_tokens: u32,
+    provider_cache_observation: String,
+    warmup_state: String,
+    thinking_policy: String,
+}
+
+fn detect_prefix_drift(usk: &str, prefix_32k_hash: &str) -> bool {
+    if usk.is_empty() || prefix_32k_hash.is_empty() {
+        return false;
+    }
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let store = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match store.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    let drift = guard
+        .get(usk)
+        .is_some_and(|previous| previous != prefix_32k_hash);
+    guard.insert(usk.to_string(), prefix_32k_hash.to_string());
+    drift
+}
+
+fn provider_cache_observation(usage: &UsageCounts) -> String {
+    if usage.cache_read_input_tokens > 0 || usage.cached_tokens > 0 {
+        "cache_hit".to_string()
+    } else if usage.cache_creation_input_tokens > 0 {
+        "cache_write".to_string()
     } else {
-        AFFINITY_LARGE_PREFIX_BYTES
+        "no_cache_signal".to_string()
     }
 }
 
-fn affinity_component_hash(value: Option<&Value>) -> String {
-    value
-        .and_then(|value| serde_json::to_vec(value).ok())
-        .map(|bytes| short_hash_bytes(&bytes))
-        .unwrap_or_else(|| "none".to_string())
+fn cache_miss_input_tokens(usage: &UsageCounts) -> u32 {
+    if let Some(cache_miss) = usage.cache_miss_input_tokens {
+        return cache_miss;
+    }
+    let prompt = usage.prompt_tokens;
+    let read = usage.cache_read_input_tokens.max(usage.cached_tokens);
+    prompt.saturating_sub(read)
 }
 
-fn short_hash_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(bytes);
-    hex::encode(&hash[..8])
+fn warmup_state_for(usk: &str, observation: &str) -> String {
+    if usk.is_empty() {
+        return "unknown".to_string();
+    }
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARM: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let store = WARM.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match store.lock() {
+        Ok(guard) => guard,
+        Err(_) => return "unknown".to_string(),
+    };
+    if observation == "cache_hit" {
+        guard.insert(usk.to_string());
+        "steady".to_string()
+    } else if guard.contains(usk) {
+        "steady".to_string()
+    } else {
+        "cold".to_string()
+    }
+}
+
+fn build_ccp_audit_snap(
+    session_id: &str,
+    usk: &str,
+    icp_scope: &str,
+    prefix_32k_hash: &str,
+    usage: &UsageCounts,
+    thinking_policy: &str,
+) -> CcpAuditSnap {
+    let prefix_drift = detect_prefix_drift(usk, prefix_32k_hash);
+    let provider_cache_observation = provider_cache_observation(usage);
+    let warmup_state = warmup_state_for(usk, &provider_cache_observation);
+    CcpAuditSnap {
+        session_id: session_id.to_string(),
+        usk: usk.to_string(),
+        icp_scope: icp_scope.to_string(),
+        prefix_32k_hash: prefix_32k_hash.to_string(),
+        prefix_drift,
+        prompt_cache_key: usk.to_string(),
+        cache_miss_input_tokens: cache_miss_input_tokens(usage),
+        provider_cache_observation,
+        warmup_state,
+        thinking_policy: thinking_policy.to_string(),
+    }
+}
+
+fn build_ccp_audit_snap_preflight(
+    session_id: &str,
+    usk: &str,
+    icp_scope: &str,
+    prefix_32k_hash: &str,
+) -> CcpAuditSnap {
+    let prefix_drift = detect_prefix_drift(usk, prefix_32k_hash);
+    CcpAuditSnap {
+        session_id: session_id.to_string(),
+        usk: usk.to_string(),
+        icp_scope: icp_scope.to_string(),
+        prefix_32k_hash: prefix_32k_hash.to_string(),
+        prefix_drift,
+        prompt_cache_key: usk.to_string(),
+        cache_miss_input_tokens: 0,
+        provider_cache_observation: String::new(),
+        warmup_state: if usk.is_empty() {
+            "unknown".to_string()
+        } else {
+            "cold".to_string()
+        },
+        thinking_policy: String::new(),
+    }
+}
+
+fn infer_thinking_policy(body: &Value) -> String {
+    if body.get("thinking").is_some() {
+        return "enabled".to_string();
+    }
+    if body
+        .get("metadata")
+        .and_then(|meta| meta.get("thinking"))
+        .is_some()
+    {
+        return "enabled".to_string();
+    }
+    "production_default".to_string()
 }
 
 fn infer_gateway(headers: &HeaderMap, external_request_id: &str) -> String {
@@ -693,23 +917,38 @@ fn normalize_tool_name(value: &str) -> String {
 }
 
 fn body_contains_strong_client_marker(value: &Value, marker: &str) -> bool {
-    match value {
-        Value::String(text) => {
-            let lower = text.to_ascii_lowercase();
-            match marker {
-                "openclaw" => contains_strong_openclaw_marker(&lower),
-                "hermes" => contains_strong_hermes_marker(&lower),
-                _ => false,
-            }
+    const MAX_SCAN_NODES: usize = 20_000;
+    const MAX_SCAN_DEPTH: usize = 128;
+
+    let mut stack = vec![(value, 0usize)];
+    let mut seen = 0usize;
+    while let Some((current, depth)) = stack.pop() {
+        seen = seen.saturating_add(1);
+        if seen > MAX_SCAN_NODES || depth > MAX_SCAN_DEPTH {
+            return false;
         }
-        Value::Array(items) => items
-            .iter()
-            .any(|item| body_contains_strong_client_marker(item, marker)),
-        Value::Object(map) => map
-            .values()
-            .any(|item| body_contains_strong_client_marker(item, marker)),
-        _ => false,
+        match current {
+            Value::String(text) => {
+                let lower = text.to_ascii_lowercase();
+                let matched = match marker {
+                    "openclaw" => contains_strong_openclaw_marker(&lower),
+                    "hermes" => contains_strong_hermes_marker(&lower),
+                    _ => false,
+                };
+                if matched {
+                    return true;
+                }
+            }
+            Value::Array(items) => {
+                stack.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            Value::Object(map) => {
+                stack.extend(map.values().map(|item| (item, depth + 1)));
+            }
+            _ => {}
+        }
     }
+    false
 }
 
 fn contains_strong_openclaw_marker(lower: &str) -> bool {
@@ -790,20 +1029,8 @@ fn apply_model_compatibility_profile(
     compatibility_profile: ModelCompatibilityProfile,
 ) -> ClientProfile {
     match compatibility_profile {
-        ModelCompatibilityProfile::StaticFlash => {
-            if matches!(profile.kind, ClientKind::Hermes | ClientKind::OpenClaw) {
-                ClientProfile::unknown()
-            } else {
-                profile
-            }
-        }
-        ModelCompatibilityProfile::StaticFlashLite => {
-            if matches!(profile.kind, ClientKind::ClaudeCode) {
-                ClientProfile::unknown()
-            } else {
-                profile
-            }
-        }
+        ModelCompatibilityProfile::StaticFlash => profile,
+        ModelCompatibilityProfile::StaticFlashLite => profile,
         ModelCompatibilityProfile::StaticMimo => {
             if matches!(profile.kind, ClientKind::ClaudeCode) {
                 profile
@@ -864,6 +1091,7 @@ struct V4CallResult {
     timings: RequestTimings,
     affinity_hit: bool,
     affinity_node_id: String,
+    session_pin_hit: bool,
     retry_chain: Vec<RequestAttemptTelemetry>,
     body_bytes_len: u64,
     usage: UsageCounts,
@@ -877,6 +1105,7 @@ struct UsageCounts {
     cached_tokens: u32,
     cache_creation_input_tokens: u32,
     cache_read_input_tokens: u32,
+    cache_miss_input_tokens: Option<u32>,
 }
 
 struct V4CallError {
@@ -1200,6 +1429,7 @@ async fn call_with_retry(
                         },
                         affinity_hit: dispatch_result.affinity_hit,
                         affinity_node_id: dispatch_result.affinity_node_id,
+                        session_pin_hit: dispatch_result.session_pin_hit,
                         retry_chain,
                         body_bytes_len,
                         usage,
@@ -1976,6 +2206,10 @@ fn metered_stream_response(
         telemetry.cached_tokens = usage.cached_tokens;
         telemetry.cache_creation_input_tokens = usage.cache_creation_input_tokens;
         telemetry.cache_read_input_tokens = usage.cache_read_input_tokens;
+        telemetry.cache_miss_input_tokens = cache_miss_input_tokens(&usage);
+        telemetry.provider_cache_observation = provider_cache_observation(&usage);
+        telemetry.warmup_state =
+            warmup_state_for(&telemetry.usk, &telemetry.provider_cache_observation);
         telemetry.latency_total_ms = stream_complete_ms;
         telemetry.ttft_ms = first_chunk_ms;
         telemetry.timings.first_chunk_ms = first_chunk_ms;
@@ -2304,6 +2538,10 @@ impl StreamMetrics {
                         self.usage.cache_read_input_tokens.max(cache_read);
                     self.usage.cached_tokens = self.usage.cached_tokens.max(cache_read);
                 }
+                if let Some(cache_miss) = usage_cache_miss_u32(usage) {
+                    self.usage.cache_miss_input_tokens =
+                        max_optional_u32(self.usage.cache_miss_input_tokens, cache_miss);
+                }
             }
             return;
         }
@@ -2367,6 +2605,10 @@ impl StreamMetrics {
             self.usage.cache_read_input_tokens = self.usage.cache_read_input_tokens.max(cache_read);
             self.usage.cached_tokens = self.usage.cached_tokens.max(cache_read);
         }
+        if let Some(cache_miss) = usage_cache_miss_u32(usage) {
+            self.usage.cache_miss_input_tokens =
+                max_optional_u32(self.usage.cache_miss_input_tokens, cache_miss);
+        }
     }
 
     fn final_usage(&self) -> UsageCounts {
@@ -2400,6 +2642,10 @@ impl StreamMetrics {
                 .usage
                 .cache_read_input_tokens
                 .max(self.fallback_usage.cache_read_input_tokens),
+            cache_miss_input_tokens: max_optional_usage(
+                self.usage.cache_miss_input_tokens,
+                self.fallback_usage.cache_miss_input_tokens,
+            ),
         }
     }
 
@@ -2469,6 +2715,23 @@ fn usage_cache_read_u32(usage: &Value) -> Option<u32> {
         .or_else(|| usage_cached_tokens_u32(usage))
 }
 
+fn usage_cache_miss_u32(usage: &Value) -> Option<u32> {
+    usage_u32_opt(usage, "cache_miss_input_tokens")
+        .or_else(|| usage_u32_opt(usage, "prompt_cache_miss_tokens"))
+}
+
+fn max_optional_u32(current: Option<u32>, next: u32) -> Option<u32> {
+    Some(current.unwrap_or(0).max(next))
+}
+
+fn max_optional_usage(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
         return UsageCounts::default();
@@ -2487,6 +2750,7 @@ fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
             cached_tokens: cache_read,
             cache_creation_input_tokens: usage_u32(usage, "cache_creation_input_tokens"),
             cache_read_input_tokens: cache_read,
+            cache_miss_input_tokens: usage_cache_miss_u32(usage),
         }
     } else {
         let cached_tokens = usage_cached_tokens_u32(usage).unwrap_or(0);
@@ -2497,6 +2761,7 @@ fn extract_usage_counts(path: &str, bytes: &Bytes) -> UsageCounts {
             cached_tokens,
             cache_creation_input_tokens: usage_u32(usage, "cache_creation_input_tokens"),
             cache_read_input_tokens: usage_u32(usage, "cache_read_input_tokens").max(cached_tokens),
+            cache_miss_input_tokens: usage_cache_miss_u32(usage),
         }
     }
 }
@@ -2684,6 +2949,39 @@ mod tests {
             .kind,
             ClientKind::Unknown
         );
+    }
+
+    #[test]
+    fn static_flash_preserves_explicit_openclaw_and_hermes_profiles() {
+        for kind in [ClientKind::OpenClaw, ClientKind::Hermes] {
+            let profile = ClientProfile::new(kind, ClientProfileSource::Header);
+            assert_eq!(
+                apply_model_compatibility_profile(profile, ModelCompatibilityProfile::StaticFlash)
+                    .kind,
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn static_flash_lite_preserves_claudecode_profile() {
+        let profile = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header);
+
+        assert_eq!(
+            apply_model_compatibility_profile(profile, ModelCompatibilityProfile::StaticFlashLite)
+                .kind,
+            ClientKind::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn deeply_nested_body_marker_scan_is_bounded_and_non_recursive() {
+        let mut value = serde_json::json!("leaf");
+        for _ in 0..512 {
+            value = serde_json::json!([value]);
+        }
+
+        assert!(!body_contains_strong_client_marker(&value, "openclaw"));
     }
 
     #[test]
@@ -3048,10 +3346,34 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
+    fn mimo_family_disables_prefix_affinity() {
+        let body = serde_json::json!({
+            "messages":[{"role":"user","content":"a".repeat(80_000)}],
+            "tools":[{"function":{"name":"Read"}}],
+            "tool_choice":"auto"
+        });
+        let key = build_affinity_key(
+            "mimo-v2.5",
+            "mimo-v2.5-free",
+            "messages",
+            "claude-code",
+            "client",
+            180_000,
+            true,
+            &body,
+        );
+        assert!(key.is_empty());
+    }
+
+    #[test]
     fn affinity_key_is_for_medium_and_large_requests() {
-        let body = serde_json::json!({"messages":[{"role":"user","content":"hello"}]});
+        let body = serde_json::json!({
+            "model": "m",
+            "messages":[{"role":"user","content":"hello"}]
+        });
         assert!(build_affinity_key(
             "m",
+            "m-up",
             "chat/completions",
             "claude-code",
             "sk",
@@ -3062,6 +3384,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         .is_empty());
         let medium_nonstream_key = build_affinity_key(
             "m",
+            "m-up",
             "chat/completions",
             "claude-code",
             "sk",
@@ -3069,11 +3392,12 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             false,
             &body,
         );
-        assert!(medium_nonstream_key.starts_with("m:chat/completions:claude-code:"));
-        assert!(medium_nonstream_key.contains(":p"));
+        assert!(medium_nonstream_key.starts_with("m-up:m:claude-code:"));
+        assert!(medium_nonstream_key.contains("chat/completions"));
 
         let medium_key = build_affinity_key(
             "m",
+            "m-up",
             "chat/completions",
             "claude-code",
             "sk",
@@ -3081,30 +3405,49 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             true,
             &body,
         );
-        assert!(medium_key.starts_with("m:chat/completions:claude-code:"));
-        assert!(medium_key.contains(":p"));
+        assert!(medium_key.starts_with("m-up:m:claude-code:"));
 
+        let large_body = serde_json::json!({
+            "model": "m",
+            "messages":[{"role":"user","content":"a".repeat(80_000)}],
+            "tools":[{"type":"function","function":{"name":"Read"}}],
+            "tool_choice":"auto"
+        });
         let key = build_affinity_key(
             "m",
+            "m-up",
             "chat/completions",
             "claude-code",
             "sk",
             200_000,
             true,
-            &body,
+            &large_body,
         );
-        assert!(key.starts_with("m:chat/completions:claude-code:"));
-        assert!(key.contains(":p"));
-        assert!(key.contains(":tools"));
-        assert!(key.contains(":choice"));
+        assert!(key.starts_with("m-up:m:claude-code:"));
+        let without_tools = build_affinity_key(
+            "m",
+            "m-up",
+            "chat/completions",
+            "claude-code",
+            "sk",
+            200_000,
+            true,
+            &serde_json::json!({
+                "model": "m",
+                "messages":[{"role":"user","content":"a".repeat(80_000)}],
+                "tool_choice":"auto"
+            }),
+        );
+        assert_ne!(key, without_tools);
     }
 
     #[test]
     fn affinity_key_uses_stable_prefix_and_tools_hash() {
         let prefix = "a".repeat(400_000);
         let first = serde_json::json!({
+            "model": "m",
             "messages":[{"role":"user","content":prefix}],
-            "tools":[{"function":{"name":"Read"}}],
+            "tools":[{"type":"function","function":{"name":"Read"}}],
             "tool_choice":"auto"
         });
         let mut second = first.clone();
@@ -3113,13 +3456,15 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             .unwrap()
             .push(serde_json::json!({"role":"user","content":"continue"}));
         let changed_prefix = serde_json::json!({
+            "model": "m",
             "messages":[{"role":"user","content":format!("b{}", "a".repeat(399_999))}],
-            "tools":[{"function":{"name":"Read"}}],
+            "tools":[{"type":"function","function":{"name":"Read"}}],
             "tool_choice":"auto"
         });
 
         let first_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",
@@ -3129,6 +3474,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         );
         let second_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",
@@ -3138,6 +3484,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         );
         let changed_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",
@@ -3160,6 +3507,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
         let claude_code_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",
@@ -3167,8 +3515,9 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             true,
             &body,
         );
-        let hermes_key =
-            build_affinity_key("m", "messages", "hermes", "client", 180_000, true, &body);
+        let hermes_key = build_affinity_key(
+            "m", "m-up", "messages", "hermes", "client", 180_000, true, &body,
+        );
 
         assert_ne!(claude_code_key, hermes_key);
     }
@@ -3177,8 +3526,9 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     fn affinity_key_keeps_medium_stable_prefix_when_tail_grows() {
         let prefix = "a".repeat(80_000);
         let first = serde_json::json!({
+            "model": "m",
             "messages":[{"role":"user","content":prefix}],
-            "tools":[{"function":{"name":"Read"}}],
+            "tools":[{"type":"function","function":{"name":"Read"}}],
             "tool_choice":"auto"
         });
         let mut second = first.clone();
@@ -3187,13 +3537,15 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             .unwrap()
             .push(serde_json::json!({"role":"user","content":"continue"}));
         let changed_prefix = serde_json::json!({
+            "model": "m",
             "messages":[{"role":"user","content":format!("b{}", "a".repeat(79_999))}],
-            "tools":[{"function":{"name":"Read"}}],
+            "tools":[{"type":"function","function":{"name":"Read"}}],
             "tool_choice":"auto"
         });
 
         let first_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",
@@ -3203,6 +3555,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         );
         let second_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",
@@ -3212,6 +3565,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         );
         let changed_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",
@@ -3240,6 +3594,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 
         let first_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",
@@ -3249,6 +3604,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         );
         let second_key = build_affinity_key(
             "m",
+            "m-up",
             "messages",
             "claude-code",
             "client",

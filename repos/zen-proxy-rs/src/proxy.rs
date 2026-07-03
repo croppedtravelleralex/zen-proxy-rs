@@ -159,6 +159,12 @@ pub async fn proxy_handler(
 
     let req_meta = RequestMeta {
         model: model.clone(),
+        upstream_model: model.clone(),
+        session_id: headers
+            .get("x-opencode-session")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(client_id.as_str())
+            .to_string(),
         stream: streaming,
         body_size: body_len,
         affinity_key: String::new(),
@@ -236,6 +242,17 @@ pub async fn proxy_handler(
                 cached_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                cache_miss_input_tokens: 0,
+                session_id: String::new(),
+                usk: String::new(),
+                icp_scope: String::new(),
+                prefix_32k_hash: String::new(),
+                prefix_drift: false,
+                session_pin_hit: false,
+                thinking_policy: String::new(),
+                prompt_cache_key: String::new(),
+                provider_cache_observation: String::new(),
+                warmup_state: String::new(),
                 bytes_sent: body_len,
                 bytes_received: pr.body_bytes.len() as u64,
                 failure_kind: if status < 400 {
