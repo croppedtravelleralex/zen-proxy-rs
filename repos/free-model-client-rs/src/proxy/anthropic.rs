@@ -743,6 +743,13 @@ async fn collect_anthropic_non_stream_parts_with_guard(
                     collected.finish_reason = Some("tool_calls".to_string());
                     return Ok(NonStreamCollectOutcome::Collected(Box::new(collected)));
                 }
+                if is_truncated_stream_error(&err) {
+                    return Ok(NonStreamCollectOutcome::RetryNoForwardable {
+                        reasoning_chars: collected.reasoning.len(),
+                        upstream_event_count,
+                        elapsed_ms: attempt_started.elapsed().as_millis() as u64,
+                    });
+                }
                 return Err(err);
             }
         };
@@ -795,6 +802,13 @@ async fn collect_anthropic_non_stream_parts_with_guard(
         ));
     }
     Ok(NonStreamCollectOutcome::Collected(Box::new(collected)))
+}
+
+fn is_truncated_stream_error(err: &AppError) -> bool {
+    err.status == axum::http::StatusCode::BAD_GATEWAY
+        && err
+            .message
+            .contains("stream truncated before DONE or finish_reason")
 }
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {

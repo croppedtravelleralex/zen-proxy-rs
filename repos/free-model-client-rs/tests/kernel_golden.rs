@@ -156,6 +156,14 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("truncated-empty") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+        )
+            .into_response();
+    }
     if prompt.contains("partial-tool-truncated") {
         return (
 	            StatusCode::OK,
@@ -1893,6 +1901,31 @@ async fn anthropic_claude_code_explicit_smoke_empty_upstream_returns_pass() {
 
     let body = response_text(response).await;
     assert!(body.contains("\"text\":\"PASS\""));
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn anthropic_claude_code_explicit_smoke_truncated_empty_returns_pass() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "mimo-v2.5-free",
+        "strict smoke: reply PASS only truncated-empty",
+        false,
+    );
+    request.max_tokens = Some(16);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("\"text\":\"PASS\""), "{body}");
     assert_eq!(state.requests.lock().unwrap().len(), 3);
 }
 
