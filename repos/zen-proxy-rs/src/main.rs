@@ -49,6 +49,8 @@ use v4::model::ModelRegistry;
 use v4::model_discovery::DynamicModelRegistry;
 use v4::model_probe_runner::run_dynamic_model_probe_once;
 
+const DEFAULT_TOKIO_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
 static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
 pub(crate) fn set_log_level(level: &str) -> Result<(), &'static str> {
@@ -300,8 +302,21 @@ async fn shutdown_signal() {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let worker_stack_bytes = std::env::var("TOKIO_WORKER_STACK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TOKIO_WORKER_STACK_BYTES)
+        .max(DEFAULT_TOKIO_WORKER_STACK_BYTES);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(worker_stack_bytes)
+        .build()
+        .expect("failed to build tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let log_filter = EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into());
     let (log_filter, log_handle) = reload::Layer::new(log_filter);
     LOG_RELOAD.set(log_handle).ok();
