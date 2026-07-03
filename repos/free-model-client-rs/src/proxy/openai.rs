@@ -264,7 +264,7 @@ async fn handle_oa_non_stream(
                 &config.zen_chat_url,
                 &config.zen_api_key,
                 &attempt_body,
-                &upstream_headers,
+                upstream_headers,
             )
             .await
             {

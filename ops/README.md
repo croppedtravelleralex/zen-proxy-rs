@@ -6,21 +6,28 @@
 
 | 说法 | 何时成立 |
 |------|----------|
-| **运维部署成功** | `deploy-panda-tmcc.sh` exit 0；磁盘二进制 hash 更新；`@1/@2/@3` active；`:4000/health` ok |
+| **运维部署成功** | GitHub release/download 路径完成；磁盘二进制 hash 更新；`@1/@2/@3` active；`:4000/health` ok |
 | **TMCC 2.0 / CCP 生产生效** | 部署后 audit **绝大多数行**含 `usk` 等新字段；R2 向 95% 收敛 |
 | **99+ 验收通过** | `cache_quality_acceptance.py --strict` 全绿 |
 
-2026-07-03 现状：**运维部署 ✅**（`572cba42…`）；**生效 ❌ 未证实**（13:57 后 deepseek audit 仅 **6.4%** 含 `usk`）；**验收 ❌**（ccswitch ~41%，NewAPI ~54%）。
+2026-07-03 22:40 现状：上一版运维 hash `8817109b…` 仍未解决主路径 cache；deepseek 21:40-22:00 `session_pin_hit` 高但 `usk/prompt_cache_key` 覆盖低，Mimo 21:58 有 stack overflow。
 
 详见 `plan.md` 与 `docs/cache-95plus-architecture.md` §「部署 vs 生效」。
 
 ## Cache 99+ 部署
 
+生产部署必须走 GitHub 中转，不使用 `scp` 传二进制。
+
+当前推荐流程：
+
 ```bash
-bash ops/deploy-panda-tmcc.sh
+# 1. 本地 release 构建并上传到 GitHub 临时 release
+# 2. panda 从 GitHub release 下载二进制
+# 3. 备份 /opt/zen-proxy-rs/zen-proxy-rs 后滚动重启 @1/@2/@3
+# 4. health / models / audit smoke 通过后删除临时 release/tag
 ```
 
-脚本会：release 构建 → strip 上传 → nginx 粘性 → 重启 `@1/@2/@3` → 追加 `CCP_*` env → smoke。
+`deploy-panda-tmcc.sh` 是旧脚本，包含 `scp` 上传步骤，不作为生产默认入口。
 **跑通 ≠ 验收通过。**
 
 ## 验收与对账
@@ -31,7 +38,7 @@ bash ops/deploy-panda-tmcc.sh
 | `deploy_schema_forensics.py` | audit 是否含 `usk` 键（新 schema 代际） |
 | `cache_quality_acceptance.py` | R1/R2/R3；`--strict` 为 99+ 门槛 |
 | `cache_join_report.py` | D1–D5 归因 |
-| `post_deploy_audit_check.sh` | scp audit + 抽样 |
+| `post_deploy_audit_check.sh` | audit 抽样；如需取远端日志，优先 ssh 流式读取，避免提交 raw logs |
 
 ```bash
 python3 ops/tri_cache_report_v2.py
@@ -55,7 +62,7 @@ done'
 | `CCP_ANTHROPIC_BP` | on | BBM（**未接线**） |
 | `CCP_SESSION_PIN_REDIS_URL` | 空 | Redis pin |
 
-部署脚本向 `/etc/default/zen-proxy-rs@N` 追加 `CCP_*=1`；须确认 systemd unit 是否 `EnvironmentFile=` 加载。
+当前 panda systemd 环境文件为 `/etc/zen-proxy-rs/common.env` 与 `/etc/zen-proxy-rs/instances/%i.env`。旧 `/etc/default/zen-proxy-rs@N` 写入不代表生效。
 
 ## panda 路径
 

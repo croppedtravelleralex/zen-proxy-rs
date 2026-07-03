@@ -31,10 +31,10 @@ pub fn apply_thinking_manifest(
         .max_tokens
         .is_some_and(|max_tokens| max_tokens <= 512);
     let no_tools = request.tools.as_ref().is_none_or(|tools| tools.is_empty())
-        && !request
+        && request
             .tool_choice
             .as_ref()
-            .is_some_and(|choice| !choice.is_null());
+            .is_none_or(|choice| choice.is_null());
     let tiny_prompt = translate::request_shape(request).estimated_total_tokens <= 512;
 
     let probe_only = no_tools

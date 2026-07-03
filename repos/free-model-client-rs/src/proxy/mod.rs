@@ -34,10 +34,6 @@ impl OutputClass {
         }
     }
 
-    pub(crate) const fn should_retry_with_disabled_thinking(self) -> bool {
-        false
-    }
-
     pub(crate) fn should_retry_with_enriched_reasoning(self, profile: ClientProfile) -> bool {
         thinking_manifest::preserves_thinking_on_retry(profile)
             && matches!(self, Self::ReasoningOnly | Self::ReasoningOnlyLength)
@@ -79,19 +75,6 @@ pub(crate) fn prune_null_optional_upstream_fields(body: &mut serde_json::Value) 
     }
 }
 
-fn is_forced_tool_choice(tool_choice: Option<&serde_json::Value>) -> bool {
-    let Some(choice) = tool_choice else {
-        return false;
-    };
-    if choice.is_null() {
-        return false;
-    }
-    if choice.as_str().is_some_and(|value| value == "auto") {
-        return false;
-    }
-    true
-}
-
 pub(crate) fn downgrade_claude_code_forced_tool_choice_for_upstream_model(
     body: &mut serde_json::Value,
     request: &mut ChatRequest,
@@ -100,31 +83,6 @@ pub(crate) fn downgrade_claude_code_forced_tool_choice_for_upstream_model(
 ) -> Option<&'static str> {
     let _ = (body, request, profile, upstream_model);
     None
-}
-
-fn claude_code_forced_tool_choice_requires_auto(model: &str) -> bool {
-    claude_code_mimo_family_model(model)
-}
-
-fn claude_code_tool_heavy_prefers_disabled_thinking(model: &str) -> bool {
-    claude_code_mimo_family_model(model)
-}
-
-fn claude_code_mimo_family_model(model: &str) -> bool {
-    let normalized: String = model
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect();
-    matches!(
-        normalized.as_str(),
-        "mimov25"
-            | "mimov25free"
-            | "northminicode"
-            | "northminicodefree"
-            | "nemotron3ultra"
-            | "nemotron3ultrafree"
-    )
 }
 
 pub(crate) fn client_kind_label(profile: ClientProfile) -> &'static str {
@@ -140,11 +98,7 @@ pub(crate) fn client_kind_label(profile: ClientProfile) -> &'static str {
 }
 
 pub(crate) fn api_key_bucket(api_key: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    api_key.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    ccp::api_key_id_for_cache(api_key)
 }
 
 pub(crate) fn build_icp_upstream_package(

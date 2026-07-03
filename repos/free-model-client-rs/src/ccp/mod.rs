@@ -96,6 +96,10 @@ pub fn compute_icp_identity_from_body(body: &Value, ctx: &UskContext<'_>) -> Opt
     Some(compute_icp_identity(&request, ctx))
 }
 
+pub fn api_key_id_for_cache(api_key: &str) -> String {
+    short_hash16(api_key)
+}
+
 pub fn affinity_key_from_identity(
     identity: &IcpIdentity,
     path: &str,

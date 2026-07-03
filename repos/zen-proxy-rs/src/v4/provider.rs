@@ -9,6 +9,7 @@ use axum::Json;
 use free_model_client_rs::client_profile::{ClientKind, ClientProfile, ClientProfileSource};
 use free_model_client_rs::error::{AppError, UpstreamErrorKind};
 use free_model_client_rs::kernel::{FreeModelKernel, KernelConfig};
+use free_model_client_rs::protocol::translate;
 use free_model_client_rs::protocol::types::{AnthropicRequest, ChatRequest};
 use futures::StreamExt;
 use serde_json::Value;
@@ -152,11 +153,13 @@ pub async fn handle_v4_proxy(
         .original_body_bytes
         .saturating_sub(effective_body_len);
 
+    let cache_api_key_id = free_model_client_rs::ccp::api_key_id_for_cache(&conf.upstream_api_key);
     let (usk, icp_scope, prefix_32k_hash, session_id) = resolve_session_identity(
+        path,
         &upstream_body,
-        &public_model,
         &resolved.upstream_model,
         &source_client,
+        &cache_api_key_id,
         client_id,
     );
     let session_id = if session_id.is_empty() {
@@ -183,16 +186,16 @@ pub async fn handle_v4_proxy(
         session_id,
         stream: streaming,
         body_size: effective_body_len,
-        affinity_key: build_affinity_key(
-            &public_model,
-            &resolved.upstream_model,
+        affinity_key: build_affinity_key(AffinityKeyInput {
+            public_model: &public_model,
+            upstream_model: &resolved.upstream_model,
             path,
-            &source_client,
-            client_id,
-            effective_body_len,
-            streaming,
-            &upstream_body,
-        ),
+            source_client: &source_client,
+            cache_api_key_id: &cache_api_key_id,
+            fallback_client_id: client_id,
+            body_size: effective_body_len,
+            body: &upstream_body,
+        }),
         allow_direct_fallback: !dynamic_model || conf.dynamic_model_allow_direct_fallback,
     };
     let request_body_bucket = body_size_bucket(effective_body_len).to_string();
@@ -572,85 +575,80 @@ fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn build_affinity_key(
-    public_model: &str,
-    upstream_model: &str,
-    path: &str,
-    source_client: &str,
-    client_id: &str,
+struct AffinityKeyInput<'a> {
+    public_model: &'a str,
+    upstream_model: &'a str,
+    path: &'a str,
+    source_client: &'a str,
+    cache_api_key_id: &'a str,
+    fallback_client_id: &'a str,
     body_size: u64,
-    _streaming: bool,
-    body: &Value,
-) -> String {
-    if crate::pool::session_pin::is_mimo_family(public_model)
-        || crate::pool::session_pin::is_mimo_family(upstream_model)
+    body: &'a Value,
+}
+
+fn build_affinity_key(input: AffinityKeyInput<'_>) -> String {
+    if crate::pool::session_pin::is_mimo_family(input.public_model)
+        || crate::pool::session_pin::is_mimo_family(input.upstream_model)
     {
         return String::new();
     }
-    let min_bytes = if source_client.trim() == "claude-code" {
+    let min_bytes = if input.source_client.trim() == "claude-code" {
         AFFINITY_MIN_BODY_BYTES_CLAUDE_CODE
     } else {
         AFFINITY_MIN_BODY_BYTES
     };
-    if body_size < min_bytes {
+    if input.body_size < min_bytes {
         return String::new();
     }
-    let client_bucket = if client_id.trim().is_empty() {
+    let client_bucket = if input.fallback_client_id.trim().is_empty() {
         "anon".to_string()
     } else {
-        LedgerEvent::short_hash(client_id)
+        LedgerEvent::short_hash(input.fallback_client_id)
     };
-    let source_bucket = if source_client.trim().is_empty() {
+    let source_bucket = if input.source_client.trim().is_empty() {
         "unknown"
     } else {
-        source_client.trim()
+        input.source_client.trim()
     };
-    let usk_ctx = free_model_client_rs::ccp::UskContext {
-        api_key_id: &client_bucket,
-        public_model,
-        upstream_model,
-        source_client: source_bucket,
-    };
-    if let Some(identity) =
-        free_model_client_rs::ccp::compute_icp_identity_from_body(body, &usk_ctx)
-    {
+    if let Some((identity, _request_model)) = compute_cache_identity(
+        input.path,
+        input.body,
+        input.upstream_model,
+        source_bucket,
+        input.cache_api_key_id,
+    ) {
         return free_model_client_rs::ccp::affinity_key_from_identity(
             &identity,
-            path,
+            input.path,
             &client_bucket,
         );
     }
     format!(
         "{}:{}:{}:{}:{}",
-        upstream_model, public_model, path, source_bucket, client_bucket
+        input.upstream_model, input.public_model, input.path, source_bucket, client_bucket
     )
 }
 
 fn resolve_session_identity(
+    path: &str,
     body: &Value,
-    public_model: &str,
     upstream_model: &str,
     source_client: &str,
-    client_id: &str,
+    cache_api_key_id: &str,
+    fallback_client_id: &str,
 ) -> (String, String, String, String) {
-    let client_bucket = if client_id.trim().is_empty() {
+    let client_bucket = if fallback_client_id.trim().is_empty() {
         "anon".to_string()
     } else {
-        LedgerEvent::short_hash(client_id)
+        LedgerEvent::short_hash(fallback_client_id)
     };
     let source_bucket = if source_client.trim().is_empty() {
         "unknown".to_string()
     } else {
         source_client.trim().to_string()
     };
-    let usk_ctx = free_model_client_rs::ccp::UskContext {
-        api_key_id: &client_bucket,
-        public_model,
-        upstream_model,
-        source_client: &source_bucket,
-    };
-    if let Some(identity) =
-        free_model_client_rs::ccp::compute_icp_identity_from_body(body, &usk_ctx)
+    if let Some((identity, _request_model)) =
+        compute_cache_identity(path, body, upstream_model, &source_bucket, cache_api_key_id)
     {
         return (
             identity.usk.clone(),
@@ -660,6 +658,58 @@ fn resolve_session_identity(
         );
     }
     (String::new(), String::new(), String::new(), client_bucket)
+}
+
+fn compute_cache_identity(
+    path: &str,
+    body: &Value,
+    upstream_model: &str,
+    source_client: &str,
+    cache_api_key_id: &str,
+) -> Option<(free_model_client_rs::ccp::IcpIdentity, String)> {
+    let request = cache_identity_chat_request(path, body)?;
+    let request_model = request.model.clone();
+    let ctx = free_model_client_rs::ccp::UskContext {
+        api_key_id: cache_api_key_id,
+        public_model: &request_model,
+        upstream_model,
+        source_client,
+    };
+    Some((
+        free_model_client_rs::ccp::compute_icp_identity(&request, &ctx),
+        request_model,
+    ))
+}
+
+fn cache_identity_chat_request(path: &str, body: &Value) -> Option<ChatRequest> {
+    match path {
+        "chat/completions" => serde_json::from_value::<ChatRequest>(body.clone()).ok(),
+        "messages" => {
+            let request = serde_json::from_value::<AnthropicRequest>(body.clone()).ok()?;
+            let model = request.model.clone();
+            let messages = translate::anthropic_to_openai_messages(&request);
+            let tools = request
+                .tools
+                .as_ref()
+                .map(|tools| translate::anthropic_tools_to_openai(tools))
+                .filter(|tools| !tools.is_empty());
+            let tool_choice = request
+                .tool_choice
+                .as_ref()
+                .map(translate::anthropic_tool_choice_to_openai);
+            Some(ChatRequest {
+                model,
+                messages,
+                stream: request.stream,
+                max_tokens: request.max_tokens,
+                temperature: request.temperature,
+                top_p: None,
+                tools,
+                tool_choice,
+            })
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2818,6 +2868,32 @@ mod tests {
     use super::*;
     use axum::body::Bytes;
 
+    macro_rules! affinity_key {
+        (
+            $public_model:expr,
+            $upstream_model:expr,
+            $path:expr,
+            $source_client:expr,
+            $cache_api_key_id:expr,
+            $fallback_client_id:expr,
+            $body_size:expr,
+            $streaming:expr,
+            $body:expr $(,)?
+        ) => {{
+            let _ = $streaming;
+            build_affinity_key(AffinityKeyInput {
+                public_model: $public_model,
+                upstream_model: $upstream_model,
+                path: $path,
+                source_client: $source_client,
+                cache_api_key_id: $cache_api_key_id,
+                fallback_client_id: $fallback_client_id,
+                body_size: $body_size,
+                body: $body,
+            })
+        }};
+    }
+
     #[test]
     fn infers_openclaw_from_body_before_generic_openai_headers() {
         let mut headers = HeaderMap::new();
@@ -3352,11 +3428,12 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "tools":[{"function":{"name":"Read"}}],
             "tool_choice":"auto"
         });
-        let key = build_affinity_key(
+        let key = affinity_key!(
             "mimo-v2.5",
             "mimo-v2.5-free",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             180_000,
             true,
@@ -3366,28 +3443,114 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
+    fn anthropic_messages_resolve_cache_identity_before_dispatch() {
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash-free",
+            "system": [{"type": "text", "text": "static system"}],
+            "messages": [{"role": "user", "content": "a".repeat(80_000)}],
+            "tools": [{
+                "name": "Read",
+                "description": "read a file",
+                "input_schema": {
+                    "type": "object",
+                    "required": ["file_path"],
+                    "properties": {"file_path": {"type": "string"}}
+                }
+            }],
+            "tool_choice": {"type": "auto"},
+            "stream": true,
+            "max_tokens": 32000
+        });
+
+        let (usk, icp_scope, prefix_32k_hash, session_id) = resolve_session_identity(
+            "messages",
+            &body,
+            "deepseek-v4-flash-free",
+            "claude-code",
+            "cache-api-key",
+            "fallback-client",
+        );
+
+        assert!(usk.starts_with("usk_v1:"));
+        assert!(icp_scope.starts_with("icp:p32k:"));
+        assert_eq!(prefix_32k_hash.len(), 16);
+        assert!(session_id.starts_with("ses_"));
+
+        let key = affinity_key!(
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-free",
+            "messages",
+            "claude-code",
+            "cache-api-key",
+            "fallback-client",
+            180_000,
+            true,
+            &body,
+        );
+
+        assert!(key.starts_with("deepseek-v4-flash-free:deepseek-v4-flash-free:claude-code:"));
+        assert!(key.contains(":messages:"));
+    }
+
+    #[test]
+    fn mimo_messages_get_session_identity_even_without_prefix_affinity() {
+        let body = serde_json::json!({
+            "model": "mimo-v2.5-free",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        });
+
+        let (usk, _, prefix_32k_hash, session_id) = resolve_session_identity(
+            "messages",
+            &body,
+            "mimo-v2.5-free",
+            "claude-code",
+            "cache-api-key",
+            "fallback-client",
+        );
+        let key = affinity_key!(
+            "mimo-v2.5",
+            "mimo-v2.5-free",
+            "messages",
+            "claude-code",
+            "cache-api-key",
+            "fallback-client",
+            180_000,
+            true,
+            &body,
+        );
+
+        assert!(usk.starts_with("usk_v1:"));
+        assert_eq!(prefix_32k_hash.len(), 16);
+        assert!(session_id.starts_with("ses_"));
+        assert!(key.is_empty());
+    }
+
+    #[test]
     fn affinity_key_is_for_medium_and_large_requests() {
         let body = serde_json::json!({
             "model": "m",
             "messages":[{"role":"user","content":"hello"}]
         });
-        assert!(build_affinity_key(
+        assert!(affinity_key!(
             "m",
             "m-up",
             "chat/completions",
             "claude-code",
             "sk",
+            "client",
             10,
             true,
             &body
         )
         .is_empty());
-        let medium_nonstream_key = build_affinity_key(
+        let medium_nonstream_key = affinity_key!(
             "m",
             "m-up",
             "chat/completions",
             "claude-code",
             "sk",
+            "client",
             200_000,
             false,
             &body,
@@ -3395,12 +3558,13 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert!(medium_nonstream_key.starts_with("m-up:m:claude-code:"));
         assert!(medium_nonstream_key.contains("chat/completions"));
 
-        let medium_key = build_affinity_key(
+        let medium_key = affinity_key!(
             "m",
             "m-up",
             "chat/completions",
             "claude-code",
             "sk",
+            "client",
             64_000,
             true,
             &body,
@@ -3413,23 +3577,25 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "tools":[{"type":"function","function":{"name":"Read"}}],
             "tool_choice":"auto"
         });
-        let key = build_affinity_key(
+        let key = affinity_key!(
             "m",
             "m-up",
             "chat/completions",
             "claude-code",
             "sk",
+            "client",
             200_000,
             true,
             &large_body,
         );
         assert!(key.starts_with("m-up:m:claude-code:"));
-        let without_tools = build_affinity_key(
+        let without_tools = affinity_key!(
             "m",
             "m-up",
             "chat/completions",
             "claude-code",
             "sk",
+            "client",
             200_000,
             true,
             &serde_json::json!({
@@ -3462,31 +3628,34 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "tool_choice":"auto"
         });
 
-        let first_key = build_affinity_key(
+        let first_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             800_000,
             true,
             &first,
         );
-        let second_key = build_affinity_key(
+        let second_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             820_000,
             true,
             &second,
         );
-        let changed_key = build_affinity_key(
+        let changed_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             800_000,
             true,
@@ -3505,18 +3674,27 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "tool_choice":"auto"
         });
 
-        let claude_code_key = build_affinity_key(
+        let claude_code_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             180_000,
             true,
             &body,
         );
-        let hermes_key = build_affinity_key(
-            "m", "m-up", "messages", "hermes", "client", 180_000, true, &body,
+        let hermes_key = affinity_key!(
+            "m",
+            "m-up",
+            "messages",
+            "hermes",
+            "cache-api-key",
+            "client",
+            180_000,
+            true,
+            &body,
         );
 
         assert_ne!(claude_code_key, hermes_key);
@@ -3543,31 +3721,34 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             "tool_choice":"auto"
         });
 
-        let first_key = build_affinity_key(
+        let first_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             180_000,
             true,
             &first,
         );
-        let second_key = build_affinity_key(
+        let second_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             190_000,
             true,
             &second,
         );
-        let changed_key = build_affinity_key(
+        let changed_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             180_000,
             true,
@@ -3592,21 +3773,23 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             .unwrap()
             .push(serde_json::json!({"role":"user","content":"x".repeat(120_000)}));
 
-        let first_key = build_affinity_key(
+        let first_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             120_000,
             true,
             &first,
         );
-        let second_key = build_affinity_key(
+        let second_key = affinity_key!(
             "m",
             "m-up",
             "messages",
             "claude-code",
+            "cache-api-key",
             "client",
             280_000,
             true,

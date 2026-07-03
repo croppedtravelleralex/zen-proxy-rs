@@ -4,6 +4,39 @@
 版本：**v2.2（运维部署完成，生产生效未证实）**
 状态：见下表 **「部署 vs 生效」** — 禁止将运维部署成功写成 TMCC 2.0 上线成功
 
+## 2026-07-03 22:40 二次根因确认
+
+用户侧新证据：
+
+- Claude Code 统计窗口 `2026-07-03 21:00:00 -> 当前`：92 次请求，缓存命中率约 **45.3%**。
+- NewAPI channel 69 在 `2026-07-03 21:58:34-21:58:38` 连续 `mimo-v2.5` 502。
+
+panda 生产取证：
+
+- 当前三实例健康，部署前运行二进制 sha256 为 `8817109bcb6c428ee083477b096a907de415d037fa16c5298f01449733a3d21d`。
+- `2026-07-03 21:55-22:05` journal 连续出现 `fatal runtime error: stack overflow, aborting`。
+- `2026-07-03 21:40-22:00` deepseek 主流量 `session_pin_hit` 很高，但 `usk/prompt_cache_key` 覆盖很低：
+  - `21:40-21:50`：74 行，72 ok，`pin=72`，但 `usk=6`。
+  - `21:50-22:00`：20 行，20 ok，`pin=20`，但 `usk=0`。
+- Mimo `21:50-22:00`：13 行，11 ok / 2 err，audit 中 `rate_limited=false`；与 journal stack overflow 同窗。
+
+确切根因：
+
+1. **DeepSeek 缓存低不是文档目标本身错，而是生产主路径没有把 CCP 身份算到 dispatch 前。** ClaudeCode 走 Anthropic `/v1/messages`，旧 `resolve_session_identity()` 只按 OpenAI `ChatRequest` 解析，导致主流量 `usk=""`、`prefix_32k_hash=""`、`prompt_cache_key=""`。结果是 L3 `session_pin_hit=true` 只能把请求粘到节点，L4 provider shard 没拿到同一个 `prompt_cache_key`，所以累计命中仍能停在 40-60%。
+2. **Mimo 不是上游真限流。** 生产 audit 对应错误 `rate_limited=false`；真正触发 NewAPI 502 的是 `PoolManager::dispatch_sticky()` 在 pinned node 忙/不可用时回退到 `self.dispatch(meta)`，再次命中同一个 session pin 后递归，最终 stack overflow abort。
+3. 旧 `session_pin_hit` 指标有膨胀：之前只要 `dispatch_sticky()` 返回就外层标成 true，即便实际已经 fallback 到普通 dispatch。
+
+本轮代码修复：
+
+- `zen-proxy-rs/src/v4/provider.rs`：在 dispatch 前用同一上游 api key bucket 计算 cache identity；`messages` 路径先转换成 OpenAI `ChatRequest`，再生成 `usk/session_id/prefix_32k_hash/prompt_cache_key`。
+- `free-model-client-rs/src/ccp/mod.rs` 与 `src/proxy/mod.rs`：统一 api key cache id，避免 zen-proxy 与 kernel 计算 USK 的 key bucket 分裂。
+- `zen-proxy-rs/src/pool/manager.rs`：新增 `dispatch_without_session_pin()`；sticky fallback 不再递归查同一个 pin，且 `session_pin_hit=true` 只在真正拿到 pinned node 时写入。
+
+验收口径：
+
+- 可以说：根因已定位并有本地测试覆盖。
+- 不可说：三模型已经 95%+。必须等 GitHub 路径部署后，生产 ClaudeCode / NewAPI / ZenProxy 新窗口同时证明 `usk/prefix_32k_hash/prompt_cache_key` 全量非空、Mimo 无 stack overflow、deepseek/big-pickle 稳态 R1/R2 达标。
+
 ## 部署 vs 生效（2026-07-03）
 
 | 维度 | 状态 | 说明 |

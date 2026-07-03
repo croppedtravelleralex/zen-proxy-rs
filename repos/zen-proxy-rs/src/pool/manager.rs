@@ -74,32 +74,11 @@ where
     pub fn register_known_node(&self, node: NodeRef) {
         self.nodes.insert(node);
     }
-}
 
-impl<D, A, R, K> PoolManager for PoolManagerImpl<D, A, R, K>
-where
-    D: Pool + 'static,
-    A: Pool + 'static,
-    R: RateLimitedPool + 'static,
-    K: DeadPool + 'static,
-{
-    fn dispatch(&self, req: &RequestMeta) -> Result<DispatchResult, DispatchError> {
-        if self.fuse.load(Ordering::Acquire) {
-            return Err(DispatchError::NoResource);
-        }
-        self.dispatch.preflight(req)?;
-
-        if !req.session_id.is_empty() && !req.upstream_model.is_empty() {
-            if let Some(node_id) = session_pin::lookup(&req.upstream_model, &req.session_id) {
-                if let Ok(result) = self.dispatch_sticky(req, &node_id) {
-                    return Ok(DispatchResult {
-                        session_pin_hit: true,
-                        ..result
-                    });
-                }
-            }
-        }
-
+    fn dispatch_without_session_pin(
+        &self,
+        req: &RequestMeta,
+    ) -> Result<DispatchResult, DispatchError> {
         let (node, affinity_hit, affinity_node_id) = self
             .dispatch
             .try_acquire_affinity(req)
@@ -150,6 +129,31 @@ where
             session_pin_hit: false,
         })
     }
+}
+
+impl<D, A, R, K> PoolManager for PoolManagerImpl<D, A, R, K>
+where
+    D: Pool + 'static,
+    A: Pool + 'static,
+    R: RateLimitedPool + 'static,
+    K: DeadPool + 'static,
+{
+    fn dispatch(&self, req: &RequestMeta) -> Result<DispatchResult, DispatchError> {
+        if self.fuse.load(Ordering::Acquire) {
+            return Err(DispatchError::NoResource);
+        }
+        self.dispatch.preflight(req)?;
+
+        if !req.session_id.is_empty() && !req.upstream_model.is_empty() {
+            if let Some(node_id) = session_pin::lookup(&req.upstream_model, &req.session_id) {
+                if let Ok(result) = self.dispatch_sticky(req, &node_id) {
+                    return Ok(result);
+                }
+            }
+        }
+
+        self.dispatch_without_session_pin(req)
+    }
 
     fn dispatch_direct(&self) -> Result<DispatchResult, DispatchError> {
         if self.fuse.load(Ordering::Acquire) || !self.allow_direct_fallback {
@@ -197,11 +201,11 @@ where
                 url,
                 affinity_hit: false,
                 affinity_node_id: String::new(),
-                session_pin_hit: false,
+                session_pin_hit: true,
             });
         }
-        // 回退到普通 dispatch
-        self.dispatch(meta)
+        // Fall back once without consulting the same session pin again.
+        self.dispatch_without_session_pin(meta)
     }
 
     fn report(&self, node_id: NodeId, result: ResultKind, latency_ms: u64) {
@@ -494,7 +498,7 @@ mod tests {
     use crate::collector::default::DefaultCollector;
     use crate::pool::active::ActivePool;
     use crate::pool::dead::DeadPoolImpl;
-    use crate::pool::dispatch::DispatchPool;
+    use crate::pool::dispatch::{AimdConfig, DispatchPool, NodeBudgetLimits};
     use crate::pool::ratelimited::RateLimitedPoolImpl;
 
     #[test]
@@ -697,6 +701,56 @@ mod tests {
             manager.dispatch(&meta),
             Err(DispatchError::NoResource)
         ));
+    }
+
+    #[test]
+    fn session_pin_fallback_does_not_recurse_when_pinned_node_is_busy() {
+        let dispatch = Arc::new(DispatchPool::new_with_options(
+            NodeBudgetLimits::default(),
+            AimdConfig {
+                min_concurrent: 1,
+                max_concurrent: 1,
+                ..AimdConfig::default()
+            },
+            4,
+        ));
+        let active = Arc::new(ActivePool::new());
+        let ratelimited = Arc::new(RateLimitedPoolImpl::new());
+        let dead = Arc::new(DeadPoolImpl::new());
+        let collector = Arc::new(DefaultCollector::new());
+        let manager = PoolManagerImpl::new(
+            dispatch.clone(),
+            active,
+            ratelimited,
+            dead,
+            collector,
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
+            false,
+        );
+        let first_node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
+        let second_node = NodeRef::new("socks5h://user:pass@127.0.0.2:1080".to_string());
+        dispatch.add(first_node);
+        dispatch.add(second_node.clone());
+
+        let meta = RequestMeta {
+            model: "mimo-v2.5".to_string(),
+            upstream_model: "mimo-v2.5-free".to_string(),
+            session_id: "test-session-pin-fallback-no-recursion".to_string(),
+            stream: false,
+            body_size: 128,
+            affinity_key: String::new(),
+            allow_direct_fallback: false,
+        };
+
+        let first = manager.dispatch(&meta).unwrap();
+        let second = manager.dispatch(&meta).unwrap();
+
+        assert_ne!(first.node.id, second.node.id);
+        assert!(!second.session_pin_hit);
     }
 
     #[test]

@@ -88,3 +88,13 @@ Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；cu
 4. Mimo cache 报告同时写 accepted/rejected 和 `read_tokens / estimated_total_tokens`，不要因缺 miss token 写成 100%。
 5. 生产部署继续用 GitHub 临时 release，中转后删除 release/tag，不用 scp。
 6. 后续新工作默认从 `/home/lenovo/zen-free-model-suite` 进入；只有需要回滚或对照历史时再读取两个旧路径。
+
+## 2026-07-03 22:40 二次排障更新
+
+- 用户截图显示 Claude Code 21:00 后累计缓存约 **45.3%**；NewAPI channel 69 在 21:58 连续 `mimo-v2.5` 502。
+- panda 生产 hash `8817109b…` 下，21:40-22:00 deepseek 主流量 `session_pin_hit` 高但 `usk/prompt_cache_key` 覆盖低：`21:40-21:50` 74 行仅 6 行有 `usk`，`21:50-22:00` 20 行 0 行有 `usk`。
+- 根因是 ClaudeCode 主路径走 Anthropic `/v1/messages`，旧 `zen-proxy-rs::resolve_session_identity()` 只按 OpenAI `ChatRequest` 解析，dispatch 前拿不到 USK；free-model-client 后续转换/注入的 `prompt_cache_key` 与 ZenProxy L3 pin 不同层，导致 L3 粘住但 L4 cache shard 不稳定。
+- Mimo 502 根因不是上游真限流：audit `rate_limited=false`，journal 同窗连续 `fatal runtime error: stack overflow, aborting`。代码根因是 `dispatch_sticky()` fallback 调 `self.dispatch(meta)`，pinned node 忙时递归命中同一 session pin。
+- 本轮本地修复：`messages` 路径 dispatch 前转换为 ChatRequest 计算 USK；FMC/ZenProxy 共用 api key cache id；sticky fallback 改为 `dispatch_without_session_pin()`，并修正 `session_pin_hit` 只在真实 pinned node 命中时为 true。
+- 本轮本地验证：`free-model-client-rs cargo fmt/clippy/test` 通过；`zen-proxy-rs cargo fmt/clippy/test` 通过（205 unit + 44 e2e）。
+- 下一步部署必须走 GitHub release/download，不走 scp；部署后只在新生产窗口达成 `usk/prefix_32k_hash/prompt_cache_key` 全量非空、无 stack overflow、三模型稳态 cache 达标时才能宣称 95%+。

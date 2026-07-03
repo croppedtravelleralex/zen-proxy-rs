@@ -3958,7 +3958,7 @@ async fn claude_code_large_stream_tool_request_keeps_thinking_on_first_attempt()
     assert!(body.contains("golden answer"));
     assert!(!body.contains("reasoning_content in the thinking mode"));
     let requests = state.requests.lock().unwrap();
-    assert!(requests.len() >= 1);
+    assert!(!requests.is_empty());
     assert!(requests.iter().all(|request| request.thinking.is_none()));
 }
 
@@ -3998,7 +3998,7 @@ async fn mimo_family_tool_heavy_stream_keeps_thinking_on_first_attempt() {
         let body = response_text(response).await;
         assert!(body.contains("golden answer"), "{model}: {body}");
         let requests = state.requests.lock().unwrap();
-        assert!(requests.len() >= 1, "{model}");
+        assert!(!requests.is_empty(), "{model}");
         assert!(
             requests.iter().all(|request| request.thinking.is_none()),
             "{model}"
