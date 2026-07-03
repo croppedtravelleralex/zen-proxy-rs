@@ -1930,6 +1930,30 @@ async fn anthropic_claude_code_explicit_smoke_truncated_empty_returns_pass() {
 }
 
 #[tokio::test]
+async fn anthropic_mimo_internal_probe_with_system_empty_upstream_returns_ok() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("mimo-v2.5-free", "empty-upstream", false);
+    request.system = Some(Value::String(
+        "You are a channel health checker.".to_string(),
+    ));
+    request.max_tokens = Some(500);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("\"text\":\"ok\""), "{body}");
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn openai_role_only_stream_is_rejected_as_empty_upstream() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);

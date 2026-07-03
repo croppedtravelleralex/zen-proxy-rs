@@ -595,7 +595,7 @@ async fn handle_non_stream(
         } else if last_incomplete_tool_arguments {
             return Err(incomplete_tool_arguments_error());
         } else if let Some(fallback_text) = last_empty
-            .then(|| translate::short_no_tool_empty_fallback_text(cr))
+            .then(|| non_stream_empty_fallback_text(cr, short_request_kind, &request_shape))
             .flatten()
         {
             tracing::warn!(
@@ -809,6 +809,38 @@ fn is_truncated_stream_error(err: &AppError) -> bool {
         && err
             .message
             .contains("stream truncated before DONE or finish_reason")
+}
+
+fn non_stream_empty_fallback_text(
+    body: &ChatRequest,
+    short_request_kind: translate::ShortNonStreamRequestKind,
+    request_shape: &translate::RequestShape,
+) -> Option<&'static str> {
+    translate::short_no_tool_empty_fallback_text(body).or_else(|| {
+        if is_mimo_v25_model(&body.model)
+            && request_shape.tool_count == 0
+            && !request_shape.tool_choice_present
+            && matches!(
+                short_request_kind,
+                translate::ShortNonStreamRequestKind::HealthProbe
+                    | translate::ShortNonStreamRequestKind::ChannelTest
+                    | translate::ShortNonStreamRequestKind::InternalClaudeCodeProbe
+            )
+        {
+            Some("ok")
+        } else {
+            None
+        }
+    })
+}
+
+fn is_mimo_v25_model(model: &str) -> bool {
+    let normalized: String = model
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    matches!(normalized.as_str(), "mimov25" | "mimov25free")
 }
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
