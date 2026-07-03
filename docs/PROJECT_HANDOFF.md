@@ -98,3 +98,12 @@ Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；cu
 - 本轮本地修复：`messages` 路径 dispatch 前转换为 ChatRequest 计算 USK；FMC/ZenProxy 共用 api key cache id；sticky fallback 改为 `dispatch_without_session_pin()`，并修正 `session_pin_hit` 只在真实 pinned node 命中时为 true。
 - 本轮本地验证：`free-model-client-rs cargo fmt/clippy/test` 通过；`zen-proxy-rs cargo fmt/clippy/test` 通过（205 unit + 44 e2e）。
 - 下一步部署必须走 GitHub release/download，不走 scp；部署后只在新生产窗口达成 `usk/prefix_32k_hash/prompt_cache_key` 全量非空、无 stack overflow、三模型稳态 cache 达标时才能宣称 95%+。
+
+## 2026-07-04 00:30 三次排障更新
+
+- 00:08 后 NewAPI 全渠道未见 DeepSeek/Mimo 真实用户请求；截图里的 45.3% 和 21:58 Mimo 502 均属于旧窗口，不能当作最新生产二进制验收。
+- 旧窗口 DeepSeek 真实低缓存成立：`2026-07-03 21:00-00:08` panda audit 中 125 行，成功 115 行，身份覆盖 `37/125`，provider R2 `62.68%`。
+- 第二层根因：22:00 后身份覆盖已补齐，但同一 `prefix_32k_hash=a1a6c89803c073d6` 因 `tools_hash` 改变导致 USK 从 `usk_v1:7234...` 变成 `usk_v1:6d6f...`，23:16 出现同前缀冷启动 `cache_miss_input_tokens=50039`。
+- 本轮本地修复：长上下文 `icp_scope` 改为 `icp:p32k:{prefix_32k_hash}`，`tools_epoch_id` 保留为观测/冻结信号但不再进入 provider `prompt_cache_key`；同前缀工具变化不再切 affinity/cache key，真实前缀变化仍切 key。
+- 本轮验证：WSL 下 `free-model-client-rs` fmt/clippy/test 通过（142 unit + 136 kernel golden）；`zen-proxy-rs` fmt/clippy/test 通过（205 unit + 44 e2e）。
+- 尚未部署该 prefix-scope USK 修复到 panda；下一步仍必须走 GitHub release/download，部署后用 Windows/WSL ClaudeCode + ccswitch + NewAPI 新窗口验收三模型 95%+。

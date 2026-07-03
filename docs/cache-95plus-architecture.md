@@ -1,8 +1,32 @@
 # Cache 99+ 架构方案 — ICP × CCP × 五层协同
 
-更新时间：2026-07-03
-版本：**v2.2（运维部署完成，生产生效未证实）**
+更新时间：2026-07-04
+版本：**v2.3（prefix-scope USK 已本地验证，生产未部署）**
 状态：见下表 **「部署 vs 生效」** — 禁止将运维部署成功写成 TMCC 2.0 上线成功
+
+## 2026-07-04 00:30 三次根因确认
+
+新增生产证据：
+
+- `2026-07-04 00:08` 后 NewAPI 全渠道没有 DeepSeek/Mimo 真实用户流量进入；截图中的 45.3% 和 21:58 Mimo 502 属于旧窗口，不能当作最新二进制验收。
+- 最新 panda 三实例无 `stack overflow/core-dump`；Mimo 内部探针已返回 200，但这只证明小探针兜底，不等于真实 ClaudeCode 全路径完成。
+- `2026-07-03 21:00-00:08` DeepSeek audit：125 行，成功 115 行，`usk/prefix_32k_hash/prompt_cache_key` 覆盖 `37/125`，provider R2 `62.68%`。
+- `2026-07-03 22:00` 后身份覆盖已接近 100%，但仍发现同一 `prefix_32k_hash=a1a6c89803c073d6` 因 `tools_hash` 从 `e177...` 变为 `c3a...` 导致 USK 从 `usk_v1:7234...` 变为 `usk_v1:6d6f...`；23:16 同前缀请求因此 `session_pin_hit=false`、`warmup_state=cold`、`cache_miss_input_tokens=50039`。
+
+确切新增根因：
+
+1. **第二层缓存低不是 provider 随机失效，而是 USK 过度分裂。** 旧 `icp_scope` 把 `tools_hash/tool_choice_hash` 放入 `prompt_cache_key` 的 USK；ClaudeCode 工具 schema 轻微变化时，即使可缓存 32K 前缀相同，也会换 cache key，等同冷启动。
+2. **正确边界是 prefix-scope provider key。** `tools_epoch_id` 仍可作为观测、冻结和质量信号，但不能参与 provider `prompt_cache_key` 分桶；长上下文 USK 应按 `prefix_32k_hash` 稳定。
+
+本轮本地修复：
+
+- `free-model-client-rs/src/ccp/mod.rs`：长上下文 `icp_scope` 改为 `icp:p32k:{prefix_32k_hash}`，不再拼入 tools/choice hash；新增单测覆盖“同 32K 前缀、工具 epoch 变化、USK 不变”。
+- `zen-proxy-rs/src/v4/provider.rs`：更新 affinity 测试，确认同 32K 前缀工具变化不切 key，真实前缀变化仍切 key。
+
+验收状态：
+
+- 本地 `free-model-client-rs` fmt/clippy/test 通过；`zen-proxy-rs` fmt/clippy/test 通过。
+- 尚未通过 GitHub release 部署到 panda；尚未用 Windows/WSL ClaudeCode + ccswitch + NewAPI 真实路径验证 95%+。
 
 ## 2026-07-03 22:40 二次根因确认
 
@@ -172,7 +196,7 @@ panda 审计 `affinity_hit=true → 99.5%` 证明：**同一 Webshare egress 是
 **定义**：对 USK 会话，第 `t` 轮 Cache-Body 的第 `t-1` 轮前缀字节 **完全相等**。
 
 ```text
-ICP(t) := serialize(tools_epoch, S1, messages[0..k_t])
+ICP(t) := serialize(cacheable_prefix_bytes[0..boundary_t])
 ∀ t>1: ICP(t-1) == prefix(ICP(t))
 ```
 
@@ -266,11 +290,11 @@ USK = "usk_v1:" + H16(
 
 icp_scope =
   if estimated_tokens < 10_000: "normal"
-  else: "icp:" + tools_epoch_id + ":" + prefix_32k_hash_stable
+  else: "icp:p32k:" + prefix_32k_hash_stable
 
 prefix_32k_hash_stable =
-  H32(canonical_serialize(tools_epoch, S1, messages[0:boundary_32k]))
-  // boundary 仅含「已提交」轮次，不含当前轮 draft
+  H32(canonical_serialize(cacheable_body)[0:32KiB])
+  // tools_epoch_id 仅保留为观测/冻结信号，不进入 provider prompt_cache_key
 ```
 
 **注意**：`session_scope` 含 compactor 标记时会变（`zen/client.rs:375`）→ compactor 触发必须 **fork 新 USK** 并记录，不能静默替换。

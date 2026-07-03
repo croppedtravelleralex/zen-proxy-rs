@@ -125,24 +125,14 @@ pub fn apply_prompt_cache_key(body: &mut Value, identity: &IcpIdentity, flags: &
 }
 
 fn icp_scope_for_request(
-    request: &ChatRequest,
+    _request: &ChatRequest,
     estimated_tokens: u64,
     prefix_32k_hash: u64,
 ) -> String {
     if estimated_tokens < 10_000 {
         return "normal".to_string();
     }
-    let tools_hash = request
-        .tools
-        .as_ref()
-        .map(|tools| short_hash16(&serde_json::to_string(tools).unwrap_or_default()))
-        .unwrap_or_else(|| "none".to_string());
-    let choice_hash = request
-        .tool_choice
-        .as_ref()
-        .map(|choice| short_hash16(&serde_json::to_string(choice).unwrap_or_default()))
-        .unwrap_or_else(|| "none".to_string());
-    format!("icp:p32k:{prefix_32k_hash:016x}:tools{tools_hash}:choice{choice_hash}")
+    format!("icp:p32k:{prefix_32k_hash:016x}")
 }
 
 fn normalize_bucket(source_client: &str) -> &str {
@@ -232,5 +222,58 @@ mod tests {
         });
         let second = compute_icp_identity(&request, &ctx).usk;
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn usk_stable_for_same_long_prefix_when_tools_epoch_changes() {
+        let ctx = UskContext {
+            api_key_id: "key-a",
+            public_model: "deepseek-v4-flash",
+            upstream_model: "deepseek-v4-flash-free",
+            source_client: "claude-code",
+        };
+        let mut request = ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: json!("a".repeat(80_000)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: Some(true),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let first = compute_icp_identity(&request, &ctx);
+        request.tools = Some(vec![crate::protocol::types::OpenAITool {
+            tool_type: "function".into(),
+            function: crate::protocol::types::OpenAIToolFunction {
+                name: "Read".into(),
+                description: None,
+                parameters: None,
+            },
+        }]);
+        let second = compute_icp_identity(&request, &ctx);
+        request.tools = Some(vec![crate::protocol::types::OpenAITool {
+            tool_type: "function".into(),
+            function: crate::protocol::types::OpenAIToolFunction {
+                name: "Write".into(),
+                description: None,
+                parameters: None,
+            },
+        }]);
+        let third = compute_icp_identity(&request, &ctx);
+
+        assert_eq!(first.prefix_32k_hash, second.prefix_32k_hash);
+        assert_eq!(first.prefix_32k_hash, third.prefix_32k_hash);
+        assert_ne!(second.tools_epoch_id, third.tools_epoch_id);
+        assert_eq!(first.usk, second.usk);
+        assert_eq!(second.usk, third.usk);
+        assert_eq!(first.affinity_routing_key, second.affinity_routing_key);
+        assert_eq!(second.affinity_routing_key, third.affinity_routing_key);
     }
 }

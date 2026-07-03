@@ -3604,11 +3604,11 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
                 "tool_choice":"auto"
             }),
         );
-        assert_ne!(key, without_tools);
+        assert_eq!(key, without_tools);
     }
 
     #[test]
-    fn affinity_key_uses_stable_prefix_and_tools_hash() {
+    fn affinity_key_uses_stable_prefix_scope() {
         let prefix = "a".repeat(400_000);
         let first = serde_json::json!({
             "model": "m",
@@ -3621,6 +3621,12 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({"role":"user","content":"continue"}));
+        let changed_tools = serde_json::json!({
+            "model": "m",
+            "messages":[{"role":"user","content":"a".repeat(400_000)}],
+            "tools":[{"type":"function","function":{"name":"Write"}}],
+            "tool_choice":"auto"
+        });
         let changed_prefix = serde_json::json!({
             "model": "m",
             "messages":[{"role":"user","content":format!("b{}", "a".repeat(399_999))}],
@@ -3650,6 +3656,17 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             true,
             &second,
         );
+        let changed_tools_key = affinity_key!(
+            "m",
+            "m-up",
+            "messages",
+            "claude-code",
+            "cache-api-key",
+            "client",
+            800_000,
+            true,
+            &changed_tools,
+        );
         let changed_key = affinity_key!(
             "m",
             "m-up",
@@ -3663,6 +3680,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         );
 
         assert_eq!(first_key, second_key);
+        assert_eq!(first_key, changed_tools_key);
         assert_ne!(first_key, changed_key);
     }
 
