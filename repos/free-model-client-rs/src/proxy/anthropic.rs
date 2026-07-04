@@ -232,6 +232,17 @@ pub async fn handle_anthropic_messages(
             zb["max_tokens"] = serde_json::json!(max_tok);
         }
     }
+    let initial_tool_reasoning_enriched =
+        super::enrich_tool_call_reasoning_body(&mut zb, profile, &reasoning_scope);
+    if initial_tool_reasoning_enriched > 0 {
+        tracing::info!(
+            protocol = "anthropic",
+            model = %cr.model,
+            source_client = ?profile.kind,
+            enriched_messages = initial_tool_reasoning_enriched,
+            "enriched upstream tool-call reasoning before first attempt"
+        );
+    }
     tracing::info!(
         protocol = "anthropic",
         model = %cr.model,

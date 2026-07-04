@@ -229,6 +229,38 @@ pub(crate) fn reasoning_retry_body_with_scope(
     }
 }
 
+pub(crate) fn enrich_tool_call_reasoning_body(
+    body: &mut serde_json::Value,
+    profile: ClientProfile,
+    reasoning_scope: &str,
+) -> usize {
+    if !thinking_manifest::preserves_thinking_on_retry(profile) {
+        return 0;
+    }
+    let session_scope = if reasoning_scope.trim().is_empty() {
+        reasoning_scope_from_upstream_body(body)
+    } else {
+        reasoning_scope.to_string()
+    };
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut typed = messages
+        .iter()
+        .filter_map(|value| {
+            serde_json::from_value::<crate::protocol::types::Message>(value.clone()).ok()
+        })
+        .collect::<Vec<_>>();
+    let enriched = canonical::enrich_messages_with_tool_call_reasoning(&mut typed, &session_scope);
+    if enriched > 0 {
+        *messages = typed
+            .into_iter()
+            .map(|message| canonical::message_to_upstream_json(&message))
+            .collect();
+    }
+    enriched
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderInvalidRetryMode {
     EnrichReasoning,

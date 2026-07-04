@@ -4213,16 +4213,9 @@ async fn anthropic_stream_tool_history_retry_uses_tool_call_reasoning_sidecar() 
     );
 
     let requests = state.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3);
-    let failed_followup_messages = requests[1].messages.as_ref().unwrap().as_array().unwrap();
-    assert!(!failed_followup_messages.iter().any(|message| {
-        message
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.trim().is_empty())
-    }));
-    let retry_messages = requests[2].messages.as_ref().unwrap().as_array().unwrap();
-    assert!(retry_messages.iter().any(|message| {
+    assert_eq!(requests.len(), 2);
+    let followup_messages = requests[1].messages.as_ref().unwrap().as_array().unwrap();
+    assert!(followup_messages.iter().any(|message| {
         message.get("role").and_then(Value::as_str) == Some("assistant")
             && message.get("reasoning_content").and_then(Value::as_str)
                 == Some("reasoning before bash")
