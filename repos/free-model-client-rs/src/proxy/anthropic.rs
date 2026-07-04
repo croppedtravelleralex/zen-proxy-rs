@@ -282,7 +282,7 @@ pub async fn handle_anthropic_messages(
                 output_tokens,
                 0,
                 0,
-                0,
+                None,
                 "end_turn".to_string(),
                 &cr,
                 profile,
@@ -980,6 +980,7 @@ fn text_resp_with_usage(
     upstream_finish_reason: Option<&str>,
 ) -> Response {
     let stop_reason = anthropic_stop_reason(upstream_finish_reason, false);
+    let usage_json = anthropic_usage_json(input_tokens, output_tokens, usage);
     Json(serde_json::json!({
         "id": format!("msg_{ts}"),
         "type": "message",
@@ -988,13 +989,7 @@ fn text_resp_with_usage(
         "content": [{"type":"text","text":text}],
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "cache_creation_input_tokens": cache_creation_tokens(usage),
-            "cache_read_input_tokens": cache_read_tokens(usage),
-            "cache_miss_input_tokens": cache_miss_tokens(usage),
-            "output_tokens": output_tokens
-        }
+        "usage": usage_json
     }))
     .into_response()
 }
@@ -1007,6 +1002,7 @@ fn tool_resp_with_usage(
     output_tokens: u64,
     usage: Option<&crate::zen::client::ZenUsage>,
 ) -> Response {
+    let usage_json = anthropic_usage_json(input_tokens, output_tokens, usage);
     Json(serde_json::json!({
         "id": format!("msg_{ts}"),
         "type": "message",
@@ -1015,15 +1011,45 @@ fn tool_resp_with_usage(
         "content": blocks,
         "stop_reason": "tool_use",
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "cache_creation_input_tokens": cache_creation_tokens(usage),
-            "cache_read_input_tokens": cache_read_tokens(usage),
-            "cache_miss_input_tokens": cache_miss_tokens(usage),
-            "output_tokens": output_tokens
-        }
+        "usage": usage_json
     }))
     .into_response()
+}
+
+fn anthropic_usage_json(
+    input_tokens: u64,
+    output_tokens: u64,
+    usage: Option<&crate::zen::client::ZenUsage>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": cache_creation_tokens(usage),
+        "cache_read_input_tokens": cache_read_tokens(usage),
+        "output_tokens": output_tokens
+    });
+    if let Some(cache_miss) = cache_miss_tokens(usage, input_tokens) {
+        value["cache_miss_input_tokens"] = serde_json::json!(cache_miss);
+    }
+    value
+}
+
+fn anthropic_stream_delta_usage_json(
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation: u64,
+    cache_read: u64,
+    cache_miss: Option<u64>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation,
+        "cache_read_input_tokens": cache_read
+    });
+    if let Some(cache_miss) = cache_miss {
+        value["cache_miss_input_tokens"] = serde_json::json!(cache_miss);
+    }
+    value
 }
 
 fn cache_creation_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
@@ -1038,14 +1064,23 @@ fn cache_read_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
         .unwrap_or(0)
 }
 
-fn cache_miss_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> u64 {
-    usage
-        .and_then(|usage| {
-            usage
-                .cache_miss_input_tokens
-                .or(usage.prompt_cache_miss_tokens)
-        })
-        .unwrap_or(0)
+fn cache_miss_tokens(
+    usage: Option<&crate::zen::client::ZenUsage>,
+    fallback_input_tokens: u64,
+) -> Option<u64> {
+    usage.map(|usage| {
+        if let Some(cache_miss) = usage
+            .cache_miss_input_tokens
+            .or(usage.prompt_cache_miss_tokens)
+        {
+            return cache_miss;
+        }
+        let cache_read = usage.cache_read_tokens().unwrap_or(0);
+        usage
+            .prompt_tokens
+            .unwrap_or(fallback_input_tokens)
+            .saturating_sub(cache_read)
+    })
 }
 
 fn anthropic_stop_reason(
@@ -2297,7 +2332,7 @@ async fn handle_stream(
             .as_ref()
             .and_then(crate::zen::client::ZenUsage::cache_read_tokens)
             .unwrap_or(0);
-        let cache_miss = cache_miss_tokens(usage.as_ref());
+        let cache_miss = cache_miss_tokens(usage.as_ref(), input_tokens);
         let cache_signals = cache_signals.with_body_usage(usage.as_ref());
         super::log_provider_cache_observation("anthropic", &body, profile, &cache_signals, attempts_used, CLAUDE_CODE_STREAM_GUARD_ATTEMPTS);
         tracing::info!(
@@ -2339,7 +2374,14 @@ async fn handle_stream(
             no_forwardable_retry_after_secs = no_forwardable_retry_after.as_secs(),
             "ClaudeCode stream guard completion summary"
         );
-        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"input_tokens":input_tokens,"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read,"cache_miss_input_tokens":cache_miss}}).to_string()));
+        let usage_json = anthropic_stream_delta_usage_json(
+            input_tokens,
+            output_tokens,
+            cache_creation,
+            cache_read,
+            cache_miss,
+        );
+        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":usage_json}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
     Ok(Sse::new(stream).into_response())
@@ -2501,7 +2543,7 @@ async fn handle_buffered_claude_code_huge_stream(
                     estimate(fallback_text).max(1),
                     0,
                     0,
-                    0,
+                    None,
                     "end_turn".to_string(),
                     cr,
                     profile,
@@ -2526,7 +2568,7 @@ async fn handle_buffered_claude_code_huge_stream(
                         estimate(literal).max(1),
                         0,
                         0,
-                        0,
+                        None,
                         "end_turn".to_string(),
                         cr,
                         profile,
@@ -2598,7 +2640,7 @@ async fn handle_buffered_claude_code_huge_stream(
             .as_ref()
             .and_then(crate::zen::client::ZenUsage::cache_read_tokens)
             .unwrap_or(0);
-        let cache_miss = cache_miss_tokens(collected.usage.as_ref());
+        let cache_miss = cache_miss_tokens(collected.usage.as_ref(), input_tokens);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2633,7 +2675,7 @@ fn anthropic_buffered_stream_resp(
     output_tokens: u64,
     cache_creation: u64,
     cache_read: u64,
-    cache_miss: u64,
+    cache_miss: Option<u64>,
     stop_reason: String,
     body: &ChatRequest,
     profile: ClientProfile,
@@ -2681,7 +2723,14 @@ fn anthropic_buffered_stream_resp(
             }
         }
         let stop_reason = if emitted_tool_blocks == 0 { stop_reason } else { "tool_use".to_string() };
-        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"input_tokens":input_tokens,"output_tokens":output_tokens,"cache_creation_input_tokens":cache_creation,"cache_read_input_tokens":cache_read,"cache_miss_input_tokens":cache_miss}}).to_string()));
+        let usage_json = anthropic_stream_delta_usage_json(
+            input_tokens,
+            output_tokens,
+            cache_creation,
+            cache_read,
+            cache_miss,
+        );
+        yield Ok(Event::default().event("message_delta").data(serde_json::json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":usage_json}).to_string()));
         yield Ok(Event::default().event("message_stop").data(serde_json::json!({"type":"message_stop"}).to_string()));
     };
     Sse::new(stream).into_response()

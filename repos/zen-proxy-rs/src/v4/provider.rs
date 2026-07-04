@@ -1348,7 +1348,7 @@ async fn call_with_retry(
                     let (response, body_bytes_len, usage, has_output) = if request_meta.stream {
                         (response, 0, UsageCounts::default(), true)
                     } else {
-                        buffered_response_with_usage(response, path).await?
+                        buffered_response_with_usage(response, path, public_model).await?
                     };
                     if !request_meta.stream && !has_output {
                         crate::pool::session_pin::clear(
@@ -1567,7 +1567,8 @@ async fn call_with_retry(
                             .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
                     })
                     .and_then(|(_, value)| value.parse::<u64>().ok());
-                if status == StatusCode::TOO_MANY_REQUESTS {
+                let provider_rate_limited = is_provider_rate_limited(status, &err.message);
+                if provider_rate_limited {
                     was_rate_limited = true;
                     state
                         .pool_manager
@@ -1675,7 +1676,7 @@ async fn call_with_retry(
                         upstream_model,
                         "retry_budget_exhausted",
                         attempt,
-                        was_rate_limited || status == StatusCode::TOO_MANY_REQUESTS,
+                        was_rate_limited || provider_rate_limited,
                         latency,
                         "retry_budget_exhausted",
                         retry_chain,
@@ -1693,7 +1694,8 @@ async fn call_with_retry(
                 }
                 if attempt >= max_for_error {
                     let (error_kind, outcome, error_type) = classify_app_error(&err);
-                    let outcome = if status == StatusCode::TOO_MANY_REQUESTS {
+                    let provider_rate_limited = is_provider_rate_limited(status, &err.message);
+                    let outcome = if provider_rate_limited {
                         "rate_limited"
                     } else if is_upstream_busy(status, &err.message) {
                         "upstream_busy"
@@ -1723,7 +1725,7 @@ async fn call_with_retry(
                         upstream_model,
                         outcome,
                         attempt,
-                        was_rate_limited || status == StatusCode::TOO_MANY_REQUESTS,
+                        was_rate_limited || provider_rate_limited,
                         latency,
                         outcome,
                         retry_chain,
@@ -1884,8 +1886,22 @@ fn is_upstream_busy(status: StatusCode, message: &str) -> bool {
             || message.contains("service_unavailable_error"))
 }
 
+fn is_provider_rate_limited(status: StatusCode, message: &str) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    let lower = message.to_ascii_lowercase();
+    lower.contains("rate limited")
+        || lower.contains("rate_limit")
+        || lower.contains("rate-limit")
+        || lower.contains("too many requests")
+}
+
 fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str) {
     let message = err.message.to_ascii_lowercase();
+    if is_provider_rate_limited(err.status, &err.message) {
+        return (ErrorKind::Upstream5xx, "rate_limited", "upstream_429");
+    }
     if is_provider_invalid_request_error(err) {
         return (
             ErrorKind::Other,
@@ -1923,6 +1939,10 @@ fn classify_app_error(err: &AppError) -> (ErrorKind, &'static str, &'static str)
 }
 
 fn result_kind_for_classified_error(error_kind: ErrorKind, error_type: &str) -> ResultKind {
+    if error_type == "upstream_429" {
+        return ResultKind::RateLimited;
+    }
+
     if error_type == "provider_invalid_request" {
         return ResultKind::Success(400);
     }
@@ -1970,7 +1990,8 @@ fn is_provider_invalid_request_error(err: &AppError) -> bool {
 }
 
 fn max_retries_for_app_error(err: &AppError, base_max: u32, empty_upstream_max: u32) -> u32 {
-    if is_provider_invalid_request_error(err) {
+    if is_provider_invalid_request_error(err) || is_provider_rate_limited(err.status, &err.message)
+    {
         0
     } else if is_empty_upstream_error(err) {
         empty_upstream_max
@@ -2105,6 +2126,7 @@ async fn buffered_response(response: Response) -> Result<(Response, u64), V4Call
 async fn buffered_response_with_usage(
     response: Response,
     path: &str,
+    public_model: &str,
 ) -> Result<(Response, u64, UsageCounts, bool), V4CallError> {
     let status = response.status();
     let headers = response.headers().clone();
@@ -2116,6 +2138,7 @@ async fn buffered_response_with_usage(
                 format!("failed to read provider response body: {err}"),
             )
         })?;
+    let bytes = rewrite_nonstream_response_model(path, bytes, public_model);
     let len = bytes.len() as u64;
     let usage = extract_usage_counts(path, &bytes);
     let has_output = response_has_assistant_output(path, &bytes) || usage.completion_tokens > 0;
@@ -2123,6 +2146,111 @@ async fn buffered_response_with_usage(
     *rebuilt.status_mut() = status;
     *rebuilt.headers_mut() = headers;
     Ok((rebuilt, len, usage, has_output))
+}
+
+fn rewrite_nonstream_response_model(path: &str, bytes: Bytes, public_model: &str) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+        return bytes;
+    };
+    if !rewrite_response_model_value(path, &mut value, public_model) {
+        return bytes;
+    }
+    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(bytes)
+}
+
+fn rewrite_stream_response_model(path: &str, bytes: Bytes, public_model: &str) -> Bytes {
+    if public_model.is_empty() {
+        return bytes;
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return bytes;
+    };
+    if !text.contains("data:") {
+        return bytes;
+    }
+
+    let mut changed = false;
+    let mut rewritten = String::with_capacity(text.len());
+    for line_with_newline in text.split_inclusive('\n') {
+        let (line, newline) = line_with_newline
+            .strip_suffix('\n')
+            .map(|line| (line, "\n"))
+            .unwrap_or((line_with_newline, ""));
+        let (line, carriage) = line
+            .strip_suffix('\r')
+            .map(|line| (line, "\r"))
+            .unwrap_or((line, ""));
+        let leading_len = line.len().saturating_sub(line.trim_start().len());
+        let (leading, rest) = line.split_at(leading_len);
+        let Some(data) = rest.strip_prefix("data:") else {
+            rewritten.push_str(line);
+            rewritten.push_str(carriage);
+            rewritten.push_str(newline);
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            rewritten.push_str(line);
+            rewritten.push_str(carriage);
+            rewritten.push_str(newline);
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+            rewritten.push_str(line);
+            rewritten.push_str(carriage);
+            rewritten.push_str(newline);
+            continue;
+        };
+        if rewrite_response_model_value(path, &mut value, public_model) {
+            match serde_json::to_string(&value) {
+                Ok(json) => {
+                    rewritten.push_str(leading);
+                    rewritten.push_str("data: ");
+                    rewritten.push_str(&json);
+                    rewritten.push_str(carriage);
+                    rewritten.push_str(newline);
+                    changed = true;
+                }
+                Err(_) => {
+                    rewritten.push_str(line);
+                    rewritten.push_str(carriage);
+                    rewritten.push_str(newline);
+                }
+            }
+        } else {
+            rewritten.push_str(line);
+            rewritten.push_str(carriage);
+            rewritten.push_str(newline);
+        }
+    }
+
+    if changed {
+        Bytes::from(rewritten)
+    } else {
+        bytes
+    }
+}
+
+fn rewrite_response_model_value(path: &str, value: &mut Value, public_model: &str) -> bool {
+    if public_model.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    if matches!(path, "messages" | "chat/completions")
+        && value.get("model").and_then(Value::as_str).is_some()
+    {
+        value["model"] = Value::String(public_model.to_string());
+        changed = true;
+    }
+    if path == "messages" {
+        if let Some(message) = value.get_mut("message").and_then(Value::as_object_mut) {
+            if message.get("model").and_then(Value::as_str).is_some() {
+                message.insert("model".to_string(), Value::String(public_model.to_string()));
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn response_has_assistant_output(path: &str, bytes: &Bytes) -> bool {
@@ -2176,6 +2304,7 @@ fn metered_stream_response(
 
     tokio::spawn(async move {
         let mut telemetry = telemetry;
+        let public_model = telemetry.public_model.clone();
         let mut lease_guard =
             StreamLeaseGuard::new(state.clone(), telemetry.selected_node_id.clone());
         let mut metrics = StreamMetrics::new(fallback_usage);
@@ -2203,6 +2332,8 @@ fn metered_stream_response(
                     let had_content = metrics.has_content_signal();
                     let had_tool = metrics.has_tool_signal();
                     metrics.ingest(&path, &bytes);
+                    let downstream_bytes =
+                        rewrite_stream_response_model(&path, bytes, &public_model);
                     let elapsed_ms = request_start.elapsed().as_millis() as u64;
                     if first_content_token_ms == 0 && !had_content && metrics.has_content_signal() {
                         first_content_token_ms = elapsed_ms;
@@ -2210,7 +2341,7 @@ fn metered_stream_response(
                     if first_tool_call_ms == 0 && !had_tool && metrics.has_tool_signal() {
                         first_tool_call_ms = elapsed_ms;
                     }
-                    match send_stream_bytes(&tx, bytes).await {
+                    match send_stream_bytes(&tx, downstream_bytes).await {
                         Ok(()) => {}
                         Err(StreamSendError::Closed) => {
                             client_gone = true;
@@ -3157,6 +3288,48 @@ mod tests {
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.cached_tokens, 70);
         assert_eq!(usage.cache_read_input_tokens, 70);
+        assert_eq!(usage.cache_miss_input_tokens, Some(30));
+    }
+
+    #[test]
+    fn rewrites_anthropic_nonstream_model_to_public_model() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","model":"mimo-v2.5-free","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":70,"cache_miss_input_tokens":30}}"#,
+        );
+
+        let rewritten = rewrite_nonstream_response_model("messages", body, "mimo-v2.5");
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(value["model"], "mimo-v2.5");
+        assert_eq!(value["usage"]["cache_read_input_tokens"], 70);
+        assert_eq!(value["usage"]["cache_miss_input_tokens"], 30);
+    }
+
+    #[test]
+    fn rewrites_anthropic_stream_message_start_model_to_public_model() {
+        let body = Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"deepseek-v4-flash-free\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":70,\"cache_miss_input_tokens\":30}}}\n\n",
+        );
+
+        let rewritten = rewrite_stream_response_model("messages", body, "deepseek-v4-flash");
+        let text = std::str::from_utf8(&rewritten).unwrap();
+
+        assert!(text.contains("\"model\":\"deepseek-v4-flash\""));
+        assert!(text.contains("\"cache_miss_input_tokens\":30"));
+        assert!(!text.contains("deepseek-v4-flash-free"));
+    }
+
+    #[test]
+    fn rewrites_openai_stream_chunk_model_to_public_model() {
+        let body = Bytes::from_static(
+            b"data: {\"id\":\"chatcmpl_1\",\"model\":\"mimo-v2.5-free\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        );
+
+        let rewritten = rewrite_stream_response_model("chat/completions", body, "mimo-v2.5");
+        let text = std::str::from_utf8(&rewritten).unwrap();
+
+        assert!(text.contains("\"model\":\"mimo-v2.5\""));
+        assert!(!text.contains("mimo-v2.5-free"));
     }
 
     #[test]
@@ -3201,6 +3374,27 @@ mod tests {
                 kind: ErrorKind::Other
             }
         ));
+    }
+
+    #[test]
+    fn provider_rate_limited_text_is_classified_as_rate_limited() {
+        let err = AppError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "upstream provider rate limited the request".to_string(),
+            upstream_headers: None,
+            upstream_error_kind: None,
+        };
+
+        let (kind, outcome, error_type) = classify_app_error(&err);
+
+        assert_eq!(kind, ErrorKind::Upstream5xx);
+        assert_eq!(outcome, "rate_limited");
+        assert_eq!(error_type, "upstream_429");
+        assert!(matches!(
+            result_kind_for_classified_error(kind, error_type),
+            ResultKind::RateLimited
+        ));
+        assert_eq!(max_retries_for_app_error(&err, 2, 4), 0);
     }
 
     #[test]

@@ -1141,6 +1141,7 @@ async fn anthropic_non_stream_preserves_cache_usage_metadata() {
     assert_eq!(body["usage"]["output_tokens"], 5);
     assert_eq!(body["usage"]["cache_creation_input_tokens"], 11);
     assert_eq!(body["usage"]["cache_read_input_tokens"], 22);
+    assert_eq!(body["usage"]["cache_miss_input_tokens"], 8);
 }
 
 #[tokio::test]
@@ -1159,6 +1160,7 @@ async fn anthropic_non_stream_tool_response_preserves_cache_usage_metadata() {
     assert_eq!(body["stop_reason"], "tool_use");
     assert_eq!(body["usage"]["cache_creation_input_tokens"], 11);
     assert_eq!(body["usage"]["cache_read_input_tokens"], 22);
+    assert_eq!(body["usage"]["cache_miss_input_tokens"], 8);
 }
 
 #[tokio::test]
@@ -1177,6 +1179,7 @@ async fn anthropic_stream_preserves_cache_usage_metadata() {
     assert!(body.contains("\"input_tokens\":30"));
     assert!(body.contains("\"cache_creation_input_tokens\":11"));
     assert!(body.contains("\"cache_read_input_tokens\":22"));
+    assert!(body.contains("\"cache_miss_input_tokens\":8"));
 }
 
 #[tokio::test]
