@@ -1351,6 +1351,10 @@ async fn call_with_retry(
                         buffered_response_with_usage(response, path).await?
                     };
                     if !request_meta.stream && !has_output {
+                        crate::pool::session_pin::clear(
+                            &request_meta.upstream_model,
+                            &request_meta.session_id,
+                        );
                         state.pool_manager.report(
                             node_id.clone(),
                             ResultKind::EmptyOutput,
@@ -2338,6 +2342,7 @@ fn metered_stream_response(
             telemetry.failure_kind = "empty_output".to_string();
             telemetry.failure_message =
                 "upstream returned no assistant content or tool call".to_string();
+            crate::pool::session_pin::clear(&telemetry.upstream_model, &telemetry.session_id);
             telemetry.retry_chain.push(RequestAttemptTelemetry {
                 attempt: telemetry.retry_count,
                 node_id: telemetry.selected_node_id.clone(),

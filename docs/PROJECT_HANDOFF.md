@@ -44,7 +44,8 @@ Windows claude.orig.exe
 - `big-pickle` 已恢复为公开名；`deepseek-v4-flash-lite` 不再作为公开模型或 NewAPI mapping 暴露。
 - panda ZenProxy 入口：nginx `:4000`，后端 `4001/4002/4004`。
 - 新 Webshare 100 代理已替换到 panda，低并发验证 100/100 可访问上游，出口国家为 `SG`。
-- 2026-07-04 11:38，panda 三个 `zen-proxy-rs@1/2/3` 均运行 sha256 `171e7a3c21b1da1c1d655a5442b8c17396299d9b4d63af273f5698328ad11358`，health OK；这是第一版 `tool_result` cache identity 修复，已证明仍不足以达成 95%+。
+- 2026-07-04 12:22，panda 三个 `zen-proxy-rs@1/2/3` 均运行 sha256 `886344e54013386a8bc648286e79a862dccb2a06839abf3c0e0eb4c5a04b1977`，health OK；这是第二版 `tool_call_id` 稳定化修复，已证明仍不足以达成 95%+。
+- 2026-07-04 12:55，DeepSeek 继续在同一 `session_id` 上重复 `empty_output`，audit 显示坏 node 被 `session_pin` 黏住；本地已补 `empty_output` 清 session pin，但尚未部署到 panda。
 - 2026-07-04 09:55 严格窗口显示 `usk/prefix_32k_hash/prompt_cache_key` 已全量存在，但三模型 cache 仍未达到 95%+：DeepSeek R1/R2 约 11.40%，BigPickle R1/R2 约 15.17%，Mimo R1 约 87.70% 且 R2 受缺失 miss token 影响不能单独采用。
 - NewAPI `logs.other` 当前没有 cache 字段，真实 cache 验收必须以 panda audit 的 `cache_read_input_tokens/cache_miss_input_tokens` 为准；cc-switch SQLite 只用于本地请求、模型和耗时对账。
 
@@ -130,3 +131,12 @@ Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；cu
 - 本轮本地修复：`canonicalize_openai_tool_history_with_policy()` 配对完成后把现有 tool id 重写为稳定 `call_fmc_*`，并同步 tool result；`request_cache_material()` 使用同一稳定 id 且忽略 `reasoning_content`。
 - 本轮验证：`free-model-client-rs` fmt/test/clippy 通过（145 unit + 136 kernel golden）；`zen-proxy-rs` fmt/test/clippy 通过（205 unit + 44 e2e）。
 - 该第二版修复尚未部署到 panda。下一步仍必须走 GitHub release/download，不走 scp；部署后重新做严格 cache 验收。不能把 171e 部署窗口写成 95%+ 成功。
+
+## 2026-07-04 12:55 六次排障更新
+
+- 第二版 `tool_call_id` 稳定化修复已通过 GitHub release asset 下载部署到 panda，运行 hash `886344e54013386a8bc648286e79a862dccb2a06839abf3c0e0eb4c5a04b1977`，三实例 health OK。
+- 部署后 WSL ClaudeCode 的 DeepSeek 非工具和工具请求仍连续返回 `500 server_error`，audit 指向同一 `session_id=ses_afd18e9f402311f2`、同一 node `97a7d2b4`、多次 `outcome=empty_output` 且 `session_pin_hit=true`。
+- 根因推进为：`empty_output` 会记录节点失败，但旧代码没有清理 Redis/session pin；ClaudeCode retry 被稳定路由到同一坏节点，导致 500/empty_output 放大，cache_read=0 不能代表稳定缓存能力。
+- 本轮本地修复：`session_pin::clear(upstream_model, session_id)` 同时清 Redis pin 和内存 fallback；非流式与流式 `empty_output` 分支都会清 pin，让下一轮可换节点。
+- 本轮验证：`zen-proxy-rs cargo fmt --check`、新增 pin 清理单测、完整 `cargo test`（206 unit + 44 e2e）、`cargo clippy --all-targets -- -D warnings` 均通过。
+- 该 v2.6 修复尚未部署到 panda。部署后第一验收目标不是直接宣称 95%+，而是确认 DeepSeek 不再连续命中同一 empty_output pin；随后再跑三模型 cache 新窗口。

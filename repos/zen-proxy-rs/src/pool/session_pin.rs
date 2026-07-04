@@ -49,6 +49,18 @@ pub fn record(upstream_model: &str, session_id: &str, node_id: &NodeId) {
     }
 }
 
+pub fn clear(upstream_model: &str, session_id: &str) -> bool {
+    if session_id.trim().is_empty() || upstream_model.trim().is_empty() {
+        return false;
+    }
+    let key = pin_key(upstream_model, session_id);
+    let mut cleared = redis_clear(&key);
+    if let Ok(mut guard) = memory_store().lock() {
+        cleared |= guard.remove(&key).is_some();
+    }
+    cleared
+}
+
 pub fn is_mimo_family(model: &str) -> bool {
     let normalized = model.trim().to_ascii_lowercase();
     normalized.contains("mimo")
@@ -76,6 +88,20 @@ fn redis_record(key: &str, node_id: &NodeId) -> bool {
         .is_ok()
 }
 
+fn redis_clear(key: &str) -> bool {
+    let Some(client) = REDIS_CLIENT.get().and_then(|client| client.as_ref()) else {
+        return false;
+    };
+    let Ok(mut conn) = client.get_connection() else {
+        return false;
+    };
+    redis::cmd("DEL")
+        .arg(key)
+        .query::<usize>(&mut conn)
+        .map(|deleted| deleted > 0)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +113,22 @@ mod tests {
             lookup("mimo-v2.5-free", "sess-1").as_deref(),
             Some("node-a")
         );
+    }
+
+    #[test]
+    fn clear_removes_memory_pin() {
+        record(
+            "deepseek-v4-flash-free",
+            "sess-clear",
+            &"node-b".to_string(),
+        );
+        assert_eq!(
+            lookup("deepseek-v4-flash-free", "sess-clear").as_deref(),
+            Some("node-b")
+        );
+
+        assert!(clear("deepseek-v4-flash-free", "sess-clear"));
+        assert_eq!(lookup("deepseek-v4-flash-free", "sess-clear"), None);
     }
 
     #[test]

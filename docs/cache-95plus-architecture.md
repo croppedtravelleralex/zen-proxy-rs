@@ -1,8 +1,36 @@
 # Cache 99+ 架构方案 — ICP × CCP × 五层协同
 
 更新时间：2026-07-04
-版本：**v2.5（生产 171e 首次部署后仍未达 95%；tool_call_id 稳定化已本地验证）**
+版本：**v2.6（生产 886e 第二版部署后仍未达 95%；empty_output 清 session pin 已本地验证）**
 状态：见下表 **「部署 vs 生效」** — 禁止将字段覆盖、运维部署成功或单侧面板数据写成缓存 95%+ 达成
+
+## 2026-07-04 12:55 六次严格验收更新
+
+新增现场事实：
+
+- 通过 GitHub release asset 部署第二版 `tool_call_id` 稳定化修复到 panda，三实例运行 sha256 `886344e54013386a8bc648286e79a862dccb2a06839abf3c0e0eb4c5a04b1977`，health OK。
+- 部署后 WSL ClaudeCode 经 cc-switch `127.0.0.1:15722` 继续跑 DeepSeek，非工具和工具请求都快速进入重复 `500 server_error`，而不是进入稳定输出。
+- panda audit 显示同一 `session_id=ses_afd18e9f402311f2` 被持续 pin 到同一 node `97a7d2b4`，多次 `outcome=empty_output`、`session_pin_hit=true`、`cache_read=0`。
+- Mimo 同窗口仍有成功样本，说明 `886e` 二进制不是全局不可用；问题集中在失败节点和 session pin 的交互。
+
+本轮新增根因：
+
+1. **DeepSeek 当前主要故障不是字段缺失，而是 bad node 被 session pin 黏住。** `empty_output` 会记录节点失败，但旧代码没有清理 `zprs:pin:{upstream_model}:{session_id}`，ClaudeCode retry 仍会回到同一坏节点。
+2. **`session_pin_hit=true` 在失败窗口反而是负信号。** 它证明路由稳定，但如果稳定到坏节点，retry 会放大 500/empty_output，并阻断后续缓存验收。
+3. **此时不能继续用低 cache 百分比做模型能力结论。** 必须先让 empty_output 退出坏 pin，再重新跑新窗口；否则 cache_read=0 混入的是失败重试，不是稳定 provider cache 表现。
+
+本轮本地修复：
+
+- `zen-proxy-rs/src/pool/session_pin.rs` 新增 `clear(upstream_model, session_id)`，同时清 Redis pin 和本实例内存 fallback。
+- `zen-proxy-rs/src/v4/provider.rs` 在非流式和流式 `empty_output` 分支调用 `session_pin::clear()`，让下一次重试可重新调度节点。
+
+本轮验证：
+
+- `zen-proxy-rs`：`cargo fmt --check` 通过。
+- 新增单测 `pool::session_pin::tests::clear_removes_memory_pin` 通过。
+- `zen-proxy-rs cargo test` 通过（206 unit + 44 e2e）。
+- `zen-proxy-rs cargo clippy --all-targets -- -D warnings` 通过。
+- 该 v2.6 修复尚未部署到 panda；部署后必须先验证 DeepSeek 不再连续命中同一 empty_output pin，再重新做三模型 cache 新窗口验收。
 
 ## 2026-07-04 12:15 五次严格验收更新
 
