@@ -242,6 +242,83 @@ pub fn record_collected_reasoning(
     crate::session::reasoning_store::put_reasoning(&key, reasoning.to_string());
 }
 
+pub fn record_tool_call_reasoning(
+    session_scope: &str,
+    tool_name: &str,
+    tool_arguments: &str,
+    reasoning: &str,
+) {
+    let Some(key) = tool_call_reasoning_key(session_scope, tool_name, tool_arguments) else {
+        return;
+    };
+    crate::session::reasoning_store::put_reasoning(&key, reasoning.to_string());
+}
+
+pub fn enrich_messages_with_tool_call_reasoning(
+    messages: &mut [Message],
+    session_scope: &str,
+) -> usize {
+    if session_scope.trim().is_empty() {
+        return 0;
+    }
+    let mut enriched = 0usize;
+    for message in messages {
+        if message.role != "assistant"
+            || message
+                .reasoning_content
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty())
+        {
+            continue;
+        }
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for call in tool_calls {
+            let Some(key) = tool_call_reasoning_key(
+                session_scope,
+                &call.function.name,
+                &call.function.arguments,
+            ) else {
+                continue;
+            };
+            if let Some(reasoning) = crate::session::reasoning_store::get_reasoning(&key) {
+                message.reasoning_content = Some(reasoning);
+                enriched += 1;
+                break;
+            }
+        }
+    }
+    enriched
+}
+
+fn tool_call_reasoning_key(
+    session_scope: &str,
+    tool_name: &str,
+    tool_arguments: &str,
+) -> Option<String> {
+    let scope = session_scope.trim();
+    let name = tool_name.trim().to_ascii_lowercase();
+    if scope.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{scope}:tool_call_reasoning:{name}:{}",
+        canonical_tool_arguments(tool_arguments)
+    ))
+}
+
+fn canonical_tool_arguments(arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return "{}".to_string();
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| serde_json::to_string(&sort_json_value(value)).ok())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
 pub fn prefix_drift_bytes(previous_hash: u64, current_hash: u64) -> bool {
     previous_hash != 0 && current_hash != previous_hash
 }
@@ -466,7 +543,7 @@ fn sort_json_value(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{OpenAITool, OpenAIToolFunction};
+    use crate::protocol::types::{OpenAITool, OpenAIToolFunction, ToolCall, ToolFunction};
     use serde_json::Value;
 
     #[test]
@@ -497,6 +574,40 @@ mod tests {
         };
         let json = message_to_upstream_json(&message);
         assert_eq!(json["reasoning_content"], "thought");
+    }
+
+    #[test]
+    fn tool_call_reasoning_backfill_uses_canonical_arguments() {
+        let mut messages = vec![Message {
+            role: "assistant".into(),
+            content: Value::Null,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_runtime".into()),
+                call_type: "function".into(),
+                function: ToolFunction {
+                    name: "Bash".into(),
+                    arguments: r#"{"b":2,"a":1}"#.into(),
+                },
+                index: Some(0),
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        record_tool_call_reasoning(
+            "unit-tool-reasoning-scope",
+            "bash",
+            r#"{"a":1,"b":2}"#,
+            "stored tool reasoning",
+        );
+        let enriched =
+            enrich_messages_with_tool_call_reasoning(&mut messages, "unit-tool-reasoning-scope");
+
+        assert_eq!(enriched, 1);
+        assert_eq!(
+            messages[0].reasoning_content.as_deref(),
+            Some("stored tool reasoning")
+        );
     }
 
     #[test]

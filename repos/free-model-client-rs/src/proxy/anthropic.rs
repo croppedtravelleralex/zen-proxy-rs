@@ -184,6 +184,7 @@ pub async fn handle_anthropic_messages(
     };
     let icp_package =
         super::build_icp_upstream_package(&cr, &upstream_model, profile, &config.zen_api_key);
+    let reasoning_scope = icp_package.identity.usk.clone();
     let mut zb = icp_package.body;
     let zen_headers = super::zen_session_headers(&icp_package.identity);
     let upstream_headers = super::merge_extra_headers(&config.extra_headers, &zen_headers);
@@ -342,7 +343,16 @@ pub async fn handle_anthropic_messages(
         )
         .await
     } else {
-        handle_non_stream(client, &request_config, &cr, &zb, profile, repair).await
+        handle_non_stream(
+            client,
+            &request_config,
+            &cr,
+            &zb,
+            profile,
+            repair,
+            &reasoning_scope,
+        )
+        .await
     }
 }
 
@@ -389,6 +399,7 @@ async fn handle_non_stream(
     zb: &Value,
     profile: ClientProfile,
     tool_history_repair: translate::ToolHistoryRepair,
+    reasoning_scope: &str,
 ) -> Result<Response, AppError> {
     use std::time::Duration;
 
@@ -429,7 +440,8 @@ async fn handle_non_stream(
                     ) =>
                 {
                     used_missing_reasoning_enrich_retry = true;
-                    attempt_body = super::reasoning_retry_body(zb, profile);
+                    attempt_body =
+                        super::reasoning_retry_body_with_scope(zb, profile, reasoning_scope);
                     super::log_missing_reasoning_content_retry(
                         "anthropic",
                         cr,
@@ -683,6 +695,15 @@ async fn handle_non_stream(
                 &input,
             ) {
                 continue;
+            }
+            if !collected.reasoning.trim().is_empty() {
+                let arguments = serde_json::to_string(&input).unwrap_or_default();
+                crate::canonical::record_tool_call_reasoning(
+                    reasoning_scope,
+                    &ct.function.name,
+                    &arguments,
+                    &collected.reasoning,
+                );
             }
             blocks.push(AnthropicContentBlock {
                 block_type: "tool_use".to_string(),
@@ -1542,6 +1563,7 @@ async fn handle_stream(
     let zen_api_key = config.zen_api_key.clone();
     let extra_headers = config.extra_headers.clone();
     let base_body = zb.clone();
+    let reasoning_scope = super::reasoning_scope_from_upstream_body(&base_body);
     let send_idle_ping = profile.kind == ClientKind::ClaudeCode;
     let idle_ping_interval = Duration::from_secs(CLAUDE_CODE_STREAM_IDLE_PING_SECS);
     let true_first_token_frt = config.true_first_token_frt;
@@ -1697,7 +1719,11 @@ async fn handle_stream(
                         used_enrich_reasoning_retry,
                     ) {
                         used_enrich_reasoning_retry = true;
-                        attempt_body = super::reasoning_retry_body(&base_body, profile);
+                        attempt_body = super::reasoning_retry_body_with_scope(
+                            &base_body,
+                            profile,
+                            &reasoning_scope,
+                        );
                         super::log_missing_reasoning_content_retry(
                             "anthropic",
                             &body,
@@ -1993,14 +2019,18 @@ async fn handle_stream(
                     if profile.kind == ClientKind::ClaudeCode
                         && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
                     {
-                        if attempt + 2 == CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
-                            && !used_enrich_reasoning_retry
-                            && body.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-                        {
-                            used_enrich_reasoning_retry = true;
-                            attempt_body = super::reasoning_retry_body(&base_body, profile);
-                            tracing::warn!(
-                                protocol = "anthropic",
+                    if attempt + 2 == CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+                        && !used_enrich_reasoning_retry
+                        && body.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+                    {
+                        used_enrich_reasoning_retry = true;
+                        attempt_body = super::reasoning_retry_body_with_scope(
+                            &base_body,
+                            profile,
+                            &reasoning_scope,
+                        );
+                        tracing::warn!(
+                            protocol = "anthropic",
                                 model = %body.model,
                                 source_client = ?profile.kind,
                                 prompt_hash,
@@ -2023,13 +2053,14 @@ async fn handle_stream(
             }
             if retry_attempt {
                 if attempt + 2 == CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
-                    && !used_enrich_reasoning_retry
-                    && body.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-                {
-                    used_enrich_reasoning_retry = true;
-                    attempt_body = super::reasoning_retry_body(&base_body, profile);
-                    tracing::warn!(
-                        protocol = "anthropic",
+                && !used_enrich_reasoning_retry
+                && body.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            {
+                used_enrich_reasoning_retry = true;
+                attempt_body =
+                    super::reasoning_retry_body_with_scope(&base_body, profile, &reasoning_scope);
+                tracing::warn!(
+                    protocol = "anthropic",
                         model = %body.model,
                         source_client = ?profile.kind,
                         prompt_hash,
@@ -2195,6 +2226,15 @@ async fn handle_stream(
                         &input,
                     ) {
                         continue;
+                    }
+                    if !reasoning.trim().is_empty() {
+                        let arguments = serde_json::to_string(&input).unwrap_or_default();
+                        crate::canonical::record_tool_call_reasoning(
+                            &reasoning_scope,
+                            &ct.function.name,
+                            &arguments,
+                            &reasoning,
+                        );
                     }
                     let tidx = emitted_tool_call_blocks;
                     yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));

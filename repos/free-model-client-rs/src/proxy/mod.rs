@@ -155,6 +155,15 @@ pub(crate) fn session_scope_from_upstream_body(body: &Value) -> String {
     format!("{model}:{:016x}", hasher.finish())
 }
 
+pub(crate) fn reasoning_scope_from_upstream_body(body: &Value) -> String {
+    body.get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| session_scope_from_upstream_body(body))
+}
+
 pub(crate) fn session_scope_for_request(request: &ChatRequest) -> String {
     let shape = translate::request_shape(request);
     format!("{}:{:016x}", request.model, shape.prompt_hash)
@@ -181,9 +190,21 @@ pub(crate) fn reasoning_retry_body(
     body: &serde_json::Value,
     profile: ClientProfile,
 ) -> serde_json::Value {
+    reasoning_retry_body_with_scope(body, profile, "")
+}
+
+pub(crate) fn reasoning_retry_body_with_scope(
+    body: &serde_json::Value,
+    profile: ClientProfile,
+    reasoning_scope: &str,
+) -> serde_json::Value {
     if thinking_manifest::preserves_thinking_on_retry(profile) {
         let mut retry = body.clone();
-        let session_scope = session_scope_from_upstream_body(&retry);
+        let session_scope = if reasoning_scope.trim().is_empty() {
+            reasoning_scope_from_upstream_body(&retry)
+        } else {
+            reasoning_scope.to_string()
+        };
         if let Some(messages) = retry.get_mut("messages").and_then(Value::as_array_mut) {
             let mut typed = messages
                 .iter()
@@ -191,6 +212,7 @@ pub(crate) fn reasoning_retry_body(
                     serde_json::from_value::<crate::protocol::types::Message>(value.clone()).ok()
                 })
                 .collect::<Vec<_>>();
+            canonical::enrich_messages_with_tool_call_reasoning(&mut typed, &session_scope);
             canonical::enrich_messages_with_reasoning_mode(
                 &mut typed,
                 &session_scope,

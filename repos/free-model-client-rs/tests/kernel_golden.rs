@@ -137,6 +137,42 @@ async fn mock_zen_handler(
                 }
             })
             .to_string(),
+            )
+            .into_response();
+    }
+    if prompt.contains("tool-history-needs-reasoning") {
+        if !reasoning_backfilled {
+            return (
+                StatusCode::BAD_REQUEST,
+                [("content-type", "application/json")],
+                json!({
+                    "error": {
+                        "message": "Error from provider (DeepSeek): The `reasoning_content` in the thinking mode must be passed back to the API.",
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error"
+                    }
+                })
+                .to_string(),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"golden answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+            .into_response();
+    }
+    if prompt.contains("emit-reasoned-bash-tool") {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"reasoning before bash\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_reasoned_bash_1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd && ls docs | sort | head -n 3\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
         )
             .into_response();
     }
@@ -4104,6 +4140,93 @@ async fn anthropic_stream_missing_reasoning_content_retry_can_emit_tool_call() {
     assert_eq!(requests.len(), 2);
     assert!(requests[0].thinking.is_none());
     assert!(requests[1].thinking.is_none());
+}
+
+#[tokio::test]
+async fn anthropic_stream_tool_history_retry_uses_tool_call_reasoning_sidecar() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let bash_tool = anthropic_tool("Bash", json!({"command": {"type": "string"}}), &["command"]);
+
+    let mut first = anthropic_request("deepseek-v4-flash", "emit-reasoned-bash-tool", true);
+    first.max_tokens = Some(32_000);
+    first.tools = Some(vec![bash_tool.clone()]);
+
+    let first_response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            first,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = response_text(first_response).await;
+    assert!(first_body.contains("\"type\":\"tool_use\""), "{first_body}");
+    assert!(first_body.contains("\"name\":\"Bash\""), "{first_body}");
+
+    let mut followup = anthropic_request("deepseek-v4-flash", "ignored", true);
+    followup.max_tokens = Some(32_000);
+    followup.tools = Some(vec![bash_tool]);
+    followup.messages = vec![
+        AnthropicMessage {
+            role: "user".to_string(),
+            content: json!("emit-reasoned-bash-tool"),
+        },
+        AnthropicMessage {
+            role: "assistant".to_string(),
+            content: json!([
+                {
+                    "type": "tool_use",
+                    "id": "call_reasoned_bash_1",
+                    "name": "Bash",
+                    "input": {"command": "pwd && ls docs | sort | head -n 3"}
+                }
+            ]),
+        },
+        AnthropicMessage {
+            role: "user".to_string(),
+            content: json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call_reasoned_bash_1",
+                    "content": "tool-history-needs-reasoning\nCLEANUP_AND_STRUCTURE.md\nOPERATING_RULES.md\nPROJECT_HANDOFF.md"
+                }
+            ]),
+        },
+    ];
+
+    let followup_response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            followup,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(followup_response.status(), StatusCode::OK);
+    let followup_body = response_text(followup_response).await;
+    assert!(followup_body.contains("golden answer"), "{followup_body}");
+    assert!(
+        !followup_body.contains("provider_missing_reasoning_content"),
+        "{followup_body}"
+    );
+
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let failed_followup_messages = requests[1].messages.as_ref().unwrap().as_array().unwrap();
+    assert!(!failed_followup_messages.iter().any(|message| {
+        message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    }));
+    let retry_messages = requests[2].messages.as_ref().unwrap().as_array().unwrap();
+    assert!(retry_messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message.get("reasoning_content").and_then(Value::as_str)
+                == Some("reasoning before bash")
+    }));
 }
 
 #[tokio::test]
