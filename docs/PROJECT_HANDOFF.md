@@ -93,6 +93,13 @@ Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；cu
 5. 生产部署继续用 GitHub 临时 release，中转后删除 release/tag，不用 scp。
 6. 后续新工作默认从 `/home/lenovo/zen-free-model-suite` 进入；只有需要回滚或对照历史时再读取两个旧路径。
 
+## 生产资源红线
+
+- panda 是生产机，禁止在 panda 上执行 `cargo build`、`rustc` 或任何高 CPU 编译任务；不要用 `nice/ionice` 作为例外。
+- 生产更新只能使用已在本地或 CI 构建完成的产物，经 GitHub release/download 中转到 panda；panda 侧只做下载、hash 校验、替换、重启和 health/smoke。
+- 如果 GitHub release asset 上传失败，必须暂停部署或改用 CI 构建 release asset；禁止退回到“下载 GitHub source tarball 后在 panda 编译”的兜底方案。
+- 2026-07-04 曾因在 panda 上从 GitHub source 编译新提交导致 CPU 被打满并影响其他业务；该路径已列为禁止项。
+
 ## 2026-07-03 22:40 二次排障更新
 
 - 用户截图显示 Claude Code 21:00 后累计缓存约 **45.3%**；NewAPI channel 69 在 21:58 连续 `mimo-v2.5` 502。

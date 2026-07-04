@@ -10,6 +10,7 @@
 - 不通过降智、缩输出、隐藏提示词或全局 disabled thinking 换首字。
 - 不把 Tailscale/panda 内网链路当成普通用户可交付链路。
 - 不回滚未确认的用户改动或历史 dirty changes。
+- 不在 panda 生产机上编译、`cargo build`、运行 `rustc` 或执行其他高 CPU 构建任务；panda 只允许下载已构建产物、校验、替换和重启。
 
 ## 测试链路
 
@@ -22,6 +23,7 @@
 
 - 需要生产部署时，通过 GitHub 临时 release 上传，远端下载部署，完成后删除 release/tag。
 - 不用 scp 传生产二进制。
+- 禁止把 GitHub source tarball 下载到 panda 后本机编译；如 release asset 上传失败，必须改用本地/CI 构建产物或暂停部署，不能用生产 CPU 兜底。
 - 部署前后记录线上 hash、服务健康、模型列表和最小 smoke。
 
 ## 文档规则
