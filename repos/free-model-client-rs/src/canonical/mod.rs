@@ -7,6 +7,7 @@ use crate::ccp::{apply_prompt_cache_key, CcpFlags, IcpIdentity, UskContext};
 use crate::protocol::types::{ChatRequest, Message, OpenAITool};
 
 static TOOLS_EPOCH: OnceLock<RwLock<HashMap<String, Value>>> = OnceLock::new();
+const TOOL_REASONING_GLOBAL_SCOPE: &str = "__fmc_tool_call_reasoning_global_v1";
 
 fn tools_epoch_store() -> &'static RwLock<HashMap<String, Value>> {
     TOOLS_EPOCH.get_or_init(|| RwLock::new(HashMap::new()))
@@ -251,13 +252,16 @@ pub fn record_tool_call_reasoning(
     if reasoning.trim().is_empty() {
         return;
     }
+    let stable_reasoning = stable_tool_call_reasoning_replay(tool_name);
     let Some(key) = tool_call_reasoning_key(session_scope, tool_name, tool_arguments) else {
         return;
     };
-    crate::session::reasoning_store::put_reasoning(
-        &key,
-        stable_tool_call_reasoning_replay(tool_name),
-    );
+    crate::session::reasoning_store::put_reasoning(&key, stable_reasoning.clone());
+    if let Some(global_key) =
+        tool_call_reasoning_key(TOOL_REASONING_GLOBAL_SCOPE, tool_name, tool_arguments)
+    {
+        crate::session::reasoning_store::put_reasoning(&global_key, stable_reasoning);
+    }
 }
 
 pub fn enrich_messages_with_tool_call_reasoning(
@@ -288,7 +292,15 @@ pub fn enrich_messages_with_tool_call_reasoning(
             ) else {
                 continue;
             };
-            if let Some(reasoning) = crate::session::reasoning_store::get_reasoning(&key) {
+            let reasoning = crate::session::reasoning_store::get_reasoning(&key).or_else(|| {
+                tool_call_reasoning_key(
+                    TOOL_REASONING_GLOBAL_SCOPE,
+                    &call.function.name,
+                    &call.function.arguments,
+                )
+                .and_then(|global_key| crate::session::reasoning_store::get_reasoning(&global_key))
+            });
+            if let Some(reasoning) = reasoning {
                 message.reasoning_content = Some(reasoning);
                 enriched += 1;
                 break;
@@ -617,6 +629,40 @@ mod tests {
         );
         let enriched =
             enrich_messages_with_tool_call_reasoning(&mut messages, "unit-tool-reasoning-scope");
+
+        assert_eq!(enriched, 1);
+        assert_eq!(
+            messages[0].reasoning_content.as_deref(),
+            Some("Tool call reasoning replayed for bash.")
+        );
+    }
+
+    #[test]
+    fn tool_call_reasoning_backfill_uses_global_stable_fallback() {
+        let mut messages = vec![Message {
+            role: "assistant".into(),
+            content: Value::Null,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_runtime".into()),
+                call_type: "function".into(),
+                function: ToolFunction {
+                    name: "Bash".into(),
+                    arguments: r#"{"command":"pwd"}"#.into(),
+                },
+                index: Some(0),
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        record_tool_call_reasoning(
+            "unit-first-provider-scope",
+            "Bash",
+            r#"{"command":"pwd"}"#,
+            "dynamic hidden reasoning",
+        );
+        let enriched =
+            enrich_messages_with_tool_call_reasoning(&mut messages, "unit-second-provider-scope");
 
         assert_eq!(enriched, 1);
         assert_eq!(

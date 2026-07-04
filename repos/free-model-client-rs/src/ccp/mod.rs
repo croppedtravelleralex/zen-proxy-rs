@@ -54,8 +54,11 @@ pub struct IcpIdentity {
 
 pub fn compute_icp_identity(request: &ChatRequest, ctx: &UskContext<'_>) -> IcpIdentity {
     let shape = translate::request_shape(request);
-    let icp_scope =
-        icp_scope_for_request(request, shape.estimated_total_tokens, shape.prefix_32k_hash);
+    let icp_scope = icp_scope_for_request(
+        shape.estimated_total_tokens,
+        shape.prompt_hash,
+        shape.prefix_32k_hash,
+    );
     let usk = format!(
         "{USK_VERSION}:{}",
         short_hash16(&format!(
@@ -124,13 +127,9 @@ pub fn apply_prompt_cache_key(body: &mut Value, identity: &IcpIdentity, flags: &
     );
 }
 
-fn icp_scope_for_request(
-    _request: &ChatRequest,
-    estimated_tokens: u64,
-    prefix_32k_hash: u64,
-) -> String {
+fn icp_scope_for_request(estimated_tokens: u64, prompt_hash: u64, prefix_32k_hash: u64) -> String {
     if estimated_tokens < 10_000 {
-        return "normal".to_string();
+        return format!("icp:pfull:{prompt_hash:016x}");
     }
     format!("icp:p32k:{prefix_32k_hash:016x}")
 }
@@ -222,6 +221,41 @@ mod tests {
         });
         let second = compute_icp_identity(&request, &ctx).usk;
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn usk_separates_distinct_short_prompts() {
+        let ctx = UskContext {
+            api_key_id: "key-a",
+            public_model: "big-pickle",
+            upstream_model: "big-pickle",
+            source_client: "claude-code",
+        };
+        let mut request = ChatRequest {
+            model: "big-pickle".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: json!("first short prompt"),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: Some(true),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let first = compute_icp_identity(&request, &ctx);
+        request.messages[0].content = json!("second short prompt");
+        let second = compute_icp_identity(&request, &ctx);
+
+        assert!(first.icp_scope.starts_with("icp:pfull:"));
+        assert!(second.icp_scope.starts_with("icp:pfull:"));
+        assert_ne!(first.icp_scope, second.icp_scope);
+        assert_ne!(first.usk, second.usk);
     }
 
     #[test]
