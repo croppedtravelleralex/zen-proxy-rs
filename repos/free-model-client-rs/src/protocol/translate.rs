@@ -768,8 +768,16 @@ fn request_cache_material(body: &ChatRequest) -> String {
     material.push_str("model=");
     material.push_str(&body.model);
     material.push('\n');
+    // Tool result payloads are expected to change between otherwise identical
+    // ClaudeCode runs. They still affect the full prompt hash, but should not
+    // split the cache identity before the stable prefix can be reused.
+    let cache_messages = body
+        .messages
+        .iter()
+        .map(cache_identity_message)
+        .collect::<Vec<_>>();
     material.push_str("messages=");
-    material.push_str(&serde_json::to_string(&body.messages).unwrap_or_default());
+    material.push_str(&serde_json::to_string(&cache_messages).unwrap_or_default());
     material.push('\n');
     material.push_str("tools=");
     material.push_str(&serde_json::to_string(&body.tools).unwrap_or_default());
@@ -777,6 +785,19 @@ fn request_cache_material(body: &ChatRequest) -> String {
     material.push_str("tool_choice=");
     material.push_str(&serde_json::to_string(&body.tool_choice).unwrap_or_default());
     material
+}
+
+fn cache_identity_message(message: &Message) -> Message {
+    if message.role != "tool" {
+        return message.clone();
+    }
+    Message {
+        role: message.role.clone(),
+        content: Value::String("[tool_result]".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
 }
 
 fn request_cache_prefix_hash(material: &str, prefix_bytes: usize) -> u64 {
@@ -1825,6 +1846,51 @@ mod tests {
                 })),
             },
         }
+    }
+
+    #[test]
+    fn cache_prefix_ignores_dynamic_tool_result_payloads() {
+        let tools = (0..39)
+            .map(|idx| OpenAITool {
+                tool_type: "function".to_string(),
+                function: OpenAIToolFunction {
+                    name: format!("tool_{idx}"),
+                    description: Some("stable schema ".repeat(120)),
+                    parameters: Some(json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "stable path schema ".repeat(80)
+                            }
+                        }
+                    })),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let mut first = request("continue", true, Some(1024));
+        first.tools = Some(tools.clone());
+        first.messages.insert(
+            0,
+            Message {
+                role: "tool".to_string(),
+                content: Value::String(format!("tool output A {}", "x".repeat(12_000))),
+                tool_calls: None,
+                tool_call_id: Some("toolu_same".to_string()),
+                reasoning_content: None,
+            },
+        );
+
+        let mut second = first.clone();
+        second.messages[0].content = Value::String(format!("tool output B {}", "y".repeat(12_000)));
+
+        let first_shape = request_shape(&first);
+        let second_shape = request_shape(&second);
+
+        assert_ne!(first_shape.prompt_hash, second_shape.prompt_hash);
+        assert_eq!(first_shape.prefix_4k_hash, second_shape.prefix_4k_hash);
+        assert_eq!(first_shape.prefix_32k_hash, second_shape.prefix_32k_hash);
     }
 
     #[test]

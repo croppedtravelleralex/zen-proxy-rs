@@ -1,6 +1,6 @@
 # Project Handoff
 
-更新时间：2026-07-02
+更新时间：2026-07-04
 
 ## 项目定位
 
@@ -44,6 +44,9 @@ Windows claude.orig.exe
 - `big-pickle` 已恢复为公开名；`deepseek-v4-flash-lite` 不再作为公开模型或 NewAPI mapping 暴露。
 - panda ZenProxy 入口：nginx `:4000`，后端 `4001/4002/4004`。
 - 新 Webshare 100 代理已替换到 panda，低并发验证 100/100 可访问上游，出口国家为 `SG`。
+- 2026-07-04 10:05，panda 三个 `zen-proxy-rs@1/2/3` 均运行 sha256 `41afc662f35482293a55d400d6f91a6a4cea721a86e3daedd0abca23a20eda32`，health OK。
+- 2026-07-04 09:55 严格窗口显示 `usk/prefix_32k_hash/prompt_cache_key` 已全量存在，但三模型 cache 仍未达到 95%+：DeepSeek R1/R2 约 11.40%，BigPickle R1/R2 约 15.17%，Mimo R1 约 87.70% 且 R2 受缺失 miss token 影响不能单独采用。
+- NewAPI `logs.other` 当前没有 cache 字段，真实 cache 验收必须以 panda audit 的 `cache_read_input_tokens/cache_miss_input_tokens` 为准；cc-switch SQLite 只用于本地请求、模型和耗时对账。
 
 ## 已完成的关键工作
 
@@ -106,4 +109,13 @@ Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；cu
 - 第二层根因：22:00 后身份覆盖已补齐，但同一 `prefix_32k_hash=a1a6c89803c073d6` 因 `tools_hash` 改变导致 USK 从 `usk_v1:7234...` 变成 `usk_v1:6d6f...`，23:16 出现同前缀冷启动 `cache_miss_input_tokens=50039`。
 - 本轮本地修复：长上下文 `icp_scope` 改为 `icp:p32k:{prefix_32k_hash}`，`tools_epoch_id` 保留为观测/冻结信号但不再进入 provider `prompt_cache_key`；同前缀工具变化不再切 affinity/cache key，真实前缀变化仍切 key。
 - 本轮验证：WSL 下 `free-model-client-rs` fmt/clippy/test 通过（142 unit + 136 kernel golden）；`zen-proxy-rs` fmt/clippy/test 通过（205 unit + 44 e2e）。
-- 尚未部署该 prefix-scope USK 修复到 panda；下一步仍必须走 GitHub release/download，部署后用 Windows/WSL ClaudeCode + ccswitch + NewAPI 新窗口验收三模型 95%+。
+- 后续生产 hash `41afc...a32` 已运行，但 09:55 严格窗口证明仅有 prefix-scope USK 仍不够，不能宣称三模型 95%+。
+
+## 2026-07-04 10:20 四次排障更新
+
+- WSL ClaudeCode 经 cc-switch provider-specific 双轮测试三模型均能请求成功；此前 WSL `403 无权访问 kiro 分组` 的根因是 cc-switch provider/live backup 使用了 `kiro` group token，已统一为 `hhhl` group token。
+- OpenCode 的 Mimo 应使用 `opencode/mimo-v2.5-free`；`opencode-go/mimo-v2.5` 报 401/Missing API key，属于 OpenCode Go credential 问题，不是 NewAPI/ZenProxy/cache 问题。
+- 严格 cache 根因继续推进：ClaudeCode 工具链中 59KB 左右、含约 12KB `tool_result` 的请求会让 `prefix_32k_hash/USK/session_id/node` 分裂；4K 稳定请求能命中，但中等工具请求继续冷启动。
+- 本轮本地修复：`free-model-client-rs/src/protocol/translate.rs` 在 cache identity 材料中标准化 `role=tool` 的动态工具结果内容，避免工具输出污染 `prefix_32k_hash`；完整 `prompt_hash` 仍反映真实内容变化。
+- 本轮验证：`free-model-client-rs cargo fmt --check`、`cargo test`（143 unit + 136 kernel golden）、`cargo clippy --all-targets -- -D warnings` 通过；`zen-proxy-rs cargo test affinity_key_uses_stable_prefix_scope` 通过。
+- 尚未部署该 tool_result 修复到 panda。生产更新仍必须走 GitHub release/download，不走 scp；部署后用 Windows/WSL ClaudeCode + cc-switch + NewAPI + panda audit 新窗口重新验收。

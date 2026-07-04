@@ -1,8 +1,37 @@
 # Cache 99+ 架构方案 — ICP × CCP × 五层协同
 
 更新时间：2026-07-04
-版本：**v2.3（prefix-scope USK 已本地验证，生产未部署）**
-状态：见下表 **「部署 vs 生效」** — 禁止将运维部署成功写成 TMCC 2.0 上线成功
+版本：**v2.4（生产 41afc 已验收但未达 95%；tool_result cache identity 修复已本地验证）**
+状态：见下表 **「部署 vs 生效」** — 禁止将字段覆盖、运维部署成功或单侧面板数据写成缓存 95%+ 达成
+
+## 2026-07-04 10:20 四次严格验收更新
+
+新增现场事实：
+
+- panda 三个 `zen-proxy-rs@1/2/3` 均运行 sha256 `41afc662f35482293a55d400d6f91a6a4cea721a86e3daedd0abca23a20eda32`，health OK。
+- WSL ClaudeCode 经 cc-switch `127.0.0.1:15722` + `https://sub2api.closeapi.top` 对三模型做 provider-specific 双轮验收；Windows cc-switch 保持运行，不作为进程操作对象。
+- 严格窗口 `2026-07-04 09:55:08` 后，panda audit 中三模型 `usk/prefix_32k_hash/prompt_cache_key` 均非空，但真实命中仍未达标：
+  - `deepseek-v4-flash`：R1/R2 `11.40%`，`pin_hit=60%`。
+  - `big-pickle`：R1/R2 `15.17%`，`pin_hit=40%`。
+  - `mimo-v2.5`：R1 `87.70%`，R2 `100%` 但 `cache_miss_input_tokens` 经常缺失/为 0，不能单独认定达标；同窗仍有 `empty_output=1`。
+- NewAPI `logs.other` 仍无 cache 字段，`rows_with_cache_fields=0`；NewAPI 面板不能单独作为真实 provider cache 验收依据。
+
+本轮新增根因：
+
+1. **缓存低已从“身份字段缺失”推进到“缓存材料前缀被动态 tool_result 污染”。** 严格窗口中 4K 左右稳定系统/工具请求可复用，但 59KB、含约 12KB `tool_result` 的中等请求出现不同 `prefix_32k_hash/USK/session_id/node`，每轮等同冷启动。
+2. **`prompt_cache_key` 覆盖 100% 不等于 95% 命中。** 当 ClaudeCode 工具结果落在 32K cache identity 前缀内时，即使字段全量存在，仍会产生多个 USK 和 pinned node，DeepSeek/BigPickle 继续停在 10-20% R1。
+3. **Mimo 的 R2=100% 口径不可靠。** 该族经常不回传 miss token；必须同时看 R1、prompt/read、错误率和 audit outcome。
+
+本轮本地修复：
+
+- `free-model-client-rs/src/protocol/translate.rs`：`request_cache_material()` 在 cache identity 中将 `role=tool` 的动态工具结果内容标准化为固定占位，不再让工具输出文本、tool id 或结果长度污染 `prefix_32k_hash`；完整 prompt hash 仍保留真实内容变化。
+- 新增单测 `cache_prefix_ignores_dynamic_tool_result_payloads`：39 工具 schema + 不同 12KB tool_result 时，`prompt_hash` 必须变化，但 `prefix_4k_hash/prefix_32k_hash` 必须稳定。
+
+本轮验证：
+
+- `free-model-client-rs`：`cargo fmt --check`、`cargo test`（143 unit + 136 kernel golden）、`cargo clippy --all-targets -- -D warnings` 均通过。
+- `zen-proxy-rs`：针对 `affinity_key_uses_stable_prefix_scope` 测试通过，确认调用侧 stable-prefix 语义未破坏。
+- 尚未通过 GitHub release/download 部署该 tool_result 修复；部署后必须重新用 Windows/WSL ClaudeCode + cc-switch + NewAPI + panda audit 新窗口验收，不能沿用本轮低命中窗口。
 
 ## 2026-07-04 00:30 三次根因确认
 
