@@ -2045,9 +2045,11 @@ async fn anthropic_missing_tool_result_id_is_repaired_before_upstream() {
     assert_eq!(response.status(), StatusCode::OK);
     let sent = observed.requests.lock().unwrap();
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
-    assert_eq!(messages[0]["tool_calls"][0]["id"], "toolu_1");
+    let stable_id = messages[0]["tool_calls"][0]["id"].as_str().unwrap();
+    assert_ne!(stable_id, "toolu_1");
+    assert!(stable_id.starts_with("call_fmc_"));
     assert_eq!(messages[1]["role"], "tool");
-    assert_eq!(messages[1]["tool_call_id"], "toolu_1");
+    assert_eq!(messages[1]["tool_call_id"], stable_id);
 }
 
 #[tokio::test]
@@ -2078,8 +2080,11 @@ async fn anthropic_mixed_text_and_tool_result_keeps_tool_result_adjacent() {
     let sent = observed.requests.lock().unwrap();
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
     assert_eq!(messages[0]["role"], "assistant");
+    let stable_id = messages[0]["tool_calls"][0]["id"].as_str().unwrap();
+    assert_ne!(stable_id, "toolu_1");
+    assert!(stable_id.starts_with("call_fmc_"));
     assert_eq!(messages[1]["role"], "tool");
-    assert_eq!(messages[1]["tool_call_id"], "toolu_1");
+    assert_eq!(messages[1]["tool_call_id"], stable_id);
     assert_eq!(messages[2]["role"], "user");
     assert_eq!(messages[2]["content"], "extra user text before result");
 }

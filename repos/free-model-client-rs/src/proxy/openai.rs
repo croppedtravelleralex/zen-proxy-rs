@@ -128,6 +128,7 @@ pub async fn handle_openai_chat(
             paired_tool_results = repair.paired_tool_results,
             downgraded_tool_results = repair.downgraded_tool_results,
             downgraded_assistant_calls = repair.downgraded_assistant_calls,
+            stabilized_tool_call_ids = repair.stabilized_tool_call_ids,
             "canonicalized openai tool history before upstream"
         );
     }

@@ -2653,11 +2653,16 @@ mod e2e {
         let seen = observed.lock().unwrap();
         assert_eq!(seen.len(), 1);
         let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
+        let assistant_id = upstream_messages[0]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("assistant tool call id");
         let tool_message = upstream_messages
             .iter()
             .find(|message| message["role"] == "tool")
             .expect("tool message should remain protocol-shaped");
-        assert_eq!(tool_message["tool_call_id"], "call_guard_1");
+        assert_ne!(assistant_id, "call_guard_1");
+        assert!(assistant_id.starts_with("call_fmc_"));
+        assert_eq!(tool_message["tool_call_id"], assistant_id);
         drop(seen);
 
         let requests_resp = client

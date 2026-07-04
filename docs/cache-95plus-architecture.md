@@ -1,8 +1,43 @@
 # Cache 99+ 架构方案 — ICP × CCP × 五层协同
 
 更新时间：2026-07-04
-版本：**v2.4（生产 41afc 已验收但未达 95%；tool_result cache identity 修复已本地验证）**
+版本：**v2.5（生产 171e 首次部署后仍未达 95%；tool_call_id 稳定化已本地验证）**
 状态：见下表 **「部署 vs 生效」** — 禁止将字段覆盖、运维部署成功或单侧面板数据写成缓存 95%+ 达成
+
+## 2026-07-04 12:15 五次严格验收更新
+
+新增现场事实：
+
+- 通过 GitHub release asset 部署 `tool_result` 第一版修复到 panda，三实例运行 sha256 `171e7a3c21b1da1c1d655a5442b8c17396299d9b4d63af273f5698328ad11358`，health OK。
+- WSL ClaudeCode 经 cc-switch `127.0.0.1:15722` 跑真实工具任务时，DeepSeek 第 1 轮 360s timeout；ClaudeCode JSONL 显示 3 个 `Read` tool result 后连续 `api_retry`。
+- 同窗口 NewAPI channel 69 记录为 `type=2`，但 45k prompt 工具请求 `stream_status.end_reason=client_gone`、`end_error=context canceled`，FRT 约 60-72s，`cache_tokens=0`。
+- panda audit `2026-07-04 11:43:40` 后显示：
+  - 3.6k 首轮短请求第二次可读到 `cache_read=3584`，说明短 prefix 仍可命中。
+  - 45k 工具结果请求 6 次同一 `prefix_32k_hash=ce52e8193bbd0bea` / `USK=usk_v1:01ac8fad62859666`，全部 `client_gone`，`read=0`、`miss=270696`。
+  - 第二轮相同任务的 45k 请求又变成 `prefix_32k_hash=6b71888147896313`，说明跨运行仍有动态内容进入 cache identity / upstream body。
+
+本轮新增根因：
+
+1. **第一版只标准化了 `role=tool` 内容，没有稳定 assistant `tool_calls[].id`。** ClaudeCode 每轮生成新的 Anthropic `tool_use_id`；转换到 OpenAI 消息后进入 assistant `tool_calls[].id`，同时 tool result 通过 `tool_call_id` 关联。该动态 id 既污染 `prefix_32k_hash/USK`，也污染真实上游 prompt bytes。
+2. **只改 audit/cache identity 仍不够。** provider 真实 cache 依赖上游 body 字节稳定；如果实际转发仍带运行时 tool id，即使本地 prefix 看似稳定，上游 provider 仍可能冷启动。
+3. **client_gone 是结果不是根因。** 45k 长工具请求未命中 cache，首字约 60s 后才出现，ClaudeCode/cc-switch 侧取消并重试，进一步放大 miss token；这解释了“反代出来慢且质量差”，也解释了为什么 OpenCode 同题可明显更快。
+
+本轮本地修复：
+
+- `free-model-client-rs/src/protocol/translate.rs`：
+  - `canonicalize_openai_tool_history_with_policy()` 在配对后把已有动态 tool call id 重写为稳定 `call_fmc_{message_index}_{tool_index}_{hash}`，并同步更新后续 `role=tool.tool_call_id`，使真实 upstream body 稳定。
+  - `request_cache_material()` 对 assistant `tool_calls[].id` 使用同一稳定 id，并清除 cache identity 中的 `reasoning_content`，与 cache upstream body 语义一致。
+  - 保留 `role=tool` 内容占位化，避免工具输出正文进入 cache prefix。
+- 新增/更新测试：
+  - `cache_prefix_ignores_dynamic_claude_code_tool_ids`
+  - `canonicalize_openai_tool_history_stabilizes_existing_tool_ids`
+  - 更新 kernel/e2e golden，要求 upstream assistant/tool id 一致且不再等于运行时 `toolu_*`。
+
+本轮验证：
+
+- `free-model-client-rs`：`cargo fmt --check`；`cargo test`（145 unit + 136 kernel golden）；`cargo clippy --all-targets -- -D warnings` 均通过。
+- `zen-proxy-rs`：`cargo fmt --check`；`cargo test`（205 unit + 44 e2e）；`cargo clippy --all-targets -- -D warnings` 均通过。
+- 该 v2.5 修复尚未部署到 panda；必须通过 GitHub release/download 部署新二进制后，重新跑 Windows/WSL ClaudeCode + cc-switch + NewAPI + panda audit 新窗口验收，才能讨论 95%+。
 
 ## 2026-07-04 10:20 四次严格验收更新
 

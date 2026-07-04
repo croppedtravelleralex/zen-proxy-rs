@@ -7,6 +7,7 @@ pub struct ToolHistoryRepair {
     pub paired_tool_results: usize,
     pub downgraded_tool_results: usize,
     pub downgraded_assistant_calls: usize,
+    pub stabilized_tool_call_ids: usize,
 }
 
 #[derive(Debug)]
@@ -124,6 +125,7 @@ pub fn canonicalize_openai_tool_history_with_policy(
     }
 
     downgrade_unresolved_pending(messages, &mut pending, &mut repair, policy);
+    repair.stabilized_tool_call_ids += stabilize_tool_call_ids(messages);
     repair
 }
 
@@ -207,6 +209,40 @@ fn synthetic_tool_id(message_index: usize, tool_index: usize, call: &ToolCall) -
         message_index, tool_index, call.function.name, call.function.arguments
     ));
     format!("call_fmc_{message_index}_{tool_index}_{hash:016x}")
+}
+
+fn stabilize_tool_call_ids(messages: &mut [Message]) -> usize {
+    use std::collections::HashMap;
+
+    let mut changed = 0usize;
+    let mut id_map = HashMap::<String, String>::new();
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        if let Some(calls) = message.tool_calls.as_mut() {
+            for (tool_index, call) in calls.iter_mut().enumerate() {
+                let stable_id = synthetic_tool_id(message_index, tool_index, call);
+                if let Some(old_id) = call.id.clone().filter(|id| !id.trim().is_empty()) {
+                    id_map.insert(old_id, stable_id.clone());
+                }
+                if call.id.as_deref() != Some(stable_id.as_str()) {
+                    call.id = Some(stable_id);
+                    changed += 1;
+                }
+            }
+        }
+        if message.role == "tool" {
+            let Some(old_id) = message.tool_call_id.clone() else {
+                continue;
+            };
+            let Some(stable_id) = id_map.get(&old_id) else {
+                continue;
+            };
+            if old_id != *stable_id {
+                message.tool_call_id = Some(stable_id.clone());
+                changed += 1;
+            }
+        }
+    }
+    changed
 }
 
 fn stable_hash64(input: &str) -> u64 {
@@ -774,7 +810,8 @@ fn request_cache_material(body: &ChatRequest) -> String {
     let cache_messages = body
         .messages
         .iter()
-        .map(cache_identity_message)
+        .enumerate()
+        .map(|(message_index, message)| cache_identity_message(message_index, message))
         .collect::<Vec<_>>();
     material.push_str("messages=");
     material.push_str(&serde_json::to_string(&cache_messages).unwrap_or_default());
@@ -787,17 +824,24 @@ fn request_cache_material(body: &ChatRequest) -> String {
     material
 }
 
-fn cache_identity_message(message: &Message) -> Message {
-    if message.role != "tool" {
-        return message.clone();
+fn cache_identity_message(message_index: usize, message: &Message) -> Message {
+    if message.role == "tool" {
+        return Message {
+            role: message.role.clone(),
+            content: Value::String("[tool_result]".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
     }
-    Message {
-        role: message.role.clone(),
-        content: Value::String("[tool_result]".to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
+    let mut cached = message.clone();
+    cached.reasoning_content = None;
+    if let Some(calls) = cached.tool_calls.as_mut() {
+        for (tool_index, call) in calls.iter_mut().enumerate() {
+            call.id = Some(synthetic_tool_id(message_index, tool_index, call));
+        }
     }
+    cached
 }
 
 fn request_cache_prefix_hash(material: &str, prefix_bytes: usize) -> u64 {
@@ -1891,6 +1935,98 @@ mod tests {
         assert_ne!(first_shape.prompt_hash, second_shape.prompt_hash);
         assert_eq!(first_shape.prefix_4k_hash, second_shape.prefix_4k_hash);
         assert_eq!(first_shape.prefix_32k_hash, second_shape.prefix_32k_hash);
+    }
+
+    #[test]
+    fn cache_prefix_ignores_dynamic_claude_code_tool_ids() {
+        let mut first = request("continue", true, Some(1024));
+        first.messages.insert(
+            0,
+            Message {
+                role: "assistant".to_string(),
+                content: Value::Null,
+                tool_calls: Some(vec![ToolCall {
+                    id: Some("toolu_dynamic_a".to_string()),
+                    call_type: "function".to_string(),
+                    function: ToolFunction {
+                        name: "Read".to_string(),
+                        arguments: json!({"file_path": "docs/cache-95plus-architecture.md"})
+                            .to_string(),
+                    },
+                    index: Some(0),
+                }]),
+                tool_call_id: None,
+                reasoning_content: Some("dynamic hidden reasoning A".to_string()),
+            },
+        );
+        first.messages.insert(
+            1,
+            Message {
+                role: "tool".to_string(),
+                content: Value::String(format!("tool output A {}", "x".repeat(12_000))),
+                tool_calls: None,
+                tool_call_id: Some("toolu_dynamic_a".to_string()),
+                reasoning_content: None,
+            },
+        );
+
+        let mut second = first.clone();
+        let calls = second.messages[0].tool_calls.as_mut().unwrap();
+        calls[0].id = Some("toolu_dynamic_b".to_string());
+        second.messages[0].reasoning_content = Some("dynamic hidden reasoning B".to_string());
+        second.messages[1].tool_call_id = Some("toolu_dynamic_b".to_string());
+        second.messages[1].content = Value::String(format!("tool output B {}", "y".repeat(12_000)));
+
+        let first_shape = request_shape(&first);
+        let second_shape = request_shape(&second);
+
+        assert_ne!(first_shape.prompt_hash, second_shape.prompt_hash);
+        assert_eq!(first_shape.prefix_4k_hash, second_shape.prefix_4k_hash);
+        assert_eq!(first_shape.prefix_32k_hash, second_shape.prefix_32k_hash);
+    }
+
+    #[test]
+    fn canonicalize_openai_tool_history_stabilizes_existing_tool_ids() {
+        let mut messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Value::Null,
+                tool_calls: Some(vec![ToolCall {
+                    id: Some("toolu_runtime_1".to_string()),
+                    call_type: "function".to_string(),
+                    function: ToolFunction {
+                        name: "Read".to_string(),
+                        arguments: json!({"file_path": "docs/cache-95plus-architecture.md"})
+                            .to_string(),
+                    },
+                    index: Some(0),
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("tool output".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("toolu_runtime_1".to_string()),
+                reasoning_content: None,
+            },
+        ];
+
+        let repair =
+            canonicalize_openai_tool_history_with_policy(&mut messages, ToolHistoryPolicy::Compat);
+        let stable_id = messages[0].tool_calls.as_ref().unwrap()[0]
+            .id
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        assert_eq!(repair.stabilized_tool_call_ids, 2);
+        assert_ne!(stable_id, "toolu_runtime_1");
+        assert_eq!(
+            messages[1].tool_call_id.as_deref(),
+            Some(stable_id.as_str())
+        );
     }
 
     #[test]

@@ -44,7 +44,7 @@ Windows claude.orig.exe
 - `big-pickle` 已恢复为公开名；`deepseek-v4-flash-lite` 不再作为公开模型或 NewAPI mapping 暴露。
 - panda ZenProxy 入口：nginx `:4000`，后端 `4001/4002/4004`。
 - 新 Webshare 100 代理已替换到 panda，低并发验证 100/100 可访问上游，出口国家为 `SG`。
-- 2026-07-04 10:05，panda 三个 `zen-proxy-rs@1/2/3` 均运行 sha256 `41afc662f35482293a55d400d6f91a6a4cea721a86e3daedd0abca23a20eda32`，health OK。
+- 2026-07-04 11:38，panda 三个 `zen-proxy-rs@1/2/3` 均运行 sha256 `171e7a3c21b1da1c1d655a5442b8c17396299d9b4d63af273f5698328ad11358`，health OK；这是第一版 `tool_result` cache identity 修复，已证明仍不足以达成 95%+。
 - 2026-07-04 09:55 严格窗口显示 `usk/prefix_32k_hash/prompt_cache_key` 已全量存在，但三模型 cache 仍未达到 95%+：DeepSeek R1/R2 约 11.40%，BigPickle R1/R2 约 15.17%，Mimo R1 约 87.70% 且 R2 受缺失 miss token 影响不能单独采用。
 - NewAPI `logs.other` 当前没有 cache 字段，真实 cache 验收必须以 panda audit 的 `cache_read_input_tokens/cache_miss_input_tokens` 为准；cc-switch SQLite 只用于本地请求、模型和耗时对账。
 
@@ -119,3 +119,14 @@ Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；cu
 - 本轮本地修复：`free-model-client-rs/src/protocol/translate.rs` 在 cache identity 材料中标准化 `role=tool` 的动态工具结果内容，避免工具输出污染 `prefix_32k_hash`；完整 `prompt_hash` 仍反映真实内容变化。
 - 本轮验证：`free-model-client-rs cargo fmt --check`、`cargo test`（143 unit + 136 kernel golden）、`cargo clippy --all-targets -- -D warnings` 通过；`zen-proxy-rs cargo test affinity_key_uses_stable_prefix_scope` 通过。
 - 尚未部署该 tool_result 修复到 panda。生产更新仍必须走 GitHub release/download，不走 scp；部署后用 Windows/WSL ClaudeCode + cc-switch + NewAPI + panda audit 新窗口重新验收。
+
+## 2026-07-04 12:15 五次排障更新
+
+- 第一版 `tool_result` 修复已按要求通过 GitHub release asset 下载部署到 panda，运行 hash `171e7a3c21b1da1c1d655a5442b8c17396299d9b4d63af273f5698328ad11358`，三实例 health OK，临时 token 已清理。
+- 部署后 WSL ClaudeCode 真实工具任务仍失败：DeepSeek 第 1 轮 360s timeout；ClaudeCode JSONL 在 3 个 `Read` tool result 后连续 `api_retry`。
+- NewAPI 同窗口显示短请求可成功且第二次有 `cache_tokens=3584`，但 45k prompt 工具请求均为 `stream_status.end_reason=client_gone`、`end_error=context canceled`、`cache_tokens=0`，FRT 约 60-72s。
+- panda audit 显示 45k 工具请求同一轮 retry 的 prefix/USK 稳定但全 miss；第二轮相同任务的 45k prefix 又变，说明还存在动态字段污染 cache identity 和真实 upstream body。
+- 新根因：ClaudeCode 动态 `tool_use_id` 经转换后进入 assistant `tool_calls[].id`，第一版只处理 `role=tool` 内容，没有稳定 assistant tool id，也没有让真实转发 body 稳定。
+- 本轮本地修复：`canonicalize_openai_tool_history_with_policy()` 配对完成后把现有 tool id 重写为稳定 `call_fmc_*`，并同步 tool result；`request_cache_material()` 使用同一稳定 id 且忽略 `reasoning_content`。
+- 本轮验证：`free-model-client-rs` fmt/test/clippy 通过（145 unit + 136 kernel golden）；`zen-proxy-rs` fmt/test/clippy 通过（205 unit + 44 e2e）。
+- 该第二版修复尚未部署到 panda。下一步仍必须走 GitHub release/download，不走 scp；部署后重新做严格 cache 验收。不能把 171e 部署窗口写成 95%+ 成功。
