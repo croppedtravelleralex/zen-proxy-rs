@@ -367,6 +367,7 @@ dependencies = [
  "bytes",
  "futures",
  "rand 0.8.6",
+ "redis",
  "regex",
  "reqwest",
  "serde",

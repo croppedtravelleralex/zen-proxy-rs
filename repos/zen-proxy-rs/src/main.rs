@@ -396,6 +396,16 @@ async fn async_main() {
     } else {
         tracing::info!("CCP session pin using in-memory backend");
     }
+    let reasoning_sidecar_redis = std::env::var("CCP_REASONING_SIDECAR_REDIS_URL")
+        .ok()
+        .or_else(|| session_pin_redis.clone())
+        .or_else(|| config.global_budget_redis_url.clone());
+    free_model_client_rs::session::reasoning_store::configure(reasoning_sidecar_redis.clone());
+    if reasoning_sidecar_redis.is_some() {
+        tracing::info!("CCP reasoning sidecar Redis backend enabled");
+    } else {
+        tracing::info!("CCP reasoning sidecar using in-memory backend");
+    }
 
     let default_collector = Arc::new(DefaultCollector::new());
     {
