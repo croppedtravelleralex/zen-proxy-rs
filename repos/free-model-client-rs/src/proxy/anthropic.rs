@@ -467,7 +467,7 @@ async fn handle_non_stream(
                         cr,
                         profile,
                         tool_history_repair,
-                        used_provider_invalid_enrich_retry,
+                        used_provider_invalid_enrich_retry || used_missing_reasoning_enrich_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
@@ -1748,7 +1748,7 @@ async fn handle_stream(
                         &body,
                         profile,
                         tool_history_repair,
-                        used_provider_invalid_enrich_retry,
+                        used_provider_invalid_enrich_retry || used_enrich_reasoning_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
@@ -2398,7 +2398,7 @@ async fn handle_buffered_claude_code_huge_stream(
                     cr,
                     profile,
                     tool_history_repair,
-                    used_provider_invalid_enrich_retry,
+                    used_provider_invalid_enrich_retry || used_missing_reasoning_enrich_retry,
                     used_provider_invalid_text_retry,
                 ) {
                     match mode {

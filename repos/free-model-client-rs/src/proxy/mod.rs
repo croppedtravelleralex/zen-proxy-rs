@@ -295,9 +295,12 @@ pub(crate) fn provider_invalid_tool_history_retry_mode(
     used_enriched_retry: bool,
     used_text_only_retry: bool,
 ) -> Option<ProviderInvalidRetryMode> {
-    if !(err.is_provider_invalid_request() || err.is_missing_reasoning_content())
-        || !is_risky_claude_code_tool_history_request(request, profile, repair)
-    {
+    let missing_reasoning = err.is_missing_reasoning_content();
+    let invalid_tool_history = err.is_provider_invalid_request();
+    if !(invalid_tool_history || missing_reasoning) {
+        return None;
+    }
+    if !is_risky_claude_code_tool_history_request(request, profile, repair, missing_reasoning) {
         return None;
     }
     if profile.kind == ClientKind::ClaudeCode && !used_enriched_retry {
@@ -343,13 +346,28 @@ fn is_risky_claude_code_tool_history_request(
     request: &ChatRequest,
     profile: ClientProfile,
     repair: translate::ToolHistoryRepair,
+    missing_reasoning: bool,
 ) -> bool {
-    profile.kind == ClientKind::ClaudeCode
-        && request
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty())
-        && (repair.downgraded_tool_results > 0 || repair.downgraded_assistant_calls > 0)
+    if profile.kind != ClientKind::ClaudeCode
+        || request.tools.as_ref().is_none_or(|tools| tools.is_empty())
+    {
+        return false;
+    }
+    if repair.downgraded_tool_results > 0 || repair.downgraded_assistant_calls > 0 {
+        return true;
+    }
+    missing_reasoning
+        && request.messages.iter().any(|message| {
+            message.role == "assistant"
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+                && message
+                    .reasoning_content
+                    .as_ref()
+                    .is_none_or(|reasoning| reasoning.trim().is_empty())
+        })
 }
 
 fn sanitize_upstream_tools(body: &mut Value) -> usize {
@@ -754,6 +772,15 @@ mod tests {
         }
     }
 
+    fn missing_reasoning_error() -> AppError {
+        AppError {
+            status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            message: "upstream provider rejected transformed tool-history request (code=provider_missing_reasoning_content)".to_string(),
+            upstream_headers: None,
+            upstream_error_kind: Some(UpstreamErrorKind::MissingReasoningContent),
+        }
+    }
+
     fn repaired_claude_code_nonstream_tool_request() -> ChatRequest {
         ChatRequest {
             model: "deepseek-v4-flash".to_string(),
@@ -880,5 +907,67 @@ mod tests {
         );
 
         assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
+    }
+
+    #[test]
+    fn missing_reasoning_retries_unrepaired_claude_code_tool_history() {
+        let mut request = repaired_claude_code_nonstream_tool_request();
+        request.messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::Null,
+            tool_calls: Some(vec![crate::protocol::types::ToolCall {
+                id: Some("call_1".to_string()),
+                call_type: "function".to_string(),
+                function: crate::protocol::types::ToolFunction {
+                    name: "Read".to_string(),
+                    arguments: r#"{"file_path":"docs/OPERATING_RULES.md"}"#.to_string(),
+                },
+                index: Some(0),
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+
+        let mode = provider_invalid_tool_history_retry_mode(
+            &missing_reasoning_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            translate::ToolHistoryRepair::default(),
+            false,
+            false,
+        );
+
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
+    }
+
+    #[test]
+    fn missing_reasoning_uses_text_only_after_enrichment_retry() {
+        let mut request = repaired_claude_code_nonstream_tool_request();
+        request.messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::Null,
+            tool_calls: Some(vec![crate::protocol::types::ToolCall {
+                id: Some("call_1".to_string()),
+                call_type: "function".to_string(),
+                function: crate::protocol::types::ToolFunction {
+                    name: "Read".to_string(),
+                    arguments: r#"{"file_path":"docs/OPERATING_RULES.md"}"#.to_string(),
+                },
+                index: Some(0),
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+
+        let mode = provider_invalid_tool_history_retry_mode(
+            &missing_reasoning_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            translate::ToolHistoryRepair::default(),
+            true,
+            false,
+        );
+
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::TextOnly));
     }
 }

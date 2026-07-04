@@ -287,7 +287,7 @@ async fn handle_oa_non_stream(
                         cr,
                         profile,
                         tool_history_repair,
-                        used_provider_invalid_enrich_retry,
+                        used_provider_invalid_enrich_retry || used_missing_reasoning_enrich_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
