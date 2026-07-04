@@ -284,6 +284,7 @@ impl ProviderInvalidRetryMode {
 pub(crate) struct ProviderInvalidRetryStats {
     pub sanitized_tools: usize,
     pub compacted_user_messages: usize,
+    pub flattened_tool_history_messages: usize,
     pub stripped_tools: bool,
 }
 
@@ -329,14 +330,25 @@ pub(crate) fn provider_invalid_tool_history_retry_body(
     let sanitized_tools = sanitize_upstream_tools(&mut retry);
     let compacted_user_messages = compact_large_user_messages_for_retry(&mut retry);
     if mode.strips_tools() {
+        let flattened_tool_history_messages = flatten_tool_history_for_text_only_retry(&mut retry);
         retry["tools"] = Value::Null;
         retry["tool_choice"] = Value::Null;
+        return (
+            retry,
+            ProviderInvalidRetryStats {
+                sanitized_tools,
+                compacted_user_messages,
+                flattened_tool_history_messages,
+                stripped_tools: true,
+            },
+        );
     }
     (
         retry,
         ProviderInvalidRetryStats {
             sanitized_tools,
             compacted_user_messages,
+            flattened_tool_history_messages: 0,
             stripped_tools: mode.strips_tools(),
         },
     )
@@ -446,6 +458,125 @@ fn compact_large_user_messages_for_retry(body: &mut Value) -> usize {
     changed
 }
 
+fn flatten_tool_history_for_text_only_retry(body: &mut Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut changed = 0usize;
+    for message in messages {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        let role = object.get("role").and_then(Value::as_str).unwrap_or_default();
+        match role {
+            "assistant" if object.get("tool_calls").is_some_and(|calls| !calls.is_null()) => {
+                let content = object
+                    .get("content")
+                    .and_then(value_to_text)
+                    .unwrap_or_default();
+                let tool_summary = object
+                    .get("tool_calls")
+                    .map(summarize_tool_calls_for_text_only_retry)
+                    .unwrap_or_default();
+                let flattened = if content.trim().is_empty() {
+                    tool_summary
+                } else if tool_summary.trim().is_empty() {
+                    content
+                } else {
+                    format!("{content}\n{tool_summary}")
+                };
+                object.insert(
+                    "content".to_string(),
+                    Value::String(if flattened.trim().is_empty() {
+                        "[provider text-only retry: previous assistant tool call omitted]"
+                            .to_string()
+                    } else {
+                        flattened
+                    }),
+                );
+                object.remove("tool_calls");
+                object.remove("function_call");
+                changed += 1;
+            }
+            "tool" => {
+                let content = object
+                    .get("content")
+                    .and_then(value_to_text)
+                    .unwrap_or_default();
+                let tool_name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                object.insert("role".to_string(), Value::String("user".to_string()));
+                object.insert(
+                    "content".to_string(),
+                    Value::String(format!(
+                        "[provider text-only retry: previous {tool_name} result]\n{content}"
+                    )),
+                );
+                object.remove("tool_call_id");
+                object.remove("name");
+                changed += 1;
+            }
+            _ => {}
+        }
+    }
+    changed
+}
+
+fn value_to_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Null => Some(String::new()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| {
+                            part.get("content")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string)
+                        })
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+fn summarize_tool_calls_for_text_only_retry(tool_calls: &Value) -> String {
+    let Some(calls) = tool_calls.as_array() else {
+        return "[provider text-only retry: previous assistant tool call omitted]".to_string();
+    };
+    let summaries = calls
+        .iter()
+        .filter_map(|call| {
+            let function = call.get("function")?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let args = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Some(format!(
+                "[provider text-only retry: previous assistant requested tool {name} with arguments {args}]"
+            ))
+        })
+        .collect::<Vec<_>>();
+    if summaries.is_empty() {
+        "[provider text-only retry: previous assistant tool call omitted]".to_string()
+    } else {
+        summaries.join("\n")
+    }
+}
+
 fn compact_text_for_provider_invalid_retry(text: &str) -> String {
     let head = text
         .chars()
@@ -490,6 +621,7 @@ pub(crate) fn log_provider_invalid_tool_history_retry(
         downgraded_assistant_calls = repair.downgraded_assistant_calls,
         sanitized_tools = stats.sanitized_tools,
         compacted_user_messages = stats.compacted_user_messages,
+        flattened_tool_history_messages = stats.flattened_tool_history_messages,
         stripped_tools = stats.stripped_tools,
         prompt_hash = %format_args!("{:016x}", shape.prompt_hash),
         prompt_tokens = shape.estimated_total_tokens,
@@ -888,6 +1020,62 @@ mod tests {
         assert!(retry["tools"].is_null());
         assert!(retry["tool_choice"].is_null());
         assert!(stats.stripped_tools);
+    }
+
+    #[test]
+    fn provider_invalid_text_only_retry_flattens_tool_history() {
+        let mut request = repaired_claude_code_nonstream_tool_request();
+        request.messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::Null,
+            tool_calls: Some(vec![crate::protocol::types::ToolCall {
+                id: Some("call_1".to_string()),
+                call_type: "function".to_string(),
+                function: crate::protocol::types::ToolFunction {
+                    name: "Read".to_string(),
+                    arguments: r#"{"file_path":"README.md"}"#.to_string(),
+                },
+                index: Some(0),
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        let body = serde_json::json!({
+            "messages": [
+                request.messages[0],
+                request.messages[1],
+                request.messages[2],
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "Read",
+                    "content": "README contents"
+                }
+            ],
+            "tools": request.tools,
+            "tool_choice": request.tool_choice
+        });
+
+        let (retry, stats) =
+            provider_invalid_tool_history_retry_body(&body, ProviderInvalidRetryMode::TextOnly);
+
+        assert!(retry["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("tool_calls").is_none()));
+        assert!(retry["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message.get("role").and_then(Value::as_str) != Some("tool")));
+        assert!(retry["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("previous assistant requested tool Read"));
+        assert_eq!(retry["messages"][3]["role"], Value::String("user".to_string()));
+        assert!(retry["messages"][3].get("tool_call_id").is_none());
+        assert_eq!(stats.flattened_tool_history_messages, 2);
     }
 
     #[test]
