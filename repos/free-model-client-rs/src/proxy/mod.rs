@@ -368,18 +368,10 @@ fn is_risky_claude_code_tool_history_request(
     if repair.downgraded_tool_results > 0 || repair.downgraded_assistant_calls > 0 {
         return true;
     }
-    missing_reasoning
-        && request.messages.iter().any(|message| {
-            message.role == "assistant"
-                && message
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|calls| !calls.is_empty())
-                && message
-                    .reasoning_content
-                    .as_ref()
-                    .is_none_or(|reasoning| reasoning.trim().is_empty())
-        })
+    if missing_reasoning {
+        return true;
+    }
+    false
 }
 
 fn sanitize_upstream_tools(body: &mut Value) -> usize {
@@ -1146,6 +1138,22 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         });
+
+        let mode = provider_invalid_tool_history_retry_mode(
+            &missing_reasoning_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            translate::ToolHistoryRepair::default(),
+            true,
+            false,
+        );
+
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::TextOnly));
+    }
+
+    #[test]
+    fn missing_reasoning_tool_request_uses_text_only_even_without_visible_tool_calls() {
+        let request = repaired_claude_code_nonstream_tool_request();
 
         let mode = provider_invalid_tool_history_retry_mode(
             &missing_reasoning_error(),
