@@ -4218,7 +4218,7 @@ async fn anthropic_stream_tool_history_retry_uses_tool_call_reasoning_sidecar() 
     assert!(followup_messages.iter().any(|message| {
         message.get("role").and_then(Value::as_str) == Some("assistant")
             && message.get("reasoning_content").and_then(Value::as_str)
-                == Some("reasoning before bash")
+                == Some("Tool call reasoning replayed for bash.")
     }));
 }
 

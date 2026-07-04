@@ -248,10 +248,16 @@ pub fn record_tool_call_reasoning(
     tool_arguments: &str,
     reasoning: &str,
 ) {
+    if reasoning.trim().is_empty() {
+        return;
+    }
     let Some(key) = tool_call_reasoning_key(session_scope, tool_name, tool_arguments) else {
         return;
     };
-    crate::session::reasoning_store::put_reasoning(&key, reasoning.to_string());
+    crate::session::reasoning_store::put_reasoning(
+        &key,
+        stable_tool_call_reasoning_replay(tool_name),
+    );
 }
 
 pub fn enrich_messages_with_tool_call_reasoning(
@@ -317,6 +323,15 @@ fn canonical_tool_arguments(arguments: &str) -> String {
         .ok()
         .and_then(|value| serde_json::to_string(&sort_json_value(value)).ok())
         .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn stable_tool_call_reasoning_replay(tool_name: &str) -> String {
+    let name = tool_name.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        "Tool call reasoning replayed.".to_string()
+    } else {
+        format!("Tool call reasoning replayed for {name}.")
+    }
 }
 
 pub fn prefix_drift_bytes(previous_hash: u64, current_hash: u64) -> bool {
@@ -606,7 +621,7 @@ mod tests {
         assert_eq!(enriched, 1);
         assert_eq!(
             messages[0].reasoning_content.as_deref(),
-            Some("stored tool reasoning")
+            Some("Tool call reasoning replayed for bash.")
         );
     }
 
