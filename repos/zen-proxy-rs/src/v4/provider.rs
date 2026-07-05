@@ -2138,10 +2138,10 @@ async fn buffered_response_with_usage(
                 format!("failed to read provider response body: {err}"),
             )
         })?;
+    let usage = extract_usage_counts(path, &bytes);
     let bytes = rewrite_nonstream_response_model(path, bytes, public_model);
     let len = bytes.len() as u64;
-    let usage = extract_usage_counts(path, &bytes);
-    let has_output = response_has_assistant_output(path, &bytes) || usage.completion_tokens > 0;
+    let has_output = response_has_assistant_output(path, &bytes);
     let mut rebuilt = Response::new(Body::from(bytes));
     *rebuilt.status_mut() = status;
     *rebuilt.headers_mut() = headers;
@@ -2159,9 +2159,6 @@ fn rewrite_nonstream_response_model(path: &str, bytes: Bytes, public_model: &str
 }
 
 fn rewrite_stream_response_model(path: &str, bytes: Bytes, public_model: &str) -> Bytes {
-    if public_model.is_empty() {
-        return bytes;
-    }
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return bytes;
     };
@@ -2232,17 +2229,15 @@ fn rewrite_stream_response_model(path: &str, bytes: Bytes, public_model: &str) -
 }
 
 fn rewrite_response_model_value(path: &str, value: &mut Value, public_model: &str) -> bool {
-    if public_model.is_empty() {
-        return false;
-    }
     let mut changed = false;
-    if matches!(path, "messages" | "chat/completions")
+    if !public_model.is_empty()
+        && matches!(path, "messages" | "chat/completions")
         && value.get("model").and_then(Value::as_str).is_some()
     {
         value["model"] = Value::String(public_model.to_string());
         changed = true;
     }
-    if path == "messages" {
+    if !public_model.is_empty() && path == "messages" {
         if let Some(message) = value.get_mut("message").and_then(Value::as_object_mut) {
             if message.get("model").and_then(Value::as_str).is_some() {
                 message.insert("model".to_string(), Value::String(public_model.to_string()));
@@ -2250,7 +2245,101 @@ fn rewrite_response_model_value(path: &str, value: &mut Value, public_model: &st
             }
         }
     }
+    if normalize_downstream_usage_value(path, value) {
+        changed = true;
+    }
     changed
+}
+
+fn normalize_downstream_usage_value(path: &str, value: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(usage) = value.get_mut("usage") {
+        changed |= normalize_downstream_usage_object(path, usage);
+    }
+    if path == "messages" {
+        if let Some(usage) = value
+            .get_mut("message")
+            .and_then(|message| message.get_mut("usage"))
+        {
+            changed |= normalize_downstream_usage_object(path, usage);
+        }
+    }
+    changed
+}
+
+fn normalize_downstream_usage_object(path: &str, usage: &mut Value) -> bool {
+    if !usage.is_object() {
+        return false;
+    }
+
+    if path == "messages" {
+        let provider_input = usage_u32(usage, "input_tokens");
+        let output_tokens = usage_u32(usage, "output_tokens");
+        let cache_read = usage_cache_read_u32(usage).unwrap_or(0);
+        let cache_creation = usage_u32(usage, "cache_creation_input_tokens");
+        let uncached_input =
+            downstream_uncached_input_tokens(provider_input, cache_read, cache_creation, usage);
+        usage["input_tokens"] = Value::from(uncached_input);
+        usage["output_tokens"] = Value::from(output_tokens);
+        usage["cache_read_input_tokens"] = Value::from(cache_read);
+        usage["zenproxy_provider_input_tokens"] = Value::from(provider_input);
+        usage["zenproxy_cache_r2_basis_tokens"] = Value::from(provider_input);
+        usage["zenproxy_true_cache_read_ratio"] =
+            Value::from(cache_ratio(provider_input, cache_read));
+        return uncached_input != provider_input || cache_read > 0;
+    }
+
+    let provider_prompt = usage_u32(usage, "prompt_tokens");
+    let completion_tokens = usage_u32(usage, "completion_tokens");
+    let cache_read = usage_cache_read_u32(usage).unwrap_or(0);
+    let cache_creation = usage_u32(usage, "cache_creation_input_tokens");
+    let uncached_prompt =
+        downstream_uncached_input_tokens(provider_prompt, cache_read, cache_creation, usage);
+    usage["prompt_tokens"] = Value::from(uncached_prompt);
+    usage["completion_tokens"] = Value::from(completion_tokens);
+    usage["total_tokens"] = Value::from(uncached_prompt.saturating_add(completion_tokens));
+    usage["cache_read_input_tokens"] = Value::from(cache_read);
+    usage["zenproxy_provider_prompt_tokens"] = Value::from(provider_prompt);
+    usage["zenproxy_cache_r2_basis_tokens"] = Value::from(provider_prompt);
+    usage["zenproxy_true_cache_read_ratio"] = Value::from(cache_ratio(provider_prompt, cache_read));
+    ensure_prompt_tokens_details_cached_tokens(usage, cache_read);
+    uncached_prompt != provider_prompt || cache_read > 0
+}
+
+fn downstream_uncached_input_tokens(
+    provider_input_tokens: u32,
+    cache_read_tokens: u32,
+    cache_creation_tokens: u32,
+    usage: &Value,
+) -> u32 {
+    usage_cache_miss_u32(usage).unwrap_or_else(|| {
+        provider_input_tokens
+            .saturating_sub(cache_read_tokens)
+            .saturating_sub(cache_creation_tokens)
+    })
+}
+
+fn cache_ratio(provider_input_tokens: u32, cache_read_tokens: u32) -> f64 {
+    if provider_input_tokens == 0 {
+        0.0
+    } else {
+        (cache_read_tokens as f64) / (provider_input_tokens as f64)
+    }
+}
+
+fn ensure_prompt_tokens_details_cached_tokens(usage: &mut Value, cache_read_tokens: u32) {
+    if !usage
+        .get("prompt_tokens_details")
+        .is_some_and(|details| details.is_object())
+    {
+        usage["prompt_tokens_details"] = serde_json::json!({});
+    }
+    if let Some(details) = usage
+        .get_mut("prompt_tokens_details")
+        .and_then(Value::as_object_mut)
+    {
+        details.insert("cached_tokens".to_string(), Value::from(cache_read_tokens));
+    }
 }
 
 fn response_has_assistant_output(path: &str, bytes: &Bytes) -> bool {
@@ -2839,7 +2928,6 @@ impl StreamMetrics {
         !self.completion_text.trim().is_empty()
             || self.text_output_chunks > 0
             || self.tool_output_chunks > 0
-            || self.usage.completion_tokens > 0
     }
 
     fn has_content_signal(&self) -> bool {
@@ -3248,6 +3336,52 @@ mod tests {
     }
 
     #[test]
+    fn completion_tokens_without_visible_openai_output_is_empty() {
+        let body = Bytes::from_static(
+            br#"{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":null}}],"usage":{"prompt_tokens":681,"completion_tokens":814,"total_tokens":1495}}"#,
+        );
+
+        assert!(!response_has_assistant_output("chat/completions", &body));
+    }
+
+    #[test]
+    fn rewrites_openai_usage_for_downstream_cache_ratio() {
+        let body = Bytes::from_static(
+            br#"{"model":"deepseek-v4-flash-free","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1000,"completion_tokens":10,"total_tokens":1010,"prompt_tokens_details":{"cached_tokens":900}}}"#,
+        );
+
+        let rewritten = rewrite_nonstream_response_model("chat/completions", body, "deepseek");
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(value["model"], "deepseek");
+        assert_eq!(value["usage"]["prompt_tokens"], 100);
+        assert_eq!(value["usage"]["completion_tokens"], 10);
+        assert_eq!(value["usage"]["total_tokens"], 110);
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cached_tokens"],
+            900
+        );
+        assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
+        assert_eq!(value["usage"]["zenproxy_provider_prompt_tokens"], 1000);
+    }
+
+    #[test]
+    fn rewrites_anthropic_usage_for_downstream_cache_ratio() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","model":"mimo-v2.5-free","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1000,"output_tokens":10,"cache_read_input_tokens":900}}"#,
+        );
+
+        let rewritten = rewrite_nonstream_response_model("messages", body, "mimo");
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(value["model"], "mimo");
+        assert_eq!(value["usage"]["input_tokens"], 100);
+        assert_eq!(value["usage"]["output_tokens"], 10);
+        assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
+        assert_eq!(value["usage"]["zenproxy_provider_input_tokens"], 1000);
+    }
+
+    #[test]
     fn extracts_openai_cache_usage_counts() {
         let body = Bytes::from_static(
             br#"{"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":80}}}"#,
@@ -3320,6 +3454,29 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_anthropic_stream_nested_usage_for_downstream_cache_ratio() {
+        let body = Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"deepseek-v4-flash-free\",\"usage\":{\"input_tokens\":1000,\"cache_read_input_tokens\":900,\"cache_miss_input_tokens\":100}}}\n\n",
+        );
+
+        let rewritten = rewrite_stream_response_model("messages", body, "deepseek");
+        let text = std::str::from_utf8(&rewritten).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let value: Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(value["message"]["model"], "deepseek");
+        assert_eq!(value["message"]["usage"]["input_tokens"], 100);
+        assert_eq!(value["message"]["usage"]["cache_read_input_tokens"], 900);
+        assert_eq!(
+            value["message"]["usage"]["zenproxy_provider_input_tokens"],
+            1000
+        );
+    }
+
+    #[test]
     fn rewrites_openai_stream_chunk_model_to_public_model() {
         let body = Bytes::from_static(
             b"data: {\"id\":\"chatcmpl_1\",\"model\":\"mimo-v2.5-free\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
@@ -3330,6 +3487,28 @@ mod tests {
 
         assert!(text.contains("\"model\":\"mimo-v2.5\""));
         assert!(!text.contains("mimo-v2.5-free"));
+    }
+
+    #[test]
+    fn rewrites_openai_stream_usage_for_downstream_cache_ratio() {
+        let body = Bytes::from_static(
+            b"data: {\"id\":\"chatcmpl_1\",\"model\":\"mimo-v2.5-free\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":10,\"total_tokens\":1010,\"prompt_tokens_details\":{\"cached_tokens\":900}}}\n\n",
+        );
+
+        let rewritten = rewrite_stream_response_model("chat/completions", body, "mimo");
+        let text = std::str::from_utf8(&rewritten).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let value: Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(value["model"], "mimo");
+        assert_eq!(value["usage"]["prompt_tokens"], 100);
+        assert_eq!(value["usage"]["completion_tokens"], 10);
+        assert_eq!(value["usage"]["total_tokens"], 110);
+        assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
+        assert_eq!(value["usage"]["zenproxy_provider_prompt_tokens"], 1000);
     }
 
     #[test]

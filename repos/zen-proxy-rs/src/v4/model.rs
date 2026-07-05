@@ -36,8 +36,11 @@ pub enum ModelCompatibilityProfile {
 impl ModelCompatibilityProfile {
     pub fn for_static(public_model: &str) -> Option<Self> {
         match public_model {
+            "deepseek" => Some(Self::StaticFlash),
             "deepseek-v4-flash" => Some(Self::StaticFlash),
+            "bigpickle" => Some(Self::StaticFlashLite),
             "big-pickle" => Some(Self::StaticFlashLite),
+            "mimo" => Some(Self::StaticMimo),
             "mimo-v2.5" => Some(Self::StaticMimo),
             "claude-haiku-4-5" => Some(Self::StaticFlash),
             _ => None,
@@ -80,6 +83,11 @@ impl StaticModelRegistry {
         ("big-pickle", "big-pickle"),
         ("mimo-v2.5", "mimo-v2.5-free"),
     ];
+    const REQUEST_ALIASES: &'static [(&'static str, &'static str, &'static str)] = &[
+        ("deepseek", "deepseek", "deepseek-v4-flash-free"),
+        ("bigpickle", "bigpickle", "big-pickle"),
+        ("mimo", "mimo", "mimo-v2.5-free"),
+    ];
     const HIDDEN_HELPER_MODELS: &'static [(&'static str, &'static str)] =
         &[("claude-haiku-4-5", "deepseek-v4-flash-free")];
 
@@ -87,7 +95,13 @@ impl StaticModelRegistry {
         Self::MODELS
             .iter()
             .chain(Self::HIDDEN_HELPER_MODELS.iter())
-            .any(|(public, upstream)| *public == model_id || *upstream == model_id)
+            .map(|(public, upstream)| (*public, *upstream))
+            .chain(
+                Self::REQUEST_ALIASES
+                    .iter()
+                    .map(|(alias, _, upstream)| (*alias, *upstream)),
+            )
+            .any(|(public, upstream)| public == model_id || upstream == model_id)
     }
 }
 
@@ -114,6 +128,17 @@ impl ModelRegistry for StaticModelRegistry {
                 upstream_model: (*upstream).to_string(),
                 compatibility_profile: ModelCompatibilityProfile::for_static(public)
                     .expect("static model must have a compatibility profile"),
+            })
+            .or_else(|| {
+                Self::REQUEST_ALIASES
+                    .iter()
+                    .find(|(alias, _, _)| *alias == public_model)
+                    .map(|(_, public, upstream)| ModelResolution {
+                        public_model: (*public).to_string(),
+                        upstream_model: (*upstream).to_string(),
+                        compatibility_profile: ModelCompatibilityProfile::for_static(public)
+                            .expect("static request alias must have a compatibility profile"),
+                    })
             })
             .ok_or_else(|| ModelError::UnknownModel(public_model.to_string()))
     }
@@ -358,6 +383,43 @@ mod tests {
         );
         assert_eq!(
             registry.resolve("mimo-v2.5").unwrap().compatibility_profile,
+            ModelCompatibilityProfile::StaticMimo
+        );
+    }
+
+    #[test]
+    fn resolves_short_request_aliases_without_public_listing() {
+        let registry = StaticModelRegistry;
+        let ids: Vec<String> = registry
+            .public_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert!(!ids.contains(&"deepseek".to_string()));
+        assert!(!ids.contains(&"bigpickle".to_string()));
+        assert!(!ids.contains(&"mimo".to_string()));
+
+        let deepseek = registry.resolve("deepseek").unwrap();
+        assert_eq!(deepseek.public_model, "deepseek");
+        assert_eq!(deepseek.upstream_model, "deepseek-v4-flash-free");
+        assert_eq!(
+            deepseek.compatibility_profile,
+            ModelCompatibilityProfile::StaticFlash
+        );
+
+        let bigpickle = registry.resolve("bigpickle").unwrap();
+        assert_eq!(bigpickle.public_model, "bigpickle");
+        assert_eq!(bigpickle.upstream_model, "big-pickle");
+        assert_eq!(
+            bigpickle.compatibility_profile,
+            ModelCompatibilityProfile::StaticFlashLite
+        );
+
+        let mimo = registry.resolve("mimo").unwrap();
+        assert_eq!(mimo.public_model, "mimo");
+        assert_eq!(mimo.upstream_model, "mimo-v2.5-free");
+        assert_eq!(
+            mimo.compatibility_profile,
             ModelCompatibilityProfile::StaticMimo
         );
     }
