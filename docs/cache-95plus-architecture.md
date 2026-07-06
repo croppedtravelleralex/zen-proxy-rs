@@ -1,8 +1,44 @@
 # Cache 99+ 架构方案 — ICP × CCP × 五层协同
 
-更新时间：2026-07-04
-版本：**v2.6（生产 886e 第二版部署后仍未达 95%；empty_output 清 session pin 已本地验证）**
+更新时间：2026-07-05
+版本：**v2.7（生产 0699 真实 R2 已透传；低 R2 主因推进为 cold/no_cache_signal 与 empty_output 坏节点重试；empty_output 节点隔离已本地验证）**
 状态：见下表 **「部署 vs 生效」** — 禁止将字段覆盖、运维部署成功或单侧面板数据写成缓存 95%+ 达成
+
+## 2026-07-05 19:10 七次严格验收更新
+
+新增现场事实：
+
+- panda 三实例当前运行 sha256 `0699d08f250a7b2666460a8f72ae6ec24e3e93197c7db4b49b16e1d8f04c4722`，health OK。
+- 最新 audit 文件为 `/var/log/zen-proxy-rs/audit/requests-2026-07-05.jsonl`；不再使用硬编码 `2026-07-03` 文件判断今天状态。
+- 最近 24h provider raw R2：
+  - `deepseek-v4-flash`：全量 R2 `66.56%`，steady R2 `83.22%`，cache-hit 行 R2 `90.11%`。
+  - `big-pickle`：全量 R2 `49.84%`，steady R2 `73.37%`，cache-hit 行 R2 `87.51%`。
+  - `mimo-v2.5`：全量 R2 `82.93%`，steady R2 `84.13%`。
+- 最近 2h provider raw R2：
+  - `deepseek-v4-flash`：全量 R2 `82.70%`，cache-hit 行 R2 `99.57%`；但仍有 same-USK `26.3k` no-cache steady 请求。
+  - `big-pickle`：全量 R2 `30.54%`，steady R2 `64.93%`，cache-hit 行 R2 `91.13%`；cold/no-cache 行占比高。
+  - `mimo-v2.5`：全量 R2 `89.65%`，steady R2 `89.71%`。
+- ledger 仍能看到同一 bad node 在同一请求中连续 `empty_output` attempt `0..12`，例如 deepseek `e4de24a0` 与 mimo `032caa47/aa119ea6`。这说明只清 session pin 不够：同一请求的下一次 dispatch 仍可能重新采样到同一坏 node。
+
+本轮新增根因：
+
+1. **字段透传已经不能解释低 R2。** provider 原始 audit 里 read/miss 已经有数；CCS/NewAPI 只要读取这些字段，显示会更真实，但不会把 provider raw R2 自动抬到 95%+。
+2. **当前低 R2 是混合窗口问题：cold/no_cache_signal、短探针、empty_output 重试和部分 20k+ 大请求 miss 在全量口径中稀释稳定 cache-hit 行。** 稳定 USK 的 deepseek 近 2h cache-hit 行可到 `99.57%`，但全量 steady 仍只有 `82.70%`。
+3. **`empty_output` 不能只清 session pin。** 旧处理只释放并降分 dispatch node，不移出 dispatch；坏节点可在同一请求重试中被再次选中，放大 502、耗时和 miss token。
+4. **big-pickle 仍缺 Anthropic BBM/cache_control 接线。** 当前 cache-hit 行能到 87-91%，但 cold/no-cache 行占比高，无法靠 usage 透传解决。
+
+本轮本地修复：
+
+- `zen-proxy-rs/src/pool/manager.rs`：`ResultKind::EmptyOutput` 现在会 quarantine node、从 dispatch 移除，并走现有 probe 恢复；避免同一请求反复打同一 empty-output 节点。
+- `free-model-client-rs/src/proxy/anthropic.rs`：日志文案从 `disabled-thinking` 修正为 `reasoning-enrichment`，避免把 reasoning enrich retry 误判成生产禁用 thinking。
+
+本轮验证：
+
+- `zen-proxy-rs cargo test`：216 unit + 44 e2e passed。
+- `zen-proxy-rs cargo clippy --all-targets -- -D warnings` passed。
+- `free-model-client-rs cargo fmt --check && cargo clippy --all-targets -- -D warnings` passed。
+- 本地 release 构建 passed；stripped asset：`/tmp/zen-proxy-rs.empty-output-quarantine.20260705`，sha256 `b6a8b2b38a6375093243053cba1dd060035f88b54a2c3ddac400611add2aa160`。
+- 尚未部署到 panda：当前环境没有 `gh`，也没有可用 GitHub token；禁止退回 scp 或 panda 编译。
 
 ## 2026-07-04 12:55 六次严格验收更新
 
@@ -494,7 +530,7 @@ else:
     no-op for Cache-Body path
 ```
 
-`anthropic_buffered` 路径仍含 `disabled-thinking retry`（`anthropic.rs:2303`）→ **必须**纳入 TMCC 2.0 清扫清单。
+`anthropic_buffered` 路径的 retry 已统一表述为 `reasoning-enrichment`；后续仍需用真实 ClaudeCode 流量确认没有生产 `thinking: disabled` 请求体。
 
 ### 4.6 Compaction Firewall
 

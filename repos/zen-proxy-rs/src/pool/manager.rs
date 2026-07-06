@@ -261,9 +261,45 @@ where
                 }
             }
             ResultKind::EmptyOutput => {
+                self.ratelimited.quarantine(node_id.clone());
                 self.active.release(&node_id, &result);
                 self.dispatch
                     .release_with_latency(&node_id, &result, latency_ms);
+                self.dispatch.remove(&node_id);
+
+                if let Some(nr) = self.nodes.get(&node_id) {
+                    let ratelimited = self.ratelimited.clone();
+                    let dispatch = self.dispatch.clone();
+                    let collector = self.collector.clone();
+                    let client = self.transport.client_for_node(&nr);
+                    let upstream = self.upstream_base.clone();
+                    let timeout = self.probe_timeout_secs;
+                    let api_key = self.upstream_api_key.clone();
+                    let nid = node_id.clone();
+
+                    tokio::spawn(async move {
+                        let ok =
+                            ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key)
+                                .await;
+
+                        if ok {
+                            ratelimited.recover(&nid);
+                            dispatch.add(NodeRef {
+                                id: nid.clone(),
+                                url: nr.url.clone(),
+                            });
+                            dispatch.release(&nid, &ResultKind::Success(200));
+                        }
+
+                        collector.record_probe(&ProbeEvent {
+                            ts: chrono::Utc::now().timestamp(),
+                            node_id: nid,
+                            pool: "empty_output_probe".to_string(),
+                            ok,
+                            latency_ms: 0,
+                        });
+                    });
+                }
             }
             ResultKind::ClientGone => {
                 self.active.release(&node_id, &result);
@@ -501,8 +537,8 @@ mod tests {
     use crate::pool::dispatch::{AimdConfig, DispatchPool, NodeBudgetLimits};
     use crate::pool::ratelimited::RateLimitedPoolImpl;
 
-    #[test]
-    fn empty_output_does_not_move_node_to_dead_pool() {
+    #[tokio::test]
+    async fn empty_output_quarantines_node_before_retry() {
         let dispatch = Arc::new(DispatchPool::new());
         let active = Arc::new(ActivePool::new());
         let ratelimited = Arc::new(RateLimitedPoolImpl::new());
@@ -511,7 +547,7 @@ mod tests {
         let manager = PoolManagerImpl::new(
             dispatch.clone(),
             active,
-            ratelimited,
+            ratelimited.clone(),
             dead.clone(),
             collector,
             "https://example.invalid".to_string(),
@@ -522,7 +558,9 @@ mod tests {
             false,
         );
         let node = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
+        let alternate = NodeRef::new("socks5h://user:pass@127.0.0.1:1081".to_string());
         dispatch.add(node.clone());
+        dispatch.add(alternate.clone());
 
         let meta = RequestMeta {
             model: "deepseek-v4-flash".to_string(),
@@ -538,7 +576,9 @@ mod tests {
 
         assert_eq!(dead.available(), 0);
         assert_eq!(dispatch.available(), 1);
-        assert!(manager.dispatch(&meta).is_ok());
+        assert_eq!(ratelimited.available(), 1);
+        let retried = manager.dispatch(&meta).unwrap();
+        assert_ne!(retried.node.id, dispatched.node.id);
     }
 
     #[test]

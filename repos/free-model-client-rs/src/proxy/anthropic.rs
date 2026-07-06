@@ -555,7 +555,7 @@ async fn handle_non_stream(
                             model = %cr.model,
                             source_client = ?profile.kind,
                             next_attempt = attempt + 2,
-                            "ClaudeCode non-stream guard enabling disabled-thinking retry after no forwardable output"
+                            "ClaudeCode non-stream guard enabling reasoning-enrichment retry after no forwardable output"
                         );
                     }
                     continue;
@@ -613,7 +613,7 @@ async fn handle_non_stream(
                         source_client = ?profile.kind,
                         empty_output_class = output_class.as_str(),
                         attempt = attempt + 1,
-                        "retrying reasoning-only output with disabled thinking"
+                        "retrying reasoning-only output with reasoning enrichment"
                     );
                     continue;
                 }
@@ -640,7 +640,7 @@ async fn handle_non_stream(
                         model = %cr.model,
                         source_client = ?profile.kind,
                         next_attempt = attempt + 2,
-                        "ClaudeCode non-stream guard enabling disabled-thinking retry for incomplete tool arguments"
+                        "ClaudeCode non-stream guard enabling reasoning-enrichment retry for incomplete tool arguments"
                     );
                 }
                 continue;
@@ -2082,7 +2082,7 @@ async fn handle_stream(
                                 prompt_hash,
                                 prompt_hash_hex = %prompt_hash_hex,
                                 next_attempt = attempt + 2,
-                                "ClaudeCode stream guard enabling disabled-thinking retry for incomplete tool arguments"
+                                "ClaudeCode stream guard enabling reasoning-enrichment retry for incomplete tool arguments"
                             );
                         }
                         completed_upstream = false;
@@ -2112,7 +2112,7 @@ async fn handle_stream(
                         prompt_hash,
                         prompt_hash_hex = %prompt_hash_hex,
                         next_attempt = attempt + 2,
-                        "ClaudeCode stream guard enabling disabled-thinking fallback for final tool retry"
+                        "ClaudeCode stream guard enabling reasoning-enrichment fallback for final tool retry"
                     );
                 }
                 continue;
@@ -2520,7 +2520,7 @@ async fn handle_buffered_claude_code_huge_stream(
                     source_client = ?profile.kind,
                     empty_output_class = output_class.as_str(),
                     attempt = attempt + 1,
-                    "retrying buffered reasoning-only output with disabled thinking"
+                    "retrying buffered reasoning-only output with reasoning enrichment"
                 );
                 continue;
             }
@@ -2596,7 +2596,7 @@ async fn handle_buffered_claude_code_huge_stream(
                     model = %cr.model,
                     source_client = ?profile.kind,
                     next_attempt = attempt + 2,
-                    "ClaudeCode buffered stream guard enabling disabled-thinking retry for incomplete tool arguments"
+                    "ClaudeCode buffered stream guard enabling reasoning-enrichment retry for incomplete tool arguments"
                 );
                 continue;
             }

@@ -459,9 +459,16 @@ fn flatten_tool_history_for_text_only_retry(body: &mut Value) -> usize {
         let Some(object) = message.as_object_mut() else {
             continue;
         };
-        let role = object.get("role").and_then(Value::as_str).unwrap_or_default();
+        let role = object
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match role {
-            "assistant" if object.get("tool_calls").is_some_and(|calls| !calls.is_null()) => {
+            "assistant"
+                if object
+                    .get("tool_calls")
+                    .is_some_and(|calls| !calls.is_null()) =>
+            {
                 let content = object
                     .get("content")
                     .and_then(value_to_text)
@@ -1065,7 +1072,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("previous assistant requested tool Read"));
-        assert_eq!(retry["messages"][3]["role"], Value::String("user".to_string()));
+        assert_eq!(
+            retry["messages"][3]["role"],
+            Value::String("user".to_string())
+        );
         assert!(retry["messages"][3].get("tool_call_id").is_none());
         assert_eq!(stats.flattened_tool_history_messages, 2);
     }
