@@ -56,6 +56,17 @@ pub(crate) fn classify_collected_output(
     OutputClass::Empty
 }
 
+pub(crate) fn collected_visible_text(collected: &CollectedStream) -> &str {
+    if collected.content.trim().is_empty()
+        && collected.tool_calls.is_empty()
+        && !collected.reasoning.trim().is_empty()
+    {
+        &collected.reasoning
+    } else {
+        &collected.content
+    }
+}
+
 pub(crate) fn apply_initial_thinking_policy(
     body: &mut serde_json::Value,
     request: &ChatRequest,
@@ -865,6 +876,33 @@ mod tests {
 
         assert_eq!(policy, "claude_code_production_default_enabled");
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn collected_visible_text_falls_back_to_reasoning_only_without_tools() {
+        let collected = CollectedStream {
+            reasoning: "visible fallback".to_string(),
+            ..CollectedStream::default()
+        };
+
+        assert_eq!(collected_visible_text(&collected), "visible fallback");
+    }
+
+    #[test]
+    fn collected_visible_text_keeps_content_and_tool_outputs_primary() {
+        let with_content = CollectedStream {
+            content: "answer".to_string(),
+            reasoning: "reasoning".to_string(),
+            ..CollectedStream::default()
+        };
+        assert_eq!(collected_visible_text(&with_content), "answer");
+
+        let with_tool = CollectedStream {
+            reasoning: "reasoning".to_string(),
+            tool_calls: vec![crate::zen::client::CollectedToolCall::default()],
+            ..CollectedStream::default()
+        };
+        assert_eq!(collected_visible_text(&with_tool), "");
     }
 
     #[test]

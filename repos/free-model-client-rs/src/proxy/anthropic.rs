@@ -571,7 +571,8 @@ async fn handle_non_stream(
                 attempt + 1,
                 NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
             );
-            let content = response_text_for_profile(profile, &collected.content);
+            let content =
+                response_text_for_profile(profile, super::collected_visible_text(&collected));
             let output_class = super::classify_collected_output(&collected, &content);
             if output_class != super::OutputClass::Valid {
                 last_empty = true;
@@ -2498,7 +2499,7 @@ async fn handle_buffered_claude_code_huge_stream(
             attempt + 1,
             CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
         );
-        let content = response_text_for_profile(profile, &collected.content);
+        let content = response_text_for_profile(profile, super::collected_visible_text(&collected));
         let output_class = super::classify_collected_output(&collected, &content);
         if output_class != super::OutputClass::Valid {
             super::log_empty_output_class(
