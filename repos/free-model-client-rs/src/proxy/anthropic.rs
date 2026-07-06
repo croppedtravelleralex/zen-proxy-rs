@@ -444,6 +444,7 @@ async fn handle_non_stream(
         let mut used_missing_reasoning_enrich_retry = false;
         let mut used_provider_invalid_enrich_retry = false;
         let mut used_provider_invalid_text_retry = false;
+        let mut used_stream_mode_retry = false;
         let mut attempt_body = zb.clone();
         let mut output = None;
         for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
@@ -572,6 +573,20 @@ async fn handle_non_stream(
                                 "Mimo internal probe received no forwardable output; returning local ok"
                             );
                             return Ok(local_non_stream_fallback_response(cr, fallback_text));
+                        }
+                        if !used_stream_mode_retry {
+                            used_stream_mode_retry = true;
+                            attempt_body["stream"] = Value::Bool(true);
+                            tracing::warn!(
+                                protocol = "anthropic",
+                                model = %cr.model,
+                                source_client = ?profile.kind,
+                                next_attempt = attempt + 2,
+                                upstream_event_count,
+                                elapsed_ms,
+                                "ClaudeCode non-stream guard retrying no-forwardable request with upstream stream mode"
+                            );
+                            continue;
                         }
                         tracing::warn!(
                             protocol = "anthropic",

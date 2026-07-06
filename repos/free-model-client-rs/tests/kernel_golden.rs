@@ -200,6 +200,20 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("nonstream-empty-then-stream-ok") {
+        let stream_requested = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        let response_body = if stream_requested {
+            "data: {\"choices\":[{\"delta\":{\"content\":\"stream fallback ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+        } else {
+            "data: {\"choices\":[{\"delta\":{}}]}\n\n"
+        };
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            response_body,
+        )
+            .into_response();
+    }
     if prompt.contains("partial-tool-truncated") {
         return (
 	            StatusCode::OK,
@@ -1966,7 +1980,35 @@ async fn anthropic_claude_code_explicit_smoke_truncated_empty_returns_pass() {
 
     let body = response_text(response).await;
     assert!(body.contains("\"text\":\"PASS\""), "{body}");
-    assert_eq!(state.requests.lock().unwrap().len(), 1);
+    assert_eq!(state.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn anthropic_non_stream_no_forwardable_retries_with_upstream_stream_mode() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash-free",
+        "nonstream-empty-then-stream-ok",
+        false,
+    );
+    request.max_tokens = Some(64);
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+
+    let body = response_text(response).await;
+    assert!(body.contains("\"text\":\"stream fallback ok\""), "{body}");
+    let requests = state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].max_tokens, Some(64));
+    assert_eq!(requests[1].max_tokens, Some(64));
 }
 
 #[tokio::test]
