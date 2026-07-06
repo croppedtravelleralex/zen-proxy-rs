@@ -22,6 +22,7 @@ const NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS: usize = 3;
 enum NonStreamCollectOutcome {
     Collected(Box<crate::zen::client::CollectedStream>),
     RetryNoForwardable {
+        collected: Box<crate::zen::client::CollectedStream>,
         reasoning_chars: usize,
         upstream_event_count: u64,
         elapsed_ms: u64,
@@ -509,6 +510,7 @@ async fn handle_non_stream(
             {
                 NonStreamCollectOutcome::Collected(collected) => collected,
                 NonStreamCollectOutcome::RetryNoForwardable {
+                    collected,
                     reasoning_chars,
                     upstream_event_count,
                     elapsed_ms,
@@ -529,6 +531,17 @@ async fn handle_non_stream(
                         tool_count = request_shape.tool_count,
                         "ClaudeCode non-stream guard retrying after reasoning-only/no-forwardable upstream output"
                     );
+                    if !collected.reasoning.trim().is_empty() {
+                        tracing::warn!(
+                            protocol = "anthropic",
+                            model = %cr.model,
+                            source_client = ?profile.kind,
+                            attempt = attempt + 1,
+                            reasoning_chars,
+                            "ClaudeCode non-stream guard accepting reasoning-only upstream output as visible text"
+                        );
+                        collected
+                    } else {
                     last_empty = true;
                     last_empty_class = Some(super::OutputClass::ReasoningOnly);
                     if let Some(fallback_text) = mimo_internal_probe_empty_fallback_text(
@@ -560,6 +573,7 @@ async fn handle_non_stream(
                         );
                     }
                     continue;
+                    }
                 }
             };
             let cache_signals = cache_signals.with_body_usage(collected.usage.as_ref());
@@ -814,8 +828,10 @@ async fn collect_anthropic_non_stream_parts_with_guard(
                     return Ok(NonStreamCollectOutcome::Collected(Box::new(collected)));
                 }
                 if is_truncated_stream_error(&err) {
+                    let reasoning_chars = collected.reasoning.len();
                     return Ok(NonStreamCollectOutcome::RetryNoForwardable {
-                        reasoning_chars: collected.reasoning.len(),
+                        collected: Box::new(collected),
+                        reasoning_chars,
                         upstream_event_count,
                         elapsed_ms: attempt_started.elapsed().as_millis() as u64,
                     });
@@ -856,8 +872,10 @@ async fn collect_anthropic_non_stream_parts_with_guard(
             continue;
         }
         if attempt_started.elapsed() >= no_forwardable_retry_after {
+            let reasoning_chars = collected.reasoning.len();
             return Ok(NonStreamCollectOutcome::RetryNoForwardable {
-                reasoning_chars: collected.reasoning.len(),
+                collected: Box::new(collected),
+                reasoning_chars,
                 upstream_event_count,
                 elapsed_ms: attempt_started.elapsed().as_millis() as u64,
             });
