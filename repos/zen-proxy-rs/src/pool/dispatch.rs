@@ -18,6 +18,16 @@ const DEFAULT_DISPATCH_SHARDS: usize = 16;
 const BUCKET_COUNT: usize = 5;
 const TOKEN_BUCKET_COUNT: usize = 5;
 const AFFINITY_MAX_NODES: usize = 4;
+const MIMO_AFFINITY_MAX_NODES: usize = 2;
+
+fn affinity_max_nodes(affinity_key: &str) -> usize {
+    let key = affinity_key.to_ascii_lowercase();
+    if key.starts_with("mimo-v2.5") || key.starts_with("mimo-v2.5-free") {
+        MIMO_AFFINITY_MAX_NODES
+    } else {
+        AFFINITY_MAX_NODES
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AimdConfig {
@@ -1010,7 +1020,7 @@ impl Pool for DispatchPool {
         let nodes = affinity.entry(affinity_key.to_string()).or_default();
         nodes.retain(|id| id != node_id);
         nodes.push_front(node_id.clone());
-        while nodes.len() > AFFINITY_MAX_NODES {
+        while nodes.len() > affinity_max_nodes(affinity_key) {
             nodes.pop_back();
         }
     }
@@ -1268,6 +1278,25 @@ mod tests {
 
         assert_eq!(selected.id, first.id);
         assert_eq!(affinity_node_id, first.id);
+    }
+
+    #[test]
+    fn mimo_affinity_keeps_tighter_node_set() {
+        let pool = DispatchPool::new();
+        let first = NodeRef::new("socks5h://user:pass@127.0.0.1:10862".to_string());
+        let second = NodeRef::new("socks5h://user:pass@127.0.0.1:10863".to_string());
+        let third = NodeRef::new("socks5h://user:pass@127.0.0.1:10864".to_string());
+        let key = "mimo-v2.5-free:mimo-v2.5-free:claude-code:abc:messages:client";
+
+        pool.record_affinity_success(key, &first.id);
+        pool.record_affinity_success(key, &second.id);
+        pool.record_affinity_success(key, &third.id);
+
+        let nodes = pool.affinity.read().unwrap().get(key).cloned().unwrap();
+        assert_eq!(nodes.len(), MIMO_AFFINITY_MAX_NODES);
+        assert_eq!(nodes[0], third.id);
+        assert_eq!(nodes[1], second.id);
+        assert!(!nodes.contains(&first.id));
     }
 
     #[test]

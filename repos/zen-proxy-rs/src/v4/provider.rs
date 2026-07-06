@@ -587,11 +587,6 @@ struct AffinityKeyInput<'a> {
 }
 
 fn build_affinity_key(input: AffinityKeyInput<'_>) -> String {
-    if crate::pool::session_pin::is_mimo_family(input.public_model)
-        || crate::pool::session_pin::is_mimo_family(input.upstream_model)
-    {
-        return String::new();
-    }
     let min_bytes = if input.source_client.trim() == "claude-code" {
         AFFINITY_MIN_BODY_BYTES_CLAUDE_CODE
     } else {
@@ -2279,14 +2274,17 @@ fn normalize_downstream_usage_object(path: &str, usage: &mut Value) -> bool {
         let cache_creation = usage_u32(usage, "cache_creation_input_tokens");
         let uncached_input =
             downstream_uncached_input_tokens(provider_input, cache_read, cache_creation, usage);
-        usage["input_tokens"] = Value::from(uncached_input);
+        usage["input_tokens"] = Value::from(provider_input);
         usage["output_tokens"] = Value::from(output_tokens);
         usage["cache_read_input_tokens"] = Value::from(cache_read);
+        usage["cache_miss_input_tokens"] = Value::from(uncached_input);
+        usage["zenproxy_billable_input_tokens"] = Value::from(uncached_input);
         usage["zenproxy_provider_input_tokens"] = Value::from(provider_input);
         usage["zenproxy_cache_r2_basis_tokens"] = Value::from(provider_input);
         usage["zenproxy_true_cache_read_ratio"] =
             Value::from(cache_ratio(provider_input, cache_read));
-        return uncached_input != provider_input || cache_read > 0;
+        usage["zenproxy_cache_contract_version"] = Value::from(2);
+        return cache_read > 0 || usage_cache_miss_u32(usage).is_some();
     }
 
     let provider_prompt = usage_u32(usage, "prompt_tokens");
@@ -2295,15 +2293,18 @@ fn normalize_downstream_usage_object(path: &str, usage: &mut Value) -> bool {
     let cache_creation = usage_u32(usage, "cache_creation_input_tokens");
     let uncached_prompt =
         downstream_uncached_input_tokens(provider_prompt, cache_read, cache_creation, usage);
-    usage["prompt_tokens"] = Value::from(uncached_prompt);
+    usage["prompt_tokens"] = Value::from(provider_prompt);
     usage["completion_tokens"] = Value::from(completion_tokens);
-    usage["total_tokens"] = Value::from(uncached_prompt.saturating_add(completion_tokens));
+    usage["total_tokens"] = Value::from(provider_prompt.saturating_add(completion_tokens));
     usage["cache_read_input_tokens"] = Value::from(cache_read);
+    usage["cache_miss_input_tokens"] = Value::from(uncached_prompt);
+    usage["zenproxy_billable_input_tokens"] = Value::from(uncached_prompt);
     usage["zenproxy_provider_prompt_tokens"] = Value::from(provider_prompt);
     usage["zenproxy_cache_r2_basis_tokens"] = Value::from(provider_prompt);
     usage["zenproxy_true_cache_read_ratio"] = Value::from(cache_ratio(provider_prompt, cache_read));
+    usage["zenproxy_cache_contract_version"] = Value::from(2);
     ensure_prompt_tokens_details_cached_tokens(usage, cache_read);
-    uncached_prompt != provider_prompt || cache_read > 0
+    cache_read > 0 || usage_cache_miss_u32(usage).is_some()
 }
 
 fn downstream_uncached_input_tokens(
@@ -3345,7 +3346,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_openai_usage_for_downstream_cache_ratio() {
+    fn rewrites_openai_usage_for_downstream_cache_contract() {
         let body = Bytes::from_static(
             br#"{"model":"deepseek-v4-flash-free","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1000,"completion_tokens":10,"total_tokens":1010,"prompt_tokens_details":{"cached_tokens":900}}}"#,
         );
@@ -3354,19 +3355,22 @@ mod tests {
         let value: Value = serde_json::from_slice(&rewritten).unwrap();
 
         assert_eq!(value["model"], "deepseek");
-        assert_eq!(value["usage"]["prompt_tokens"], 100);
+        assert_eq!(value["usage"]["prompt_tokens"], 1000);
         assert_eq!(value["usage"]["completion_tokens"], 10);
-        assert_eq!(value["usage"]["total_tokens"], 110);
+        assert_eq!(value["usage"]["total_tokens"], 1010);
         assert_eq!(
             value["usage"]["prompt_tokens_details"]["cached_tokens"],
             900
         );
         assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
+        assert_eq!(value["usage"]["cache_miss_input_tokens"], 100);
+        assert_eq!(value["usage"]["zenproxy_billable_input_tokens"], 100);
         assert_eq!(value["usage"]["zenproxy_provider_prompt_tokens"], 1000);
+        assert_eq!(value["usage"]["zenproxy_cache_contract_version"], 2);
     }
 
     #[test]
-    fn rewrites_anthropic_usage_for_downstream_cache_ratio() {
+    fn rewrites_anthropic_usage_for_downstream_cache_contract() {
         let body = Bytes::from_static(
             br#"{"type":"message","model":"mimo-v2.5-free","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1000,"output_tokens":10,"cache_read_input_tokens":900}}"#,
         );
@@ -3375,10 +3379,13 @@ mod tests {
         let value: Value = serde_json::from_slice(&rewritten).unwrap();
 
         assert_eq!(value["model"], "mimo");
-        assert_eq!(value["usage"]["input_tokens"], 100);
+        assert_eq!(value["usage"]["input_tokens"], 1000);
         assert_eq!(value["usage"]["output_tokens"], 10);
         assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
+        assert_eq!(value["usage"]["cache_miss_input_tokens"], 100);
+        assert_eq!(value["usage"]["zenproxy_billable_input_tokens"], 100);
         assert_eq!(value["usage"]["zenproxy_provider_input_tokens"], 1000);
+        assert_eq!(value["usage"]["zenproxy_cache_contract_version"], 2);
     }
 
     #[test]
@@ -3468,8 +3475,13 @@ mod tests {
         let value: Value = serde_json::from_str(data).unwrap();
 
         assert_eq!(value["message"]["model"], "deepseek");
-        assert_eq!(value["message"]["usage"]["input_tokens"], 100);
+        assert_eq!(value["message"]["usage"]["input_tokens"], 1000);
         assert_eq!(value["message"]["usage"]["cache_read_input_tokens"], 900);
+        assert_eq!(value["message"]["usage"]["cache_miss_input_tokens"], 100);
+        assert_eq!(
+            value["message"]["usage"]["zenproxy_billable_input_tokens"],
+            100
+        );
         assert_eq!(
             value["message"]["usage"]["zenproxy_provider_input_tokens"],
             1000
@@ -3504,10 +3516,12 @@ mod tests {
         let value: Value = serde_json::from_str(data).unwrap();
 
         assert_eq!(value["model"], "mimo");
-        assert_eq!(value["usage"]["prompt_tokens"], 100);
+        assert_eq!(value["usage"]["prompt_tokens"], 1000);
         assert_eq!(value["usage"]["completion_tokens"], 10);
-        assert_eq!(value["usage"]["total_tokens"], 110);
+        assert_eq!(value["usage"]["total_tokens"], 1010);
         assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
+        assert_eq!(value["usage"]["cache_miss_input_tokens"], 100);
+        assert_eq!(value["usage"]["zenproxy_billable_input_tokens"], 100);
         assert_eq!(value["usage"]["zenproxy_provider_prompt_tokens"], 1000);
     }
 
@@ -3800,8 +3814,9 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
-    fn mimo_family_disables_prefix_affinity() {
+    fn mimo_family_uses_usk_affinity() {
         let body = serde_json::json!({
+            "model": "mimo-v2.5-free",
             "messages":[{"role":"user","content":"a".repeat(80_000)}],
             "tools":[{"function":{"name":"Read"}}],
             "tool_choice":"auto"
@@ -3817,7 +3832,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
             true,
             &body,
         );
-        assert!(key.is_empty());
+        assert!(key.starts_with("mimo-v2.5-free:mimo-v2.5-free:claude-code:"));
+        assert!(key.contains(":messages:"));
     }
 
     #[test]
@@ -3871,7 +3887,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
     }
 
     #[test]
-    fn mimo_messages_get_session_identity_even_without_prefix_affinity() {
+    fn mimo_messages_get_session_identity_and_affinity() {
         let body = serde_json::json!({
             "model": "mimo-v2.5-free",
             "messages": [{"role": "user", "content": "hello"}],
@@ -3901,7 +3917,8 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
         assert!(usk.starts_with("usk_v1:"));
         assert_eq!(prefix_32k_hash.len(), 16);
         assert!(session_id.starts_with("ses_"));
-        assert!(key.is_empty());
+        assert!(key.starts_with("mimo-v2.5-free:mimo-v2.5-free:claude-code:"));
+        assert!(key.contains(":messages:"));
     }
 
     #[test]
