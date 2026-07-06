@@ -27,7 +27,19 @@
 - `free-model-client-rs cargo test usk_ -- --nocapture`：4 passed。
 - `free-model-client-rs cargo fmt --check && cargo test`：157 unit + 138 kernel golden passed。
 - `free-model-client-rs cargo clippy --all-targets -- -D warnings`：passed。
-- 尚未部署到 panda；下一步必须本地构建、GitHub release asset 上传、panda 下载校验替换，禁止 scp 和 panda 编译。部署后必须按用户给定真实矩阵重新验收，不能用短 probe 宣称 85/95+。
+- `zen-proxy-rs cargo fmt --check && cargo test`：217 unit + 44 e2e passed。
+- `zen-proxy-rs cargo clippy --all-targets -- -D warnings`：passed。
+- 本地 WSL release build passed；GitHub release asset `cache-normal-scope-20260706-034850`，sha256 `91c1e7fa6040e5f1272086a75d694c44e6acd3d63637e1304e9e8599a799a684`。
+
+部署与冒烟：
+
+- 已通过 GitHub release asset 下载部署到 panda，三实例运行 sha256 `91c1e7fa6040e5f1272086a75d694c44e6acd3d63637e1304e9e8599a799a684`，health OK。
+- panda 备份：`/opt/zen-proxy-rs/backups/zen-proxy-rs.20260706-035348.pre-cache-normal-scope`。
+- direct Anthropic `/v1/messages` 三模型 smoke：DeepSeek/Mimo/BigPickle 均 HTTP 200，耗时约 2.9-3.3s。
+- WSL ClaudeCode → Windows CCS DeepSeek smoke：Bash/WebFetch pass，WebSearch marker_missing。
+- WSL ClaudeCode → sub2api/panda/Zenproxy direct，按模型独立 key：DeepSeek、Mimo、BigPickle 的 Bash/WebFetch 均 pass。
+- 部署后冷启动/冒烟窗口 audit：三模型 `usk/prompt_cache_key/prefix_32k_hash` 覆盖 100%；R2 仅 29-37%，该窗口以短 probe/cold 为主，禁止写成真实矩阵达标。
+- 下一步必须按用户给定四项目真实矩阵重新验收，不能用短 probe 宣称 85/95+。
 
 ## 2026-07-05 19:10 七次严格验收更新
 
