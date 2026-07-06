@@ -187,6 +187,18 @@ pub async fn handle_anthropic_messages(
         super::build_icp_upstream_package(&cr, &upstream_model, profile, &config.zen_api_key);
     let reasoning_scope = icp_package.identity.usk.clone();
     let mut zb = icp_package.body;
+    let deepseek_stable_breakpoints =
+        crate::canonical::apply_deepseek_stable_cache_breakpoints(&mut zb, &cr);
+    if deepseek_stable_breakpoints > 0 {
+        tracing::info!(
+            protocol = "anthropic",
+            model = %cr.model,
+            upstream_model = %upstream_model,
+            source_client = ?profile.kind,
+            cache_control_breakpoints = deepseek_stable_breakpoints,
+            "applied deepseek stable cache_control breakpoints"
+        );
+    }
     let zen_headers = super::zen_session_headers(&icp_package.identity);
     let upstream_headers = super::merge_extra_headers(&config.extra_headers, &zen_headers);
     let mut request_config = config.clone();
@@ -542,37 +554,35 @@ async fn handle_non_stream(
                         );
                         collected
                     } else {
-                    last_empty = true;
-                    last_empty_class = Some(super::OutputClass::ReasoningOnly);
-                    if let Some(fallback_text) = mimo_internal_probe_empty_fallback_text(
-                        cr,
-                        short_request_kind,
-                        &request_shape,
-                    ) {
-                        tracing::warn!(
-                            model = cr.model,
-                            source_client = ?profile.kind,
-                            short_request_kind = short_request_kind.as_str(),
-                            prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
-                            prompt_tokens = request_shape.estimated_total_tokens,
-                            message_count = request_shape.message_count,
-                            max_tokens = ?request_shape.max_tokens,
-                            "Mimo internal probe received no forwardable output; returning local ok"
-                        );
-                        return Ok(local_non_stream_fallback_response(cr, fallback_text));
-                    }
-                    if profile.kind == ClientKind::ClaudeCode && !used_reasoning_enrich_retry {
-                        used_reasoning_enrich_retry = true;
-                        attempt_body = super::reasoning_retry_body(zb, profile);
+                        last_empty = true;
+                        last_empty_class = Some(super::OutputClass::NoForwardable);
+                        if let Some(fallback_text) = mimo_internal_probe_empty_fallback_text(
+                            cr,
+                            short_request_kind,
+                            &request_shape,
+                        ) {
+                            tracing::warn!(
+                                model = cr.model,
+                                source_client = ?profile.kind,
+                                short_request_kind = short_request_kind.as_str(),
+                                prompt_hash = %format_args!("{:016x}", request_shape.prompt_hash),
+                                prompt_tokens = request_shape.estimated_total_tokens,
+                                message_count = request_shape.message_count,
+                                max_tokens = ?request_shape.max_tokens,
+                                "Mimo internal probe received no forwardable output; returning local ok"
+                            );
+                            return Ok(local_non_stream_fallback_response(cr, fallback_text));
+                        }
                         tracing::warn!(
                             protocol = "anthropic",
                             model = %cr.model,
                             source_client = ?profile.kind,
-                            next_attempt = attempt + 2,
-                            "ClaudeCode non-stream guard enabling reasoning-enrichment retry after no forwardable output"
+                            attempt = attempt + 1,
+                            upstream_event_count,
+                            elapsed_ms,
+                            "ClaudeCode non-stream guard received no forwardable upstream events; stop same-node retry"
                         );
-                    }
-                    continue;
+                        break;
                     }
                 }
             };

@@ -712,6 +712,7 @@ impl Config {
             "deepseek-v4-flash-free".to_string(),
         );
         m.insert("big-pickle".to_string(), "big-pickle".to_string());
+        m.insert("mimo-v2.5".to_string(), "mimo-v2.5-free".to_string());
         m
     }
 
@@ -1480,7 +1481,11 @@ mod tests {
             "deepseek-v4-flash-free"
         );
         assert_eq!(cfg.model_mapping.get("big-pickle").unwrap(), "big-pickle");
-        assert_eq!(cfg.model_mapping.len(), 2);
+        assert_eq!(
+            cfg.model_mapping.get("mimo-v2.5").unwrap(),
+            "mimo-v2.5-free"
+        );
+        assert_eq!(cfg.model_mapping.len(), 3);
     }
 
     #[test]

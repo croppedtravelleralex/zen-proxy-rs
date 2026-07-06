@@ -328,7 +328,8 @@ async fn handle_oa_non_stream(
                 attempt + 1,
                 NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
             );
-            let content = response_text_for_profile(profile, super::collected_visible_text(&collected));
+            let content =
+                response_text_for_profile(profile, super::collected_visible_text(&collected));
             let output_class = super::classify_collected_output(&collected, &content);
             if output_class != super::OutputClass::Valid {
                 last_empty = true;

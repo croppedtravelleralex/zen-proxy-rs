@@ -1060,18 +1060,19 @@ async fn openai_stream_closes_unclosed_markdown_fence() {
 }
 
 #[tokio::test]
-async fn openai_non_stream_rejects_eof_without_done_or_finish_reason() {
+async fn openai_non_stream_accepts_usable_content_without_done_or_finish_reason() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let err = kernel
+    let response = kernel
         .openai_chat(
             &client,
             chat_request("deepseek-v4-flash-free", "truncated-stream", false, None),
         )
         .await
-        .unwrap_err();
-    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
-    assert!(err.message.contains("stream truncated"));
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    assert!(body.contains("partial"), "{body}");
 }
 
 #[tokio::test]
@@ -1965,11 +1966,11 @@ async fn anthropic_claude_code_explicit_smoke_truncated_empty_returns_pass() {
 
     let body = response_text(response).await;
     assert!(body.contains("\"text\":\"PASS\""), "{body}");
-    assert_eq!(state.requests.lock().unwrap().len(), 3);
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
-async fn anthropic_mimo_internal_probe_with_system_empty_upstream_returns_ok() {
+async fn anthropic_mimo_internal_probe_with_system_reasoning_only_is_visible() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request("mimo-v2.5-free", "reasoning-only", false);
@@ -1988,7 +1989,7 @@ async fn anthropic_mimo_internal_probe_with_system_empty_upstream_returns_ok() {
         .unwrap();
 
     let body = response_text(response).await;
-    assert!(body.contains("\"text\":\"ok\""), "{body}");
+    assert!(body.contains("\"text\":\"hidden chain only\""), "{body}");
     assert_eq!(state.requests.lock().unwrap().len(), 1);
 }
 
@@ -2278,7 +2279,7 @@ async fn claude_code_tools_do_not_disable_thinking() {
 }
 
 #[tokio::test]
-async fn claude_code_low_budget_openai_tool_probe_disables_thinking_and_raises_max_tokens() {
+async fn claude_code_low_budget_openai_tool_probe_keeps_thinking_and_raises_max_tokens() {
     let (config, client, observed) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut req = chat_request(
@@ -2310,9 +2311,9 @@ async fn claude_code_low_budget_openai_tool_probe_disables_thinking_and_raises_m
         .unwrap();
 
     let body = response_text(response).await;
-    assert!(body.contains("golden answer after disabled thinking"));
+    assert!(body.contains("hidden chain only"));
     let sent = observed.requests.lock().unwrap();
-    assert!(sent.len() >= 2);
+    assert_eq!(sent.len(), 1);
     assert!(sent.iter().all(|request| request.thinking.is_none()));
     assert_eq!(sent[0].max_tokens, Some(64));
 }
@@ -3830,22 +3831,26 @@ fn anthropic_tool_result_content_is_redacted_before_upstream() {
 }
 
 #[tokio::test]
-async fn reasoning_only_output_is_rejected_as_empty_upstream() {
+async fn reasoning_only_output_is_returned_as_visible_text() {
     let (config, client, _) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
-    let err = kernel
+    let response = kernel
         .openai_chat(
             &client,
             chat_request("deepseek-v4-flash-free", "reasoning-only", false, None),
         )
         .await
-        .unwrap_err();
-    assert_eq!(err.status, axum::http::StatusCode::BAD_GATEWAY);
-    assert!(err.message.contains("no assistant content"));
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hidden chain only"
+    );
 }
 
 #[tokio::test]
-async fn openai_non_stream_reasoning_only_length_retries_with_disabled_thinking() {
+async fn openai_non_stream_reasoning_only_length_is_returned_as_visible_text() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let response = kernel
@@ -3865,16 +3870,15 @@ async fn openai_non_stream_reasoning_only_length_retries_with_disabled_thinking(
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
     assert_eq!(
         body["choices"][0]["message"]["content"],
-        "golden answer after disabled thinking"
+        "hidden chain only"
     );
     let requests = state.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert!(requests[0].thinking.is_none());
-    assert!(requests[1].thinking.is_none());
 }
 
 #[tokio::test]
-async fn anthropic_non_stream_reasoning_only_length_retries_with_disabled_thinking() {
+async fn anthropic_non_stream_reasoning_only_length_is_returned_as_visible_text() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let response = kernel
@@ -3887,14 +3891,10 @@ async fn anthropic_non_stream_reasoning_only_length_retries_with_disabled_thinki
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(
-        body["content"][0]["text"],
-        "golden answer after disabled thinking"
-    );
+    assert_eq!(body["content"][0]["text"], "hidden chain only");
     let requests = state.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert!(requests[0].thinking.is_none());
-    assert!(requests[1].thinking.is_none());
 }
 
 #[tokio::test]
@@ -3928,8 +3928,7 @@ async fn anthropic_non_stream_missing_reasoning_content_retries_with_disabled_th
 }
 
 #[tokio::test]
-async fn claude_code_anthropic_non_stream_retries_no_forwardable_reasoning_with_disabled_thinking()
-{
+async fn claude_code_anthropic_non_stream_reasoning_loop_is_returned_as_visible_text() {
     let (mut config, client, state) = spawn_mock_zen().await;
     config.claude_code_stream_no_forwardable_retry_secs = 1;
     let kernel = FreeModelKernel::new(config);
@@ -3956,19 +3955,19 @@ async fn claude_code_anthropic_non_stream_retries_no_forwardable_reasoning_with_
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(body["stop_reason"], "tool_use");
-    assert_eq!(body["content"][0]["type"], "tool_use");
-    assert_eq!(body["content"][0]["name"], "Write");
-    assert_eq!(body["content"][0]["input"]["file_path"], "guard.txt");
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(
+        body["content"][0]["text"],
+        "thinkingthinkingthinkingthinkingthinking"
+    );
     let requests = state.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert!(requests[0].thinking.is_none());
-    assert!(requests[1].thinking.is_none());
 }
 
 #[tokio::test]
-async fn claude_code_anthropic_non_stream_no_tool_retries_no_forwardable_reasoning_with_disabled_thinking(
-) {
+async fn claude_code_anthropic_non_stream_no_tool_reasoning_loop_is_returned_as_visible_text() {
     let (mut config, client, state) = spawn_mock_zen().await;
     config.claude_code_stream_no_forwardable_retry_secs = 1;
     let kernel = FreeModelKernel::new(config);
@@ -3991,11 +3990,13 @@ async fn claude_code_anthropic_non_stream_no_tool_retries_no_forwardable_reasoni
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
     assert_eq!(body["content"][0]["type"], "text");
-    assert_eq!(body["content"][0]["text"], "visible answer");
+    assert_eq!(
+        body["content"][0]["text"],
+        "thinkingthinkingthinkingthinkingthinking"
+    );
     let requests = state.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert!(requests[0].thinking.is_none());
-    assert!(requests[1].thinking.is_none());
 }
 
 #[tokio::test]

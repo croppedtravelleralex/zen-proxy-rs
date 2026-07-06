@@ -20,6 +20,7 @@ const PROVIDER_INVALID_RETRY_TAIL_CHARS: usize = 2 * 1024;
 pub(crate) enum OutputClass {
     Valid,
     Empty,
+    NoForwardable,
     ReasoningOnly,
     ReasoningOnlyLength,
 }
@@ -29,6 +30,7 @@ impl OutputClass {
         match self {
             Self::Valid => "valid",
             Self::Empty => "empty_output",
+            Self::NoForwardable => "no_forwardable_output",
             Self::ReasoningOnly => "reasoning_only",
             Self::ReasoningOnlyLength => "reasoning_only_length",
         }

@@ -482,6 +482,32 @@ fn model_supports_anthropic_breakpoints(model: &str) -> bool {
     matches!(normalized.as_str(), "bigpickle" | "mimov25" | "mimov25free")
 }
 
+pub fn apply_deepseek_stable_cache_breakpoints(body: &mut Value, request: &ChatRequest) -> usize {
+    if !model_is_deepseek_flash(&request.model) {
+        return 0;
+    }
+    let mut applied = 0usize;
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        applied += usize::from(add_cache_control_to_last_object(tools));
+    }
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return applied;
+    };
+    applied + usize::from(add_cache_control_to_role(messages, "system"))
+}
+
+fn model_is_deepseek_flash(model: &str) -> bool {
+    let normalized: String = model
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "deepseekv4flash" | "deepseekv4flashfree"
+    )
+}
+
 fn add_cache_control_to_last_object(items: &mut [Value]) -> bool {
     items
         .iter_mut()
@@ -812,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_does_not_add_anthropic_cache_control_breakpoints() {
+    fn deepseek_does_not_add_global_anthropic_cache_control_breakpoints() {
         let request = ChatRequest {
             model: "deepseek-v4-flash".into(),
             messages: vec![Message {
@@ -850,6 +876,77 @@ mod tests {
 
         assert!(package.body.get("prompt_cache_key").is_some());
         assert_eq!(count_cache_controls(&package.body), 0);
+    }
+
+    #[test]
+    fn deepseek_stable_breakpoints_only_mark_tools_and_system() {
+        let request = ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: vec![
+                Message {
+                    role: "system".into(),
+                    content: Value::String("stable system".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "user".into(),
+                    content: Value::String("current question".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+            ],
+            stream: Some(true),
+            max_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            tools: Some(vec![OpenAITool {
+                tool_type: "function".into(),
+                function: OpenAIToolFunction {
+                    name: "Read".into(),
+                    description: Some("read".into()),
+                    parameters: Some(
+                        json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                    ),
+                },
+            }]),
+            tool_choice: None,
+        };
+        let package = prepare_icp_upstream_request(
+            &request,
+            "scope",
+            "deepseek-v4-flash-free",
+            &UskContext {
+                api_key_id: "key",
+                public_model: "deepseek-v4-flash",
+                upstream_model: "deepseek-v4-flash-free",
+                source_client: "claude-code",
+            },
+            &CcpFlags {
+                icp_enabled: true,
+                prompt_cache_key: true,
+                anthropic_breakpoints: true,
+                reasoning_sidecar: true,
+                trf_strict: true,
+            },
+        );
+        let mut body = package.body;
+        assert_eq!(
+            apply_deepseek_stable_cache_breakpoints(&mut body, &request),
+            2
+        );
+        assert_eq!(count_cache_controls(&body), 2);
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(body["messages"][1]["content"], "current question");
     }
 
     fn count_cache_controls(value: &Value) -> usize {

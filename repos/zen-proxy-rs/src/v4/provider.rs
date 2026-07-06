@@ -427,16 +427,54 @@ pub async fn handle_v4_proxy(
                 &err.failure_kind,
                 &err.message,
             );
-            let mut response = error_response(err.status, err.message);
+            let mut response = error_response(err.status, err.message.clone());
             if let Some(retry_after) = err.retry_after_secs {
                 response.headers_mut().insert(
                     "retry-after",
                     HeaderValue::from_str(&retry_after.to_string()).unwrap(),
                 );
             }
+            insert_error_diagnostics_headers(response.headers_mut(), &err);
             insert_nonstream_guard_headers(response.headers_mut(), &nonstream_guard);
             insert_context_headers(response.headers_mut(), &context_telemetry);
             response
+        }
+    }
+}
+
+fn insert_error_diagnostics_headers(headers: &mut HeaderMap, err: &V4CallError) {
+    if let Ok(value) = HeaderValue::from_str(&err.retry_count.to_string()) {
+        headers.insert("x-zen-retry-count", value);
+    }
+    if !err.failure_kind.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&err.failure_kind) {
+            headers.insert("x-zen-failure-kind", value);
+        }
+    }
+    if let Some(node_id) = err
+        .selected_node_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if let Ok(value) = HeaderValue::from_str(node_id) {
+            headers.insert("x-zen-selected-node-id", value);
+        }
+    }
+    let retry_chain = err
+        .retry_chain
+        .iter()
+        .take(16)
+        .map(|attempt| {
+            format!(
+                "{}:{}:{}",
+                attempt.node_id, attempt.status, attempt.error_type
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if !retry_chain.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&retry_chain) {
+            headers.insert("x-zen-retry-chain", value);
         }
     }
 }
