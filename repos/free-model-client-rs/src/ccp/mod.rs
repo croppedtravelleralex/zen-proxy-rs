@@ -129,7 +129,11 @@ pub fn apply_prompt_cache_key(body: &mut Value, identity: &IcpIdentity, flags: &
 
 fn icp_scope_for_request(estimated_tokens: u64, prompt_hash: u64, prefix_32k_hash: u64) -> String {
     if estimated_tokens < 10_000 {
-        return format!("icp:pfull:{prompt_hash:016x}");
+        // Short and early-turn ClaudeCode requests mutate on every tool-history
+        // append. Keep them on one provider cache shard; the provider still
+        // validates exact cacheable bytes before serving a cache read.
+        let _ = prompt_hash;
+        return "icp:normal".to_string();
     }
     format!("icp:p32k:{prefix_32k_hash:016x}")
 }
@@ -224,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn usk_separates_distinct_short_prompts() {
+    fn usk_uses_normal_scope_for_distinct_short_prompts() {
         let ctx = UskContext {
             api_key_id: "key-a",
             public_model: "big-pickle",
@@ -252,10 +256,11 @@ mod tests {
         request.messages[0].content = json!("second short prompt");
         let second = compute_icp_identity(&request, &ctx);
 
-        assert!(first.icp_scope.starts_with("icp:pfull:"));
-        assert!(second.icp_scope.starts_with("icp:pfull:"));
-        assert_ne!(first.icp_scope, second.icp_scope);
-        assert_ne!(first.usk, second.usk);
+        assert_eq!(first.icp_scope, "icp:normal");
+        assert_eq!(second.icp_scope, "icp:normal");
+        assert_ne!(first.prefix_32k_hash, second.prefix_32k_hash);
+        assert_eq!(first.usk, second.usk);
+        assert_eq!(first.affinity_routing_key, second.affinity_routing_key);
     }
 
     #[test]

@@ -1,8 +1,33 @@
 # Cache 99+ 架构方案 — ICP × CCP × 五层协同
 
-更新时间：2026-07-05
-版本：**v2.7（生产 0699 真实 R2 已透传；低 R2 主因推进为 cold/no_cache_signal 与 empty_output 坏节点重试；empty_output 节点隔离已本地验证）**
+更新时间：2026-07-06
+版本：**v2.8（新增修复短请求 USK 过度分裂：`<10k` 从 `icp:pfull:{prompt_hash}` 改回文档定义的 `icp:normal`；待 GitHub release 部署后重跑真实矩阵）**
 状态：见下表 **「部署 vs 生效」** — 禁止将字段覆盖、运维部署成功或单侧面板数据写成缓存 95%+ 达成
+
+## 2026-07-06 继续排查更新
+
+新增现场事实：
+
+- 文档 3.2 明确定义 `<10k tokens` 的 `icp_scope = "normal"`，但代码实际使用 `icp:pfull:{prompt_hash}`。
+- ClaudeCode 日常开发早期/中短请求会随着 assistant/tool history 追加而改变 full prompt hash；因此 `prompt_cache_key/USK/session_id/affinity_routing_key` 会每轮变化。
+- 这类分裂不能通过 NewAPI/CCS 字段透传解决；透传只能让读数真实，不能让 provider raw R2 自动提高。
+
+本轮新增根因：
+
+1. **短请求 USK 过度分裂。** `<10k` 请求按 full prompt hash 分桶，导致同一任务早期每轮等同新 cache shard，解释了真实矩阵里 40-50% 命中长期无法抬高的一部分。
+2. **代码与架构文档不一致。** 文档要求短请求 `normal` scope，代码实现却比文档更保守，牺牲了生产复用。
+
+本轮本地修复：
+
+- `free-model-client-rs/src/ccp/mod.rs`：`icp_scope_for_request()` 将 `<10k` 请求改为固定 `icp:normal`；provider 仍按真实 cacheable bytes 验证命中，不改变模型输出语义。
+- 更新单测：不同短 prompt 的 `prefix_32k_hash` 仍可观测不同，但 `USK/affinity_routing_key` 保持一致。
+
+本轮验证：
+
+- `free-model-client-rs cargo test usk_ -- --nocapture`：4 passed。
+- `free-model-client-rs cargo fmt --check && cargo test`：157 unit + 138 kernel golden passed。
+- `free-model-client-rs cargo clippy --all-targets -- -D warnings`：passed。
+- 尚未部署到 panda；下一步必须本地构建、GitHub release asset 上传、panda 下载校验替换，禁止 scp 和 panda 编译。部署后必须按用户给定真实矩阵重新验收，不能用短 probe 宣称 85/95+。
 
 ## 2026-07-05 19:10 七次严格验收更新
 
