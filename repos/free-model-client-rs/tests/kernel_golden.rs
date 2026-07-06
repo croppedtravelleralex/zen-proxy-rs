@@ -614,6 +614,19 @@ fn content_text_parts(content: &Value) -> Vec<String> {
     }
 }
 
+fn content_text(content: &Value) -> String {
+    content_text_parts(content).join("\n")
+}
+
+fn messages_prompt_text(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .filter_map(|message| message.get("content"))
+        .flat_map(content_text_parts)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn spawn_mock_zen() -> (KernelConfig, reqwest::Client, MockState) {
     let state = MockState::default();
     let app = Router::new()
@@ -2168,7 +2181,10 @@ async fn anthropic_mixed_text_and_tool_result_keeps_tool_result_adjacent() {
     assert_eq!(messages[1]["role"], "tool");
     assert_eq!(messages[1]["tool_call_id"], stable_id);
     assert_eq!(messages[2]["role"], "user");
-    assert_eq!(messages[2]["content"], "extra user text before result");
+    assert_eq!(
+        content_text(&messages[2]["content"]),
+        "extra user text before result"
+    );
 }
 
 #[tokio::test]
@@ -2238,10 +2254,7 @@ async fn anthropic_orphan_tool_result_is_downgraded_before_upstream() {
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
     assert_eq!(messages[0]["role"], "user");
     assert!(messages[0].get("tool_call_id").is_none());
-    assert_eq!(
-        messages[0]["content"].as_str().unwrap(),
-        "orphan tool output"
-    );
+    assert_eq!(content_text(&messages[0]["content"]), "orphan tool output");
 }
 
 #[tokio::test]
@@ -3332,11 +3345,7 @@ async fn deepseek_flash_claude_code_huge_exact_output_preserves_upstream_prompt_
     let sent = state.requests.lock().unwrap();
     assert_eq!(sent.len(), 1);
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
-    let prompt = messages
-        .iter()
-        .filter_map(|message| message["content"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let prompt = messages_prompt_text(messages);
     assert!(!prompt.contains("context compactor"));
     assert!(prompt.contains("huge-section"));
     assert!(prompt.contains("Final question: output HUGE_OK only."));
@@ -3384,11 +3393,7 @@ async fn deepseek_flash_claude_code_anthropic_non_stream_preserves_large_input_b
     let sent = state.requests.lock().unwrap();
     assert_eq!(sent[0].max_tokens, Some(20_000));
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
-    let prompt = messages
-        .iter()
-        .filter_map(|message| message["content"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let prompt = messages_prompt_text(messages);
     assert!(messages.len() > 650);
     assert!(!prompt.contains("folded stale ClaudeCode tool/session history"));
     assert!(prompt.contains("old non-stream fallback loop 0"));
@@ -3487,11 +3492,7 @@ async fn deepseek_flash_claude_code_anthropic_stream_preserves_large_context_bef
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].max_tokens, Some(20_000));
     let messages = sent[0].messages.as_ref().unwrap().as_array().unwrap();
-    let prompt = messages
-        .iter()
-        .filter_map(|message| message["content"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let prompt = messages_prompt_text(messages);
     assert!(!prompt.contains("context compactor"));
     assert!(prompt.contains("Final question: describe the HUGE_OK marker."));
 }

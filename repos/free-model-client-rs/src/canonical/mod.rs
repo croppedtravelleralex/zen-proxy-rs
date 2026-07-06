@@ -447,29 +447,15 @@ fn apply_anthropic_cache_breakpoints(body: &mut Value, request: &ChatRequest, fl
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    if add_cache_control_to_role(messages, "system") {
+    if add_cache_control_to_last_role(messages, "system") {
         remaining -= 1;
     }
     if remaining == 0 {
         return;
     }
 
-    let mut candidates = Vec::new();
-    if messages.len() > 1 {
-        candidates.push(messages.len() - 2);
-    }
-    if !messages.is_empty() {
-        candidates.push(messages.len() - 1);
-    }
-    candidates.sort_unstable();
-    candidates.dedup();
-    for index in candidates {
-        if remaining == 0 {
-            break;
-        }
-        if add_cache_control_to_message_at(messages, index) {
-            remaining -= 1;
-        }
+    if remaining > 0 {
+        add_cache_control_to_last_role(messages, "user");
     }
 }
 
@@ -493,7 +479,8 @@ pub fn apply_deepseek_stable_cache_breakpoints(body: &mut Value, request: &ChatR
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return applied;
     };
-    applied + usize::from(add_cache_control_to_role(messages, "system"))
+    applied += usize::from(add_cache_control_to_last_role(messages, "system"));
+    applied + usize::from(add_cache_control_to_last_role(messages, "user"))
 }
 
 fn model_is_deepseek_flash(model: &str) -> bool {
@@ -516,9 +503,10 @@ fn add_cache_control_to_last_object(items: &mut [Value]) -> bool {
         .is_some_and(add_cache_control)
 }
 
-fn add_cache_control_to_role(messages: &mut [Value], role: &str) -> bool {
+fn add_cache_control_to_last_role(messages: &mut [Value], role: &str) -> bool {
     messages
         .iter_mut()
+        .rev()
         .find_map(|message| {
             let object = message.as_object_mut()?;
             if object
@@ -531,13 +519,6 @@ fn add_cache_control_to_role(messages: &mut [Value], role: &str) -> bool {
                 None
             }
         })
-        .is_some_and(add_cache_control_to_message)
-}
-
-fn add_cache_control_to_message_at(messages: &mut [Value], index: usize) -> bool {
-    messages
-        .get_mut(index)
-        .and_then(Value::as_object_mut)
         .is_some_and(add_cache_control_to_message)
 }
 
@@ -767,7 +748,7 @@ mod tests {
         );
 
         assert!(package.body.get("prompt_cache_key").is_some());
-        assert_eq!(count_cache_controls(&package.body), 4);
+        assert_eq!(count_cache_controls(&package.body), 3);
         assert_eq!(
             package.body["tools"][0]["cache_control"],
             json!({"type":"ephemeral"})
@@ -775,6 +756,11 @@ mod tests {
         assert_eq!(package.body["messages"][0]["cache_control"], Value::Null);
         assert_eq!(
             package.body["messages"][0]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(package.body["messages"][2]["content"], json!("second"));
+        assert_eq!(
+            package.body["messages"][3]["content"][0]["cache_control"],
             json!({"type":"ephemeral"})
         );
     }
@@ -826,10 +812,10 @@ mod tests {
         );
 
         assert!(package.body.get("prompt_cache_key").is_some());
-        assert_eq!(count_cache_controls(&package.body), 2);
+        assert_eq!(count_cache_controls(&package.body), 1);
         assert_eq!(
-            package.body["messages"][0]["content"][0]["cache_control"],
-            json!({"type":"ephemeral"})
+            package.body["messages"][0]["content"],
+            json!("stable prefix")
         );
         assert_eq!(
             package.body["messages"][1]["content"][0]["cache_control"],
@@ -879,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_stable_breakpoints_only_mark_tools_and_system() {
+    fn deepseek_stable_breakpoints_match_opencode_auto_policy() {
         let request = ChatRequest {
             model: "deepseek-v4-flash".into(),
             messages: vec![
@@ -935,9 +921,9 @@ mod tests {
         let mut body = package.body;
         assert_eq!(
             apply_deepseek_stable_cache_breakpoints(&mut body, &request),
-            2
+            3
         );
-        assert_eq!(count_cache_controls(&body), 2);
+        assert_eq!(count_cache_controls(&body), 3);
         assert_eq!(
             body["tools"][0]["cache_control"],
             json!({"type":"ephemeral"})
@@ -946,7 +932,75 @@ mod tests {
             body["messages"][0]["content"][0]["cache_control"],
             json!({"type":"ephemeral"})
         );
-        assert_eq!(body["messages"][1]["content"], "current question");
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+    }
+
+    #[test]
+    fn opencode_auto_policy_ignores_trailing_tool_result_for_message_breakpoint() {
+        let request = ChatRequest {
+            model: "mimo-v2.5".into(),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: Value::String("current user request".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: Value::String("need tool".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "tool".into(),
+                    content: Value::String("dynamic tool output".into()),
+                    tool_calls: None,
+                    tool_call_id: Some("toolu_1".into()),
+                    reasoning_content: None,
+                },
+            ],
+            stream: Some(true),
+            max_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let package = prepare_icp_upstream_request(
+            &request,
+            "scope",
+            "mimo-v2.5-free",
+            &UskContext {
+                api_key_id: "key",
+                public_model: "mimo-v2.5",
+                upstream_model: "mimo-v2.5-free",
+                source_client: "claude-code",
+            },
+            &CcpFlags {
+                icp_enabled: true,
+                prompt_cache_key: true,
+                anthropic_breakpoints: true,
+                reasoning_sidecar: true,
+                trf_strict: true,
+            },
+        );
+
+        assert_eq!(count_cache_controls(&package.body), 1);
+        assert_eq!(
+            package.body["messages"][0]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(package.body["messages"][1]["content"], json!("need tool"));
+        assert_eq!(
+            package.body["messages"][2]["content"],
+            json!("dynamic tool output")
+        );
     }
 
     fn count_cache_controls(value: &Value) -> usize {

@@ -753,6 +753,10 @@ pub(crate) fn log_final_upstream_body_fingerprint(
         .get("prompt_cache_key")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let cache_control_locations = cache_control_marker_locations(body);
+    let cache_control_block_hashes = cache_control_block_hashes(body, &cache_control_locations);
+    let official_opencode_cache_policy_match =
+        official_opencode_cache_policy_match(body, &cache_control_locations);
     tracing::info!(
         protocol,
         model = %request.model,
@@ -764,7 +768,10 @@ pub(crate) fn log_final_upstream_body_fingerprint(
         final_upstream_body_prefix_256k_hash = %hash_prefix_bytes(&raw_body, 256 * 1024),
         prompt_cache_key_present = !prompt_cache_key.is_empty(),
         prompt_cache_key_hash = %hash_str(prompt_cache_key),
-        cache_control_markers = count_cache_control_markers(body),
+        cache_control_markers = cache_control_locations.len(),
+        cache_control_locations = %cache_control_locations.join(","),
+        cache_control_block_hashes = %cache_control_block_hashes.join(","),
+        official_opencode_cache_policy_match,
         ccp_prefix_32k_hash = %format_args!("{:016x}", shape.prefix_32k_hash),
         ccp_cache_material_bytes = shape.cache_material_bytes,
         "final upstream body fingerprint before provider"
@@ -789,15 +796,120 @@ fn stable_hash64(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-fn count_cache_control_markers(value: &Value) -> u64 {
+fn cache_control_marker_locations(value: &Value) -> Vec<String> {
+    let mut locations = Vec::new();
+    collect_cache_control_marker_locations(value, "$", &mut locations);
+    locations
+}
+
+fn collect_cache_control_marker_locations(value: &Value, path: &str, locations: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
-            let own = u64::from(map.contains_key("cache_control"));
-            own + map.values().map(count_cache_control_markers).sum::<u64>()
+            if map.contains_key("cache_control") {
+                locations.push(path.to_string());
+            }
+            for (key, child) in map {
+                collect_cache_control_marker_locations(child, &format!("{path}.{key}"), locations);
+            }
         }
-        Value::Array(values) => values.iter().map(count_cache_control_markers).sum(),
-        _ => 0,
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                collect_cache_control_marker_locations(
+                    child,
+                    &format!("{path}[{index}]"),
+                    locations,
+                );
+            }
+        }
+        _ => {}
     }
+}
+
+fn cache_control_block_hashes(body: &Value, locations: &[String]) -> Vec<String> {
+    locations
+        .iter()
+        .filter_map(|location| {
+            value_at_path(body, location)
+                .and_then(|value| serde_json::to_vec(value).ok())
+                .map(|bytes| format!("{location}:{}", stable_hash64(&bytes)))
+        })
+        .collect()
+}
+
+fn official_opencode_cache_policy_match(body: &Value, actual_locations: &[String]) -> bool {
+    let mut expected = expected_opencode_cache_policy_locations(body);
+    let mut actual = actual_locations.to_vec();
+    expected.sort();
+    actual.sort();
+    expected == actual
+}
+
+fn expected_opencode_cache_policy_locations(body: &Value) -> Vec<String> {
+    let mut expected = Vec::new();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        if !tools.is_empty() {
+            expected.push(format!("$.tools[{}]", tools.len() - 1));
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        if let Some(index) = last_message_index_by_role(messages, "system") {
+            expected.push(expected_message_cache_location(messages, index));
+        }
+        if let Some(index) = last_message_index_by_role(messages, "user") {
+            expected.push(expected_message_cache_location(messages, index));
+        }
+    }
+    expected
+}
+
+fn last_message_index_by_role(messages: &[Value], role: &str) -> Option<usize> {
+    messages.iter().rposition(|message| {
+        message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == role)
+    })
+}
+
+fn expected_message_cache_location(messages: &[Value], index: usize) -> String {
+    let Some(content) = messages
+        .get(index)
+        .and_then(|message| message.get("content"))
+    else {
+        return format!("$.messages[{index}]");
+    };
+    match content {
+        Value::Array(items) => items
+            .iter()
+            .rposition(Value::is_object)
+            .map(|content_index| format!("$.messages[{index}].content[{content_index}]"))
+            .unwrap_or_else(|| format!("$.messages[{index}]")),
+        Value::Object(_) => format!("$.messages[{index}].content"),
+        _ => format!("$.messages[{index}]"),
+    }
+}
+
+fn value_at_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    let mut rest = path.strip_prefix('$')?;
+    while !rest.is_empty() {
+        if let Some(next) = rest.strip_prefix('.') {
+            let end = next.find(['.', '[']).unwrap_or(next.len());
+            let key = &next[..end];
+            current = current.get(key)?;
+            rest = &next[end..];
+            continue;
+        }
+        if let Some(next) = rest.strip_prefix('[') {
+            let end = next.find(']')?;
+            let index = next[..end].parse::<usize>().ok()?;
+            current = current.get(index)?;
+            rest = &next[end + 1..];
+            continue;
+        }
+        return None;
+    }
+    Some(current)
 }
 
 pub(crate) fn log_provider_cache_observation(
@@ -898,6 +1010,54 @@ mod tests {
             tools: None,
             tool_choice,
         }
+    }
+
+    #[test]
+    fn official_opencode_cache_policy_match_accepts_tools_system_latest_user() {
+        let body = serde_json::json!({
+            "tools": [
+                {"type": "function", "function": {"name": "Read"}, "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": [{"type": "text", "text": "latest", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let locations = cache_control_marker_locations(&body);
+
+        assert_eq!(
+            locations,
+            vec![
+                "$.messages[0].content[0]".to_string(),
+                "$.messages[3].content[0]".to_string(),
+                "$.tools[0]".to_string(),
+            ]
+        );
+        assert!(official_opencode_cache_policy_match(&body, &locations));
+        assert_eq!(cache_control_block_hashes(&body, &locations).len(), 3);
+    }
+
+    #[test]
+    fn official_opencode_cache_policy_match_rejects_trailing_tool_marker() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "latest", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": "need tool"},
+                {"role": "tool", "content": [{"type": "text", "text": "dynamic", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let locations = cache_control_marker_locations(&body);
+
+        assert_eq!(
+            locations,
+            vec![
+                "$.messages[0].content[0]".to_string(),
+                "$.messages[2].content[0]".to_string(),
+            ]
+        );
+        assert!(!official_opencode_cache_policy_match(&body, &locations));
     }
 
     #[test]

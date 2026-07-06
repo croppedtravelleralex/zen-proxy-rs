@@ -1,7 +1,7 @@
 # Cache 99+ 架构方案 — ICP × CCP × 五层协同
 
 更新时间：2026-07-06
-版本：**v2.9（真实四项目矩阵已跑完：字段/USK 修复后仍未达 85/95，下一阶段必须转向 provider raw cacheable segment 稳定）**
+版本：**v3.0（已对齐官方 opencode auto cache policy；仍需真实矩阵证明 provider R2 是否提升）**
 状态：见下表 **「部署 vs 生效」** — 禁止将字段覆盖、运维部署成功或单侧面板数据写成缓存 95%+ 达成
 
 ## 2026-07-06 真实矩阵结论
@@ -17,6 +17,36 @@ Windows ClaudeCode → cc-switch → 本地 ZenProxy → Webshare → opencode �
 opencode 原生对照已跑完，不能简单归纳为“原生总是更快/更好”：DeepSeek Tide 原生质量明显更好但更慢；Mimo 多数反代输出更完整；BigPickle 原生 MiroFish timeout。真正问题不是 UI 字段传输，而是 ClaudeCode 工具历史下 provider 真实可缓存段仍不稳定。
 
 当前不得上线宣称 cache fix 达标。下一阶段必须以 `raw provider cacheable segment` 为验收对象，做 cache_control 分段、工具历史动态段隔离和同一 prompt_cache_key 下 raw segment hash 对账。
+
+## 2026-07-06 opencode auto cache policy 对齐
+
+官方 opencode `v1.17.13` 和未发布 `dev` 分支核对结论：
+
+- 最小 LLM 请求单位是 provider turn/step；工具调用后下一轮会带投影后的完整历史。
+- 默认 cache policy 是 `tools -> system -> latest real user message`，Anthropic wire 最多 4 个 breakpoint。
+- `dev` 分支未改 `cache-policy.ts` 或 `anthropic-messages.ts`，不需要追未发布缓存逻辑。
+
+本轮本地修复：
+
+- `free-model-client-rs/src/canonical/mod.rs`：Mimo/BigPickle 不再给尾部 assistant/tool 结果加 cache_control，只标 last tool、last system、latest user。
+- DeepSeek stable breakpoint 从 tools+system 扩为 tools+system+latest user，用测试覆盖，后续必须用真实 provider R2 判断是否收益或引入 provider 400。
+- `free-model-client-rs/src/proxy/mod.rs`：新增 `cache_control_locations`、`cache_control_block_hashes`、`official_opencode_cache_policy_match` 日志字段；只输出路径和 hash，不输出 prompt/tool 原文。
+- `kernel_golden` 测试改为兼容 string 和 content block 两种上游 body 形态，避免把 cache_control text block 误判为 prompt 丢失。
+
+本轮验证：
+
+- 失败证明：修改测试后，旧实现 BigPickle/Mimo/DeepSeek 相关 cache policy 测试失败，证明旧实现确实偏离官方 opencode policy。
+- `free-model-client-rs cargo fmt --check`：passed。
+- `free-model-client-rs CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings`：passed。
+- `free-model-client-rs CARGO_INCREMENTAL=0 cargo test`：163 unit + 138 kernel golden + doc tests passed。
+- `zen-proxy-rs CARGO_INCREMENTAL=0 cargo test`：220 unit + 44 e2e passed。
+- `zen-proxy-rs cargo fmt --check`：passed。
+- `zen-proxy-rs CARGO_INCREMENTAL=0 cargo clippy --all-targets -- -D warnings`：passed。
+
+边界：
+
+- 这次只证明 ZenProxy/FMC 上游 body 形态已按官方 opencode auto policy 对齐，不证明生产 R2 已到 85/95。
+- 下一步必须走 GitHub release 部署到 panda 后跑用户指定四项目真实矩阵，并按 provider R2 + NewAPI/CCS 统一口径验收。
 
 ## 2026-07-06 继续排查更新
 
