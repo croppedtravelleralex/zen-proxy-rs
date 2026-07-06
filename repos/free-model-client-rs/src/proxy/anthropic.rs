@@ -314,6 +314,7 @@ pub async fn handle_anthropic_messages(
         }
         return Ok(text_resp(ts, &cr.model, "ok", input_tokens, output_tokens));
     }
+    super::log_final_upstream_body_fingerprint("anthropic", &cr, profile, &zb);
     if body.stream.unwrap_or(false) {
         let exact_output_literal = translate::exact_output_literal_from_messages(&cr.messages);
         let claude_code_buffer_reason = claude_code_buffered_stream_reason(

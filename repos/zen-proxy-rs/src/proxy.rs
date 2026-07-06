@@ -247,6 +247,7 @@ pub async fn proxy_handler(
                 usk: String::new(),
                 icp_scope: String::new(),
                 prefix_32k_hash: String::new(),
+                cache_forensics: None,
                 prefix_drift: false,
                 session_pin_hit: false,
                 thinking_policy: String::new(),

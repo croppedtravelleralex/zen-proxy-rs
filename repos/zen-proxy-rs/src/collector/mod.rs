@@ -72,6 +72,8 @@ pub struct RequestTelemetry {
     pub icp_scope: String,
     #[serde(default)]
     pub prefix_32k_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_forensics: Option<CacheForensicsTelemetry>,
     #[serde(default)]
     pub prefix_drift: bool,
     #[serde(default)]
@@ -93,6 +95,31 @@ pub struct RequestTelemetry {
     #[serde(default)]
     pub retry_chain: Vec<RequestAttemptTelemetry>,
     pub context: Option<ContextTelemetry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheForensicsTelemetry {
+    pub ccp_prompt_hash: String,
+    pub ccp_prefix_4k_hash: String,
+    pub ccp_prefix_32k_hash: String,
+    pub ccp_prefix_128k_hash: String,
+    pub ccp_prefix_256k_hash: String,
+    pub ccp_cache_material_bytes: u64,
+    pub raw_body_prefix_4k_hash: String,
+    pub raw_body_prefix_32k_hash: String,
+    pub raw_body_prefix_128k_hash: String,
+    pub raw_body_prefix_256k_hash: String,
+    pub raw_body_bytes: u64,
+    pub estimated_total_tokens: u64,
+    pub message_count: u64,
+    pub tool_count: u64,
+    pub tools_hash: String,
+    pub roles_hash: String,
+    pub tool_result_bytes: u64,
+    pub tool_result_count: u64,
+    pub ccp_raw_prefix_match_32k: bool,
+    pub fork_key: String,
+    pub fork_reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

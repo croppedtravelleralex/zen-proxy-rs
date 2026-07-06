@@ -230,6 +230,7 @@ pub async fn handle_openai_chat(
             prompt_tokens + completion_tokens,
         ));
     }
+    super::log_final_upstream_body_fingerprint("openai", &cr, profile, &zb);
     if body.stream.unwrap_or(false) {
         handle_oa_stream(client, config, &cr, &zb, profile, &upstream_headers).await
     } else {

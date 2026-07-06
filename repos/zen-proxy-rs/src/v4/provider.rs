@@ -17,8 +17,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::collector::{
-    DataCollector, ProtocolGuardTelemetry, RequestAttemptTelemetry, RequestTelemetry,
-    RequestTimings,
+    CacheForensicsTelemetry, DataCollector, ProtocolGuardTelemetry, RequestAttemptTelemetry,
+    RequestTelemetry, RequestTimings,
 };
 use crate::config::Config;
 use crate::ledger::LedgerEvent;
@@ -178,6 +178,14 @@ pub async fn handle_v4_proxy(
 
     let ccp_snap_preflight =
         build_ccp_audit_snap_preflight(&session_id, &usk, &icp_scope, &prefix_32k_hash);
+    let cache_forensics = build_cache_forensics(
+        path,
+        &upstream_body,
+        &resolved.upstream_model,
+        &source_client,
+        &cache_api_key_id,
+        client_id,
+    );
     let thinking_policy = infer_thinking_policy(&upstream_body);
 
     let request_meta = RequestMeta {
@@ -290,6 +298,7 @@ pub async fn handle_v4_proxy(
                 usk: ccp_snap.usk,
                 icp_scope: ccp_snap.icp_scope,
                 prefix_32k_hash: ccp_snap.prefix_32k_hash,
+                cache_forensics: cache_forensics.clone(),
                 prefix_drift: ccp_snap.prefix_drift,
                 session_pin_hit: result.session_pin_hit,
                 thinking_policy: ccp_snap.thinking_policy,
@@ -395,6 +404,7 @@ pub async fn handle_v4_proxy(
                     usk: ccp_snap_preflight.usk.clone(),
                     icp_scope: ccp_snap_preflight.icp_scope.clone(),
                     prefix_32k_hash: ccp_snap_preflight.prefix_32k_hash.clone(),
+                    cache_forensics: cache_forensics.clone(),
                     prefix_drift: ccp_snap_preflight.prefix_drift,
                     session_pin_hit: false,
                     thinking_policy: thinking_policy.clone(),
@@ -653,6 +663,163 @@ fn resolve_session_identity(
         );
     }
     (String::new(), String::new(), String::new(), client_bucket)
+}
+
+#[derive(Debug, Clone)]
+struct CacheForkShape {
+    ccp_prefix_32k_hash: String,
+    raw_body_prefix_32k_hash: String,
+    tools_hash: String,
+    roles_hash: String,
+    message_count: u64,
+    tool_count: u64,
+    tool_result_bytes: u64,
+}
+
+fn build_cache_forensics(
+    path: &str,
+    body: &Value,
+    upstream_model: &str,
+    source_client: &str,
+    cache_api_key_id: &str,
+    fallback_client_id: &str,
+) -> Option<CacheForensicsTelemetry> {
+    let request = cache_identity_chat_request(path, body)?;
+    let shape = translate::request_shape(&request);
+    let raw_body = serde_json::to_vec(body).unwrap_or_default();
+    let tools_json = request
+        .tools
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let roles = request
+        .messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let (tool_result_bytes, tool_result_count) = tool_result_stats(&request);
+    let client_bucket = if fallback_client_id.trim().is_empty() {
+        "anon".to_string()
+    } else {
+        LedgerEvent::short_hash(fallback_client_id)
+    };
+    let source_bucket = if source_client.trim().is_empty() {
+        "unknown"
+    } else {
+        source_client.trim()
+    };
+    let fork_key = LedgerEvent::short_hash(&format!(
+        "{cache_api_key_id}:{upstream_model}:{path}:{source_bucket}:{client_bucket}"
+    ));
+    let mut telemetry = CacheForensicsTelemetry {
+        ccp_prompt_hash: format!("{:016x}", shape.prompt_hash),
+        ccp_prefix_4k_hash: format!("{:016x}", shape.prefix_4k_hash),
+        ccp_prefix_32k_hash: format!("{:016x}", shape.prefix_32k_hash),
+        ccp_prefix_128k_hash: format!("{:016x}", shape.prefix_128k_hash),
+        ccp_prefix_256k_hash: format!("{:016x}", shape.prefix_256k_hash),
+        ccp_cache_material_bytes: shape.cache_material_bytes as u64,
+        raw_body_prefix_4k_hash: hash_prefix_bytes(&raw_body, 4 * 1024),
+        raw_body_prefix_32k_hash: hash_prefix_bytes(&raw_body, 32 * 1024),
+        raw_body_prefix_128k_hash: hash_prefix_bytes(&raw_body, 128 * 1024),
+        raw_body_prefix_256k_hash: hash_prefix_bytes(&raw_body, 256 * 1024),
+        raw_body_bytes: raw_body.len() as u64,
+        estimated_total_tokens: shape.estimated_total_tokens,
+        message_count: shape.message_count as u64,
+        tool_count: shape.tool_count as u64,
+        tools_hash: LedgerEvent::short_hash(&tools_json),
+        roles_hash: LedgerEvent::short_hash(&roles),
+        tool_result_bytes,
+        tool_result_count,
+        ccp_raw_prefix_match_32k: false,
+        fork_key,
+        fork_reason: String::new(),
+    };
+    telemetry.ccp_raw_prefix_match_32k =
+        telemetry.ccp_prefix_32k_hash == telemetry.raw_body_prefix_32k_hash;
+    telemetry.fork_reason = classify_cache_fork(&telemetry);
+    Some(telemetry)
+}
+
+fn tool_result_stats(request: &ChatRequest) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut count = 0u64;
+    for message in &request.messages {
+        if message.role != "tool" {
+            continue;
+        }
+        count = count.saturating_add(1);
+        let len = match &message.content {
+            Value::String(text) => text.len(),
+            other => serde_json::to_vec(other)
+                .map(|value| value.len())
+                .unwrap_or(0),
+        };
+        bytes = bytes.saturating_add(len as u64);
+    }
+    (bytes, count)
+}
+
+fn hash_prefix_bytes(bytes: &[u8], prefix_bytes: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let len = bytes.len().min(prefix_bytes);
+    let digest = Sha256::digest(&bytes[..len]);
+    hex16(&digest)
+}
+
+fn hex16(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn classify_cache_fork(current: &CacheForensicsTelemetry) -> String {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static LAST: OnceLock<Mutex<HashMap<String, CacheForkShape>>> = OnceLock::new();
+    let store = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match store.lock() {
+        Ok(guard) => guard,
+        Err(_) => return "unknown".to_string(),
+    };
+    let previous = guard.insert(
+        current.fork_key.clone(),
+        CacheForkShape {
+            ccp_prefix_32k_hash: current.ccp_prefix_32k_hash.clone(),
+            raw_body_prefix_32k_hash: current.raw_body_prefix_32k_hash.clone(),
+            tools_hash: current.tools_hash.clone(),
+            roles_hash: current.roles_hash.clone(),
+            message_count: current.message_count,
+            tool_count: current.tool_count,
+            tool_result_bytes: current.tool_result_bytes,
+        },
+    );
+    let Some(previous) = previous else {
+        return "baseline".to_string();
+    };
+    if previous.raw_body_prefix_32k_hash == current.raw_body_prefix_32k_hash {
+        return "raw_prefix_stable".to_string();
+    }
+    if previous.ccp_prefix_32k_hash == current.ccp_prefix_32k_hash {
+        return "raw_prefix_drift_with_stable_ccp_identity".to_string();
+    }
+    if previous.tools_hash != current.tools_hash || previous.tool_count != current.tool_count {
+        return "tools_schema_drift".to_string();
+    }
+    if previous.roles_hash != current.roles_hash {
+        return "message_roles_drift".to_string();
+    }
+    if previous.tool_result_bytes != current.tool_result_bytes {
+        return "tool_result_payload_drift".to_string();
+    }
+    if previous.message_count != current.message_count {
+        return "message_history_growth".to_string();
+    }
+    "ccp_prefix_drift".to_string()
 }
 
 fn compute_cache_identity(

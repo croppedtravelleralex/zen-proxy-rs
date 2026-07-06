@@ -691,6 +691,65 @@ pub(crate) fn log_request_shape(
     );
 }
 
+pub(crate) fn log_final_upstream_body_fingerprint(
+    protocol: &'static str,
+    request: &ChatRequest,
+    profile: ClientProfile,
+    body: &Value,
+) {
+    let shape = translate::request_shape(request);
+    let raw_body = serde_json::to_vec(body).unwrap_or_default();
+    let prompt_cache_key = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    tracing::info!(
+        protocol,
+        model = %request.model,
+        source_client = ?profile.kind,
+        final_upstream_body_bytes = raw_body.len(),
+        final_upstream_body_prefix_4k_hash = %hash_prefix_bytes(&raw_body, 4 * 1024),
+        final_upstream_body_prefix_32k_hash = %hash_prefix_bytes(&raw_body, 32 * 1024),
+        final_upstream_body_prefix_128k_hash = %hash_prefix_bytes(&raw_body, 128 * 1024),
+        final_upstream_body_prefix_256k_hash = %hash_prefix_bytes(&raw_body, 256 * 1024),
+        prompt_cache_key_present = !prompt_cache_key.is_empty(),
+        prompt_cache_key_hash = %hash_str(prompt_cache_key),
+        cache_control_markers = count_cache_control_markers(body),
+        ccp_prefix_32k_hash = %format_args!("{:016x}", shape.prefix_32k_hash),
+        ccp_cache_material_bytes = shape.cache_material_bytes,
+        "final upstream body fingerprint before provider"
+    );
+}
+
+fn hash_prefix_bytes(bytes: &[u8], prefix_bytes: usize) -> String {
+    let len = bytes.len().min(prefix_bytes);
+    stable_hash64(&bytes[..len])
+}
+
+fn hash_str(value: &str) -> String {
+    stable_hash64(value.as_bytes())
+}
+
+fn stable_hash64(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn count_cache_control_markers(value: &Value) -> u64 {
+    match value {
+        Value::Object(map) => {
+            let own = u64::from(map.contains_key("cache_control"));
+            own + map.values().map(count_cache_control_markers).sum::<u64>()
+        }
+        Value::Array(values) => values.iter().map(count_cache_control_markers).sum(),
+        _ => 0,
+    }
+}
+
 pub(crate) fn log_provider_cache_observation(
     protocol: &'static str,
     request: &ChatRequest,
