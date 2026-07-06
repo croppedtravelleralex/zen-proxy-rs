@@ -384,7 +384,44 @@ fn is_risky_claude_code_tool_history_request(
     if missing_reasoning {
         return true;
     }
+    if has_visible_tool_history(request) {
+        return true;
+    }
+    if has_risky_tool_schema(request) {
+        return true;
+    }
     false
+}
+
+fn has_visible_tool_history(request: &ChatRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message.role == "tool"
+            || message.tool_call_id.is_some()
+            || message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tool_calls| !tool_calls.is_empty())
+    })
+}
+
+fn has_risky_tool_schema(request: &ChatRequest) -> bool {
+    request.tools.as_ref().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            let Some(parameters) = &tool.function.parameters else {
+                return false;
+            };
+            let Some(object) = parameters.as_object() else {
+                return true;
+            };
+            object.get("type").and_then(Value::as_str) != Some("object")
+                || !object.get("properties").is_some_and(Value::is_object)
+                || object.get("required").is_some_and(|required| {
+                    !required
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string))
+                })
+        })
+    })
 }
 
 fn sanitize_upstream_tools(body: &mut Value) -> usize {
@@ -1067,6 +1104,92 @@ mod tests {
         );
 
         assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
+    }
+
+    #[test]
+    fn provider_invalid_retries_schema_sanitize_even_without_downgrade() {
+        let request = repaired_claude_code_nonstream_tool_request();
+        let mode = provider_invalid_tool_history_retry_mode(
+            &provider_invalid_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            translate::ToolHistoryRepair::default(),
+            false,
+            false,
+        );
+
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
+    }
+
+    #[test]
+    fn provider_invalid_retries_visible_tool_history_even_without_downgrade() {
+        let mut request = repaired_claude_code_nonstream_tool_request();
+        request.tools = Some(vec![OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: "Read".to_string(),
+                description: Some("read".to_string()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"]
+                })),
+            },
+        }]);
+        request.messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::Null,
+            tool_calls: Some(vec![crate::protocol::types::ToolCall {
+                id: Some("call_runtime".to_string()),
+                call_type: "function".to_string(),
+                function: crate::protocol::types::ToolFunction {
+                    name: "Read".to_string(),
+                    arguments: r#"{"file_path":"README.md"}"#.to_string(),
+                },
+                index: Some(0),
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+
+        let mode = provider_invalid_tool_history_retry_mode(
+            &provider_invalid_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            translate::ToolHistoryRepair::default(),
+            false,
+            false,
+        );
+
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
+    }
+
+    #[test]
+    fn provider_invalid_does_not_retry_simple_valid_tool_request() {
+        let mut request = repaired_claude_code_nonstream_tool_request();
+        request.tools = Some(vec![OpenAITool {
+            tool_type: "function".to_string(),
+            function: OpenAIToolFunction {
+                name: "Read".to_string(),
+                description: Some("read".to_string()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"]
+                })),
+            },
+        }]);
+
+        let mode = provider_invalid_tool_history_retry_mode(
+            &provider_invalid_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            translate::ToolHistoryRepair::default(),
+            false,
+            false,
+        );
+
+        assert_eq!(mode, None);
     }
 
     #[test]

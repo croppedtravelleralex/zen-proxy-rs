@@ -1784,7 +1784,8 @@ def run_windows_claudecode(
                 "error_class": "config_error",
                 "config_mode": "windows-native",
             }
-        cmd = claude_command(case, model, base_url, windows=True, include_settings=True, api_key=key)
+        # Windows ClaudeCode rejects empty --setting-sources; env carries base_url/key.
+        cmd = claude_command(case, model, base_url, windows=True, include_settings=False, api_key=key)
         cmd[0] = claude
         rec = run_process(cmd, workspace, env, timeout_ms, prompt_text)
         result, usage, tool_count, first_content_offset = extract_claude_stream(rec.get("stdout", ""))
@@ -1821,7 +1822,8 @@ def run_windows_claudecode(
     prompt_path = workspace / f"prompt-{uuid.uuid4().hex}.txt"
     prompt_path.write_text(prompt_text, encoding="utf-8")
     win_prompt = wsl_to_windows_path(prompt_path)
-    args = claude_command(case, model, base_url, windows=True, include_settings=True, api_key=key)
+    # Windows ClaudeCode rejects empty --setting-sources; env carries base_url/key.
+    args = claude_command(case, model, base_url, windows=True, include_settings=False, api_key=key)
     ps_args = " ".join(powershell_quote(arg) for arg in args[1:])
     ps = (
         powershell_env_assignments(env)

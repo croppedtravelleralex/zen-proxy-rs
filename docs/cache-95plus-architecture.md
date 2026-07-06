@@ -1,8 +1,22 @@
 # Cache 99+ 架构方案 — ICP × CCP × 五层协同
 
 更新时间：2026-07-06
-版本：**v2.8（新增修复短请求 USK 过度分裂：`<10k` 从 `icp:pfull:{prompt_hash}` 改回文档定义的 `icp:normal`；待 GitHub release 部署后重跑真实矩阵）**
+版本：**v2.9（真实四项目矩阵已跑完：字段/USK 修复后仍未达 85/95，下一阶段必须转向 provider raw cacheable segment 稳定）**
 状态：见下表 **「部署 vs 生效」** — 禁止将字段覆盖、运维部署成功或单侧面板数据写成缓存 95%+ 达成
+
+## 2026-07-06 真实矩阵结论
+
+Windows ClaudeCode → cc-switch → 本地 ZenProxy → Webshare → opencode 四项目矩阵已跑完：
+
+| model | provider audit R2 | 结论 |
+|---|---:|---|
+| deepseek-v4-flash | 50.89% | 未达 85/95，且有一个 wrapper timeout |
+| mimo-v2.5 | 79.88% | 最接近，但仍未达 85；CCS denominator 口径更低 |
+| big-pickle | 60.63% | 未达标，MiroFish 单项只有 2.05% |
+
+opencode 原生对照已跑完，不能简单归纳为“原生总是更快/更好”：DeepSeek Tide 原生质量明显更好但更慢；Mimo 多数反代输出更完整；BigPickle 原生 MiroFish timeout。真正问题不是 UI 字段传输，而是 ClaudeCode 工具历史下 provider 真实可缓存段仍不稳定。
+
+当前不得上线宣称 cache fix 达标。下一阶段必须以 `raw provider cacheable segment` 为验收对象，做 cache_control 分段、工具历史动态段隔离和同一 prompt_cache_key 下 raw segment hash 对账。
 
 ## 2026-07-06 继续排查更新
 

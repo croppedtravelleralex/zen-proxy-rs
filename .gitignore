@@ -18,11 +18,13 @@ __pycache__/
 # Local env, credentials, and raw logs
 .env
 .env.*
+ops/local-dev/local.env
 *.log
 logs/
 **/logs/raw/
 test-records/runs/
 **/test-records/runs/
+.local-dev/
 
 # Artifact drop zone; keep the directory documented but do not commit raw outputs.
 artifacts/*

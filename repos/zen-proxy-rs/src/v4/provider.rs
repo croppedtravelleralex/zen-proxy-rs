@@ -1447,12 +1447,14 @@ async fn call_with_retry(
     let compatibility_profile = call_context.compatibility_profile;
     let source_client = call_context.source_client;
     let base_max = conf.pool_max_retries;
-    let empty_upstream_max = conf.v4_empty_upstream_max_retries.max(base_max);
+    let configured_empty_upstream_max = conf.v4_empty_upstream_max_retries.max(base_max);
+    let empty_upstream_max =
+        effective_empty_upstream_max_retries(path, &request_meta, configured_empty_upstream_max);
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut was_rate_limited = false;
     let mut dispatch_wait_ms = 0u64;
     let mut retry_chain = Vec::new();
-    let retry_budget_ms = conf.v4_retry_budget_ms;
+    let retry_budget_ms = effective_retry_budget_ms(path, &request_meta, conf.v4_retry_budget_ms);
     let mut force_direct_next = false;
 
     for attempt in 0..=empty_upstream_max {
@@ -1964,6 +1966,44 @@ async fn call_with_retry(
 
 fn retry_chain_latency_ms(retry_chain: &[RequestAttemptTelemetry]) -> u64 {
     retry_chain.iter().map(|attempt| attempt.latency_ms).sum()
+}
+
+fn effective_empty_upstream_max_retries(
+    path: &str,
+    request_meta: &RequestMeta,
+    configured_max: u32,
+) -> u32 {
+    if !is_mimo_messages_request(path, request_meta) {
+        return configured_max;
+    }
+    if request_meta.estimated_input_tokens() >= 10_000 {
+        return configured_max.min(2);
+    }
+    configured_max.min(4)
+}
+
+fn effective_retry_budget_ms(
+    path: &str,
+    request_meta: &RequestMeta,
+    configured_budget_ms: u64,
+) -> u64 {
+    if configured_budget_ms == 0 || !is_mimo_messages_request(path, request_meta) {
+        return configured_budget_ms;
+    }
+    let estimated_tokens = request_meta.estimated_input_tokens();
+    if estimated_tokens >= 50_000 {
+        return configured_budget_ms.min(20_000);
+    }
+    if estimated_tokens >= 10_000 {
+        return configured_budget_ms.min(30_000);
+    }
+    configured_budget_ms
+}
+
+fn is_mimo_messages_request(path: &str, request_meta: &RequestMeta) -> bool {
+    path == "messages"
+        && (crate::pool::session_pin::is_mimo_family(&request_meta.model)
+            || crate::pool::session_pin::is_mimo_family(&request_meta.upstream_model))
 }
 
 fn retry_budget_message(
@@ -3322,6 +3362,59 @@ mod tests {
                 body: $body,
             })
         }};
+    }
+
+    fn request_meta(model: &str, upstream_model: &str, body_size: u64) -> RequestMeta {
+        RequestMeta {
+            model: model.to_string(),
+            upstream_model: upstream_model.to_string(),
+            session_id: "session".to_string(),
+            stream: true,
+            body_size,
+            affinity_key: "affinity".to_string(),
+            allow_direct_fallback: false,
+        }
+    }
+
+    #[test]
+    fn mimo_large_messages_caps_empty_output_retries() {
+        let meta = request_meta("mimo-v2.5", "mimo-v2.5-free", 40_000);
+
+        assert_eq!(
+            effective_empty_upstream_max_retries("messages", &meta, 12),
+            2
+        );
+        assert_eq!(effective_retry_budget_ms("messages", &meta, 45_000), 30_000);
+    }
+
+    #[test]
+    fn mimo_huge_messages_caps_retry_budget_more_aggressively() {
+        let meta = request_meta("mimo-v2.5", "mimo-v2.5-free", 220_000);
+
+        assert_eq!(
+            effective_empty_upstream_max_retries("messages", &meta, 12),
+            2
+        );
+        assert_eq!(effective_retry_budget_ms("messages", &meta, 45_000), 20_000);
+    }
+
+    #[test]
+    fn mimo_retry_cap_does_not_affect_chat_or_other_models() {
+        let mimo = request_meta("mimo-v2.5", "mimo-v2.5-free", 220_000);
+        let deepseek = request_meta("deepseek-v4-flash", "deepseek-v4-flash-free", 220_000);
+
+        assert_eq!(
+            effective_empty_upstream_max_retries("chat/completions", &mimo, 12),
+            12
+        );
+        assert_eq!(
+            effective_empty_upstream_max_retries("messages", &deepseek, 12),
+            12
+        );
+        assert_eq!(
+            effective_retry_budget_ms("messages", &deepseek, 45_000),
+            45_000
+        );
     }
 
     #[test]
