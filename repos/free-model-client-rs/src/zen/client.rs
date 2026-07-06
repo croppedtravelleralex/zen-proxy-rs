@@ -574,11 +574,36 @@ pub async fn collect_stream_parts(
             apply_sse_frame_to_collection(frame, &mut collected)?;
         }
     }
-    parser.finish()?;
+    if let Err(err) = parser.finish() {
+        if !has_collected_output_signal(&collected) {
+            return Err(err);
+        }
+        tracing::warn!(
+            content_chars = collected.content.chars().count(),
+            reasoning_chars = collected.reasoning.chars().count(),
+            tool_calls = collected.tool_calls.len(),
+            "accepting truncated upstream stream because parsed output is usable"
+        );
+        return Ok(collected);
+    }
     if !collected.saw_done && collected.finish_reason.is_none() {
-        return Err(truncated_stream_error());
+        if !has_collected_output_signal(&collected) {
+            return Err(truncated_stream_error());
+        }
+        tracing::warn!(
+            content_chars = collected.content.chars().count(),
+            reasoning_chars = collected.reasoning.chars().count(),
+            tool_calls = collected.tool_calls.len(),
+            "accepting upstream stream without terminal marker because parsed output is usable"
+        );
     }
     Ok(collected)
+}
+
+fn has_collected_output_signal(collected: &CollectedStream) -> bool {
+    !collected.content.trim().is_empty()
+        || !collected.reasoning.trim().is_empty()
+        || !collected.tool_calls.is_empty()
 }
 
 pub fn stream_sse_events(
@@ -1158,5 +1183,41 @@ mod tests {
         assert!(parser.next_frame().unwrap().is_none());
         let err = parser.finish().unwrap_err();
         assert!(err.message.contains("stream truncated"));
+    }
+
+    #[test]
+    fn collected_output_signal_accepts_content_without_terminal_marker() {
+        let mut collected = CollectedStream::default();
+        apply_sse_frame_to_collection(
+            SseFrame {
+                data: r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}"#
+                    .to_string(),
+                ..SseFrame::default()
+            },
+            &mut collected,
+        )
+        .unwrap();
+
+        assert!(has_collected_output_signal(&collected));
+        assert_eq!(collected.content, "ok");
+        assert!(!collected.saw_done);
+        assert!(collected.finish_reason.is_none());
+    }
+
+    #[test]
+    fn collected_output_signal_rejects_empty_without_terminal_marker() {
+        let mut collected = CollectedStream::default();
+        apply_sse_frame_to_collection(
+            SseFrame {
+                data: r#"{"choices":[{"delta":{},"finish_reason":null}]}"#.to_string(),
+                ..SseFrame::default()
+            },
+            &mut collected,
+        )
+        .unwrap();
+
+        assert!(!has_collected_output_signal(&collected));
+        assert!(!collected.saw_done);
+        assert!(collected.finish_reason.is_none());
     }
 }
