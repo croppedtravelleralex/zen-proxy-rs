@@ -73,6 +73,22 @@ class PandaPressureRunnerHarnessTests(unittest.TestCase):
         self.assertTrue(all(case.expected_effective_client == "unknown" for case in lite_cases))
         self.assertTrue(all(case.tools for case in lite_cases))
 
+    def test_policy_plan_respects_single_model_key_scope(self):
+        runner = load_runner()
+
+        for model in ["deepseek-v4-flash", "mimo-v2.5", "big-pickle"]:
+            with self.subTest(model=model):
+                plan = runner.build_policy_plan("policy-smoke", [model])
+
+                self.assertTrue(plan)
+                self.assertEqual({case.model for case in plan}, {model})
+                self.assertEqual({case.protocol for case in plan}, {"openai", "anthropic"})
+                self.assertTrue(
+                    {"provider_usage_probe", "cache_probe"}.issubset(
+                        {case.case_type for case in plan}
+                    )
+                )
+
     def test_claudecode_timeout_takes_precedence_over_stream_text_auth_words(self):
         runner = load_runner()
         tmp_dir = tempfile.TemporaryDirectory()

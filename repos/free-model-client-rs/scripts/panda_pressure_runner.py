@@ -705,14 +705,22 @@ def build_plan(mode: str, rounds: int | None) -> list[CaseSpec]:
     raise ValueError(f"unsupported mode: {mode}")
 
 
-def select_policy_models(models: list[str]) -> tuple[str, str]:
-    flash = next((model for model in models if "flash" in model and "lite" not in model), DEFAULT_MODELS[0])
-    lite = next((model for model in models if "lite" in model), DEFAULT_MODELS[1])
+def select_policy_models(models: list[str]) -> tuple[str | None, str | None]:
+    flash = next((model for model in models if "flash" in model and "lite" not in model), None)
+    lite = next(
+        (
+            model
+            for model in models
+            if "lite" in model.lower() or "pickle" in model.lower()
+        ),
+        None,
+    )
     return flash, lite
 
 
 def build_policy_plan(mode: str, models: list[str]) -> list[PolicyCaseSpec]:
     flash, lite = select_policy_models(models)
+    policy_models = models or list(DEFAULT_MODELS)
     if mode == "policy-smoke":
         input_tokens = 8_000
         output_tokens = 256
@@ -724,30 +732,35 @@ def build_policy_plan(mode: str, models: list[str]) -> list[PolicyCaseSpec]:
 
     cases: list[PolicyCaseSpec] = []
     for protocol in ("openai", "anthropic"):
-        cases.extend(
-            [
-                PolicyCaseSpec(
-                    case_type="flash_input_room",
-                    protocol=protocol,
-                    model=flash,
-                    stream=True,
-                    client_header="claude-code",
-                    max_tokens=512,
-                    prompt_target_tokens=input_tokens,
-                    expected_source_client="claude-code",
-                    expected_effective_client="claude-code",
-                ),
-                PolicyCaseSpec(
-                    case_type="flash_output_room",
-                    protocol=protocol,
-                    model=flash,
-                    stream=True,
-                    client_header="claude-code",
-                    max_tokens=4096,
-                    expected_min_output_tokens=output_tokens,
-                    expected_source_client="claude-code",
-                    expected_effective_client="claude-code",
-                ),
+        if flash:
+            cases.extend(
+                [
+                    PolicyCaseSpec(
+                        case_type="flash_input_room",
+                        protocol=protocol,
+                        model=flash,
+                        stream=True,
+                        client_header="claude-code",
+                        max_tokens=512,
+                        prompt_target_tokens=input_tokens,
+                        expected_source_client="claude-code",
+                        expected_effective_client="claude-code",
+                    ),
+                    PolicyCaseSpec(
+                        case_type="flash_output_room",
+                        protocol=protocol,
+                        model=flash,
+                        stream=True,
+                        client_header="claude-code",
+                        max_tokens=4096,
+                        expected_min_output_tokens=output_tokens,
+                        expected_source_client="claude-code",
+                        expected_effective_client="claude-code",
+                    ),
+                ]
+            )
+        if lite:
+            cases.append(
                 PolicyCaseSpec(
                     case_type="lite_not_claudecode",
                     protocol=protocol,
@@ -758,31 +771,36 @@ def build_policy_plan(mode: str, models: list[str]) -> list[PolicyCaseSpec]:
                     tools=True,
                     expected_source_client="claude-code",
                     expected_effective_client="unknown",
-                ),
-                PolicyCaseSpec(
-                    case_type="provider_usage_probe",
-                    protocol=protocol,
-                    model=flash,
-                    stream=False,
-                    client_header="openai-sdk" if protocol == "openai" else "anthropic-sdk",
-                    max_tokens=64,
-                    expected_source_client="openai-sdk" if protocol == "openai" else "anthropic-sdk",
-                    expected_effective_client="openai-sdk" if protocol == "openai" else "anthropic-sdk",
-                ),
-                PolicyCaseSpec(
-                    case_type="cache_probe",
-                    protocol=protocol,
-                    model=flash,
-                    stream=False,
-                    client_header="openai-sdk" if protocol == "openai" else "anthropic-sdk",
-                    max_tokens=256,
-                    prompt_target_tokens=4_000,
-                    cache_attempted=True,
-                    expected_source_client="openai-sdk" if protocol == "openai" else "anthropic-sdk",
-                    expected_effective_client="openai-sdk" if protocol == "openai" else "anthropic-sdk",
-                ),
-            ]
-        )
+                )
+            )
+        for model in policy_models:
+            client = "openai-sdk" if protocol == "openai" else "anthropic-sdk"
+            cases.extend(
+                [
+                    PolicyCaseSpec(
+                        case_type="provider_usage_probe",
+                        protocol=protocol,
+                        model=model,
+                        stream=False,
+                        client_header=client,
+                        max_tokens=64,
+                        expected_source_client=client,
+                        expected_effective_client=client,
+                    ),
+                    PolicyCaseSpec(
+                        case_type="cache_probe",
+                        protocol=protocol,
+                        model=model,
+                        stream=False,
+                        client_header=client,
+                        max_tokens=256,
+                        prompt_target_tokens=4_000,
+                        cache_attempted=True,
+                        expected_source_client=client,
+                        expected_effective_client=client,
+                    ),
+                ]
+            )
     return cases
 
 
