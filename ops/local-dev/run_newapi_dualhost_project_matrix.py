@@ -149,10 +149,25 @@ def verify_inputs() -> None:
         raise FileNotFoundError(f"missing WSL ClaudeCode binary: {WSL_CLAUDE}")
 
 
-def audit_offset() -> int:
+def audit_offset() -> tuple[int | None, str | None]:
     cmd = f"test -f {shlex.quote(AUDIT_REMOTE)} && stat -c %s {shlex.quote(AUDIT_REMOTE)} || echo 0"
-    proc = subprocess.run(["ssh", "panda", cmd], text=True, capture_output=True, check=True)
-    return int((proc.stdout.strip() or "0").splitlines()[-1])
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", "panda", cmd],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "ssh_timeout"
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip().replace("\n", " ")
+        return None, f"ssh_exit_{proc.returncode}: {stderr[:400]}"
+    try:
+        return int((proc.stdout.strip() or "0").splitlines()[-1]), None
+    except ValueError:
+        return None, f"invalid_offset: {(proc.stdout or '').strip()[:200]}"
 
 
 def read_audit_since(offset: int) -> tuple[list[dict[str, Any]], str | None]:
@@ -397,7 +412,7 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
     cfg = load_provider(model)
     model_dir = run_dir / model
     model_dir.mkdir(parents=True, exist_ok=True)
-    start_offset = audit_offset()
+    start_offset, audit_offset_error = audit_offset()
     started = time.time()
     futures: list[concurrent.futures.Future[CaseResult]] = []
     results: list[CaseResult] = []
@@ -445,7 +460,11 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
                 flush=True,
             )
     time.sleep(3)
-    audit_rows_window, audit_read_error = read_audit_since(start_offset)
+    if start_offset is None:
+        audit_rows_window: list[dict[str, Any]] = []
+        audit_read_error = "skipped: audit_offset_failed"
+    else:
+        audit_rows_window, audit_read_error = read_audit_since(start_offset)
     audit_rows_exact = [row for row in audit_rows_window if audit_model_matches(row, model)]
     audit_rows = audit_rows_exact or audit_rows_window
     audit_selection = "exact_model" if audit_rows_exact else "time_window_fallback"
@@ -461,6 +480,7 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
         "audit_selection": audit_selection,
         "audit_exact_model": audit_summary(audit_rows_exact),
         "audit_time_window": audit_summary(audit_rows_window),
+        "audit_offset_error": audit_offset_error,
         "audit_read_error": audit_read_error,
         "audit_route_mismatch": route_mismatch,
     }
