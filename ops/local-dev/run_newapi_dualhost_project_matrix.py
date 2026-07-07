@@ -39,6 +39,32 @@ PROVIDERS = {
     "big-pickle": "codex-closeapi-bigpickle",
 }
 
+EXPECTED_ROUTES = {
+    "deepseek-v4-flash": {
+        "public": {"deepseek-v4-flash"},
+        "wire": {"deepseek-v4-flash", "deepseek-v4-flash-free"},
+    },
+    "mimo-v2.5": {
+        "public": {"mimo-v2.5"},
+        "wire": {"mimo-v2.5", "mimo-v2.5-free"},
+    },
+    "big-pickle": {
+        "public": {"big-pickle"},
+        "wire": {"big-pickle"},
+    },
+}
+
+PANDA_READY_SERVICES = [
+    "zen-proxy-rs@1.service",
+    "zen-proxy-rs@2.service",
+    "zen-proxy-rs@3.service",
+    "nginx.service",
+    "claude-newapi-adapter.service",
+    "docker.service",
+]
+
+PANDA_ZEN_PORTS = [4001, 4002, 4004]
+
 CASES = [
     ("tide", r"D:\SelfMadeTool\Tide", "全面深入检查项目并详细汇报。只读检查，不要修改、删除或创建项目文件。"),
     ("mirofish", r"D:\SelfMadeTool\MiroFish", "全面深入检查项目并详细汇报。只读检查，不要修改、删除或创建项目文件。"),
@@ -75,8 +101,170 @@ class CaseResult:
     stderr_path: str
 
 
+class ReadyGateError(RuntimeError):
+    def __init__(self, report: dict[str, Any]) -> None:
+        self.report = report
+        failed = [item["name"] for item in report.get("checks", []) if not item.get("ok")]
+        super().__init__("panda ready gate failed: " + ", ".join(failed))
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def ssh_capture(command: str, timeout_s: int = 30) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "panda",
+                "bash -lc " + shlex.quote(command),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return 124, stdout, stderr
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def add_ready_check(report: dict[str, Any], name: str, ok: bool, detail: Any) -> None:
+    report.setdefault("checks", []).append({"name": name, "ok": bool(ok), "detail": detail})
+
+
+def panda_ready_gate(
+    *,
+    min_uptime_s: int,
+    recent_window_s: int,
+    max_proxy_errors: int,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "checked_at": dt.datetime.now(dt.UTC).isoformat(),
+        "min_uptime_s": min_uptime_s,
+        "recent_window_s": recent_window_s,
+        "max_proxy_errors": max_proxy_errors,
+        "checks": [],
+    }
+
+    code, stdout, stderr = ssh_capture("date +%s; awk '/btime/ {print $2}' /proc/stat", timeout_s=20)
+    if code != 0:
+        add_ready_check(report, "ssh", False, (stderr or stdout).strip()[:500])
+    else:
+        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        try:
+            now_s = int(lines[0])
+            boot_s = int(lines[1])
+            uptime_s = now_s - boot_s
+            report["panda_uptime_s"] = uptime_s
+            add_ready_check(report, "uptime", uptime_s >= min_uptime_s, {"uptime_s": uptime_s})
+        except (IndexError, ValueError):
+            add_ready_check(report, "uptime", False, stdout.strip()[:500])
+
+    service_cmd = "systemctl is-active " + " ".join(shlex.quote(item) for item in PANDA_READY_SERVICES)
+    code, stdout, stderr = ssh_capture(service_cmd, timeout_s=20)
+    states = stdout.splitlines()
+    service_detail = dict(zip(PANDA_READY_SERVICES, states, strict=False))
+    add_ready_check(
+        report,
+        "services",
+        code == 0 and all(state == "active" for state in service_detail.values()) and len(service_detail) == len(PANDA_READY_SERVICES),
+        service_detail or (stderr or stdout).strip()[:500],
+    )
+
+    endpoint_detail: dict[str, Any] = {}
+    endpoint_ok = True
+    for port in PANDA_ZEN_PORTS:
+        code, stdout, stderr = ssh_capture(
+            f"curl -fsS --max-time 5 http://127.0.0.1:{port}/v1/models | wc -c",
+            timeout_s=10,
+        )
+        key = f"zen_{port}_models"
+        if code == 0:
+            try:
+                endpoint_detail[key] = int((stdout.strip() or "0").splitlines()[-1])
+                endpoint_ok = endpoint_ok and endpoint_detail[key] > 0
+            except ValueError:
+                endpoint_detail[key] = stdout.strip()[:200]
+                endpoint_ok = False
+        else:
+            endpoint_detail[key] = (stderr or stdout).strip()[:300]
+            endpoint_ok = False
+    code, stdout, stderr = ssh_capture("curl -fsS --max-time 5 http://127.0.0.1:8081/api/status | wc -c", timeout_s=10)
+    if code == 0:
+        try:
+            endpoint_detail["newapi_status"] = int((stdout.strip() or "0").splitlines()[-1])
+            endpoint_ok = endpoint_ok and endpoint_detail["newapi_status"] > 0
+        except ValueError:
+            endpoint_detail["newapi_status"] = stdout.strip()[:200]
+            endpoint_ok = False
+    else:
+        endpoint_detail["newapi_status"] = (stderr or stdout).strip()[:300]
+        endpoint_ok = False
+    add_ready_check(report, "endpoints", endpoint_ok, endpoint_detail)
+
+    code, stdout, stderr = ssh_capture(
+        "docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' new-api",
+        timeout_s=15,
+    )
+    docker_status = stdout.strip()
+    add_ready_check(
+        report,
+        "newapi_container",
+        code == 0 and docker_status == "running healthy",
+        docker_status or (stderr or stdout).strip()[:300],
+    )
+
+    recent_pattern = (
+        "Power key pressed|Powering off|Failed to execute poweroff|"
+        "nginx-health-check.service: Failed|docker.service.*failed|"
+        "Failed to get event|error reading from server: EOF"
+    )
+    code, stdout, stderr = ssh_capture(
+        "journalctl --since "
+        + shlex.quote(f"-{recent_window_s} seconds")
+        + " --no-pager -o short-iso | grep -Ei "
+        + shlex.quote(recent_pattern)
+        + " | head -20 || true",
+        timeout_s=20,
+    )
+    recent_events = [line for line in stdout.splitlines() if line.strip()]
+    add_ready_check(report, "recent_origin_instability", code == 0 and not recent_events, recent_events[:20])
+
+    proxy_pattern = "opencode.ai|i/o timeout|NXDOMAIN|connection refused|handshake did not complete"
+    code, stdout, stderr = ssh_capture(
+        "journalctl -u sing-box -u cloudflared --since "
+        + shlex.quote(f"-{recent_window_s} seconds")
+        + " --no-pager -o cat | grep -Ei "
+        + shlex.quote(proxy_pattern)
+        + " | wc -l || true",
+        timeout_s=20,
+    )
+    try:
+        proxy_errors = int((stdout.strip() or "0").splitlines()[-1])
+    except ValueError:
+        proxy_errors = max_proxy_errors + 1
+    report["recent_proxy_error_count"] = proxy_errors
+    add_ready_check(report, "recent_proxy_errors", proxy_errors <= max_proxy_errors, {"count": proxy_errors})
+
+    offset, offset_error = audit_offset()
+    report["audit_offset"] = offset
+    add_ready_check(report, "audit_ssh", offset_error is None, offset_error or {"offset": offset})
+
+    if any(not item.get("ok") for item in report["checks"]):
+        raise ReadyGateError(report)
+    return report
 
 
 def ps_quote(value: str) -> str:
@@ -199,8 +387,27 @@ def read_audit_since(offset: int) -> tuple[list[dict[str, Any]], str | None]:
     return rows, None
 
 
+def audit_route_matches(row: dict[str, Any], model: str) -> bool:
+    expected = EXPECTED_ROUTES.get(model, {"public": {model}, "wire": {model}})
+    public_expected = expected["public"]
+    wire_expected = expected["wire"] | public_expected
+    seen = False
+    public_model = row.get("public_model")
+    if public_model:
+        seen = True
+        if str(public_model) not in public_expected:
+            return False
+    for key in ("model", "upstream_model"):
+        value = row.get(key)
+        if value:
+            seen = True
+            if str(value) not in wire_expected:
+                return False
+    return seen
+
+
 def audit_model_matches(row: dict[str, Any], model: str) -> bool:
-    return (row.get("public_model") or row.get("model")) == model
+    return audit_route_matches(row, model)
 
 
 def audit_model_triplets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -466,9 +673,25 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
     else:
         audit_rows_window, audit_read_error = read_audit_since(start_offset)
     audit_rows_exact = [row for row in audit_rows_window if audit_model_matches(row, model)]
-    audit_rows = audit_rows_exact or audit_rows_window
-    audit_selection = "exact_model" if audit_rows_exact else "time_window_fallback"
-    route_mismatch = any(not audit_model_matches(row, model) for row in audit_rows_window)
+    audit_rows_mismatch = [row for row in audit_rows_window if not audit_model_matches(row, model)]
+    audit_rows = audit_rows_exact
+    audit_selection = "exact_model" if audit_rows_exact else "exact_model_empty"
+    route_mismatch = bool(audit_rows_mismatch)
+    hard_failures: list[dict[str, Any]] = []
+    if audit_offset_error:
+        hard_failures.append({"code": "audit_offset_failed", "detail": audit_offset_error})
+    if audit_read_error:
+        hard_failures.append({"code": "audit_read_failed", "detail": audit_read_error})
+    if not audit_rows_exact:
+        hard_failures.append({"code": "audit_exact_model_empty", "detail": "no audit rows matched requested model identity"})
+    if audit_rows_mismatch:
+        hard_failures.append(
+            {
+                "code": "route_mismatch",
+                "detail": "time-window audit rows include another model identity",
+                "model_triplets": audit_model_triplets(audit_rows_mismatch),
+            }
+        )
     summary = {
         "model": model,
         "provider_id": cfg.provider_id,
@@ -480,9 +703,14 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
         "audit_selection": audit_selection,
         "audit_exact_model": audit_summary(audit_rows_exact),
         "audit_time_window": audit_summary(audit_rows_window),
+        "audit_route_mismatch_rows": len(audit_rows_mismatch),
+        "audit_route_mismatch_triplets": audit_model_triplets(audit_rows_mismatch),
         "audit_offset_error": audit_offset_error,
         "audit_read_error": audit_read_error,
         "audit_route_mismatch": route_mismatch,
+        "audit_route_verified": bool(audit_rows_exact) and not route_mismatch and not audit_read_error,
+        "audit_fallback_disabled": True,
+        "hard_failures": hard_failures,
     }
     (model_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return summary
@@ -493,6 +721,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", nargs="+", default=list(PROVIDERS))
     parser.add_argument("--timeout-s", type=int, default=1800)
     parser.add_argument("--run-id", default=dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S"))
+    parser.add_argument("--skip-ready-gate", action="store_true")
+    parser.add_argument("--ready-min-uptime-s", type=int, default=300)
+    parser.add_argument("--ready-recent-window-s", type=int, default=300)
+    parser.add_argument("--ready-max-proxy-errors", type=int, default=10)
+    parser.add_argument("--allow-audit-hard-failures", action="store_true")
     return parser.parse_args()
 
 
@@ -501,16 +734,45 @@ def main() -> int:
     verify_inputs()
     run_dir = RUN_ROOT / f"newapi-dualhost-project-matrix-{args.run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    if not args.skip_ready_gate:
+        try:
+            ready_report = panda_ready_gate(
+                min_uptime_s=args.ready_min_uptime_s,
+                recent_window_s=args.ready_recent_window_s,
+                max_proxy_errors=args.ready_max_proxy_errors,
+            )
+        except ReadyGateError as exc:
+            (run_dir / "ready-gate.json").write_text(
+                json.dumps(exc.report, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(json.dumps({"event": "ready_gate_failed", "report": exc.report}, ensure_ascii=False), flush=True)
+            return 2
+        (run_dir / "ready-gate.json").write_text(
+            json.dumps(ready_report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps({"event": "ready_gate_passed", "report": ready_report}, ensure_ascii=False), flush=True)
     all_summaries = []
+    hard_failure_count = 0
     for model in args.models:
         if model not in PROVIDERS:
             raise SystemExit(f"unsupported model: {model}")
         print(json.dumps({"event": "model_start", "model": model}, ensure_ascii=False), flush=True)
         summary = run_model(model, args.timeout_s, run_dir)
         all_summaries.append(summary)
+        hard_failure_count += len(summary.get("hard_failures") or [])
         print(json.dumps({"event": "model_done", "model": model, "audit": summary["audit"]}, ensure_ascii=False), flush=True)
     (run_dir / "summary.json").write_text(json.dumps(all_summaries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"event": "done", "run_dir": str(run_dir)}, ensure_ascii=False), flush=True)
+    print(
+        json.dumps(
+            {"event": "done", "run_dir": str(run_dir), "hard_failure_count": hard_failure_count},
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    if hard_failure_count and not args.allow_audit_hard_failures:
+        return 2
     return 0
 
 
