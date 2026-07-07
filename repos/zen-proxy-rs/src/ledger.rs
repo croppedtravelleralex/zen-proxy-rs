@@ -62,6 +62,11 @@ pub fn sanitize_request_telemetry(input: &RequestTelemetry) -> RequestTelemetry 
     out.failure_message = sanitize_text(&out.failure_message);
     out.path = sanitize_text(&out.path);
     out.gateway = sanitize_text(&out.gateway);
+    out.run_id = sanitize_text(&out.run_id);
+    out.source_platform = sanitize_text(&out.source_platform);
+    out.case_id = sanitize_text(&out.case_id);
+    out.runner_model = sanitize_text(&out.runner_model);
+    out.provider_id = sanitize_text(&out.provider_id);
     out.retry_chain = out.retry_chain.iter().map(sanitize_attempt).collect();
     if let Some(context) = out.context.as_mut() {
         context.trace = context

@@ -231,11 +231,13 @@ pub async fn handle_openai_chat(
         ));
     }
     super::log_final_upstream_body_fingerprint("openai", &cr, profile, &zb);
-    if body.stream.unwrap_or(false) {
+    let mut response = if body.stream.unwrap_or(false) {
         handle_oa_stream(client, config, &cr, &zb, profile, &upstream_headers).await
     } else {
         handle_oa_non_stream(client, config, &cr, &zb, profile, repair, &upstream_headers).await
-    }
+    }?;
+    super::insert_final_upstream_cache_headers(response.headers_mut(), &zb);
+    Ok(response)
 }
 
 async fn handle_oa_non_stream(

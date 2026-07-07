@@ -20,6 +20,18 @@ pub struct RequestTelemetry {
     pub gateway: String,
     #[serde(default)]
     pub gateway_channel_id: String,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub source_platform: String,
+    #[serde(default)]
+    pub case_id: String,
+    #[serde(default)]
+    pub runner_model: String,
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub turn_index: u32,
     pub model: String,
     pub public_model: String,
     pub upstream_model: String,
@@ -99,6 +111,12 @@ pub struct RequestTelemetry {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheForensicsTelemetry {
+    #[serde(default)]
+    pub ccp_hash_algorithm: String,
+    #[serde(default)]
+    pub raw_body_hash_algorithm: String,
+    #[serde(default)]
+    pub raw_body_stage: String,
     pub ccp_prompt_hash: String,
     pub ccp_prefix_4k_hash: String,
     pub ccp_prefix_32k_hash: String,
@@ -118,6 +136,18 @@ pub struct CacheForensicsTelemetry {
     pub tool_result_bytes: u64,
     pub tool_result_count: u64,
     pub ccp_raw_prefix_match_32k: bool,
+    #[serde(default)]
+    pub final_provider_body_bytes: u64,
+    #[serde(default)]
+    pub final_provider_body_prefix_32k_hash: String,
+    #[serde(default)]
+    pub final_provider_cache_control_locations: String,
+    #[serde(default)]
+    pub final_provider_cache_control_block_hashes: String,
+    #[serde(default)]
+    pub final_provider_cache_policy_match: bool,
+    #[serde(default)]
+    pub final_provider_cache_segment_hash: String,
     pub fork_key: String,
     pub fork_reason: String,
 }

@@ -199,6 +199,12 @@ pub async fn proxy_handler(
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or_default()
                     .to_string(),
+                run_id: String::new(),
+                source_platform: String::new(),
+                case_id: String::new(),
+                runner_model: String::new(),
+                provider_id: String::new(),
+                turn_index: 0,
                 model: pr.model.clone(),
                 public_model: pr.model.clone(),
                 upstream_model: pr.model.clone(),

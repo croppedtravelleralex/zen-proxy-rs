@@ -10,6 +10,7 @@ use crate::error::AppError;
 use crate::protocol::{translate, types::ChatRequest};
 use crate::thinking_manifest;
 use crate::zen::client::{CollectedStream, ProviderCacheSignals};
+use axum::http::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 
 const PROVIDER_INVALID_RETRY_LARGE_USER_BYTES: usize = 12 * 1024;
@@ -776,6 +777,53 @@ pub(crate) fn log_final_upstream_body_fingerprint(
         ccp_cache_material_bytes = shape.cache_material_bytes,
         "final upstream body fingerprint before provider"
     );
+}
+
+pub(crate) fn insert_final_upstream_cache_headers(headers: &mut HeaderMap, body: &Value) {
+    let raw_body = serde_json::to_vec(body).unwrap_or_default();
+    let cache_control_locations = cache_control_marker_locations(body);
+    let cache_control_block_hashes = cache_control_block_hashes(body, &cache_control_locations);
+    let cache_segment_hash = stable_hash64(cache_control_block_hashes.join("|").as_bytes());
+    insert_header(
+        headers,
+        "x-fmc-final-body-bytes",
+        &raw_body.len().to_string(),
+    );
+    insert_header(
+        headers,
+        "x-fmc-final-body-prefix-32k-hash",
+        &hash_prefix_bytes(&raw_body, 32 * 1024),
+    );
+    insert_header(
+        headers,
+        "x-fmc-cache-control-locations",
+        &cache_control_locations.join(","),
+    );
+    insert_header(
+        headers,
+        "x-fmc-cache-control-block-hashes",
+        &cache_control_block_hashes.join(","),
+    );
+    insert_header(
+        headers,
+        "x-fmc-cache-policy-match",
+        if official_opencode_cache_policy_match(body, &cache_control_locations) {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    insert_header(
+        headers,
+        "x-fmc-provider-cache-segment-hash",
+        &cache_segment_hash,
+    );
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
 }
 
 fn hash_prefix_bytes(bytes: &[u8], prefix_bytes: usize) -> String {

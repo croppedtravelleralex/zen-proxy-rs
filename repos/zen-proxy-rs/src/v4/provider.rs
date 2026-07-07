@@ -79,6 +79,7 @@ pub async fn handle_v4_proxy(
     };
     let external_request_id = extract_external_request_id(headers);
     let gateway = infer_gateway(headers, &external_request_id);
+    let run_tags = extract_run_tags(headers);
     let mut context_telemetry = context_plan.telemetry();
     let mut parsed = context_plan.body;
     let force_final_guard = protocol_guard_summary
@@ -250,6 +251,10 @@ pub async fn handle_v4_proxy(
                 &result.usage,
                 &thinking_policy,
             );
+            let mut success_cache_forensics = cache_forensics.clone();
+            if let Some(forensics) = success_cache_forensics.as_mut() {
+                result.final_provider_cache.apply_to(forensics);
+            }
             let telemetry = RequestTelemetry {
                 rid: result.request_id.clone(),
                 ts: chrono::Utc::now().timestamp_millis(),
@@ -257,6 +262,12 @@ pub async fn handle_v4_proxy(
                 gateway: gateway.clone(),
                 gateway_channel_id: extract_header(headers, "x-newapi-channel-id")
                     .unwrap_or_default(),
+                run_id: run_tags.run_id.clone(),
+                source_platform: run_tags.source_platform.clone(),
+                case_id: run_tags.case_id.clone(),
+                runner_model: run_tags.runner_model.clone(),
+                provider_id: run_tags.provider_id.clone(),
+                turn_index: run_tags.turn_index,
                 model: public_model.clone(),
                 public_model: public_model.clone(),
                 upstream_model: result.upstream_model,
@@ -298,7 +309,7 @@ pub async fn handle_v4_proxy(
                 usk: ccp_snap.usk,
                 icp_scope: ccp_snap.icp_scope,
                 prefix_32k_hash: ccp_snap.prefix_32k_hash,
-                cache_forensics: cache_forensics.clone(),
+                cache_forensics: success_cache_forensics.clone(),
                 prefix_drift: ccp_snap.prefix_drift,
                 session_pin_hit: result.session_pin_hit,
                 thinking_policy: ccp_snap.thinking_policy,
@@ -359,6 +370,12 @@ pub async fn handle_v4_proxy(
                     gateway: gateway.clone(),
                     gateway_channel_id: extract_header(headers, "x-newapi-channel-id")
                         .unwrap_or_default(),
+                    run_id: run_tags.run_id.clone(),
+                    source_platform: run_tags.source_platform.clone(),
+                    case_id: run_tags.case_id.clone(),
+                    runner_model: run_tags.runner_model.clone(),
+                    provider_id: run_tags.provider_id.clone(),
+                    turn_index: run_tags.turn_index,
                     model: public_model.clone(),
                     public_model: public_model.clone(),
                     upstream_model: err.upstream_model.clone(),
@@ -623,6 +640,42 @@ fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[derive(Debug, Clone, Default)]
+struct RunTags {
+    run_id: String,
+    source_platform: String,
+    case_id: String,
+    runner_model: String,
+    provider_id: String,
+    turn_index: u32,
+}
+
+fn extract_run_tags(headers: &HeaderMap) -> RunTags {
+    RunTags {
+        run_id: extract_first_header(headers, &["x-zfs-run-id", "x-zen-run-id", "x-run-id"]),
+        source_platform: extract_first_header(
+            headers,
+            &["x-zfs-platform", "x-source-platform", "x-run-platform"],
+        ),
+        case_id: extract_first_header(headers, &["x-zfs-case", "x-case-id"]),
+        runner_model: extract_first_header(
+            headers,
+            &["x-zfs-model", "x-runner-model", "x-claude-model"],
+        ),
+        provider_id: extract_first_header(headers, &["x-zfs-provider-id", "x-provider-id"]),
+        turn_index: extract_first_header(headers, &["x-zfs-turn-index", "x-turn-index"])
+            .parse::<u32>()
+            .unwrap_or_default(),
+    }
+}
+
+fn extract_first_header(headers: &HeaderMap, names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| extract_header(headers, name))
+        .unwrap_or_default()
+}
+
 struct AffinityKeyInput<'a> {
     public_model: &'a str,
     upstream_model: &'a str,
@@ -753,6 +806,9 @@ fn build_cache_forensics(
         "{cache_api_key_id}:{upstream_model}:{path}:{source_bucket}:{client_bucket}"
     ));
     let mut telemetry = CacheForensicsTelemetry {
+        ccp_hash_algorithm: "fnv1a64:cache_material".to_string(),
+        raw_body_hash_algorithm: "sha256:hex16".to_string(),
+        raw_body_stage: "zenproxy_upstream_body_before_kernel".to_string(),
         ccp_prompt_hash: format!("{:016x}", shape.prompt_hash),
         ccp_prefix_4k_hash: format!("{:016x}", shape.prefix_4k_hash),
         ccp_prefix_32k_hash: format!("{:016x}", shape.prefix_32k_hash),
@@ -772,6 +828,12 @@ fn build_cache_forensics(
         tool_result_bytes,
         tool_result_count,
         ccp_raw_prefix_match_32k: false,
+        final_provider_body_bytes: 0,
+        final_provider_body_prefix_32k_hash: String::new(),
+        final_provider_cache_control_locations: String::new(),
+        final_provider_cache_control_block_hashes: String::new(),
+        final_provider_cache_policy_match: false,
+        final_provider_cache_segment_hash: String::new(),
         fork_key,
         fork_reason: String::new(),
     };
@@ -1345,6 +1407,47 @@ struct V4CallResult {
     retry_chain: Vec<RequestAttemptTelemetry>,
     body_bytes_len: u64,
     usage: UsageCounts,
+    final_provider_cache: FinalProviderCacheHeaders,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FinalProviderCacheHeaders {
+    body_bytes: u64,
+    body_prefix_32k_hash: String,
+    cache_control_locations: String,
+    cache_control_block_hashes: String,
+    cache_policy_match: bool,
+    cache_segment_hash: String,
+}
+
+impl FinalProviderCacheHeaders {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            body_bytes: extract_header(headers, "x-fmc-final-body-bytes")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default(),
+            body_prefix_32k_hash: extract_header(headers, "x-fmc-final-body-prefix-32k-hash")
+                .unwrap_or_default(),
+            cache_control_locations: extract_header(headers, "x-fmc-cache-control-locations")
+                .unwrap_or_default(),
+            cache_control_block_hashes: extract_header(headers, "x-fmc-cache-control-block-hashes")
+                .unwrap_or_default(),
+            cache_policy_match: extract_header(headers, "x-fmc-cache-policy-match")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+            cache_segment_hash: extract_header(headers, "x-fmc-provider-cache-segment-hash")
+                .unwrap_or_default(),
+        }
+    }
+
+    fn apply_to(&self, telemetry: &mut CacheForensicsTelemetry) {
+        telemetry.final_provider_body_bytes = self.body_bytes;
+        telemetry.final_provider_body_prefix_32k_hash = self.body_prefix_32k_hash.clone();
+        telemetry.final_provider_cache_control_locations = self.cache_control_locations.clone();
+        telemetry.final_provider_cache_control_block_hashes =
+            self.cache_control_block_hashes.clone();
+        telemetry.final_provider_cache_policy_match = self.cache_policy_match;
+        telemetry.final_provider_cache_segment_hash = self.cache_segment_hash.clone();
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1542,6 +1645,8 @@ async fn call_with_retry(
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
+                    let final_provider_cache =
+                        FinalProviderCacheHeaders::from_headers(response.headers());
                     let observed_exit_ip = response
                         .headers()
                         .get("x-zen-observed-exit-ip")
@@ -1689,6 +1794,7 @@ async fn call_with_retry(
                         retry_chain,
                         body_bytes_len,
                         usage,
+                        final_provider_cache,
                     });
                 }
                 last_status = status;
@@ -1713,6 +1819,7 @@ async fn call_with_retry(
                 } else {
                     "upstream_error"
                 };
+                clear_session_pin_for_failure(&request_meta, status, failure_kind);
                 retry_chain.push(RequestAttemptTelemetry {
                     attempt,
                     node_id: node_id.clone(),
@@ -1833,7 +1940,8 @@ async fn call_with_retry(
                     });
                 } else {
                     let (error_kind, outcome, error_type) = classify_app_error(&err);
-                    let result = result_kind_for_classified_error(error_kind, error_type);
+                    clear_session_pin_for_failure(&request_meta, status, error_type);
+                    let result = result_kind_for_app_error(&err, error_kind, error_type);
                     state.pool_manager.report(node_id.clone(), result, latency);
                     record_ledger(
                         state,
@@ -2094,13 +2202,18 @@ fn report_status_failure(
             stream,
         );
     } else {
-        state.pool_manager.report(
-            node_id.to_string(),
+        let result = if matches!(status, 502 | 504) {
+            ResultKind::Error {
+                kind: ErrorKind::Upstream5xx,
+            }
+        } else {
             ResultKind::SoftFailure {
                 kind: ErrorKind::Upstream5xx,
-            },
-            latency,
-        );
+            }
+        };
+        state
+            .pool_manager
+            .report(node_id.to_string(), result, latency);
         record_ledger(
             state,
             conf,
@@ -2205,6 +2318,57 @@ fn result_kind_for_classified_error(error_kind: ErrorKind, error_type: &str) -> 
         | ErrorKind::SocksHandshake => ResultKind::Error { kind: error_kind },
         ErrorKind::Upstream5xx | ErrorKind::Other => ResultKind::SoftFailure { kind: error_kind },
     }
+}
+
+fn result_kind_for_app_error(
+    err: &AppError,
+    error_kind: ErrorKind,
+    error_type: &str,
+) -> ResultKind {
+    if matches!(
+        err.status,
+        StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
+    ) && error_type == "upstream_error"
+    {
+        return ResultKind::Error {
+            kind: ErrorKind::Upstream5xx,
+        };
+    }
+    result_kind_for_classified_error(error_kind, error_type)
+}
+
+fn clear_session_pin_for_failure(request_meta: &RequestMeta, status: StatusCode, error_type: &str) {
+    if !should_clear_session_pin_for_failure(status, error_type) {
+        return;
+    }
+    crate::pool::session_pin::clear(&request_meta.upstream_model, &request_meta.session_id);
+}
+
+fn should_clear_session_pin_for_failure(status: StatusCode, error_type: &str) -> bool {
+    if matches!(
+        error_type,
+        "upstream_429" | "provider_invalid_request" | "upstream_busy" | "client_gone"
+    ) {
+        return false;
+    }
+    if matches!(
+        error_type,
+        "empty_output"
+            | "timeout"
+            | "network"
+            | "connection_refused"
+            | "dns_failure"
+            | "socks_handshake"
+    ) {
+        return true;
+    }
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY
+            | StatusCode::GATEWAY_TIMEOUT
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::SERVICE_UNAVAILABLE
+    )
 }
 
 fn is_transport_error_type(error_type: &str) -> bool {
@@ -2758,6 +2922,21 @@ fn metered_stream_response(
         } else if let Some(message) = stream_error {
             let error_type = classify_stream_error_message(&message).to_string();
             let stream_rate_limited = error_type == "upstream_429";
+            let status_code =
+                StatusCode::from_u16(telemetry.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            clear_session_pin_for_failure(
+                &RequestMeta {
+                    model: telemetry.public_model.clone(),
+                    upstream_model: telemetry.upstream_model.clone(),
+                    session_id: telemetry.session_id.clone(),
+                    stream: telemetry.is_streaming,
+                    body_size: telemetry.bytes_sent,
+                    affinity_key: telemetry.affinity_key.clone(),
+                    allow_direct_fallback: true,
+                },
+                status_code,
+                &error_type,
+            );
             telemetry.outcome = "stream_error".to_string();
             telemetry.failure_kind = error_type.clone();
             telemetry.failure_message = message;

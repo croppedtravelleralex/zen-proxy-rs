@@ -42,27 +42,15 @@ pub fn apply_tools_epoch(model: &str, session_scope: &str, tools: &[OpenAITool])
             }
         }
     }
-    freeze_tools_epoch(model, session_scope, tools)
+    let canonical = canonical_tools_value(tools);
+    if let Ok(mut guard) = tools_epoch_store().write() {
+        guard.insert(key, canonical.clone());
+    }
+    canonical
 }
 
 fn tools_semantically_compatible(current: &[OpenAITool], frozen: &Value) -> bool {
-    let Some(frozen_tools) = frozen.as_array() else {
-        return false;
-    };
-    if frozen_tools.len() != current.len() {
-        return false;
-    }
-    current
-        .iter()
-        .zip(frozen_tools.iter())
-        .all(|(left, right)| {
-            left.function.name
-                == right
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-        })
+    canonical_tools_value(current) == *frozen
 }
 
 pub fn canonical_tools_value(tools: &[OpenAITool]) -> Value {
@@ -595,6 +583,40 @@ mod tests {
         let first = freeze_tools_epoch("deepseek-v4-flash", "sess-a", &tools);
         let second = apply_tools_epoch("deepseek-v4-flash", "sess-a", &tools);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn tools_epoch_rejects_same_name_with_different_schema() {
+        let original = vec![OpenAITool {
+            tool_type: "function".into(),
+            function: OpenAIToolFunction {
+                name: "Bash".into(),
+                description: Some("run".into()),
+                parameters: Some(
+                    json!({"type":"object","properties":{"command":{"type":"string"}}}),
+                ),
+            },
+        }];
+        let changed = vec![OpenAITool {
+            tool_type: "function".into(),
+            function: OpenAIToolFunction {
+                name: "Bash".into(),
+                description: Some("run".into()),
+                parameters: Some(json!({
+                    "type":"object",
+                    "properties":{
+                        "command":{"type":"string"},
+                        "timeout_ms":{"type":"integer"}
+                    }
+                })),
+            },
+        }];
+
+        let first = freeze_tools_epoch("deepseek-v4-flash", "sess-schema-a", &original);
+        let second = apply_tools_epoch("deepseek-v4-flash", "sess-schema-a", &changed);
+
+        assert_ne!(first, second);
+        assert_eq!(second, canonical_tools_value(&changed));
     }
 
     #[test]
