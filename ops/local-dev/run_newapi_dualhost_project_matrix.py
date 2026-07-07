@@ -155,13 +155,25 @@ def audit_offset() -> int:
     return int((proc.stdout.strip() or "0").splitlines()[-1])
 
 
-def read_audit_since(offset: int) -> list[dict[str, Any]]:
+def read_audit_since(offset: int) -> tuple[list[dict[str, Any]], str | None]:
     start = offset + 1
     cmd = (
         f"test -f {shlex.quote(AUDIT_REMOTE)} && "
         f"tail -c +{start} {shlex.quote(AUDIT_REMOTE)} || true"
     )
-    proc = subprocess.run(["ssh", "panda", cmd], text=True, capture_output=True, check=True)
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", "panda", cmd],
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return [], "ssh_timeout"
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip().replace("\n", " ")
+        return [], f"ssh_exit_{proc.returncode}: {stderr[:400]}"
     rows: list[dict[str, Any]] = []
     for line in proc.stdout.splitlines():
         try:
@@ -169,7 +181,7 @@ def read_audit_since(offset: int) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         rows.append(row)
-    return rows
+    return rows, None
 
 
 def audit_model_matches(row: dict[str, Any], model: str) -> bool:
@@ -433,7 +445,7 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
                 flush=True,
             )
     time.sleep(3)
-    audit_rows_window = read_audit_since(start_offset)
+    audit_rows_window, audit_read_error = read_audit_since(start_offset)
     audit_rows_exact = [row for row in audit_rows_window if audit_model_matches(row, model)]
     audit_rows = audit_rows_exact or audit_rows_window
     audit_selection = "exact_model" if audit_rows_exact else "time_window_fallback"
@@ -449,6 +461,7 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
         "audit_selection": audit_selection,
         "audit_exact_model": audit_summary(audit_rows_exact),
         "audit_time_window": audit_summary(audit_rows_window),
+        "audit_read_error": audit_read_error,
         "audit_route_mismatch": route_mismatch,
     }
     (model_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
