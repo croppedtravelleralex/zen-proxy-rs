@@ -10,6 +10,7 @@ never writes the key into result files.
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures
 import dataclasses
 import datetime as dt
@@ -154,7 +155,7 @@ def audit_offset() -> int:
     return int((proc.stdout.strip() or "0").splitlines()[-1])
 
 
-def read_audit_since(offset: int, model: str) -> list[dict[str, Any]]:
+def read_audit_since(offset: int) -> list[dict[str, Any]]:
     start = offset + 1
     cmd = (
         f"test -f {shlex.quote(AUDIT_REMOTE)} && "
@@ -167,29 +168,61 @@ def read_audit_since(offset: int, model: str) -> list[dict[str, Any]]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if (row.get("public_model") or row.get("model")) == model:
-            rows.append(row)
+        rows.append(row)
     return rows
+
+
+def audit_model_matches(row: dict[str, Any], model: str) -> bool:
+    return (row.get("public_model") or row.get("model")) == model
+
+
+def audit_model_triplets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: collections.Counter[tuple[str, str, str]] = collections.Counter()
+    for row in rows:
+        counts[
+            (
+                str(row.get("public_model") or ""),
+                str(row.get("model") or ""),
+                str(row.get("upstream_model") or ""),
+            )
+        ] += 1
+    return [
+        {"public_model": public, "model": model, "upstream_model": upstream, "rows": count}
+        for (public, model, upstream), count in counts.most_common()
+    ]
 
 
 def audit_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     read = 0
     miss = 0
+    prompt = 0
+    completion = 0
     ttfts: list[int] = []
     outcomes: dict[str, int] = {}
+    status_outcomes: collections.Counter[str] = collections.Counter()
+    warmup_states: collections.Counter[str] = collections.Counter()
+    session_pin_hits: collections.Counter[str] = collections.Counter()
+    prefix_hashes: collections.Counter[str] = collections.Counter()
     for row in rows:
         usage = row.get("usage") if isinstance(row.get("usage"), dict) else row
         cr = int(usage.get("cache_read_input_tokens") or usage.get("cached_tokens") or 0)
         cm_raw = usage.get("cache_miss_input_tokens")
+        prompt_tokens = int(usage.get("prompt_tokens") or row.get("prompt_tokens") or 0)
         if cm_raw is None:
-            prompt = int(usage.get("prompt_tokens") or row.get("prompt_tokens") or 0)
-            cm = max(prompt - cr, 0)
+            cm = max(prompt_tokens - cr, 0)
         else:
             cm = int(cm_raw or 0)
         read += cr
         miss += cm
+        prompt += prompt_tokens
+        completion += int(usage.get("completion_tokens") or row.get("completion_tokens") or 0)
         outcome = str(row.get("outcome") or "unknown")
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        status_outcomes[f"{row.get('status')}:{outcome}:{row.get('failure_kind') or ''}"] += 1
+        warmup_states[str(row.get("warmup_state"))] += 1
+        session_pin_hits[str(row.get("session_pin_hit"))] += 1
+        if row.get("prefix_32k_hash"):
+            prefix_hashes[str(row["prefix_32k_hash"])] += 1
         timings = row.get("timings") if isinstance(row.get("timings"), dict) else {}
         ttft = int(row.get("ttft_ms") or timings.get("protocol_first_byte_ms") or timings.get("first_content_token_ms") or 0)
         if ttft > 0:
@@ -200,10 +233,22 @@ def audit_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "rows": len(rows),
         "read_tokens": read,
         "miss_tokens": miss,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
         "r2_pct": round(read / denominator * 100.0, 2) if denominator else None,
         "outcomes": outcomes,
+        "status_outcomes": dict(status_outcomes.most_common()),
         "ttft_p50_ms": ttfts[len(ttfts) // 2] if ttfts else None,
         "ttft_p90_ms": ttfts[min(len(ttfts) - 1, round((len(ttfts) - 1) * 0.9))] if ttfts else None,
+        "warmup_state": dict(warmup_states.most_common()),
+        "session_pin_hit": dict(session_pin_hits.most_common()),
+        "unique_prefix_32k_hashes": len(prefix_hashes),
+        "reused_prefix_32k_hashes": [
+            {"hash": prefix, "rows": count}
+            for prefix, count in prefix_hashes.most_common(10)
+            if count > 1
+        ],
+        "model_triplets": audit_model_triplets(rows),
     }
 
 
@@ -283,6 +328,8 @@ def run_wsl_case(
     prompt_path = case_dir / "prompt.txt"
     stdout_path = case_dir / "stdout.txt"
     stderr_path = case_dir / "stderr.txt"
+    claude_config_dir = case_dir / "_claude-config"
+    claude_config_dir.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt, encoding="utf-8")
     cwd_wsl = wsl_path(cwd)
     env = os.environ.copy()
@@ -294,13 +341,17 @@ def run_wsl_case(
             "ANTHROPIC_MODEL": model,
             "ANTHROPIC_SMALL_FAST_MODEL": model,
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            # WSL user settings may point at a stale local gateway. Keep the
+            # matrix hermetic so process env wins without writing secrets.
+            "CLAUDE_CONFIG_DIR": str(claude_config_dir),
         }
     )
     script = (
         f"cd {shlex.quote(cwd_wsl)} && "
         f"cat {shlex.quote(str(prompt_path))} | {shlex.quote(WSL_CLAUDE)} -p "
         f"--model {shlex.quote(model)} --output-format stream-json --verbose "
-        f"--permission-mode bypassPermissions --no-session-persistence --add-dir {shlex.quote(cwd_wsl)}"
+        f"--permission-mode bypassPermissions --no-session-persistence "
+        f"--setting-sources user --add-dir {shlex.quote(cwd_wsl)}"
     )
     started = time.perf_counter()
     timed_out = False
@@ -382,7 +433,11 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
                 flush=True,
             )
     time.sleep(3)
-    audit_rows = read_audit_since(start_offset, model)
+    audit_rows_window = read_audit_since(start_offset)
+    audit_rows_exact = [row for row in audit_rows_window if audit_model_matches(row, model)]
+    audit_rows = audit_rows_exact or audit_rows_window
+    audit_selection = "exact_model" if audit_rows_exact else "time_window_fallback"
+    route_mismatch = any(not audit_model_matches(row, model) for row in audit_rows_window)
     summary = {
         "model": model,
         "provider_id": cfg.provider_id,
@@ -391,6 +446,10 @@ def run_model(model: str, timeout_s: int, run_dir: Path) -> dict[str, Any]:
         "elapsed_s": round(time.time() - started, 1),
         "results": [dataclasses.asdict(item) for item in sorted(results, key=lambda x: (x.platform, x.case_id))],
         "audit": audit_summary(audit_rows),
+        "audit_selection": audit_selection,
+        "audit_exact_model": audit_summary(audit_rows_exact),
+        "audit_time_window": audit_summary(audit_rows_window),
+        "audit_route_mismatch": route_mismatch,
     }
     (model_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return summary
