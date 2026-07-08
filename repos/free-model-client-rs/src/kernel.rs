@@ -2,7 +2,7 @@ use axum::response::Response;
 use reqwest::Client;
 
 use crate::client_profile::ClientProfile;
-use crate::config::Config;
+use crate::config::{Config, ModelMapping};
 use crate::error::AppError;
 use crate::protocol::types::{AnthropicRequest, ChatRequest};
 
@@ -20,12 +20,17 @@ pub struct KernelConfig {
 
 impl From<&Config> for KernelConfig {
     fn from(config: &Config) -> Self {
+        Self::from_config_and_mappings(config, &config.model_mappings)
+    }
+}
+
+impl KernelConfig {
+    pub fn from_config_and_mappings(config: &Config, mappings: &[ModelMapping]) -> Self {
         Self {
             zen_chat_url: config.zen_chat_url.clone(),
             zen_api_key: config.zen_api_key.clone(),
             extra_headers: Vec::new(),
-            model_mappings: config
-                .model_mappings
+            model_mappings: mappings
                 .iter()
                 .map(|mapping| (mapping.public_name.clone(), mapping.upstream_name.clone()))
                 .collect(),
@@ -52,6 +57,10 @@ impl FreeModelKernel {
 
     pub fn from_config(config: &Config) -> Self {
         Self::new(KernelConfig::from(config))
+    }
+
+    pub fn from_config_and_mappings(config: &Config, mappings: &[ModelMapping]) -> Self {
+        Self::new(KernelConfig::from_config_and_mappings(config, mappings))
     }
 
     pub async fn openai_chat(

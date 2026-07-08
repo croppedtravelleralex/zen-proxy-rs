@@ -1264,8 +1264,8 @@ async fn claude_code_anthropic_stream_suppresses_pre_first_ping_for_true_frt() {
     let body = response_text(response).await;
     assert!(!body.contains("event: ping"));
     assert!(!body.contains("\"type\":\"ping\""));
-    assert!(body.contains("delayed answer"));
-    assert!(body.contains("event: message_stop"));
+    assert!(body.contains("delayed answer"), "{body}");
+    assert!(body.contains("event: message_stop"), "{body}");
 }
 
 #[tokio::test]
@@ -1304,10 +1304,10 @@ async fn claude_code_anthropic_stream_can_keep_legacy_pre_first_ping() {
         .unwrap();
 
     let body = response_text(response).await;
-    assert!(body.contains("event: ping"));
-    assert!(body.contains("\"type\":\"ping\""));
-    assert!(body.contains("delayed answer"));
-    assert!(body.contains("event: message_stop"));
+    assert!(body.contains("event: ping"), "{body}");
+    assert!(body.contains("\"type\":\"ping\""), "{body}");
+    assert!(body.contains("delayed answer"), "{body}");
+    assert!(body.contains("event: message_stop"), "{body}");
 }
 
 #[tokio::test]

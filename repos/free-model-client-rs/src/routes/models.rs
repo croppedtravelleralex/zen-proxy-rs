@@ -18,9 +18,9 @@ pub async fn models_handler(
     }
 
     let models: Vec<serde_json::Value> = state
-        .config
-        .free_models
-        .iter()
+        .free_model_names()
+        .await
+        .into_iter()
         .map(|id| {
             serde_json::json!({
                 "id": id,

@@ -2,6 +2,7 @@ use crate::auth;
 use crate::client_profile::ClientProfile;
 use crate::error::AppError;
 use crate::kernel::FreeModelKernel;
+use crate::protocol::translate;
 use crate::protocol::types::{AnthropicRequest, ChatRequest};
 use crate::routes::AppState;
 use axum::extract::State;
@@ -23,11 +24,15 @@ pub async fn chat_handler(
     if req.messages.is_empty() {
         return AppError::empty_messages().into_response();
     }
-    let nm = req.model.strip_prefix("opencode/").unwrap_or(&req.model);
-    if !state.config.free_models.iter().any(|m| m == nm) {
+    let nm = translate::normalize_model(&req.model);
+    let model_mappings = state.model_mappings().await;
+    if !model_mappings
+        .iter()
+        .any(|mapping| mapping.public_name == nm)
+    {
         return AppError::invalid_model(req.model).into_response();
     }
-    let kernel = FreeModelKernel::from_config(&state.config);
+    let kernel = FreeModelKernel::from_config_and_mappings(&state.config, &model_mappings);
     let profile = ClientProfile::from_openai(&headers, &req);
     match kernel
         .openai_chat_with_profile(&state.http_client, req, profile)
@@ -53,11 +58,15 @@ pub async fn messages_handler(
     if req.messages.is_empty() {
         return AppError::empty_messages().into_response();
     }
-    let nm = req.model.strip_prefix("opencode/").unwrap_or(&req.model);
-    if !state.config.free_models.iter().any(|m| m == nm) {
+    let nm = translate::normalize_model(&req.model);
+    let model_mappings = state.model_mappings().await;
+    if !model_mappings
+        .iter()
+        .any(|mapping| mapping.public_name == nm)
+    {
         return AppError::invalid_model(req.model).into_response();
     }
-    let kernel = FreeModelKernel::from_config(&state.config);
+    let kernel = FreeModelKernel::from_config_and_mappings(&state.config, &model_mappings);
     let profile = ClientProfile::from_anthropic(&headers, &req);
     match kernel
         .anthropic_messages_with_profile(&state.http_client, req, profile)

@@ -88,7 +88,7 @@ impl ClientProfile {
                 }
             }
             "bigpickle" => self,
-            "minimaxm3" | "minimaxm3free" | "qwen36plus" | "qwen36plusfree" => {
+            "hy3" | "hy3free" | "minimaxm3" | "minimaxm3free" | "qwen36plus" | "qwen36plusfree" => {
                 if matches!(
                     self.kind,
                     ClientKind::ClaudeCode | ClientKind::Hermes | ClientKind::OpenClaw
@@ -569,6 +569,8 @@ mod tests {
         for model in [
             "minimax-m3",
             "minimax-m3-free",
+            "hy3",
+            "hy3-free",
             "qwen3.6-plus",
             "qwen3.6-plus-free",
         ] {

@@ -1900,9 +1900,10 @@ async fn handle_stream(
                                 );
                             }
                             if started_tool_call_indexes.is_empty()
+                                && idle_ping_count >= 2
                                 && should_retry_stream_without_forwardable_output(
-                                profile,
-                                attempt,
+                                    profile,
+                                    attempt,
                                 &text,
                                 &tool_calls,
                                 attempt_started.elapsed(),

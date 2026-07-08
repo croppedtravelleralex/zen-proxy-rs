@@ -5,6 +5,7 @@ pub mod client_profile;
 pub mod config;
 pub mod error;
 pub mod kernel;
+pub mod model_catalog;
 pub mod protocol;
 pub mod proxy;
 pub mod redact;

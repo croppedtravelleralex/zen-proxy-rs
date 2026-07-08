@@ -958,6 +958,8 @@ pub fn model_disables_input_compaction(model: &str) -> bool {
             | "big-pickle"
             | "mimo-v2.5"
             | "mimo-v2.5-free"
+            | "hy3"
+            | "hy3-free"
             | "north-mini-code"
             | "north-mini-code-free"
             | "nemotron-3-ultra"
@@ -2152,6 +2154,8 @@ mod tests {
             "deepseek-v4-flash",
             "mimo-v2.5",
             "mimo-v2.5-free",
+            "hy3",
+            "hy3-free",
             "north-mini-code",
             "nemotron-3-ultra-free",
         ] {
