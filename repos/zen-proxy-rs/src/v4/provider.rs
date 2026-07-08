@@ -1350,6 +1350,7 @@ fn apply_model_compatibility_profile(
                 ClientProfile::unknown()
             }
         }
+        ModelCompatibilityProfile::StaticGeneric => ClientProfile::unknown(),
         ModelCompatibilityProfile::DynamicClaudeCodeCompatible => {
             if matches!(profile.kind, ClientKind::ClaudeCode) {
                 profile

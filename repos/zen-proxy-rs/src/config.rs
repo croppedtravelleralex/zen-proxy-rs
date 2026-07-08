@@ -713,6 +713,7 @@ impl Config {
         );
         m.insert("big-pickle".to_string(), "big-pickle".to_string());
         m.insert("mimo-v2.5".to_string(), "mimo-v2.5-free".to_string());
+        m.insert("hy3".to_string(), "hy3-free".to_string());
         m
     }
 
@@ -1485,7 +1486,8 @@ mod tests {
             cfg.model_mapping.get("mimo-v2.5").unwrap(),
             "mimo-v2.5-free"
         );
-        assert_eq!(cfg.model_mapping.len(), 3);
+        assert_eq!(cfg.model_mapping.get("hy3").unwrap(), "hy3-free");
+        assert_eq!(cfg.model_mapping.len(), 4);
     }
 
     #[test]

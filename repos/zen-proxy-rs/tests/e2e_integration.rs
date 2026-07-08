@@ -518,7 +518,10 @@ mod e2e {
             .iter()
             .filter_map(|model| model["id"].as_str())
             .collect();
-        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        assert_eq!(
+            ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+        );
 
         let detail = reqwest::blocking::get(format!(
             "http://127.0.0.1:{}/v1/models/deepseek-v4-flash",
@@ -568,7 +571,7 @@ mod e2e {
                 .collect();
             assert_eq!(
                 probe_ids,
-                vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"],
+                vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"],
                 "{probe_name} model probe ids"
             );
         }
@@ -609,7 +612,7 @@ mod e2e {
             .collect();
         assert_eq!(
             public_ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
         );
 
         let client = reqwest::blocking::Client::new();
@@ -789,7 +792,7 @@ mod e2e {
             .collect();
         assert_eq!(
             before_ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
         );
 
         let promoted = client
@@ -823,6 +826,7 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "new-opencode"
             ]
         );
@@ -908,6 +912,7 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "new-candidate-direct",
                 "second-candidate-direct"
             ]
@@ -1016,6 +1021,7 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "nemotron-3-ultra"
             ]
         );
@@ -1204,6 +1210,7 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "new-manual-harness"
             ]
         );
@@ -1287,6 +1294,7 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "new-harness-probed"
             ]
         );
@@ -1455,6 +1463,7 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "new-http-probed"
             ]
         );
@@ -1738,7 +1747,7 @@ mod e2e {
             .collect();
         assert_eq!(
             public_ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
         );
 
         stop_server(child, port);
@@ -2268,7 +2277,10 @@ mod e2e {
             .iter()
             .filter_map(|model| model["id"].as_str())
             .collect();
-        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        assert_eq!(
+            ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+        );
         stop_server(child, port);
     }
 
@@ -2922,7 +2934,10 @@ mod e2e {
             .iter()
             .filter_map(|model| model["id"].as_str())
             .collect();
-        assert_eq!(v4_ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        assert_eq!(
+            v4_ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+        );
         stop_server(v4_child, v4_port);
     }
 

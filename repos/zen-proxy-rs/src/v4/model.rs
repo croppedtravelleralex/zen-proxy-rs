@@ -28,6 +28,7 @@ pub enum ModelCompatibilityProfile {
     StaticFlash,
     StaticFlashLite,
     StaticMimo,
+    StaticGeneric,
     DynamicGeneric,
     DynamicClaudeCodeCompatible,
     DynamicRestricted,
@@ -42,6 +43,7 @@ impl ModelCompatibilityProfile {
             "big-pickle" => Some(Self::StaticFlashLite),
             "mimo" => Some(Self::StaticMimo),
             "mimo-v2.5" => Some(Self::StaticMimo),
+            "hy3" => Some(Self::StaticGeneric),
             "claude-haiku-4-5" => Some(Self::StaticFlash),
             _ => None,
         }
@@ -62,6 +64,7 @@ impl ModelCompatibilityProfile {
             Self::StaticFlash => "static_flash",
             Self::StaticFlashLite => "static_flash_lite",
             Self::StaticMimo => "static_mimo",
+            Self::StaticGeneric => "static_generic",
             Self::DynamicGeneric => "dynamic_generic",
             Self::DynamicClaudeCodeCompatible => "dynamic_claudecode_compatible",
             Self::DynamicRestricted => "dynamic_restricted",
@@ -82,11 +85,13 @@ impl StaticModelRegistry {
         ("deepseek-v4-flash", "deepseek-v4-flash-free"),
         ("big-pickle", "big-pickle"),
         ("mimo-v2.5", "mimo-v2.5-free"),
+        ("hy3", "hy3-free"),
     ];
     const REQUEST_ALIASES: &'static [(&'static str, &'static str, &'static str)] = &[
         ("deepseek", "deepseek", "deepseek-v4-flash-free"),
         ("bigpickle", "bigpickle", "big-pickle"),
         ("mimo", "mimo", "mimo-v2.5-free"),
+        ("hy3free", "hy3", "hy3-free"),
     ];
     const HIDDEN_HELPER_MODELS: &'static [(&'static str, &'static str)] =
         &[("claude-haiku-4-5", "deepseek-v4-flash-free")];
@@ -346,7 +351,10 @@ mod tests {
             .into_iter()
             .map(|model| model.id)
             .collect();
-        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        assert_eq!(
+            ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+        );
     }
 
     #[test]
@@ -385,6 +393,11 @@ mod tests {
             registry.resolve("mimo-v2.5").unwrap().compatibility_profile,
             ModelCompatibilityProfile::StaticMimo
         );
+        assert_eq!(registry.resolve("hy3").unwrap().upstream_model, "hy3-free");
+        assert_eq!(
+            registry.resolve("hy3").unwrap().compatibility_profile,
+            ModelCompatibilityProfile::StaticGeneric
+        );
     }
 
     #[test]
@@ -398,6 +411,7 @@ mod tests {
         assert!(!ids.contains(&"deepseek".to_string()));
         assert!(!ids.contains(&"bigpickle".to_string()));
         assert!(!ids.contains(&"mimo".to_string()));
+        assert!(!ids.contains(&"hy3free".to_string()));
 
         let deepseek = registry.resolve("deepseek").unwrap();
         assert_eq!(deepseek.public_model, "deepseek");
@@ -421,6 +435,14 @@ mod tests {
         assert_eq!(
             mimo.compatibility_profile,
             ModelCompatibilityProfile::StaticMimo
+        );
+
+        let hy3 = registry.resolve("hy3free").unwrap();
+        assert_eq!(hy3.public_model, "hy3");
+        assert_eq!(hy3.upstream_model, "hy3-free");
+        assert_eq!(
+            hy3.compatibility_profile,
+            ModelCompatibilityProfile::StaticGeneric
         );
     }
 
@@ -483,7 +505,10 @@ mod tests {
             .into_iter()
             .map(|model| model.id)
             .collect();
-        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        assert_eq!(
+            ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+        );
         assert!(matches!(
             registry.resolve("new-active-free"),
             Err(ModelError::UnknownModel(model)) if model == "new-active-free"
@@ -507,6 +532,7 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "new-active",
                 "new-canary"
             ]
@@ -538,6 +564,7 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "new-active",
                 "new-canary",
                 "new-candidate"
@@ -659,7 +686,13 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "new-active"]
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "hy3",
+                "new-active"
+            ]
         );
         assert!(registry.resolve("new-active").is_ok());
         assert!(registry.resolve("new-canary-free").is_err());
@@ -679,7 +712,10 @@ mod tests {
         );
         let models = registry.public_models();
         let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
-        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        assert_eq!(
+            ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+        );
         assert_eq!(
             registry.resolve("mimo-v2.5").unwrap().upstream_model,
             "mimo-v2.5-free"
@@ -717,6 +753,7 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "nemotron-3-ultra"
             ]
         );
@@ -750,7 +787,10 @@ mod tests {
             .into_iter()
             .map(|model| model.id)
             .collect();
-        assert_eq!(ids, vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5"]);
+        assert_eq!(
+            ids,
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+        );
 
         let minimax = registry.resolve("minimax-m3").unwrap();
         assert_eq!(minimax.upstream_model, "minimax-m3-free");
@@ -789,6 +829,7 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
+                "hy3",
                 "nemotron-3-ultra"
             ]
         );
