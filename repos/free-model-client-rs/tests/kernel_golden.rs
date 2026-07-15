@@ -29,6 +29,7 @@ struct ObservedRequest {
     tools: Option<Value>,
     tool_choice: Option<Value>,
     thinking: Option<Value>,
+    stream: Option<bool>,
     max_tokens_present: bool,
     max_tokens: Option<u64>,
 }
@@ -55,6 +56,7 @@ async fn mock_zen_handler(
         tools: body.get("tools").cloned(),
         tool_choice: body.get("tool_choice").cloned(),
         thinking: body.get("thinking").cloned(),
+        stream: body.get("stream").and_then(Value::as_bool),
         max_tokens_present: body.get("max_tokens").is_some(),
         max_tokens: body.get("max_tokens").and_then(Value::as_u64),
     };
@@ -1997,7 +1999,7 @@ async fn anthropic_claude_code_explicit_smoke_truncated_empty_returns_pass() {
 }
 
 #[tokio::test]
-async fn anthropic_non_stream_no_forwardable_retries_with_upstream_stream_mode() {
+async fn anthropic_non_stream_forces_upstream_stream_mode() {
     let (config, client, state) = spawn_mock_zen().await;
     let kernel = FreeModelKernel::new(config);
     let mut request = anthropic_request(
@@ -2019,9 +2021,9 @@ async fn anthropic_non_stream_no_forwardable_retries_with_upstream_stream_mode()
     let body = response_text(response).await;
     assert!(body.contains("\"text\":\"stream fallback ok\""), "{body}");
     let requests = state.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].max_tokens, Some(64));
-    assert_eq!(requests[1].max_tokens, Some(64));
+    assert_eq!(requests[0].stream, Some(true));
 }
 
 #[tokio::test]
@@ -2701,6 +2703,42 @@ async fn anthropic_claude_code_forced_tool_choice_keeps_function_choice_for_sele
             sent[0].thinking.is_none(),
             "{model} must not disable thinking"
         );
+    }
+}
+
+#[tokio::test]
+async fn anthropic_claude_code_forced_tool_choice_keeps_for_deepseek_family() {
+    for model in ["deepseek-v4-flash-free", "hy3-free", "big-pickle"] {
+        let (config, client, observed) = spawn_mock_zen().await;
+        let kernel = FreeModelKernel::new(config);
+        let mut req = anthropic_request(model, "Use Bash to run exactly: printf OK", false);
+        req.tools = Some(vec![anthropic_tool(
+            "Bash",
+            json!({
+                "command": {"type": "string"},
+                "description": {"type": "string"}
+            }),
+            &["command"],
+        )]);
+        req.tool_choice = Some(json!({"type":"tool","name":"Bash"}));
+
+        let response = kernel
+            .anthropic_messages_with_profile(
+                &client,
+                req,
+                ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let sent = observed.requests.lock().unwrap();
+        assert_eq!(
+            sent[0].tool_choice.as_ref(),
+            Some(&json!({"type":"function","function":{"name":"Bash"}})),
+            "{model} must preserve the requested tool"
+        );
+        assert!(sent[0].thinking.is_none(), "{model}");
     }
 }
 

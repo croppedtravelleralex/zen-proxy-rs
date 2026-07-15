@@ -33,6 +33,8 @@ pub struct ZenChoice {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ZenDelta {
     pub content: Option<String>,
+    // OpenCode/OpenRouter hy3 emits `reasoning`; DeepSeek-style emits `reasoning_content`.
+    #[serde(default, alias = "reasoning")]
     pub reasoning_content: Option<String>,
     pub tool_calls: Option<Vec<ZenToolCallDelta>>,
 }
@@ -1219,5 +1221,23 @@ mod tests {
         assert!(!has_collected_output_signal(&collected));
         assert!(!collected.saw_done);
         assert!(collected.finish_reason.is_none());
+    }
+
+    #[test]
+    fn collected_output_signal_accepts_opencode_reasoning_alias() {
+        let mut collected = CollectedStream::default();
+        apply_sse_frame_to_collection(
+            SseFrame {
+                data: r#"{"choices":[{"delta":{"content":"","reasoning":"think"},"finish_reason":null}]}"#
+                    .to_string(),
+                ..SseFrame::default()
+            },
+            &mut collected,
+        )
+        .unwrap();
+
+        assert!(has_collected_output_signal(&collected));
+        assert_eq!(collected.reasoning, "think");
+        assert!(collected.content.is_empty());
     }
 }

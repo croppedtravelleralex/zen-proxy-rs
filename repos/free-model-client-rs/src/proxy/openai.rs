@@ -263,6 +263,9 @@ async fn handle_oa_non_stream(
         let mut attempt_body = zb.clone();
         let mut output = None;
         for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
+            // Aggregate non-stream responses from upstream SSE; stream=false JSON
+            // is not parseable by collect_stream_parts.
+            attempt_body["stream"] = Value::Bool(true);
             let resp = match crate::zen::client::fetch_zen_stream_with_headers(
                 client,
                 &config.zen_chat_url,

@@ -453,7 +453,10 @@ fn model_supports_anthropic_breakpoints(model: &str) -> bool {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .map(|ch| ch.to_ascii_lowercase())
         .collect();
-    matches!(normalized.as_str(), "bigpickle" | "mimov25" | "mimov25free")
+    matches!(
+        normalized.as_str(),
+        "bigpickle" | "mimov25" | "mimov25free" | "hy3" | "hy3free"
+    )
 }
 
 pub fn apply_deepseek_stable_cache_breakpoints(body: &mut Value, request: &ChatRequest) -> usize {
@@ -788,61 +791,66 @@ mod tests {
     }
 
     #[test]
-    fn mimo_adds_content_block_cache_control_breakpoints() {
-        let request = ChatRequest {
-            model: "mimo-v2.5".into(),
-            messages: vec![
-                Message {
-                    role: "user".into(),
-                    content: Value::String("stable prefix".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
+    fn mimo_and_hy3_add_content_block_cache_control_breakpoints() {
+        for (public_model, upstream_model) in [("mimo-v2.5", "mimo-v2.5-free"), ("hy3", "hy3-free")]
+        {
+            let request = ChatRequest {
+                model: public_model.into(),
+                messages: vec![
+                    Message {
+                        role: "user".into(),
+                        content: Value::String("stable prefix".into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    },
+                    Message {
+                        role: "user".into(),
+                        content: Value::String("tail".into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    },
+                ],
+                stream: Some(true),
+                max_tokens: Some(1024),
+                temperature: None,
+                top_p: None,
+                tools: None,
+                tool_choice: None,
+            };
+            let package = prepare_icp_upstream_request(
+                &request,
+                "scope",
+                upstream_model,
+                &UskContext {
+                    api_key_id: "key",
+                    public_model,
+                    upstream_model,
+                    source_client: "claude-code",
                 },
-                Message {
-                    role: "user".into(),
-                    content: Value::String("tail".into()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
+                &CcpFlags {
+                    icp_enabled: true,
+                    prompt_cache_key: true,
+                    anthropic_breakpoints: true,
+                    reasoning_sidecar: true,
+                    trf_strict: true,
                 },
-            ],
-            stream: Some(true),
-            max_tokens: Some(1024),
-            temperature: None,
-            top_p: None,
-            tools: None,
-            tool_choice: None,
-        };
-        let package = prepare_icp_upstream_request(
-            &request,
-            "scope",
-            "mimo-v2.5-free",
-            &UskContext {
-                api_key_id: "key",
-                public_model: "mimo-v2.5",
-                upstream_model: "mimo-v2.5-free",
-                source_client: "claude-code",
-            },
-            &CcpFlags {
-                icp_enabled: true,
-                prompt_cache_key: true,
-                anthropic_breakpoints: true,
-                reasoning_sidecar: true,
-                trf_strict: true,
-            },
-        );
+            );
 
-        assert!(package.body.get("prompt_cache_key").is_some());
-        assert_eq!(count_cache_controls(&package.body), 1);
-        assert_eq!(
-            package.body["messages"][0]["content"],
-            json!("stable prefix")
-        );
-        assert_eq!(
-            package.body["messages"][1]["content"][0]["cache_control"],
-            json!({"type":"ephemeral"})
-        );
+            assert!(package.body.get("prompt_cache_key").is_some());
+            assert_eq!(count_cache_controls(&package.body), 1, "{public_model}");
+            assert_eq!(
+                package.body["messages"][0]["content"],
+                json!("stable prefix"),
+                "{public_model}"
+            );
+            assert_eq!(
+                package.body["messages"][1]["content"][0]["cache_control"],
+                json!({"type":"ephemeral"}),
+                "{public_model}"
+            );
+        }
     }
 
     #[test]

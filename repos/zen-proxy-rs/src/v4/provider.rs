@@ -1350,7 +1350,13 @@ fn apply_model_compatibility_profile(
                 ClientProfile::unknown()
             }
         }
-        ModelCompatibilityProfile::StaticGeneric => ClientProfile::unknown(),
+        ModelCompatibilityProfile::StaticGeneric => {
+            if matches!(profile.kind, ClientKind::ClaudeCode) {
+                profile
+            } else {
+                ClientProfile::unknown()
+            }
+        }
         ModelCompatibilityProfile::DynamicClaudeCodeCompatible => {
             if matches!(profile.kind, ClientKind::ClaudeCode) {
                 profile
@@ -3751,6 +3757,28 @@ mod tests {
                 .kind,
             ClientKind::ClaudeCode
         );
+    }
+
+    #[test]
+    fn static_generic_preserves_only_claudecode_profile() {
+        let claudecode = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header);
+        assert_eq!(
+            apply_model_compatibility_profile(claudecode, ModelCompatibilityProfile::StaticGeneric)
+                .kind,
+            ClientKind::ClaudeCode
+        );
+
+        for kind in [ClientKind::Hermes, ClientKind::OpenClaw] {
+            let profile = ClientProfile::new(kind, ClientProfileSource::Header);
+            assert_eq!(
+                apply_model_compatibility_profile(
+                    profile,
+                    ModelCompatibilityProfile::StaticGeneric
+                )
+                .kind,
+                ClientKind::Unknown
+            );
+        }
     }
 
     #[test]

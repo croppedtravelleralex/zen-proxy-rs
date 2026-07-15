@@ -451,6 +451,10 @@ async fn handle_non_stream(
         let mut output = None;
         for attempt in 0..NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS {
             let attempt_started = std::time::Instant::now();
+            // Non-stream client responses are aggregated from upstream SSE.
+            // Upstream stream=false returns JSON and breaks collect_stream_parts
+            // (hy3/OpenCode: 502 stream truncated before DONE or finish_reason).
+            attempt_body["stream"] = Value::Bool(true);
             let resp = match crate::zen::client::fetch_zen_stream_with_headers(
                 client,
                 &config.zen_chat_url,
@@ -1284,6 +1288,29 @@ fn adaptive_no_forwardable_retry_after(
     configured.min(std::time::Duration::from_secs(bucket_secs))
 }
 
+fn claude_code_upstream_wait_interval(
+    profile: ClientProfile,
+    attempt: usize,
+    has_started_tool_call: bool,
+    text: &str,
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+    elapsed: std::time::Duration,
+    retry_after: std::time::Duration,
+    idle_ping_interval: std::time::Duration,
+) -> std::time::Duration {
+    let waiting_for_forwardable_output = profile.kind == ClientKind::ClaudeCode
+        && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+        && !has_started_tool_call
+        && text.trim().is_empty()
+        && tool_calls.is_empty();
+    if !waiting_for_forwardable_output {
+        return idle_ping_interval;
+    }
+
+    let remaining = retry_after.saturating_sub(elapsed);
+    idle_ping_interval.min(remaining.max(std::time::Duration::from_millis(1)))
+}
+
 fn anthropic_tool_json_delta_chunks(input: &str) -> Vec<&str> {
     if input.is_empty() {
         return Vec::new();
@@ -1869,7 +1896,17 @@ async fn handle_stream(
             let mut retry_attempt = false;
             loop {
                 let next_event = if send_idle_ping {
-                    match tokio::time::timeout(idle_ping_interval, upstream.next()).await {
+                    let upstream_wait_interval = claude_code_upstream_wait_interval(
+                        profile,
+                        attempt,
+                        !started_tool_call_indexes.is_empty(),
+                        &text,
+                        &tool_calls,
+                        attempt_started.elapsed(),
+                        no_forwardable_retry_after,
+                        idle_ping_interval,
+                    );
+                    match tokio::time::timeout(upstream_wait_interval, upstream.next()).await {
                         Ok(next) => next,
                         Err(_) => {
                             idle_ping_count += 1;
@@ -1900,7 +1937,6 @@ async fn handle_stream(
                                 );
                             }
                             if started_tool_call_indexes.is_empty()
-                                && idle_ping_count >= 2
                                 && should_retry_stream_without_forwardable_output(
                                     profile,
                                     attempt,
@@ -3605,6 +3641,53 @@ mod tests {
         assert_eq!(
             adaptive_no_forwardable_retry_after(std::time::Duration::from_secs(8), 300_000),
             std::time::Duration::from_secs(8)
+        );
+    }
+
+    #[test]
+    fn upstream_wait_honors_adaptive_no_forwardable_deadline() {
+        let profile = claude_code_profile();
+        let idle = std::time::Duration::from_secs(15);
+        let retry_after = std::time::Duration::from_secs(10);
+
+        assert_eq!(
+            claude_code_upstream_wait_interval(
+                profile,
+                0,
+                false,
+                "",
+                &[],
+                std::time::Duration::ZERO,
+                retry_after,
+                idle,
+            ),
+            retry_after
+        );
+        assert_eq!(
+            claude_code_upstream_wait_interval(
+                profile,
+                0,
+                false,
+                "",
+                &[],
+                std::time::Duration::from_secs(9),
+                retry_after,
+                idle,
+            ),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            claude_code_upstream_wait_interval(
+                profile,
+                0,
+                false,
+                "forwardable",
+                &[],
+                std::time::Duration::ZERO,
+                retry_after,
+                idle,
+            ),
+            idle
         );
     }
 

@@ -1212,30 +1212,35 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_forced_tool_choice_keeps_for_other_models() {
-        let forced = serde_json::json!({
-            "type": "function",
-            "function": { "name": "Bash" }
-        });
-        let mut request = request_with_tool_choice(Some(forced.clone()));
-        request.model = "deepseek-v4-flash-free".to_string();
-        let mut body = serde_json::json!({
-            "model": "deepseek-v4-flash-free",
-            "tool_choice": forced,
-        });
+    fn claude_code_forced_tool_choice_keeps_for_deepseek_hy3_big_pickle() {
+        for model in ["deepseek-v4-flash-free", "hy3-free", "big-pickle"] {
+            let forced = serde_json::json!({
+                "type": "function",
+                "function": { "name": "Bash" }
+            });
+            let mut request = request_with_tool_choice(Some(forced.clone()));
+            request.model = model.to_string();
+            let mut body = serde_json::json!({
+                "model": model,
+                "tool_choice": forced,
+            });
 
-        let tool_choice_policy = downgrade_claude_code_forced_tool_choice_for_upstream_model(
-            &mut body,
-            &mut request,
-            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
-            "deepseek-v4-flash-free",
-        );
+            let tool_choice_policy = downgrade_claude_code_forced_tool_choice_for_upstream_model(
+                &mut body,
+                &mut request,
+                ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+                model,
+            );
 
-        assert_eq!(tool_choice_policy, None);
-        assert_eq!(
-            body["tool_choice"],
-            serde_json::json!({"type":"function","function":{"name":"Bash"}})
-        );
+            assert_eq!(tool_choice_policy, None, "{model}");
+            assert_eq!(body["tool_choice"], forced, "{model}");
+            assert_eq!(
+                request.tool_choice.as_ref(),
+                Some(&body["tool_choice"]),
+                "{model}"
+            );
+            assert!(body.get("thinking").is_none(), "{model}");
+        }
     }
 
     fn provider_invalid_error() -> AppError {

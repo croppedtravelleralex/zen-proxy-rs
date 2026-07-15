@@ -88,7 +88,14 @@ impl ClientProfile {
                 }
             }
             "bigpickle" => self,
-            "hy3" | "hy3free" | "minimaxm3" | "minimaxm3free" | "qwen36plus" | "qwen36plusfree" => {
+            "hy3" | "hy3free" => {
+                if matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw) {
+                    Self::unknown()
+                } else {
+                    self
+                }
+            }
+            "minimaxm3" | "minimaxm3free" | "qwen36plus" | "qwen36plusfree" => {
                 if matches!(
                     self.kind,
                     ClientKind::ClaudeCode | ClientKind::Hermes | ClientKind::OpenClaw
@@ -565,12 +572,28 @@ mod tests {
     }
 
     #[test]
+    fn hy3_keeps_claude_code_policy_but_drops_other_deep_client_policies() {
+        for model in ["hy3", "hy3-free"] {
+            let claudecode =
+                ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+                    .effective_for_model(model);
+            assert_eq!(claudecode.kind, ClientKind::ClaudeCode, "{model}");
+            assert!(claudecode.preserves_model_text_exactly(), "{model}");
+
+            for kind in [ClientKind::Hermes, ClientKind::OpenClaw] {
+                let profile = ClientProfile::new(kind, ClientProfileSource::Header)
+                    .effective_for_model(model);
+                assert_eq!(profile.kind, ClientKind::Unknown, "{model}");
+                assert!(!profile.uses_compat_tool_history(), "{model}");
+            }
+        }
+    }
+
+    #[test]
     fn generic_opencode_free_models_drop_deep_client_policies() {
         for model in [
             "minimax-m3",
             "minimax-m3-free",
-            "hy3",
-            "hy3-free",
             "qwen3.6-plus",
             "qwen3.6-plus-free",
         ] {

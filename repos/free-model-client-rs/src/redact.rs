@@ -11,6 +11,7 @@ fn secret_patterns() -> &'static [Regex] {
                 r"(?i)\b(api[_-]?key|newapi[_-]?key|password|token|secret)\s*=\s*([^\s\r\n]+)",
             )
             .unwrap(),
+            Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{6,}").unwrap(),
             Regex::new(r"\b([A-Za-z0-9_.-]+:\d{2,5}:)([^:\s]+):([^:\s]+)\b").unwrap(),
             Regex::new(
                 r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
@@ -29,9 +30,12 @@ pub fn redact_text(input: &str) -> String {
         .replace_all(&output, "${1}=[REDACTED]")
         .into_owned();
     output = secret_patterns()[2]
-        .replace_all(&output, "${1}[REDACTED]:[REDACTED]")
+        .replace_all(&output, "Bearer [REDACTED]")
         .into_owned();
     output = secret_patterns()[3]
+        .replace_all(&output, "${1}[REDACTED]:[REDACTED]")
+        .into_owned();
+    output = secret_patterns()[4]
         .replace_all(&output, "[REDACTED_PRIVATE_KEY]")
         .into_owned();
     output
@@ -57,10 +61,11 @@ mod tests {
 
     #[test]
     fn redacts_common_secret_shapes() {
-        let text = "API_KEY=abc123\nNEWAPI_KEY=sk-fake-do-not-leak\nproxy.example:8080:user:pass";
+        let text = "API_KEY=abc123\nNEWAPI_KEY=sk-fake-do-not-leak\nBearer opaque-access-token\nproxy.example:8080:user:pass";
         let redacted = redact_text(text);
         assert!(!redacted.contains("abc123"));
         assert!(!redacted.contains("sk-fake-do-not-leak"));
+        assert!(!redacted.contains("opaque-access-token"));
         assert!(!redacted.contains("user:pass"));
         assert!(redacted.contains("API_KEY=[REDACTED]"));
     }

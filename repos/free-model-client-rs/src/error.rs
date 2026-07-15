@@ -172,6 +172,29 @@ fn classify_upstream_error(status: u16, body_text: &str) -> UpstreamErrorKind {
     UpstreamErrorKind::ProviderError
 }
 
+fn provider_error_message_summary(body_text: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body_text).ok()?;
+    let message = parsed
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let normalized = message.to_ascii_lowercase();
+    if ["opencode", "zen", "internal proxy", "proxy route"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return None;
+    }
+    let redacted = crate::redact::redact_text(message);
+    let mut summary: String = redacted.chars().take(160).collect();
+    if redacted.chars().count() > 160 {
+        summary.push('…');
+    }
+    Some(summary)
+}
+
 fn public_upstream_message(
     status: u16,
     body_text: &str,
@@ -186,10 +209,19 @@ fn public_upstream_message(
         }
         UpstreamErrorKind::RateLimited => "upstream provider rate limited the request".to_string(),
         UpstreamErrorKind::ProviderInvalidRequest | UpstreamErrorKind::ProviderError => {
-            if let Some(code) = provider_error_code(body_text) {
-                format!("upstream provider error (status={status}, code={code})")
-            } else {
-                format!("upstream provider error (status={status})")
+            let code = provider_error_code(body_text);
+            let detail = provider_error_message_summary(body_text);
+            match (code, detail) {
+                (Some(code), Some(detail)) => {
+                    format!("upstream provider error (status={status}, code={code}, detail={detail})")
+                }
+                (Some(code), None) => {
+                    format!("upstream provider error (status={status}, code={code})")
+                }
+                (None, Some(detail)) => {
+                    format!("upstream provider error (status={status}, detail={detail})")
+                }
+                (None, None) => format!("upstream provider error (status={status})"),
             }
         }
     }
