@@ -453,10 +453,7 @@ fn model_supports_anthropic_breakpoints(model: &str) -> bool {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .map(|ch| ch.to_ascii_lowercase())
         .collect();
-    matches!(
-        normalized.as_str(),
-        "bigpickle" | "mimov25" | "mimov25free" | "hy3" | "hy3free"
-    )
+    matches!(normalized.as_str(), "bigpickle" | "mimov25" | "mimov25free")
 }
 
 pub fn apply_deepseek_stable_cache_breakpoints(body: &mut Value, request: &ChatRequest) -> usize {
@@ -791,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn mimo_and_hy3_add_content_block_cache_control_breakpoints() {
+    fn mimo_uses_breakpoint_while_hy3_uses_only_prompt_cache_key() {
         for (public_model, upstream_model) in [("mimo-v2.5", "mimo-v2.5-free"), ("hy3", "hy3-free")]
         {
             let request = ChatRequest {
@@ -839,17 +836,26 @@ mod tests {
             );
 
             assert!(package.body.get("prompt_cache_key").is_some());
-            assert_eq!(count_cache_controls(&package.body), 1, "{public_model}");
+            let expected_breakpoints = usize::from(public_model == "mimo-v2.5");
+            assert_eq!(
+                count_cache_controls(&package.body),
+                expected_breakpoints,
+                "{public_model}"
+            );
             assert_eq!(
                 package.body["messages"][0]["content"],
                 json!("stable prefix"),
                 "{public_model}"
             );
-            assert_eq!(
-                package.body["messages"][1]["content"][0]["cache_control"],
-                json!({"type":"ephemeral"}),
-                "{public_model}"
-            );
+            if public_model == "mimo-v2.5" {
+                assert_eq!(
+                    package.body["messages"][1]["content"][0]["cache_control"],
+                    json!({"type":"ephemeral"}),
+                    "{public_model}"
+                );
+            } else {
+                assert_eq!(package.body["messages"][1]["content"], json!("tail"));
+            }
         }
     }
 
