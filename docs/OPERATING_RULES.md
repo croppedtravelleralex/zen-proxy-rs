@@ -16,15 +16,19 @@
 
 - ClaudeCode 验收必须走 cc-switch 和 `https://sub2api.closeapi.top`。
 - dev/new 当前测试域名是 `https://new.relai.asia/`，不要再用旧 `new.closeapi.top`。
-- 生产 channel 69 当前只公开 `deepseek-v4-flash`、`big-pickle`、`mimo-v2.5`。
+- 生产 channel 69 当前公开 `deepseek-v4-flash`、`big-pickle`、`mimo-v2.5`、`hy3`。
+- `hy3` 的公开名映射到上游 `hy3-free`；NewAPI `ModelPrice.hy3=0`、`ModelRatio.hy3=0`。
 - hidden routing 模型不加入 NewAPI 公开列表。
 
 ## 部署规则
 
+- 任何 Panda 远程操作必须先加载并遵守 `panda-remote-ops` skill；skill 不可用时不得执行 Panda 变更。
+- Panda 变更前必须做容量预检；部署先做单实例 canary，再逐个实例推进，并设置明确的 CPU、内存和并发上限。
+- 发现资源恶化、SSH 超时/断连或服务健康下降时立即停止，不继续并发重试或扩大变更面。
 - 需要生产部署时，通过 GitHub 临时 release 上传，远端下载部署，完成后删除 release/tag。
 - 不用 scp 传生产二进制。
 - 禁止把 GitHub source tarball 下载到 panda 后本机编译；如 release asset 上传失败，必须改用本地/CI 构建产物或暂停部署，不能用生产 CPU 兜底。
-- 部署前后记录线上 hash、服务健康、模型列表和最小 smoke。
+- 部署前后记录线上 hash、服务健康、模型列表和最小 smoke；变更 NewAPI 时还要记录 channel、abilities、models、price options 和回滚备份表。
 
 ## 文档规则
 

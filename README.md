@@ -41,6 +41,16 @@
 deepseek-v4-flash
 big-pickle
 mimo-v2.5
+hy3
 ```
 
-`deepseek-v4-flash-lite` 已撤下公开名；其它免费模型只做 hidden routing，不加入 NewAPI 公开列表。
+最近一次生产核验时间为 2026-07-08。公开名与上游映射为：
+
+```text
+deepseek-v4-flash -> deepseek-v4-flash-free
+big-pickle        -> big-pickle
+mimo-v2.5         -> mimo-v2.5-free
+hy3               -> hy3-free
+```
+
+`deepseek-v4-flash-lite` 已撤下公开名；其它自动发现的免费模型默认只作为 candidate/hidden routing，不自动加入 NewAPI 公开列表。当前状态、部署证据和未提交工作以 `docs/PROJECT_HANDOFF.md` 为准。

@@ -24,13 +24,14 @@ Replace the current hand-built Zen reverse-proxy path in `zen-proxy-rs` with a
 FreeModel kernel integration, without losing proxy rotation or operational
 visibility.
 
-Current active continuation is V4.109 dynamic free-model promotion: keep
-`deepseek-v4-flash` and `deepseek-v4-flash-lite` stable, discover opencode
-free-looking models, allow candidates to be listed only in explicitly
-configured self-use/test channels, and promote dynamic models to canary/active
-only after bounded protocol probes, canary traffic quorum, and earned
-ClaudeCode compatibility. Do not change NewAPI, ClaudeCode, cc-switch, or
-production channel 69 while doing this work.
+Current active continuation is production hardening for four stable public
+aliases: `deepseek-v4-flash`, `big-pickle`, `mimo-v2.5`, and `hy3`. OpenCode
+free-model discovery remains conservative, but `hy3-free` was explicitly
+promoted to the stable public alias `hy3` and published through NewAPI channel
+69 on 2026-07-08. This promotion does not prove cache or client quality:
+uncommitted follow-up work still covers hy3 non-stream aggregation, reasoning
+aliases, forced tool-choice downgrade, retries, and stricter cache/TTFT
+acceptance. Read the root project handoff before changing production.
 
 Target chain:
 
@@ -61,7 +62,13 @@ the sidecar's own client, not the proxy node selected by `zen-proxy-rs`.
 V4.0 replaces all older documentation. Do not revive archived legacy docs or
 root-level legacy audit reports as active guidance.
 
-Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md), [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md), [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md), [2026-06-10 Cache Usage And Affinity Alignment](./22_2026-06-10_cache_usage_affinity_alignment.md), [V4.108 Dynamic Model Discovery Phase 1](./23_v4.108_dynamic_model_discovery_phase1.md), [V4.109 Dynamic Free-Model Promotion Goal](./24_v4.109_dynamic_model_promotion_goal.md), [2026-06-13 Dynamic Model Handoff](./25_2026-06-13_dynamic_model_handoff.md), and [2026-06-14 ClaudeCode Production Prep](./26_2026-06-14_claudecode_production_prep.md) before making any claim about panda NewAPI, Hermes, OpenClaw, closeapi, ClaudeCode huge-context behavior, V4.8 acceptance progress, current proxy-pool health, cache usage display, cache-affinity behavior, or dynamic free-model discovery/promotion.
+For the current production model contract, the root project handoff and
+[Models and Routing](./05_models_and_routing.md) override older examples that
+still mention only two aliases or `deepseek-v4-flash-lite`. Dated discovery,
+promotion, and operations documents remain historical evidence, not the current
+public model list.
+
+Latest handoff status must be checked first in [Project Handoff](../../../../docs/PROJECT_HANDOFF.md), then in [2026-05-30 Handoff And Unfinished Work](./19_2026-05-30_handoff_and_unfinished_work.md), [2026-06-01 Final-Anchor Deployment And Smoke](./20_2026-06-01_final_anchor_deploy.md), [2026-06-06 Stream Leasefix And Usage Analysis](./21_2026-06-06_stream_leasefix_and_usage_analysis.md), [2026-06-10 Cache Usage And Affinity Alignment](./22_2026-06-10_cache_usage_affinity_alignment.md), [V4.108 Dynamic Model Discovery Phase 1](./23_v4.108_dynamic_model_discovery_phase1.md), [V4.109 Dynamic Free-Model Promotion Goal](./24_v4.109_dynamic_model_promotion_goal.md), [2026-06-13 Dynamic Model Handoff](./25_2026-06-13_dynamic_model_handoff.md), and [2026-06-14 ClaudeCode Production Prep](./26_2026-06-14_claudecode_production_prep.md) before making any claim about panda NewAPI, Hermes, OpenClaw, closeapi, ClaudeCode huge-context behavior, V4.8 acceptance progress, current proxy-pool health, cache usage display, cache-affinity behavior, or dynamic free-model discovery/promotion.
 
 ## Required Reading Order
 
@@ -88,12 +95,15 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
 21. [V4.109 Dynamic Free-Model Promotion Goal](./24_v4.109_dynamic_model_promotion_goal.md)
 22. [2026-06-13 Dynamic Model Handoff](./25_2026-06-13_dynamic_model_handoff.md)
 23. [2026-06-14 ClaudeCode Production Prep](./26_2026-06-14_claudecode_production_prep.md)
+24. [Root Project Handoff](../../../../docs/PROJECT_HANDOFF.md)
 
 ## Hard Decisions
 
-- Public model list is limited to two names:
+- Production public model list is limited to four stable names:
   - `deepseek-v4-flash`
-  - `deepseek-v4-flash-lite`
+  - `big-pickle`
+  - `mimo-v2.5`
+  - `hy3`
 - V4.108 Phase 1 may discover opencode free-looking models as admin-only
   candidates, but candidates are not public, not routable, and not
   auto-promoted.
@@ -103,8 +113,9 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
   on a private self-use/test channel. Dynamic public names must be sanitized:
   upstream ids ending in `-free` are exposed without the suffix, while the raw
   upstream id remains admin-only. The stable upstream ids
-  `deepseek-v4-flash-free` and `big-pickle` are reserved for the two stable
-  aliases and must not be re-exposed as dynamic models. Test instances may also
+  `deepseek-v4-flash-free`, `big-pickle`, `mimo-v2.5-free`, and `hy3-free` are
+  reserved for stable aliases and must not be re-exposed as dynamic models.
+  Test instances may also
   set `DYNAMIC_MODEL_PUBLIC_ALLOWLIST` to the exact sanitized/raw dynamic model
   ids that passed manual usability checks; when set, dynamic models outside the
   allowlist are not listed and cannot be resolved even if the public mode would
@@ -116,7 +127,9 @@ Latest handoff status must be checked in [2026-05-30 Handoff And Unfinished Work
   matrix.
 - Model mapping:
   - `deepseek-v4-flash -> deepseek-v4-flash-free`
-  - `deepseek-v4-flash-lite -> big-pickle`
+  - `big-pickle -> big-pickle`
+  - `mimo-v2.5 -> mimo-v2.5-free`
+  - `hy3 -> hy3-free`
 - No prompt injection in V4.0.
 - FreeModel behavior must be embedded as a kernel/library path, not an HTTP
   sidecar.

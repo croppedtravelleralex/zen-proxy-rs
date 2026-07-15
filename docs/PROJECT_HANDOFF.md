@@ -1,6 +1,6 @@
 # Project Handoff
 
-更新时间：2026-07-04
+更新时间：2026-07-15
 
 ## 项目定位
 
@@ -39,20 +39,55 @@ Windows claude.orig.exe
 
 ## 当前生产事实
 
-- channel 69 名称：`Zenproxyrs4.3`。
-- channel 69 公开模型：`deepseek-v4-flash,big-pickle,mimo-v2.5`。
+- channel 69 名称：`ocrs`。
+- channel 69 公开模型：`deepseek-v4-flash,big-pickle,mimo-v2.5,hy3`。
+- 公开映射：`deepseek-v4-flash -> deepseek-v4-flash-free`、`big-pickle -> big-pickle`、`mimo-v2.5 -> mimo-v2.5-free`、`hy3 -> hy3-free`。
 - `big-pickle` 已恢复为公开名；`deepseek-v4-flash-lite` 不再作为公开模型或 NewAPI mapping 暴露。
+- NewAPI 已为 `hy3` 建立 active model 和 `defualt/oc` 两组 abilities；价格为 `ModelPrice.hy3=0`、`ModelRatio.hy3=0`。
 - panda ZenProxy 入口：nginx `:4000`，后端 `4001/4002/4004`。
 - 新 Webshare 100 代理已替换到 panda，低并发验证 100/100 可访问上游，出口国家为 `SG`。
-- 2026-07-04 12:22，panda 三个 `zen-proxy-rs@1/2/3` 均运行 sha256 `886344e54013386a8bc648286e79a862dccb2a06839abf3c0e0eb4c5a04b1977`，health OK；这是第二版 `tool_call_id` 稳定化修复，已证明仍不足以达成 95%+。
-- 2026-07-04 12:55，DeepSeek 继续在同一 `session_id` 上重复 `empty_output`，audit 显示坏 node 被 `session_pin` 黏住；本地已补 `empty_output` 清 session pin，但尚未部署到 panda。
-- 2026-07-04 09:55 严格窗口显示 `usk/prefix_32k_hash/prompt_cache_key` 已全量存在，但三模型 cache 仍未达到 95%+：DeepSeek R1/R2 约 11.40%，BigPickle R1/R2 约 15.17%，Mimo R1 约 87.70% 且 R2 受缺失 miss token 影响不能单独采用。
+- 最近一次生产核验为 2026-07-08：三个 `zen-proxy-rs@1/2/3` 均 active，部署二进制 sha256 为 `a9f1c3ba79944dac895665a62df93fbfe38e8678a56cb91fc670d71948acf00f`，Zen `/v1/models` 返回四个公开模型。
+- 2026-07-08 使用一次性 NewAPI token 验证授权 `/v1/models`，结果包含 `hy3`；验证 token 随后删除。
+- 现有文档没有更新鲜的严格证据证明三模型或四模型稳态 cache 已达到 85%-95%；此前低 R2 和长尾 TTFT 结论仍不能被“模型已上线”替代。
 - NewAPI `logs.other` 当前没有 cache 字段，真实 cache 验收必须以 panda audit 的 `cache_read_input_tokens/cache_miss_input_tokens` 为准；cc-switch SQLite 只用于本地请求、模型和耗时对账。
+
+## 2026-07-15 交接快照
+
+### 已落地且已提交
+
+- `3f3d2c0 feat: discover OpenCode free models`：`free-model-client-rs` 增加 OpenCode Zen 免费模型自动发现，`hy3-free` 规范化为公开候选名 `hy3`。
+- `7430d00 feat: publish hy3 through zen proxy`：`zen-proxy-rs` 增加静态 `hy3 -> hy3-free` 映射，并使用 `StaticGeneric` profile，避免误套 Mimo/ClaudeCode 特化策略。
+- 本地 release build 完成后，通过 GitHub 临时 release asset 中转到 Panda；Panda 未执行 `cargo build`、`rustc` 或其它编译。
+- 部署完成后，GitHub 临时 release、asset、tag、本地临时二进制、部署脚本和远端临时 token 均已删除。
+
+### NewAPI 数据与回滚锚点
+
+- channel 69 的 `models` 已追加 `hy3`。
+- `abilities` 已增加 `(defualt,hy3,69)` 和 `(oc,hy3,69)` 两条 enabled 记录，priority/weight 均为 100。
+- `models` 已增加 active `hy3`，endpoints 为 `["anthropic","openai"]`。
+- `options.ModelPrice.hy3=0`、`options.ModelRatio.hy3=0`。
+- 变更前备份表：`closeapi_channel69_backup_20260708_1210_pre_hy3`、`closeapi_abilities_channel69_backup_20260708_1210_pre_hy3`、`closeapi_models_hy3_backup_20260708_1210_pre_hy3`、`closeapi_options_pricing_backup_20260708_1210_pre_hy3`。
+- 回滚时先恢复上述四组数据，再重启 NewAPI 刷新内存缓存；任何 Panda/NewAPI 远程变更必须走 `panda-remote-ops` skill、容量预检和单实例 canary。
+
+### 当前未提交工作，接手时不要混入文档提交
+
+- `ops/local-dev/run_newapi_cache_canary.py`、`run_newapi_dualhost_project_matrix.py` 和未跟踪的 `render_cache_acceptance_report.py`：增加 R2、TTFT P90/P95、慢首字、疑似缓冲流、`client_gone/empty_output` 等硬验收门槛和报告。
+- `repos/free-model-client-rs/src/*` 与 `tests/kernel_golden.rs`：正在处理 hy3/DeepSeek/BigPickle 的非流聚合、forced tool choice 降级、`reasoning` alias、可脱敏 provider error detail 和重试资格；这些改动尚未形成独立提交，本轮文档同步不对其正确性作声明。
+- `repos/free-model-client-rs/docs/logs/2026/2026-07.md` 已有未提交记录；`repos/zen-proxy-rs/src/pool/session_pin.rs` 在工作树显示 modified，提交前必须单独核对内容/行尾差异。
+- 后续 agent 必须先运行 `git status --short` 和分组 `git diff`，只按主题分批提交，禁止 `git add -A`。
+
+### 推荐接手顺序
+
+1. 先把缓存验收 runner/report 与 FMC hy3 兼容修复拆成两个独立改动集。
+2. 在本地分别运行两个 Rust 项目的 fmt/clippy/test/release build；Panda 不参与编译。
+3. 用 Windows + WSL 的 ClaudeCode/OpenCode 原生矩阵验证四个公开模型，报告同时给出质量、耗时、R2、TTFT 长尾、错误分类和缓存口径。
+4. 只有本地验收通过后，才按 GitHub release asset -> Panda 单实例 canary -> 分实例部署 -> NewAPI/Zen 双层 smoke 的顺序进入生产。
 
 ## 已完成的关键工作
 
 - 修复 ClaudeCode 工具参数完整性、坏文件路径、重复工具调用、`SendMessage.summary`、空 `query/command` 等问题。
 - 支持 Anthropic `input_json_delta` 分片和 progressive tool streaming，降低工具首字延迟。
+- 增加 OpenCode Zen 免费模型自动发现，并将 `hy3-free` 作为稳定公开别名 `hy3` 发布到 ZenProxy/NewAPI。
 - 区分 ClaudeCode、Hermes、OpenClaw profile，避免跨客户端套错高侵入策略。
 - 取消不合理输出限制：默认不补 `max_tokens`，显式值原样透传。
 - 增加 stream idle ping、no-forwardable watchdog、有限重试和 provider 错误脱敏。
@@ -78,6 +113,8 @@ Windows claude.orig.exe
 
 cc-switch 使用统计显示的是 `request_model -> provider/upstream model`，所以可能显示 `mimo-v2.5 -> mimo-v2.5-free`。NewAPI 使用日志显示 channel 69 收到的公开模型名，所以显示 `mimo-v2.5`。这是层级差异，不是路由错误。
 
+同理，`hy3` 是 NewAPI/ZenProxy 的公开名，上游实际模型是 `hy3-free`；日志两侧名称不同不代表路由错误。
+
 Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；curl/no-UA/ClaudeCode-like/Mozilla UA 可到达 NewAPI 鉴权层。不要用 Python urllib 直连失败判断 ClaudeCode/cc-switch 被 Cloudflare 挡。
 
 ## 工程反思
@@ -92,10 +129,12 @@ Cloudflare 1010 的 A/B 结论：`Python-urllib/3.12` UA 会触发 403/1010；cu
 4. Mimo cache 报告同时写 accepted/rejected 和 `read_tokens / estimated_total_tokens`，不要因缺 miss token 写成 100%。
 5. 生产部署继续用 GitHub 临时 release，中转后删除 release/tag，不用 scp。
 6. 后续新工作默认从 `/home/lenovo/zen-free-model-suite` 进入；只有需要回滚或对照历史时再读取两个旧路径。
+7. 当前未提交的缓存验收和 FMC hy3 兼容改动必须分开验证、分开提交，不能与文档提交或生产部署混在一起。
 
 ## 生产资源红线
 
 - panda 是生产机，禁止在 panda 上执行 `cargo build`、`rustc` 或任何高 CPU 编译任务；不要用 `nice/ionice` 作为例外。
+- 任何 Panda 操作必须使用 `panda-remote-ops` skill；先做容量预检，先单实例 canary，设置硬 CPU/内存/并发限制，SSH 或资源状态恶化时立即停止。
 - 生产更新只能使用已在本地或 CI 构建完成的产物，经 GitHub release/download 中转到 panda；panda 侧只做下载、hash 校验、替换、重启和 health/smoke。
 - 如果 GitHub release asset 上传失败，必须暂停部署或改用 CI 构建 release asset；禁止退回到“下载 GitHub source tarball 后在 panda 编译”的兜底方案。
 - 2026-07-04 曾因在 panda 上从 GitHub source 编译新提交导致 CPU 被打满并影响其他业务；该路径已列为禁止项。
