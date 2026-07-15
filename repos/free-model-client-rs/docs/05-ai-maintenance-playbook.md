@@ -5,8 +5,9 @@
 1. 先读 `docs/README.md`。
 2. 再读 `docs/02-current-state.md`、`docs/03-roadmap.md`、`docs/04-improvement-backlog.md`。
 3. 如果接手 ClaudeCode WebSearch/WebFetch、`Failed to parse JSON`、502 或工具参数问题，先读 `docs/reports/2026-06-13-claudecode-web-tool-handoff.md`。
-4. 如果要改代码，读相关模块，不全仓漫扫。
-5. 如果文档和代码冲突，以代码、配置、测试和真实命令结果为准，并在同一轮修正文档。
+4. 如果接手 DeepSeek/Mimo/Hy3 的 ClaudeCode 稳定性、首字或缓存，先读顶层 `docs/CLAUDECODE_STABILITY_HANDOFF_2026-07-15.md`。
+5. 如果要改代码，读相关模块，不全仓漫扫。
+6. 如果文档和代码冲突，以代码、配置、测试和真实命令结果为准，并在同一轮修正文档。
 
 ## 当前项目边界
 
@@ -31,6 +32,7 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 
 - 2026-06-22 起，生产 NewAPI `https://sub2api.closeapi.top/` 可在用户明确要求下变更；dev/new 测试域名是 `https://new.relai.asia/`，不要再使用旧 `new.closeapi.top` 作为当前入口。
 - 如果需要部署生产，按用户要求通过 GitHub 临时 release 上传、远端下载、部署后删除 release；不要用 `scp`，也不要在报告里泄露 token/key/proxy 凭据。
+- Panda 上禁止编译。部署脚本必须检查可用内存 >=1 GiB 且 >=25%、归一化 load <=0.70、根磁盘 <=85%；单实例 canary 后逐实例滚动，失败自动恢复 canary 前备份。
 - 2026-07-02 起，生产 channel 69 公开模型只应包含 `deepseek-v4-flash`、`big-pickle`、`mimo-v2.5`；其它免费模型只能 hidden route。
 - `deepseek-v4-flash-lite` 是旧公开名，已改回 `big-pickle`，NewAPI channel 69 和 ZenProxy public alias 不应再公开旧 lite 名称。
 - base URL 使用 `http://100.69.228.93:8081`，除非用户更新。
@@ -53,6 +55,8 @@ CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/tmp/free-model-client-rs-target cargo test
 - cc-switch 使用统计里的模型箭头是 `request_model -> provider/upstream model`，例如 `mimo-v2.5 -> mimo-v2.5-free`；NewAPI 使用日志显示的是 channel 69 公开请求模型 `mimo-v2.5`。判断是否同一路请求时优先对 `channel_id=69`、时间、prompt/cache tokens、request id 和 ZenProxy ingress/upstream 日志，不要只看模型名后缀。
 - 不要用 Python urllib 直连 `sub2api.closeapi.top` 判断 ClaudeCode 链路是否被 Cloudflare 挡。2026-07-02 A/B 已确认 `Python-urllib/3.12` UA 会触发 Cloudflare 403/1010，而 curl/no-UA/ClaudeCode-like/Mozilla UA 可到达 NewAPI 鉴权层。
 - Mimo provider 常省略显式 miss tokens；报告 cache 时同时列 accepted/rejected 和 `read_tokens / estimated_total_tokens`，不要把 `read/(read+miss)=100%` 写成真实全量命中。
+- CC Switch `input_token_semantics=2` 时，优先报告“出现 cache_read_tokens 的请求覆盖”和原始 token 数，不自行套 `read/(input+read)` 公式。
+- Hy3 当前禁止 Anthropic `cache_control` breakpoint；forced tool + breakpoint 已实测出现不完整参数。只保留稳定 session/project/request identity，直到 provider 行为改变且通过工具回归。
 - 当前 `prompt_bucket=10k` runner 标签会因 ClaudeCode system/tools envelope 变成远端约 `53k-56.5k` estimated tokens；正式 10k/50k/100k/200k 前先校准 `stable_prefix_bytes`，再启动 50rpm。
 
 ## NewAPI 使用日志导出器纪律

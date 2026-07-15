@@ -46,7 +46,7 @@ Windows claude.orig.exe
 - NewAPI 已为 `hy3` 建立 active model 和 `defualt/oc` 两组 abilities；价格为 `ModelPrice.hy3=0`、`ModelRatio.hy3=0`。
 - panda ZenProxy 入口：nginx `:4000`，后端 `4001/4002/4004`。
 - 新 Webshare 100 代理已替换到 panda，低并发验证 100/100 可访问上游，出口国家为 `SG`。
-- 最近一次生产核验为 2026-07-08：三个 `zen-proxy-rs@1/2/3` 均 active，部署二进制 sha256 为 `a9f1c3ba79944dac895665a62df93fbfe38e8678a56cb91fc670d71948acf00f`，Zen `/v1/models` 返回四个公开模型。
+- 最近一次生产核验为 2026-07-15：三个 `zen-proxy-rs@1/2/3` 均 active，部署二进制 sha256 为 `1e5102df0d2f4ec9bd7cbb6fbae44134368ba48f1613a694df4becb6dfad41d7`，`4000/4001/4002/4004` health 均为 200。
 - 2026-07-08 使用一次性 NewAPI token 验证授权 `/v1/models`，结果包含 `hy3`；验证 token 随后删除。
 - 现有文档没有更新鲜的严格证据证明三模型或四模型稳态 cache 已达到 85%-95%；此前低 R2 和长尾 TTFT 结论仍不能被“模型已上线”替代。
 - NewAPI `logs.other` 当前没有 cache 字段，真实 cache 验收必须以 panda audit 的 `cache_read_input_tokens/cache_miss_input_tokens` 为准；cc-switch SQLite 只用于本地请求、模型和耗时对账。
@@ -69,19 +69,28 @@ Windows claude.orig.exe
 - 变更前备份表：`closeapi_channel69_backup_20260708_1210_pre_hy3`、`closeapi_abilities_channel69_backup_20260708_1210_pre_hy3`、`closeapi_models_hy3_backup_20260708_1210_pre_hy3`、`closeapi_options_pricing_backup_20260708_1210_pre_hy3`。
 - 回滚时先恢复上述四组数据，再重启 NewAPI 刷新内存缓存；任何 Panda/NewAPI 远程变更必须走 `panda-remote-ops` skill、容量预检和单实例 canary。
 
-### 当前未提交工作，接手时不要混入文档提交
+### 2026-07-15 ClaudeCode 稳定性部署
 
-- `ops/local-dev/run_newapi_cache_canary.py`、`run_newapi_dualhost_project_matrix.py` 和未跟踪的 `render_cache_acceptance_report.py`：增加 R2、TTFT P90/P95、慢首字、疑似缓冲流、`client_gone/empty_output` 等硬验收门槛和报告。
-- `repos/free-model-client-rs/src/*` 与 `tests/kernel_golden.rs`：正在处理 hy3/DeepSeek/BigPickle 的非流聚合、forced tool choice 降级、`reasoning` alias、可脱敏 provider error detail 和重试资格；这些改动尚未形成独立提交，本轮文档同步不对其正确性作声明。
-- `repos/free-model-client-rs/docs/logs/2026/2026-07.md` 已有未提交记录；`repos/zen-proxy-rs/src/pool/session_pin.rs` 在工作树显示 modified，提交前必须单独核对内容/行尾差异。
+- 源码提交：`a3fc5ca`、`2c29662`、`210f60c`。
+- 正式 Windows ClaudeCode 三模型矩阵：`184/189` 通过，工具执行识别 `185/189`。
+- 部署后定向矩阵首轮 `16/18`，两个随机性失败各自重跑通过；NewAPI/CC Switch 部署后窗口 `57/57` HTTP 200、0 错误。
+- 部署后 CC Switch FRT P50/P95：DeepSeek `5.972s/8.015s`，Mimo `7.309s/15.748s`，Hy3 `10.300s/13.918s`。
+- 请求级 cache-read 覆盖：Mimo `95.65%`，DeepSeek `36.84%`，Hy3 `40.00%`。后两者不满足 85%-95%，不得写成已达标。
+- Hy3 不启用 `cache_control` breakpoint；实测该组合会损害 forced-tool 参数完整性。完整证据与后续口径见 `docs/CLAUDECODE_STABILITY_HANDOFF_2026-07-15.md`。
+- 临时 GitHub release/assets、NewAPI token 897、本地 key、CC Switch 临时 provider/备份和 Panda `-v2/-v3` 中间备份均已清理；只保留最早生产回滚锚点。
+
+### 当前未提交工作，接手时不要混入
+
+- `ops/local-dev/run_newapi_cache_canary.py`、`run_newapi_dualhost_project_matrix.py` 和未跟踪的 `render_cache_acceptance_report.py` 属于另一组缓存验收 runner 改动，本轮不提交。
+- `repos/zen-proxy-rs/src/pool/session_pin.rs` 的工作区 hash 与 HEAD 一致，只存在行尾/索引状态噪声；不要为清状态重写文件。
 - 后续 agent 必须先运行 `git status --short` 和分组 `git diff`，只按主题分批提交，禁止 `git add -A`。
 
 ### 推荐接手顺序
 
-1. 先把缓存验收 runner/report 与 FMC hy3 兼容修复拆成两个独立改动集。
-2. 在本地分别运行两个 Rust 项目的 fmt/clippy/test/release build；Panda 不参与编译。
-3. 用 Windows + WSL 的 ClaudeCode/OpenCode 原生矩阵验证四个公开模型，报告同时给出质量、耗时、R2、TTFT 长尾、错误分类和缓存口径。
-4. 只有本地验收通过后，才按 GitHub release asset -> Panda 单实例 canary -> 分实例部署 -> NewAPI/Zen 双层 smoke 的顺序进入生产。
+1. 先观察 24 小时真实流量，按模型、输入桶、冷/暖会话拆分成功率、工具质量、TTFT 和 cache read/miss。
+2. DeepSeek/Hy3 的下一轮缓存优化先做 provider 行为 A/B，不再继续增加无证据的 session/header 变体。
+3. Mimo 重点追踪 `Grep include + stream-json` 的 100s+ 总耗时长尾，区分 ClaudeCode 多轮、Web/工具执行和上游生成耗时。
+4. 继续坚持本地构建，按 GitHub release asset -> Panda 单实例 canary -> 分实例部署 -> NewAPI/Zen 双层 smoke 的顺序生产发布。
 
 ## 已完成的关键工作
 

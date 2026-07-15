@@ -2,6 +2,16 @@
 
 ## P0：必须优先处理
 
+### 2026-07-15 三模型 ClaudeCode 稳态与缓存分层
+
+- 状态：兼容修复已部署；正式 189 项 `184/189`，部署后 NewAPI/CC Switch `57/57` HTTP 200。
+- 已达成：DeepSeek/Mimo/Hy3 的 Bash、Edit、Glob/Grep、Task、WebSearch 等高风险工具链可用；未见协议解析、工具 schema 或进程级故障。
+- 首字：部署后 CC Switch FRT P95 为 DeepSeek `8.015s`、Mimo `15.748s`、Hy3 `13.918s`。
+- 缓存：Mimo 请求级 cache-read 覆盖 `95.65%`；DeepSeek `36.84%`、Hy3 `40.00%`，后两者仍是 P0 观察项。
+- 约束：Hy3 不允许开启 `cache_control` breakpoint 换命中率；实测它会导致 forced-tool 参数不完整。
+- 下一步：做 24 小时冷/暖会话分层统计；DeepSeek/Hy3 在相同前缀、相同 session、相同节点和相同账号下做 provider A/B。只有 provider 返回真实 read/miss 证据后才调整缓存目标。
+- 验收：暖会话 cache read 85%-95%，HTTP/协议成功率 >=99.5%，工具执行 >=99%，且 TTFT P95、工具参数完整和输出质量不退化。
+
 ### 2026-07-02 channel 69 proxy auth 恢复与 big-pickle 公开名
 
 - 状态：已恢复生产；新 Webshare 100 代理低并发验证 100/100 可用且出口 `SG`，已替换 panda `nodes-prod.json`。

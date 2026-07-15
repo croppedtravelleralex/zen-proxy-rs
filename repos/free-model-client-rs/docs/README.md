@@ -10,7 +10,7 @@
 /home/lenovo/zen-free-model-suite
 ```
 
-该目录通过软链接聚合两个仓库和关键 smoke 产物，不移动真实 git 仓库。跨仓接手优先读 `/home/lenovo/zen-free-model-suite/README.md` 和 `/home/lenovo/zen-free-model-suite/docs/PROJECT_HANDOFF.md`。
+该目录已通过 `git subtree` 导入两个项目的真实源码目录，不再使用软链接。跨仓接手优先读 `/home/lenovo/zen-free-model-suite/README.md`、`docs/PROJECT_HANDOFF.md` 和 `docs/CLAUDECODE_STABILITY_HANDOFF_2026-07-15.md`。
 
 ## 阅读顺序
 
@@ -24,6 +24,8 @@
 8. docs/reports/2026-06-13-claudecode-web-tool-handoff.md：ClaudeCode WebSearch/WebFetch、cc-switch provider、502/parse JSON 调查交接。
 9. docs/reports/2026-07-02-cross-repo-suite-handoff.md：跨仓聚合入口、链路、完成事项、约束和后续建议。
 10. docs/logs/YYYY/YYYY-MM.md：按时间追加的工作记录。
+
+最新生产交接：`/home/lenovo/zen-free-model-suite/docs/CLAUDECODE_STABILITY_HANDOFF_2026-07-15.md`。
 
 ## 真相来源优先级
 

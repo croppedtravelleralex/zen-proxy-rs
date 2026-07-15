@@ -1,7 +1,18 @@
 # 当前状态
 
-更新时间：2026-07-02
-分支：`codex/v47-client-split-cache-harness`
+更新时间：2026-07-15
+分支：`codex/cache-lane-85plus`
+
+## 2026-07-15 ClaudeCode 三模型稳定性
+
+1. `hy3` 已作为 `hy3-free` 的公开别名进入 ZenProxy 和 NewAPI channel 69；价格为 0。
+2. ClaudeCode 兼容修复已提交为 `a3fc5ca`、`2c29662`、`210f60c`，覆盖 profile 隔离、非流式上游 SSE 聚合、Hy3 forced-tool 降级、reasoning alias、watchdog 和错误脱敏。
+3. 本地验证通过：`free-model-client-rs` 172 unit + 140 golden；`zen-proxy-rs` 221 unit + 44 e2e；release build 均在本地完成。
+4. Panda 当前生产二进制 SHA256 为 `1e5102df0d2f4ec9bd7cbb6fbae44134368ba48f1613a694df4becb6dfad41d7`，三实例 active，四个 health 端口均 200。
+5. Windows official ClaudeCode 189 项正式矩阵 `184/189` 通过；部署后 18 项定向矩阵首轮 `16/18`，两个失败重跑均通过。
+6. 部署后专用 token 窗口 NewAPI/CC Switch 均为 `57/57` HTTP 200、0 错误。
+7. 请求级 cache-read 覆盖为 Mimo `95.65%`、DeepSeek `36.84%`、Hy3 `40.00%`。Hy3 的 `cache_control` breakpoint 会损害 forced-tool 参数完整性，当前明确禁用。
+8. 完整数据、口径和后续验收见顶层 `docs/CLAUDECODE_STABILITY_HANDOFF_2026-07-15.md`。
 
 ## 2026-07-02 channel 69 代理池与 big-pickle 恢复
 

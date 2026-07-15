@@ -2,13 +2,13 @@
 
 ## Now
 
-1. 当前暂停继续测试和修复；先以 `docs/reports/2026-06-13-claudecode-web-tool-handoff.md` 作为接手入口。
-2. 若恢复工作，第一步不是改代码，而是重新确认当前 Windows ClaudeCode/cc-switch provider 是否仍为 `closedeepseek -> https://sub2api.closeapi.top`，还是已切回 panda NewAPI/channel 69。
-3. WebSearch/WebFetch 后续排查必须先分清 ClaudeCode 内置 Web 工具、MCP/Playwright 工具、模型服务商原生搜索三条能力；本轮已确认 WebFetch 参数完整但安全验证链路失败。
-4. `Failed to parse JSON` 后续排查必须先拿同一时间窗口的 ClaudeCode stream-json、cc-switch request log、panda NewAPI log、ZenProxy journal，不要凭终端报错直接归因。
-5. 继续保留 V4.105/V4.106/V4.107/V4.110 的线上观察目标：cache hit、真实首字、工具参数完整率、reasoning-only/no-forwardable 重试、连接层 502/524。
-6. 清理或归类未跟踪文件，尤其是 `north-mini-code`、`.codex_tmp/`、密钥、测试输出；默认不提交、不盲删。
-7. 如果代码继续变化，保持根 README、维护文档、日志和真实部署状态同步。
+1. 以顶层 `docs/CLAUDECODE_STABILITY_HANDOFF_2026-07-15.md` 为最新接手入口，观察部署后 24 小时真实流量。
+2. 分模型、输入桶和冷/暖会话统计成功率、工具执行、FRT/总耗时、cache read/miss；不再用单一总缓存率评价三种 provider。
+3. DeepSeek/Hy3 的缓存优化先做 provider A/B，验证相同 prefix/session/account 下的真实 cache 行为；没有证据前不继续叠加 session/header 变体。
+4. Mimo 继续追踪 100s+ ClaudeCode 总耗时长尾，同时保持其 85%-95% 暖会话 cache 覆盖。
+5. `Failed to parse JSON`、400/500/502/524 必须同窗口对齐 ClaudeCode、CC Switch、NewAPI 和 ZenProxy 日志后再归因。
+6. 所有生产构建在本地/CI 完成，Panda 只做下载、校验、单实例 canary 和顺序滚动。
+7. 清理临时 key、CC Switch provider、GitHub release/tag 和测试产物，保持用户默认配置无污染。
 
 ## Done This Phase
 
