@@ -95,8 +95,32 @@ pub(crate) fn downgrade_claude_code_forced_tool_choice_for_upstream_model(
     profile: ClientProfile,
     upstream_model: &str,
 ) -> Option<&'static str> {
-    let _ = (body, request, profile, upstream_model);
-    None
+    let normalized_model: String = upstream_model
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    if profile.kind != ClientKind::ClaudeCode
+        || !matches!(normalized_model.as_str(), "hy3" | "hy3free")
+    {
+        return None;
+    }
+    let forced = body.get("tool_choice").is_some_and(|choice| match choice {
+        Value::String(value) => matches!(value.as_str(), "required" | "any"),
+        Value::Object(object) => object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "function" | "tool" | "required" | "any")),
+        _ => false,
+    });
+    if !forced {
+        return None;
+    }
+
+    let auto = Value::String("auto".to_string());
+    body["tool_choice"] = auto.clone();
+    request.tool_choice = Some(auto);
+    Some("hy3_forced_tool_choice_downgraded_to_auto")
 }
 
 pub(crate) fn client_kind_label(profile: ClientProfile) -> &'static str {
@@ -1212,8 +1236,8 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_forced_tool_choice_keeps_for_deepseek_hy3_big_pickle() {
-        for model in ["deepseek-v4-flash-free", "hy3-free", "big-pickle"] {
+    fn claude_code_forced_tool_choice_keeps_for_deepseek_and_big_pickle() {
+        for model in ["deepseek-v4-flash-free", "big-pickle"] {
             let forced = serde_json::json!({
                 "type": "function",
                 "function": { "name": "Bash" }
@@ -1241,6 +1265,32 @@ mod tests {
             );
             assert!(body.get("thinking").is_none(), "{model}");
         }
+    }
+
+    #[test]
+    fn hy3_forced_tool_choice_downgrades_to_auto() {
+        let forced = serde_json::json!({
+            "type": "function",
+            "function": { "name": "Bash" }
+        });
+        let mut request = request_with_tool_choice(Some(forced.clone()));
+        request.model = "hy3-free".to_string();
+        let mut body = serde_json::json!({
+            "model": "hy3-free",
+            "tool_choice": forced,
+        });
+
+        let policy = downgrade_claude_code_forced_tool_choice_for_upstream_model(
+            &mut body,
+            &mut request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            "hy3-free",
+        );
+
+        assert_eq!(policy, Some("hy3_forced_tool_choice_downgraded_to_auto"));
+        assert_eq!(body["tool_choice"], serde_json::json!("auto"));
+        assert_eq!(request.tool_choice, Some(serde_json::json!("auto")));
+        assert!(body.get("thinking").is_none());
     }
 
     fn provider_invalid_error() -> AppError {

@@ -2707,8 +2707,8 @@ async fn anthropic_claude_code_forced_tool_choice_keeps_function_choice_for_sele
 }
 
 #[tokio::test]
-async fn anthropic_claude_code_forced_tool_choice_keeps_for_deepseek_family() {
-    for model in ["deepseek-v4-flash-free", "hy3-free", "big-pickle"] {
+async fn anthropic_claude_code_forced_tool_choice_keeps_for_supported_models() {
+    for model in ["deepseek-v4-flash-free", "big-pickle"] {
         let (config, client, observed) = spawn_mock_zen().await;
         let kernel = FreeModelKernel::new(config);
         let mut req = anthropic_request(model, "Use Bash to run exactly: printf OK", false);
@@ -2740,6 +2740,36 @@ async fn anthropic_claude_code_forced_tool_choice_keeps_for_deepseek_family() {
         );
         assert!(sent[0].thinking.is_none(), "{model}");
     }
+}
+
+#[tokio::test]
+async fn anthropic_hy3_forced_tool_choice_downgrades_to_auto() {
+    let (config, client, observed) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut req = anthropic_request("hy3-free", "Use Bash to run exactly: printf OK", false);
+    req.tools = Some(vec![anthropic_tool(
+        "Bash",
+        json!({
+            "command": {"type": "string"},
+            "description": {"type": "string"}
+        }),
+        &["command"],
+    )]);
+    req.tool_choice = Some(json!({"type":"tool","name":"Bash"}));
+
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            req,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sent = observed.requests.lock().unwrap();
+    assert_eq!(sent[0].tool_choice.as_ref(), Some(&json!("auto")));
+    assert!(sent[0].thinking.is_none());
 }
 
 #[tokio::test]
