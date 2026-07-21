@@ -443,6 +443,7 @@ async fn handle_non_stream(
         let mut last_empty_class = None;
         let mut last_incomplete_tool_arguments = false;
         let mut used_reasoning_enrich_retry = false;
+        let mut used_thinking_disabled_retry = false;
         let mut used_missing_reasoning_enrich_retry = false;
         let mut used_provider_invalid_enrich_retry = false;
         let mut used_provider_invalid_text_retry = false;
@@ -661,6 +662,23 @@ async fn handle_non_stream(
                         empty_output_class = output_class.as_str(),
                         attempt = attempt + 1,
                         "retrying reasoning-only output with reasoning enrichment"
+                    );
+                    continue;
+                }
+                if output_class.should_retry_with_enriched_reasoning(profile)
+                    && used_reasoning_enrich_retry
+                    && !used_thinking_disabled_retry
+                    && attempt + 1 < NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS
+                {
+                    used_thinking_disabled_retry = true;
+                    attempt_body = super::thinking_disabled_retry_body(&attempt_body);
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %cr.model,
+                        source_client = ?profile.kind,
+                        empty_output_class = output_class.as_str(),
+                        attempt = attempt + 1,
+                        "retrying reasoning-only output with thinking disabled as last resort"
                     );
                     continue;
                 }
@@ -1174,6 +1192,22 @@ fn should_retry_stream_without_forwardable_output(
         && text.trim().is_empty()
         && tool_calls.is_empty()
         && elapsed >= retry_after
+}
+
+fn should_retry_stream_completed_reasoning_only(
+    profile: ClientProfile,
+    attempt: usize,
+    text: &str,
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+    emitted_tool_call_indexes: &std::collections::HashSet<i64>,
+    reasoning: &str,
+) -> bool {
+    profile.kind == ClientKind::ClaudeCode
+        && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+        && text.trim().is_empty()
+        && tool_calls.is_empty()
+        && emitted_tool_call_indexes.is_empty()
+        && !reasoning.trim().is_empty()
 }
 
 fn should_retry_stream_error_before_output(
@@ -2179,6 +2213,64 @@ async fn handle_stream(
                     final_stream_error =
                         Some("upstream returned incomplete tool call arguments".to_string());
                 }
+                if should_retry_stream_completed_reasoning_only(
+                    profile,
+                    attempt,
+                    &text,
+                    &tool_calls,
+                    &emitted_tool_call_indexes,
+                    &reasoning,
+                ) && translate::short_no_tool_empty_fallback_text(&body).is_none()
+                {
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        prompt_hash,
+                        prompt_hash_hex = %prompt_hash_hex,
+                        attempt = attempts_used,
+                        max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                        elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                        upstream_event_count,
+                        reasoning_chars = reasoning.len(),
+                        finish_reason = ?upstream_finish_reason,
+                        "ClaudeCode stream guard retrying after completed reasoning-only upstream output"
+                    );
+                    if !used_enrich_reasoning_retry {
+                        used_enrich_reasoning_retry = true;
+                        attempt_body = super::reasoning_retry_body_with_scope(
+                            &base_body,
+                            profile,
+                            &reasoning_scope,
+                        );
+                        tracing::warn!(
+                            protocol = "anthropic",
+                            model = %body.model,
+                            source_client = ?profile.kind,
+                            prompt_hash,
+                            prompt_hash_hex = %prompt_hash_hex,
+                            next_attempt = attempt + 2,
+                            "ClaudeCode stream guard enabling reasoning-enrichment retry for reasoning-only output"
+                        );
+                    } else if attempt + 2 == CLAUDE_CODE_STREAM_GUARD_ATTEMPTS {
+                        attempt_body = super::thinking_disabled_retry_body(&attempt_body);
+                        tracing::warn!(
+                            protocol = "anthropic",
+                            model = %body.model,
+                            source_client = ?profile.kind,
+                            prompt_hash,
+                            prompt_hash_hex = %prompt_hash_hex,
+                            next_attempt = attempt + 2,
+                            "ClaudeCode stream guard disabling thinking for final reasoning-only retry"
+                        );
+                    }
+                    completed_upstream = false;
+                    upstream_finish_reason = None;
+                    usage = None;
+                    cache_signals = ProviderCacheSignals::ignored();
+                    reasoning.clear();
+                    continue;
+                }
                 break;
             }
             if retry_attempt {
@@ -2483,6 +2575,7 @@ async fn handle_buffered_claude_code_huge_stream(
     let exact_output_literal = translate::exact_output_literal_from_messages(&cr.messages);
     let mut attempt_body = zb.clone();
     let mut used_reasoning_enrich_retry = false;
+    let mut used_thinking_disabled_retry = false;
     let mut used_missing_reasoning_enrich_retry = false;
     let mut used_provider_invalid_enrich_retry = false;
     let mut used_provider_invalid_text_retry = false;
@@ -2605,6 +2698,23 @@ async fn handle_buffered_claude_code_huge_stream(
                     empty_output_class = output_class.as_str(),
                     attempt = attempt + 1,
                     "retrying buffered reasoning-only output with reasoning enrichment"
+                );
+                continue;
+            }
+            if output_class.should_retry_with_enriched_reasoning(profile)
+                && used_reasoning_enrich_retry
+                && !used_thinking_disabled_retry
+                && attempt + 1 < CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS
+            {
+                used_thinking_disabled_retry = true;
+                attempt_body = super::thinking_disabled_retry_body(&attempt_body);
+                tracing::warn!(
+                    protocol = "anthropic_buffered",
+                    model = %cr.model,
+                    source_client = ?profile.kind,
+                    empty_output_class = output_class.as_str(),
+                    attempt = attempt + 1,
+                    "retrying buffered reasoning-only output with thinking disabled as last resort"
                 );
                 continue;
             }
@@ -3612,6 +3722,92 @@ mod tests {
             std::time::Duration::from_secs(44),
             std::time::Duration::from_secs(45)
         ));
+    }
+
+    #[test]
+    fn stream_guard_retries_completed_reasoning_only_output() {
+        let profile = claude_code_profile();
+        let no_emitted = std::collections::HashSet::<i64>::new();
+
+        assert!(should_retry_stream_completed_reasoning_only(
+            profile,
+            0,
+            "",
+            &[],
+            &no_emitted,
+            "chain of thought only"
+        ));
+        // No reasoning at all -> plain empty output, not this retry path.
+        assert!(!should_retry_stream_completed_reasoning_only(
+            profile, 0, "", &[], &no_emitted, "   "
+        ));
+        // Visible text present -> valid output, never retry.
+        assert!(!should_retry_stream_completed_reasoning_only(
+            profile,
+            0,
+            "answer",
+            &[],
+            &no_emitted,
+            "chain of thought"
+        ));
+        // Collected tool calls -> handled by the incomplete-tool path instead.
+        assert!(!should_retry_stream_completed_reasoning_only(
+            profile,
+            0,
+            "",
+            &[crate::zen::client::CollectedToolCall::default()],
+            &no_emitted,
+            "chain of thought"
+        ));
+        // Already emitted tool call blocks downstream -> never retry.
+        let mut emitted = std::collections::HashSet::<i64>::new();
+        emitted.insert(0);
+        assert!(!should_retry_stream_completed_reasoning_only(
+            profile,
+            0,
+            "",
+            &[],
+            &emitted,
+            "chain of thought"
+        ));
+        // Attempt budget exhausted.
+        assert!(!should_retry_stream_completed_reasoning_only(
+            profile,
+            CLAUDE_CODE_STREAM_GUARD_ATTEMPTS - 1,
+            "",
+            &[],
+            &no_emitted,
+            "chain of thought"
+        ));
+    }
+
+    #[test]
+    fn thinking_disabled_retry_body_forces_disabled_thinking() {
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash-free",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096}
+        });
+        let retry = super::super::thinking_disabled_retry_body(&body);
+        assert_eq!(
+            retry.get("thinking"),
+            Some(&serde_json::json!({"type": "disabled"}))
+        );
+        // Original body must stay untouched.
+        assert_eq!(
+            body.get("thinking").and_then(|t| t.get("type")),
+            Some(&serde_json::json!("enabled"))
+        );
+
+        let body_without_thinking = serde_json::json!({
+            "model": "deepseek-v4-flash-free",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let retry = super::super::thinking_disabled_retry_body(&body_without_thinking);
+        assert_eq!(
+            retry.get("thinking"),
+            Some(&serde_json::json!({"type": "disabled"}))
+        );
     }
 
     #[test]

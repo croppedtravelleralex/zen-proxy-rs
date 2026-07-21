@@ -231,6 +231,14 @@ pub(crate) fn reasoning_retry_body(
     reasoning_retry_body_with_scope(body, profile, "")
 }
 
+/// Last-resort retry body for persistent reasoning-only upstream output:
+/// force-disable thinking so the model must emit plain assistant content.
+pub(crate) fn thinking_disabled_retry_body(body: &serde_json::Value) -> serde_json::Value {
+    let mut retry = body.clone();
+    retry["thinking"] = json!({"type": "disabled"});
+    retry
+}
+
 pub(crate) fn reasoning_retry_body_with_scope(
     body: &serde_json::Value,
     profile: ClientProfile,
