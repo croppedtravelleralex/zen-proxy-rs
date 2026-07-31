@@ -24,6 +24,7 @@ use crate::config::Config;
 use crate::ledger::LedgerEvent;
 use crate::pool::{body_size_bucket, DispatchError, ErrorKind, RequestMeta, ResultKind};
 use crate::state::AppState;
+use crate::utils::smart_backoff;
 use crate::v4::context;
 use crate::v4::model::{
     EffectiveModelRegistry, ModelCompatibilityProfile, ModelError, ModelRegistry,
@@ -31,6 +32,10 @@ use crate::v4::model::{
 use crate::v4::protocol_guard::{self, GuardPhase};
 
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// How long to buffer a streaming upstream before its first content/tool signal
+/// before treating it as empty output (slow-or-empty). Mirrors the existing
+/// 30s upstream initial stream fetch timeout used by the kernel.
+const STREAM_EMPTY_PRECHECK_TIMEOUT_SECS: u64 = 30;
 const STREAM_DOWNSTREAM_SEND_TIMEOUT_SECS: u64 = 30;
 const AFFINITY_MIN_BODY_BYTES: u64 = 32 * 1024;
 const AFFINITY_MIN_BODY_BYTES_CLAUDE_CODE: u64 = 16 * 1024;
@@ -1660,11 +1665,21 @@ async fn call_with_retry(
                         .and_then(|value| value.to_str().ok())
                         .map(ToOwned::to_owned);
                     let (response, body_bytes_len, usage, has_output) = if request_meta.stream {
-                        (response, 0, UsageCounts::default(), true)
+                        match precheck_stream_first_output(response, path).await {
+                            StreamPrecheck::HasOutput(resp) => {
+                                (resp, 0, UsageCounts::default(), true)
+                            }
+                            StreamPrecheck::Empty => (
+                                Response::new(Body::empty()),
+                                0,
+                                UsageCounts::default(),
+                                false,
+                            ),
+                        }
                     } else {
                         buffered_response_with_usage(response, path, public_model).await?
                     };
-                    if !request_meta.stream && !has_output {
+                    if !has_output {
                         crate::pool::session_pin::clear(
                             &request_meta.upstream_model,
                             &request_meta.session_id,
@@ -2070,7 +2085,8 @@ async fn call_with_retry(
             ));
         }
 
-        tokio::time::sleep(Duration::from_millis(100 * (attempt as u64 + 1))).await;
+        let backoff_s = smart_backoff(attempt, Some(last_status.as_u16()));
+        tokio::time::sleep(Duration::from_secs_f64(backoff_s)).await;
     }
 
     Err(V4CallError::before_dispatch(
@@ -2792,6 +2808,90 @@ fn response_has_assistant_output(path: &str, bytes: &Bytes) -> bool {
                     .and_then(Value::as_array)
                     .is_some_and(|items| !items.is_empty())
         })
+}
+
+enum StreamPrecheck {
+    /// Upstream produced a content/tool signal (or a stream error); forward as-is.
+    HasOutput(Response),
+    /// Upstream ended or timed out without any content/tool signal.
+    Empty,
+}
+
+/// Buffer the upstream stream until the first content/tool signal, stream end,
+/// or the precheck timeout. When a signal arrives the buffered frames are
+/// replayed downstream first, so metered_stream_response sees the exact same
+/// byte sequence it would have without this precheck. When the stream ends
+/// (or times out) with zero output, return Empty so call_with_retry can switch
+/// nodes instead of failing the client with an empty 200.
+async fn precheck_stream_first_output(response: Response, path: &str) -> StreamPrecheck {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut upstream = response.into_body().into_data_stream();
+    let mut buffered: Vec<Bytes> = Vec::new();
+    let mut metrics = StreamMetrics::new(UsageCounts::default());
+    let mut has_output = false;
+
+    let peek = async {
+        loop {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    metrics.ingest(path, &bytes);
+                    if metrics.has_content_signal() || metrics.has_tool_signal() {
+                        buffered.push(bytes);
+                        has_output = true;
+                        break;
+                    }
+                    buffered.push(bytes);
+                }
+                Some(Err(_err)) => {
+                    // Upstream stream error: forward it so the downstream
+                    // stream-error path reports it to the client.
+                    has_output = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(STREAM_EMPTY_PRECHECK_TIMEOUT_SECS), peek).await {
+        Ok(_) => {}
+        Err(_) => {
+            // Timed out without a content/tool signal: treat as slow-or-empty.
+        }
+    }
+    if !has_output {
+        return StreamPrecheck::Empty;
+    }
+
+    let path_owned = path.to_string();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(16);
+    tokio::spawn(async move {
+        for bytes in buffered {
+            if tx.send(Ok(bytes)).await.is_err() {
+                return;
+            }
+        }
+        while let Some(item) = upstream.next().await {
+            match item {
+                Ok(bytes) => {
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let message = format!("upstream stream error: {err}");
+                    if tx.send(Ok(stream_error_frame(&path_owned, &message))).await.is_err() {
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    let mut rebuilt = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    *rebuilt.status_mut() = status;
+    *rebuilt.headers_mut() = headers;
+    StreamPrecheck::HasOutput(rebuilt)
 }
 
 fn metered_stream_response(
@@ -4820,5 +4920,48 @@ data: [DONE]
 
         assert!(message.contains("last_error=timeout"));
         assert!(message.contains("attempts=1"));
+    }
+
+    #[tokio::test]
+    async fn stream_precheck_classifies_empty_stream_as_empty() {
+        use tokio_stream::wrappers::ReceiverStream;
+
+        // A streaming response that ends with zero bytes.
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+        drop(tx);
+        let resp = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+
+        let verdict = precheck_stream_first_output(resp, "chat/completions").await;
+        assert!(matches!(verdict, StreamPrecheck::Empty));
+    }
+
+    #[tokio::test]
+    async fn stream_precheck_forwards_content_within_budget() {
+        use tokio_stream::wrappers::ReceiverStream;
+
+        // A streaming response with one content frame: precheck must classify
+        // HasOutput and replay the frame downstream.
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+        let tx2 = tx.clone();
+        let content = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}
+
+".to_vec();
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(Bytes::from(content))).await;
+            drop(tx2);
+        });
+        let resp = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+
+        let verdict = precheck_stream_first_output(resp, "chat/completions").await;
+        match verdict {
+            StreamPrecheck::HasOutput(rebuild) => {
+                let body = axum::body::to_bytes(rebuild.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let s = String::from_utf8_lossy(&body);
+                assert!(s.contains("\"content\":\"hi\""), "{s}");
+            }
+            _ => panic!("expected HasOutput"),
+        }
     }
 }
