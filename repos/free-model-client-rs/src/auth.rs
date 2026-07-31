@@ -46,6 +46,9 @@ mod tests {
             claude_code_stream_initial_fetch_timeout_secs: 30,
             claude_code_stream_slow_guard_min_input_tokens: 150_000,
             claude_code_stream_no_forwardable_retry_secs: 45,
+            claude_code_stream_reasoning_stall_retry_secs: 15,
+            claude_code_stream_reasoning_stall_window_secs: 5,
+            claude_code_stream_max_wait_forwardable_secs: 60,
             free_models: vec![],
             model_mappings: vec![],
         }

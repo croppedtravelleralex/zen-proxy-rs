@@ -16,6 +16,9 @@ pub struct KernelConfig {
     pub claude_code_stream_initial_fetch_timeout_secs: u64,
     pub claude_code_stream_slow_guard_min_input_tokens: u64,
     pub claude_code_stream_no_forwardable_retry_secs: u64,
+    pub claude_code_stream_reasoning_stall_retry_secs: u64,
+    pub claude_code_stream_reasoning_stall_window_secs: u64,
+    pub claude_code_stream_max_wait_forwardable_secs: u64,
 }
 
 impl From<&Config> for KernelConfig {
@@ -41,6 +44,12 @@ impl KernelConfig {
                 .claude_code_stream_slow_guard_min_input_tokens,
             claude_code_stream_no_forwardable_retry_secs: config
                 .claude_code_stream_no_forwardable_retry_secs,
+            claude_code_stream_reasoning_stall_retry_secs: config
+                .claude_code_stream_reasoning_stall_retry_secs,
+            claude_code_stream_reasoning_stall_window_secs: config
+                .claude_code_stream_reasoning_stall_window_secs,
+            claude_code_stream_max_wait_forwardable_secs: config
+                .claude_code_stream_max_wait_forwardable_secs,
         }
     }
 }

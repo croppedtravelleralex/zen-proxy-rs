@@ -1,7 +1,10 @@
 # Zen Free Model Suite — Cache/Quality/Latency 99+ 实施计划
 
-更新时间：2026-07-03 15:00 CST  
-状态：**代码 F0–F4 已落地；panda 运维部署已完成；TMCC 2.0 生产生效 ❌ 未证实；F5 验收 ❌ 未通过**
+- 相关报告：
+  - [渠道 69 全量诊断 2026-07-27](docs/diagnosis-2026-07-27-channel69-comprehensive.md)（per-request audit 分析，含根因矩阵 + 实施路线 + 数据源缺口）
+  - [渠道 69 修复待办 2026-07-22](docs/plan-2026-07-22-zenproxy-reasoning-only-retry.md)（运维清单，**部分结论已被 07-27 报告证伪**）
+
+更新时间：2026-07-03 15:00 CST（**2026-07-27 渠道 69 全面诊断已发布，见上**）
 
 ## 部署 vs 生效（必读，禁止混用）
 

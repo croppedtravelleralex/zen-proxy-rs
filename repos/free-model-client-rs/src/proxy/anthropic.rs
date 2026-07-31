@@ -1195,12 +1195,28 @@ fn should_retry_stream_without_forwardable_output(
     tool_calls: &[crate::zen::client::CollectedToolCall],
     elapsed: std::time::Duration,
     retry_after: std::time::Duration,
+    reasoning_len: usize,
+    reasoning_last_progress: std::time::Instant,
+    stall_window: std::time::Duration,
+    max_wait: std::time::Duration,
 ) -> bool {
-    profile.kind == ClientKind::ClaudeCode
-        && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
-        && text.trim().is_empty()
-        && tool_calls.is_empty()
-        && elapsed >= retry_after
+    if profile.kind != ClientKind::ClaudeCode
+        || attempt + 1 >= CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
+        || !text.trim().is_empty()
+        || !tool_calls.is_empty()
+    {
+        return false;
+    }
+    if elapsed < retry_after {
+        return false;
+    }
+    // Reasoning is still growing => upstream is alive, just thinking. Wait longer.
+    let reasoning_alive = reasoning_len > 0
+        && reasoning_last_progress.elapsed() < stall_window;
+    if reasoning_alive && elapsed < max_wait {
+        return false;
+    }
+    true
 }
 
 fn should_retry_stream_completed_reasoning_only(
@@ -1340,6 +1356,10 @@ fn claude_code_upstream_wait_interval(
     elapsed: std::time::Duration,
     retry_after: std::time::Duration,
     idle_ping_interval: std::time::Duration,
+    reasoning_len: usize,
+    reasoning_last_progress: std::time::Instant,
+    stall_window: std::time::Duration,
+    max_wait: std::time::Duration,
 ) -> std::time::Duration {
     let waiting_for_forwardable_output = profile.kind == ClientKind::ClaudeCode
         && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
@@ -1350,7 +1370,16 @@ fn claude_code_upstream_wait_interval(
         return idle_ping_interval;
     }
 
-    let remaining = retry_after.saturating_sub(elapsed);
+    // While reasoning is still growing, upstream is alive: wait up to max_wait,
+    // pinging at the standard idle interval so the client sees liveness.
+    let reasoning_alive = reasoning_len > 0
+        && reasoning_last_progress.elapsed() < stall_window;
+    let horizon = if reasoning_alive {
+        max_wait
+    } else {
+        retry_after
+    };
+    let remaining = horizon.saturating_sub(elapsed);
     idle_ping_interval.min(remaining.max(std::time::Duration::from_millis(1)))
 }
 
@@ -1734,6 +1763,16 @@ async fn handle_stream(
         Duration::from_secs(config.claude_code_stream_no_forwardable_retry_secs.max(1)),
         request_shape.estimated_total_tokens,
     );
+    let reasoning_stall_window = Duration::from_secs(
+        config
+            .claude_code_stream_reasoning_stall_window_secs
+            .max(1),
+    );
+    let reasoning_max_wait = Duration::from_secs(
+        config
+            .claude_code_stream_max_wait_forwardable_secs
+            .max(no_forwardable_retry_after.as_secs()),
+    );
     let initial_fetch_timeout = if should_apply_initial_fetch_timeout(
         profile,
         request_shape.estimated_total_tokens,
@@ -1762,6 +1801,8 @@ async fn handle_stream(
         let mut used_provider_invalid_text_retry = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut attempt_reasoning_len = 0_usize;
+        let mut reasoning_progress_updated = Instant::now();
         let mut thinking_block_open = false;
         let mut thinking_block_index = 0_u64;
         let mut text_block_open = false;
@@ -1801,6 +1842,8 @@ async fn handle_stream(
                     usage = None;
                     cache_signals = ProviderCacheSignals::ignored();
                     reasoning.clear();
+                    attempt_reasoning_len = 0;
+                    reasoning_progress_updated = Instant::now();
                     thinking_block_open = false;
                     tool_calls.clear();
                     started_tool_call_indexes.clear();
@@ -1951,6 +1994,10 @@ async fn handle_stream(
                         attempt_started.elapsed(),
                         no_forwardable_retry_after,
                         idle_ping_interval,
+                        reasoning.len(),
+                        reasoning_progress_updated,
+                        reasoning_stall_window,
+                        reasoning_max_wait,
                     );
                     match tokio::time::timeout(upstream_wait_interval, upstream.next()).await {
                         Ok(next) => next,
@@ -1986,11 +2033,15 @@ async fn handle_stream(
                                 && should_retry_stream_without_forwardable_output(
                                     profile,
                                     attempt,
-                                &text,
-                                &tool_calls,
-                                attempt_started.elapsed(),
-                                no_forwardable_retry_after,
-                            ) {
+                                    &text,
+                                    &tool_calls,
+                                    attempt_started.elapsed(),
+                                    no_forwardable_retry_after,
+                                    reasoning.len(),
+                                    reasoning_progress_updated,
+                                    reasoning_stall_window,
+                                    reasoning_max_wait,
+                                ) {
                                 tracing::warn!(
                                     protocol = "anthropic",
                                     model = %body.model,
@@ -2098,6 +2149,10 @@ async fn handle_stream(
                                 first_reasoning_ms = stream_started.elapsed().as_millis() as u64;
                             }
                             reasoning.push_str(&reasoning_content);
+                            if reasoning.len() > attempt_reasoning_len {
+                                attempt_reasoning_len = reasoning.len();
+                                reasoning_progress_updated = Instant::now();
+                            }
                             // === thinking passthrough ===
                             if !reasoning_content.trim().is_empty() {
                                 if !message_started {
@@ -2161,6 +2216,10 @@ async fn handle_stream(
                         &tool_calls,
                         attempt_started.elapsed(),
                         no_forwardable_retry_after,
+                        reasoning.len(),
+                        reasoning_progress_updated,
+                        reasoning_stall_window,
+                        reasoning_max_wait,
                     ) {
                         tracing::warn!(
                             protocol = "anthropic",
@@ -3005,6 +3064,72 @@ mod tests {
     }
 
     #[test]
+    fn stream_guard_waits_while_reasoning_is_still_growing() {
+        let profile = claude_code_profile();
+        let retry_after = std::time::Duration::from_secs(14);
+        let stall_window = std::time::Duration::from_secs(5);
+        let max_wait = std::time::Duration::from_secs(60);
+
+        // reasoning just updated 1s ago => alive => no retry even past retry_after
+        let alive = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(!should_retry_stream_without_forwardable_output(
+            profile,
+            0,
+            "",
+            &[],
+            std::time::Duration::from_secs(20),
+            retry_after,
+            100,
+            alive,
+            stall_window,
+            max_wait
+        ));
+
+        // reasoning stalled for longer than window => retry
+        assert!(should_retry_stream_without_forwardable_output(
+            profile,
+            0,
+            "",
+            &[],
+            std::time::Duration::from_secs(20),
+            retry_after,
+            100,
+            std::time::Instant::now() - stall_window - std::time::Duration::from_secs(1),
+            stall_window,
+            max_wait
+        ));
+
+        // reasoning alive but max_wait exceeded => retry anyway
+        assert!(should_retry_stream_without_forwardable_output(
+            profile,
+            0,
+            "",
+            &[],
+            std::time::Duration::from_secs(61),
+            retry_after,
+            100,
+            alive,
+            stall_window,
+            max_wait
+        ));
+
+        // no reasoning at all, past retry_after => retry (unchanged behavior)
+        assert!(should_retry_stream_without_forwardable_output(
+            profile,
+            0,
+            "",
+            &[],
+            std::time::Duration::from_secs(20),
+            retry_after,
+            0,
+            std::time::Instant::now(),
+            stall_window,
+            max_wait
+        ));
+    }
+
+    #[test]
     fn claude_code_buffered_stream_skips_tool_sessions_even_with_exact_output_literal() {
         let reason = claude_code_buffered_stream_reason(
             claude_code_profile(),
@@ -3720,7 +3845,11 @@ mod tests {
             "",
             &[],
             std::time::Duration::from_secs(45),
-            std::time::Duration::from_secs(45)
+            std::time::Duration::from_secs(45),
+            0,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60)
         ));
         assert!(!should_retry_stream_without_forwardable_output(
             profile,
@@ -3728,7 +3857,11 @@ mod tests {
             "partial text",
             &[],
             std::time::Duration::from_secs(45),
-            std::time::Duration::from_secs(45)
+            std::time::Duration::from_secs(45),
+            0,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60)
         ));
         assert!(!should_retry_stream_without_forwardable_output(
             profile,
@@ -3736,7 +3869,11 @@ mod tests {
             "",
             &[crate::zen::client::CollectedToolCall::default()],
             std::time::Duration::from_secs(45),
-            std::time::Duration::from_secs(45)
+            std::time::Duration::from_secs(45),
+            0,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60)
         ));
         assert!(!should_retry_stream_without_forwardable_output(
             profile,
@@ -3744,7 +3881,11 @@ mod tests {
             "",
             &[],
             std::time::Duration::from_secs(45),
-            std::time::Duration::from_secs(45)
+            std::time::Duration::from_secs(45),
+            0,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60)
         ));
         assert!(!should_retry_stream_without_forwardable_output(
             profile,
@@ -3752,7 +3893,11 @@ mod tests {
             "",
             &[],
             std::time::Duration::from_secs(44),
-            std::time::Duration::from_secs(45)
+            std::time::Duration::from_secs(45),
+            0,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60)
         ));
     }
 
@@ -3888,6 +4033,10 @@ mod tests {
                 std::time::Duration::ZERO,
                 retry_after,
                 idle,
+                0,
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(60),
             ),
             retry_after
         );
@@ -3901,6 +4050,10 @@ mod tests {
                 std::time::Duration::from_secs(9),
                 retry_after,
                 idle,
+                0,
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(60),
             ),
             std::time::Duration::from_secs(1)
         );
@@ -3914,6 +4067,10 @@ mod tests {
                 std::time::Duration::ZERO,
                 retry_after,
                 idle,
+                0,
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(60),
             ),
             idle
         );

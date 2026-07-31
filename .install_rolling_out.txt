@@ -1,0 +1,6 @@
+install: '/opt/zen-proxy-rs/rolling_restart.sh' and '/opt/zen-proxy-rs/rolling_restart.sh' are the same file
+-rwxr-xr-x 1 root root 1907 Jul 25 09:34 /opt/zen-proxy-rs/rolling_restart.sh
+CRON---
+BASHN---
+BASHN_EXIT:0
+cat: /etc/cron.d/zen-proxy-rolling-restart: No such file or directory

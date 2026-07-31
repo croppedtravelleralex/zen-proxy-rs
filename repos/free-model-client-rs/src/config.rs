@@ -27,6 +27,9 @@ pub struct Config {
     pub claude_code_stream_initial_fetch_timeout_secs: u64,
     pub claude_code_stream_slow_guard_min_input_tokens: u64,
     pub claude_code_stream_no_forwardable_retry_secs: u64,
+    pub claude_code_stream_reasoning_stall_retry_secs: u64,
+    pub claude_code_stream_reasoning_stall_window_secs: u64,
+    pub claude_code_stream_max_wait_forwardable_secs: u64,
     pub free_models: Vec<String>,
     pub model_mappings: Vec<ModelMapping>,
 }
@@ -146,6 +149,21 @@ impl Config {
                 45,
             )
             .max(1),
+            claude_code_stream_reasoning_stall_retry_secs: env_u64(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_REASONING_STALL_RETRY_SECS",
+                15,
+            )
+            .max(1),
+            claude_code_stream_reasoning_stall_window_secs: env_u64(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_REASONING_STALL_WINDOW_SECS",
+                5,
+            )
+            .max(1),
+            claude_code_stream_max_wait_forwardable_secs: env_u64(
+                "FREE_MODEL_CLAUDE_CODE_STREAM_MAX_WAIT_FORWARDABLE_SECS",
+                60,
+            )
+            .max(10),
             free_models: model_mappings
                 .iter()
                 .map(|mapping| mapping.public_name.clone())
