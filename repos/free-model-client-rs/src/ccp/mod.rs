@@ -148,11 +148,18 @@ fn normalize_bucket(source_client: &str) -> &str {
 }
 
 fn short_hash16(input: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    // FNV-1a 64-bit with a fixed seed so cache identity is stable across
+    // process restarts and across multiple zen-proxy instances.
+    // DefaultHasher (SipHash with random keys) changed the USK on every
+    // instance/restart, breaking cross-instance cache reuse.
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{:016x}", hash)
 }
 
 #[cfg(test)]

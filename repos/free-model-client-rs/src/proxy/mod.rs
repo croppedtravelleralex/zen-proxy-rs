@@ -186,11 +186,15 @@ pub(crate) fn session_scope_from_upstream_body(body: &Value) -> String {
         .get("messages")
         .and_then(|value| serde_json::to_string(value).ok())
         .unwrap_or_default();
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    messages_key.hash(&mut hasher);
-    format!("{model}:{:016x}", hasher.finish())
+    // FNV-1a fixed-seed hash for cross-instance stability (same scheme as ccp::short_hash16)
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in messages_key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{model}:{:016x}", hash)
 }
 
 pub(crate) fn reasoning_scope_from_upstream_body(body: &Value) -> String {
