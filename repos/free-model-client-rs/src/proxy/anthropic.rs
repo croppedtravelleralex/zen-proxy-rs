@@ -842,6 +842,7 @@ async fn handle_non_stream(
             output_tokens,
             collected.usage.as_ref(),
             collected.finish_reason.as_deref(),
+            Some(&collected.reasoning),
         ),
         observed_exit_ip,
     ))
@@ -1007,7 +1008,7 @@ fn is_mimo_v25_model(model: &str) -> bool {
 }
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
-    text_resp_with_usage(ts, model, text, input_tokens, output_tokens, None, None)
+    text_resp_with_usage(ts, model, text, input_tokens, output_tokens, None, None, None)
 }
 
 fn response_text_for_profile(profile: ClientProfile, text: &str) -> String {
@@ -1047,15 +1048,23 @@ fn text_resp_with_usage(
     output_tokens: u64,
     usage: Option<&crate::zen::client::ZenUsage>,
     upstream_finish_reason: Option<&str>,
+    thinking: Option<&str>,
 ) -> Response {
     let stop_reason = anthropic_stop_reason(upstream_finish_reason, false);
     let usage_json = anthropic_usage_json(input_tokens, output_tokens, usage);
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    if let Some(t) = thinking {
+        if !t.trim().is_empty() {
+            blocks.push(serde_json::json!({"type":"thinking","thinking":t}));
+        }
+    }
+    blocks.push(serde_json::json!({"type":"text","text":text}));
     Json(serde_json::json!({
         "id": format!("msg_{ts}"),
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type":"text","text":text}],
+        "content": blocks,
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": usage_json
@@ -1753,6 +1762,8 @@ async fn handle_stream(
         let mut used_provider_invalid_text_retry = false;
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut thinking_block_open = false;
+        let mut thinking_block_index = 0_u64;
         let mut text_block_open = false;
         let mut text_block_index = 0_u64;
         let mut markdown_guard = if profile.preserves_model_text_exactly() {
@@ -1790,6 +1801,7 @@ async fn handle_stream(
                     usage = None;
                     cache_signals = ProviderCacheSignals::ignored();
                     reasoning.clear();
+                    thinking_block_open = false;
                     tool_calls.clear();
                     started_tool_call_indexes.clear();
                     started_tool_block_indexes.clear();
@@ -2086,6 +2098,21 @@ async fn handle_stream(
                                 first_reasoning_ms = stream_started.elapsed().as_millis() as u64;
                             }
                             reasoning.push_str(&reasoning_content);
+                            // === thinking passthrough ===
+                            if !reasoning_content.trim().is_empty() {
+                                if !message_started {
+                                    yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                                    message_started = true;
+                                }
+                                if !thinking_block_open {
+                                    thinking_block_open = true;
+                                    thinking_block_index = emitted_tool_call_blocks;
+                                    yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":thinking_block_index,"content_block":{"type":"thinking","thinking":""}}).to_string()));
+                                    emitted_tool_call_blocks = emitted_tool_call_blocks.saturating_add(1);
+                                }
+                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":thinking_block_index,"delta":{"type":"thinking_delta","thinking":reasoning_content}}).to_string()));
+                                emitted_downstream_event = true;
+                            }
                         }
                             if let Some(items) = delta.tool_calls {
                                 let had_tool_calls = !tool_calls.is_empty();
@@ -2269,6 +2296,7 @@ async fn handle_stream(
                     usage = None;
                     cache_signals = ProviderCacheSignals::ignored();
                     reasoning.clear();
+                    thinking_block_open = false;
                     continue;
                 }
                 break;
@@ -2402,6 +2430,10 @@ async fn handle_stream(
                 yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":message}}).to_string()));
                 return;
             }
+        }
+        if thinking_block_open {
+            yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":thinking_block_index}).to_string()));
+            thinking_block_open = false;
         }
         if text_block_open {
             yield Ok(Event::default().event("content_block_stop").data(serde_json::json!({"type":"content_block_stop","index":text_block_index}).to_string()));

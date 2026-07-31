@@ -165,6 +165,28 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("reasoning-then-text") {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"step one\"}}]}
+
+",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" step two\"}}]}
+
+",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"},\"finish_reason\":\"stop\"}]}
+
+",
+            "data: [DONE]
+
+"
+        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
     if prompt.contains("emit-reasoned-bash-tool") {
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"reasoning before bash\"}}]}\n\n",
@@ -4002,7 +4024,8 @@ async fn anthropic_non_stream_reasoning_only_length_is_returned_as_visible_text(
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(body["content"][0]["text"], "hidden chain only");
+    assert_eq!(body["content"][0]["type"], "thinking");
+    assert_eq!(body["content"][0]["thinking"], "hidden chain only");
     let requests = state.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].thinking.is_none());
@@ -4067,9 +4090,9 @@ async fn claude_code_anthropic_non_stream_reasoning_loop_is_returned_as_visible_
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
     assert_eq!(body["stop_reason"], "end_turn");
-    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][0]["type"], "thinking");
     assert_eq!(
-        body["content"][0]["text"],
+        body["content"][0]["thinking"],
         "thinkingthinkingthinkingthinkingthinking"
     );
     let requests = state.requests.lock().unwrap();
@@ -4100,9 +4123,9 @@ async fn claude_code_anthropic_non_stream_no_tool_reasoning_loop_is_returned_as_
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
-    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][0]["type"], "thinking");
     assert_eq!(
-        body["content"][0]["text"],
+        body["content"][0]["thinking"],
         "thinkingthinkingthinkingthinkingthinking"
     );
     let requests = state.requests.lock().unwrap();
@@ -4430,4 +4453,32 @@ async fn stream_truncation_is_emitted_before_done() {
     let body = response_text(response).await;
     assert!(body.contains("stream truncated"));
     assert!(body.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_emits_thinking_block_then_text() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "reasoning-then-text", true);
+    request.max_tokens = Some(32_000);
+    let response = kernel
+        .anthropic_messages_with_profile(
+            &client,
+            request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_text(response).await;
+    // thinking block start with type=thinking
+    assert!(body.contains("\"type\":\"thinking\""), "{body}");
+    // thinking deltas carry the reasoning text
+    assert!(body.contains("\"thinking_delta\""), "{body}");
+    assert!(body.contains("step one"), "{body}");
+    assert!(body.contains("step two"), "{body}");
+    // thinking block stop emitted with the same index
+    assert!(body.contains("\"content_block_stop\""), "{body}");
+    // text block still present after thinking
+    assert!(body.contains("final answer"), "{body}");
 }
