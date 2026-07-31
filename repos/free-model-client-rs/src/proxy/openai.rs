@@ -603,6 +603,23 @@ fn append_openai_usage_metadata(
     }
     if let Some(cache_read) = cache_read_tokens(Some(usage)) {
         usage_json["cache_read_input_tokens"] = serde_json::json!(cache_read);
+        // OpenAI-compatible aggregation: new-api / one-api parse cache hits
+        // exclusively from prompt_tokens_details.cached_tokens. Upstream reports
+        // hits via cache_read_input_tokens; mirror into the standard field.
+        let details_obj = if let Some(existing) = usage_json
+            .get_mut("prompt_tokens_details")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            Some(existing)
+        } else {
+            usage_json["prompt_tokens_details"] = serde_json::json!({});
+            usage_json
+                .get_mut("prompt_tokens_details")
+                .and_then(serde_json::Value::as_object_mut)
+        };
+        if let Some(obj) = details_obj {
+            obj.insert("cached_tokens".into(), serde_json::json!(cache_read));
+        }
     }
     if let Some(cache_creation) = usage.cache_creation_input_tokens {
         usage_json["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
