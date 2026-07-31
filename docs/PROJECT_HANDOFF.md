@@ -1,6 +1,15 @@
 # Project Handoff
 
-更新时间：2026-07-15
+更新时间：2026-07-27（新增 §「2026-07-27 渠道 69 全面诊断」）
+
+## 重要：2026-07-22 计划文档已部分证伪
+
+`plan-2026-07-22-zenproxy-reasoning-only-retry.md` 中有三条结论已被 2026-07-27 的 per-request audit 数据推翻：
+1. 「TTFB 慢在 reasoning」→ 实际 `first_content − first_chunk` 仅 322ms
+2. 「10 秒是重试等待」→ EO 请求 `retry_count` 100% 为 0，不重试
+3. 「缓存命中率低」→ 7 天 77–85%，稳定无下滑
+
+新报告在 `docs/diagnosis-2026-07-27-channel69-comprehensive.md`。
 
 ## 项目定位
 
