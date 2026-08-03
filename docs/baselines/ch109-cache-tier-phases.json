@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "label": "cache-tier-phased-90",
+  "min_cache_pct": 90.0,
+  "min_ch109_samples_per_tier": 3,
+  "min_newapi_cache_pct_probe": 90.0,
+  "tiers": [
+    {
+      "id": "lt_50k",
+      "label": "prompt < 50k",
+      "prompt_tokens_min": 0,
+      "prompt_tokens_max_exclusive": 50000,
+      "probe_case_id": "bucket_10k",
+      "target_context_tokens": 10000
+    },
+    {
+      "id": "50k_100k",
+      "label": "50k <= prompt < 100k",
+      "prompt_tokens_min": 50000,
+      "prompt_tokens_max_exclusive": 100000,
+      "probe_case_id": "bucket_50k",
+      "target_context_tokens": 50000
+    },
+    {
+      "id": "100k_200k",
+      "label": "100k <= prompt < 200k",
+      "prompt_tokens_min": 100000,
+      "prompt_tokens_max_exclusive": 200000,
+      "probe_case_id": "bucket_100k",
+      "target_context_tokens": 100000
+    },
+    {
+      "id": "200k_300k",
+      "label": "200k <= prompt < 300k",
+      "prompt_tokens_min": 200000,
+      "prompt_tokens_max_exclusive": 300000,
+      "probe_case_id": "bucket_300k",
+      "target_context_tokens": 300000
+    }
+  ],
+  "phases": [
+    {
+      "id": "phase_1",
+      "label": "阶段1：<50k 达 90%+",
+      "enforce_tiers": ["lt_50k"]
+    },
+    {
+      "id": "phase_2",
+      "label": "阶段2：50–100k 达 90%+（保留 <50k）",
+      "enforce_tiers": ["lt_50k", "50k_100k"]
+    },
+    {
+      "id": "phase_3",
+      "label": "阶段3：100–200k 达 90%+",
+      "enforce_tiers": ["lt_50k", "50k_100k", "100k_200k"]
+    },
+    {
+      "id": "phase_4",
+      "label": "阶段4：200–300k 达 90%+（全档）",
+      "enforce_tiers": ["lt_50k", "50k_100k", "100k_200k", "200k_300k"]
+    }
+  ],
+  "default_phase": "phase_1"
+}

@@ -1,0 +1,231 @@
+{
+  "version": 1,
+  "root": "D:\\SelfMadeTool\\pi-cache-bucket-20260801",
+  "chars_per_token_estimate": 4,
+  "min_prompt_tokens": {
+    "10000": 7500,
+    "50000": 37500,
+    "100000": 75000,
+    "200000": 150000,
+    "300000": 225000,
+    "350000": 270000
+  },
+  "cases": [
+    {
+      "id": "bucket_10k",
+      "dir": "bucket_10k",
+      "target_context_tokens": 10000,
+      "module": "tiny_gate.rs",
+      "answer_token": "ANSWER_TOKEN=BUCKET_10K",
+      "anchors": {
+        "fn_check": "check_ttl",
+        "err_ttl": "ERR_TTL_ZERO",
+        "const_max": "MAX_TTL=3600"
+      },
+      "turns": [
+        {
+          "id": "load",
+          "suffix": "通读源码。只回复：BUCKET_LOADED_10K",
+          "marker": "BUCKET_LOADED_10K"
+        },
+        {
+          "id": "code_q1",
+          "suffix": "编程题1：check_ttl 在 input 为 0 时返回什么错误？写出函数名与错误名。至少 40 字。",
+          "quality": {
+            "required_facts": ["check_ttl", "ERR_TTL_ZERO"],
+            "min_chars": 40
+          }
+        },
+        {
+          "id": "code_q2",
+          "suffix": "编程题2：MAX_TTL 取值是多少？最后一行：QUALITY_BUCKET_10K_PASS",
+          "quality": {
+            "required_facts": ["MAX_TTL", "3600"],
+            "required_tokens": ["QUALITY_BUCKET_10K_PASS"],
+            "min_chars": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "bucket_50k",
+      "dir": "bucket_50k",
+      "target_context_tokens": 50000,
+      "module": "mid_gate.rs",
+      "answer_token": "ANSWER_TOKEN=BUCKET_50K",
+      "anchors": {
+        "fn_check": "verify_slot",
+        "err_limit": "ERR_RATE_LIMITED",
+        "const_burst": "BURST=16"
+      },
+      "turns": [
+        {
+          "id": "load",
+          "suffix": "通读源码。只回复：BUCKET_LOADED_50K",
+          "marker": "BUCKET_LOADED_50K"
+        },
+        {
+          "id": "code_q1",
+          "suffix": "编程题1：verify_slot 触发 ERR_RATE_LIMITED 的条件？至少 40 字。",
+          "quality": {
+            "required_facts": ["verify_slot", "ERR_RATE_LIMITED"],
+            "min_chars": 40
+          }
+        },
+        {
+          "id": "code_q2",
+          "suffix": "编程题2：BURST 常量取值？最后一行：QUALITY_BUCKET_50K_PASS",
+          "quality": {
+            "required_facts": ["BURST", "16"],
+            "required_tokens": ["QUALITY_BUCKET_50K_PASS"],
+            "min_chars": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "bucket_100k",
+      "dir": "bucket_100k",
+      "target_context_tokens": 100000,
+      "module": "gate_100k.rs",
+      "answer_token": "ANSWER_TOKEN=BUCKET_100K",
+      "anchors": {
+        "fn_validate": "validate_session",
+        "err_session": "ERR_SESSION_EXPIRED",
+        "const_max": "MAX_TTL_SECS=86400"
+      },
+      "turns": [
+        {
+          "id": "load",
+          "suffix": "通读源码。只回复：BUCKET_LOADED_100K",
+          "marker": "BUCKET_LOADED_100K"
+        },
+        {
+          "id": "code_q1",
+          "suffix": "编程题1：validate_session 在 input 为 0 时返回什么错误？至少 50 字。",
+          "quality": {
+            "required_facts": ["validate_session", "ERR_SESSION_EXPIRED"],
+            "min_chars": 50
+          }
+        },
+        {
+          "id": "code_q2",
+          "suffix": "编程题2：MAX_TTL_SECS 取值？最后一行：QUALITY_BUCKET_100K_PASS",
+          "quality": {
+            "required_facts": ["MAX_TTL_SECS", "86400"],
+            "required_tokens": ["QUALITY_BUCKET_100K_PASS"],
+            "min_chars": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "bucket_200k",
+      "dir": "bucket_200k",
+      "target_context_tokens": 200000,
+      "module": "gate_200k.rs",
+      "answer_token": "ANSWER_TOKEN=BUCKET_200K",
+      "anchors": {
+        "fn_parse": "parse_config",
+        "err_json": "ERR_JSON_SYNTAX",
+        "const_depth": "MAX_DEPTH=64"
+      },
+      "turns": [
+        {
+          "id": "load",
+          "suffix": "通读源码。只回复：BUCKET_LOADED_200K",
+          "marker": "BUCKET_LOADED_200K"
+        },
+        {
+          "id": "code_q1",
+          "suffix": "编程题1：parse_config 在 input 为 0 时返回什么错误？至少 50 字。",
+          "quality": {
+            "required_facts": ["parse_config", "ERR_JSON_SYNTAX"],
+            "min_chars": 50
+          }
+        },
+        {
+          "id": "code_q2",
+          "suffix": "编程题2：MAX_DEPTH 取值？最后一行：QUALITY_BUCKET_200K_PASS",
+          "quality": {
+            "required_facts": ["MAX_DEPTH", "64"],
+            "required_tokens": ["QUALITY_BUCKET_200K_PASS"],
+            "min_chars": 30
+          }
+        }
+      ]
+    },
+    {
+      "id": "bucket_300k",
+      "dir": "bucket_300k",
+      "target_context_tokens": 300000,
+      "module": "gate_300k.rs",
+      "answer_token": "ANSWER_TOKEN=BUCKET_300K",
+      "anchors": {
+        "fn_mux": "mux_stream",
+        "fn_flush": "flush_pending",
+        "err_trunc": "ERR_STREAM_TRUNCATED"
+      },
+      "turns": [
+        {
+          "id": "load",
+          "suffix": "通读源码。只回复：BUCKET_LOADED_300K",
+          "marker": "BUCKET_LOADED_300K"
+        },
+        {
+          "id": "code_q1",
+          "suffix": "编程题1：mux_stream 在 input 为 0 时返回什么错误？至少 50 字。",
+          "quality": {
+            "required_facts": ["mux_stream", "ERR_STREAM_TRUNCATED"],
+            "min_chars": 50
+          }
+        },
+        {
+          "id": "code_q2",
+          "suffix": "编程题2：flush_pending 与 mux_stream 调用顺序？最后一行：QUALITY_BUCKET_300K_PASS",
+          "quality": {
+            "required_facts": ["flush_pending", "mux_stream"],
+            "required_tokens": ["QUALITY_BUCKET_300K_PASS"],
+            "min_chars": 40
+          }
+        }
+      ]
+    },
+    {
+      "id": "bucket_350k",
+      "dir": "bucket_350k",
+      "target_context_tokens": 350000,
+      "module": "gate_350k.rs",
+      "answer_token": "ANSWER_TOKEN=BUCKET_350K",
+      "anchors": {
+        "fn_mux": "mux_stream",
+        "fn_flush": "flush_pending",
+        "err_trunc": "ERR_STREAM_TRUNCATED"
+      },
+      "turns": [
+        {
+          "id": "load",
+          "suffix": "通读源码。只回复：BUCKET_LOADED_350K",
+          "marker": "BUCKET_LOADED_350K"
+        },
+        {
+          "id": "code_q1",
+          "suffix": "编程题1：mux_stream 在 input 为 0 时返回什么错误？至少 50 字。",
+          "quality": {
+            "required_facts": ["mux_stream", "ERR_STREAM_TRUNCATED"],
+            "min_chars": 50
+          }
+        },
+        {
+          "id": "code_q2",
+          "suffix": "编程题2：flush_pending 与 mux_stream 调用顺序？最后一行：QUALITY_BUCKET_350K_PASS",
+          "quality": {
+            "required_facts": ["flush_pending", "mux_stream"],
+            "required_tokens": ["QUALITY_BUCKET_350K_PASS"],
+            "min_chars": 40
+          }
+        }
+      ]
+    }
+  ]
+}

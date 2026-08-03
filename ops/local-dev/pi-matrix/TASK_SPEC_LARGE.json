@@ -1,0 +1,73 @@
+{
+  "version": 3,
+  "root": "D:\\SelfMadeTool\\pi-matrix-large-20260801",
+  "chars_per_token_estimate": 4,
+  "strict_no_subagent": true,
+  "cases": [
+    {
+      "id": "case_01_100k",
+      "dir": "case_01_100k",
+      "target_context_tokens": 100000,
+      "timeout_s": 120,
+      "expected_tokens": ["ANSWER_TOKEN=MATRIX_100K_01", "MATRIX_CASE_01_OK"],
+      "prompt": "只读。禁止 subagent/scout/parallel/chain。bash：head -c 2048 context_bulk.txt | grep ANSWER_TOKEN。最终两行：原样 ANSWER_TOKEN 行 + MATRIX_CASE_01_OK"
+    },
+    {
+      "id": "case_02_100k",
+      "dir": "case_02_100k",
+      "target_context_tokens": 100000,
+      "timeout_s": 120,
+      "expected_tokens": ["ANSWER_TOKEN=MATRIX_100K_02", "MATRIX_CASE_02_OK"],
+      "prompt": "只读。禁止 subagent/scout。bash：grep -m1 ANSWER_TOKEN context_bulk.txt。最终两行：原样 ANSWER_TOKEN 行 + MATRIX_CASE_02_OK"
+    },
+    {
+      "id": "case_03_200k",
+      "dir": "case_03_200k",
+      "target_context_tokens": 200000,
+      "timeout_s": 150,
+      "expected_tokens": ["ANSWER_TOKEN=MATRIX_200K_03", "MATRIX_CASE_03_OK"],
+      "prompt": "只读。禁止 subagent/scout。bash：head -c 4096 context_bulk.txt | grep ANSWER_TOKEN。最终两行：原样 ANSWER_TOKEN 行 + MATRIX_CASE_03_OK"
+    },
+    {
+      "id": "case_04_200k",
+      "dir": "case_04_200k",
+      "target_context_tokens": 200000,
+      "timeout_s": 150,
+      "expected_tokens": ["ANSWER_TOKEN=MATRIX_200K_04", "MATRIX_CASE_04_OK"],
+      "prompt": "只读。禁止 subagent/scout。bash 用 head 读 context_bulk.txt 前 2KB 并 grep ANSWER_TOKEN，最终两行：原样 ANSWER_TOKEN 行 + MATRIX_CASE_04_OK"
+    },
+    {
+      "id": "case_05_200k",
+      "dir": "case_05_200k",
+      "target_context_tokens": 200000,
+      "timeout_s": 150,
+      "expected_tokens": ["ANSWER_TOKEN=MATRIX_200K_05", "MATRIX_CASE_05_OK"],
+      "prompt": "只读。禁止 subagent/scout。bash：grep -m1 ANSWER_TOKEN context_bulk.txt。最终两行：原样 ANSWER_TOKEN 行 + MATRIX_CASE_05_OK"
+    },
+    {
+      "id": "case_06_350k",
+      "dir": "case_06_350k",
+      "target_context_tokens": 350000,
+      "timeout_s": 180,
+      "expected_tokens": ["ANSWER_TOKEN=MATRIX_350K_06", "MATRIX_CASE_06_OK"],
+      "prompt": "只读。禁止 subagent/scout/分段扫描。bash：head -c 4096 context_bulk.txt | grep ANSWER_TOKEN。最终两行：原样 ANSWER_TOKEN 行 + MATRIX_CASE_06_OK"
+    },
+    {
+      "id": "case_07_350k",
+      "dir": "case_07_350k",
+      "target_context_tokens": 350000,
+      "timeout_s": 180,
+      "expected_tokens": ["ANSWER_TOKEN=MATRIX_350K_07", "MATRIX_CASE_07_OK"],
+      "prompt": "只读。禁止 subagent/scout/parallel。bash：grep -m1 ANSWER_TOKEN context_bulk.txt。最终两行：原样 ANSWER_TOKEN 行 + MATRIX_CASE_07_OK"
+    },
+    {
+      "id": "case_08_350k",
+      "dir": "case_08_350k",
+      "target_context_tokens": 350000,
+      "timeout_s": 180,
+      "expected_tokens": ["ANSWER_TOKEN=MATRIX_350K_08", "MATRIX_CASE_08_DONE"],
+      "prompt": "只读。禁止 subagent/scout/chain/reviewer。bash：head -c 2048 context_bulk.txt | grep ANSWER_TOKEN。最终两行：原样 ANSWER_TOKEN 行 + MATRIX_CASE_08_DONE"
+    }
+  ],
+  "self_check_suffix": ""
+}
