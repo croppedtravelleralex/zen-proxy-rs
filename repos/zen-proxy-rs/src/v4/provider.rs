@@ -36,7 +36,11 @@ const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// before treating it as empty output (slow-or-empty). Mirrors the existing
 /// 30s upstream initial stream fetch timeout used by the kernel.
 const STREAM_EMPTY_PRECHECK_TIMEOUT_SECS: u64 = 30;
+const STREAM_MICRO_PROBE_PRECHECK_TIMEOUT_SECS: u64 = 10;
 const STREAM_DOWNSTREAM_SEND_TIMEOUT_SECS: u64 = 30;
+const PUBLIC_PROXY_POOL_EXHAUSTED_MESSAGE: &str = "Service temporarily unavailable; retry later";
+const PUBLIC_PROXY_CIRCUIT_OPEN_MESSAGE: &str =
+    "Service temporarily unavailable due to upstream rate limiting; retry later";
 const AFFINITY_MIN_BODY_BYTES: u64 = 32 * 1024;
 const AFFINITY_MIN_BODY_BYTES_CLAUDE_CODE: u64 = 16 * 1024;
 
@@ -325,6 +329,10 @@ pub async fn handle_v4_proxy(
                 bytes_received: result.body_bytes_len,
                 failure_kind: String::new(),
                 failure_message: String::new(),
+                empty_output_class: String::new(),
+                raw_tool_format: String::new(),
+                text_chars: 0,
+                reasoning_chars: 0,
                 retry_chain: result.retry_chain,
                 context: Some(context_telemetry.clone()),
                 protocol_guard: protocol_guard_summary.clone(),
@@ -366,82 +374,92 @@ pub async fn handle_v4_proxy(
         }
         Err(err) => {
             state.upstream_health.record(err.status.as_u16());
-            if let Some(rid) = err.request_id.as_ref() {
-                let latency = start.elapsed().as_millis() as u64;
-                state.collector.record_request(&RequestTelemetry {
-                    rid: rid.clone(),
-                    ts: chrono::Utc::now().timestamp_millis(),
-                    external_request_id: external_request_id.clone(),
-                    gateway: gateway.clone(),
-                    gateway_channel_id: extract_header(headers, "x-newapi-channel-id")
-                        .unwrap_or_default(),
-                    run_id: run_tags.run_id.clone(),
-                    source_platform: run_tags.source_platform.clone(),
-                    case_id: run_tags.case_id.clone(),
-                    runner_model: run_tags.runner_model.clone(),
-                    provider_id: run_tags.provider_id.clone(),
-                    turn_index: run_tags.turn_index,
-                    model: public_model.clone(),
-                    public_model: public_model.clone(),
-                    upstream_model: err.upstream_model.clone(),
-                    protocol: if path == "messages" {
-                        "anthropic_messages".to_string()
-                    } else {
-                        "openai_chat_completions".to_string()
-                    },
-                    client_id: client_id.to_string(),
-                    path: path.to_string(),
-                    method: method.to_string(),
-                    is_streaming: streaming,
-                    node_url: err.node_url_redacted.clone().unwrap_or_default(),
-                    selected_node_id: err.selected_node_id.clone().unwrap_or_default(),
-                    selected_node_url_redacted: err.node_url_redacted.clone().unwrap_or_default(),
-                    observed_exit_ip: String::new(),
-                    outcome: err.outcome.clone(),
-                    pool: "dispatch".to_string(),
-                    exit_ip: String::new(),
-                    status: err.status.as_u16(),
-                    rate_limited: err.was_rate_limited,
-                    retry_count: err.retry_count,
-                    latency_total_ms: latency,
-                    upstream_ms: err.upstream_ms,
-                    ttft_ms: 0,
-                    timings: RequestTimings {
-                        upstream_response_ms: err.upstream_ms,
-                        total_ms: latency,
-                        ..RequestTimings::default()
-                    },
-                    affinity_key: request_affinity_key.clone(),
-                    affinity_hit: false,
-                    affinity_node_id: String::new(),
-                    body_size_bucket: request_body_bucket.clone(),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                    cached_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0,
-                    cache_miss_input_tokens: 0,
-                    session_id: ccp_snap_preflight.session_id.clone(),
-                    usk: ccp_snap_preflight.usk.clone(),
-                    icp_scope: ccp_snap_preflight.icp_scope.clone(),
-                    prefix_32k_hash: ccp_snap_preflight.prefix_32k_hash.clone(),
-                    cache_forensics: cache_forensics.clone(),
-                    prefix_drift: ccp_snap_preflight.prefix_drift,
-                    session_pin_hit: false,
-                    thinking_policy: thinking_policy.clone(),
-                    prompt_cache_key: ccp_snap_preflight.prompt_cache_key.clone(),
-                    provider_cache_observation: String::new(),
-                    warmup_state: ccp_snap_preflight.warmup_state.clone(),
-                    bytes_sent: effective_body_len,
-                    bytes_received: 0,
-                    failure_kind: err.failure_kind.clone(),
-                    failure_message: err.message.clone(),
-                    retry_chain: err.retry_chain.clone(),
-                    context: Some(context_telemetry.clone()),
-                    protocol_guard: protocol_guard_summary.clone(),
-                });
-            }
+            let latency = start.elapsed().as_millis() as u64;
+            let audit_rid = err
+                .request_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            state.collector.record_request(&RequestTelemetry {
+                rid: audit_rid,
+                ts: chrono::Utc::now().timestamp_millis(),
+                external_request_id: external_request_id.clone(),
+                gateway: gateway.clone(),
+                gateway_channel_id: extract_header(headers, "x-newapi-channel-id")
+                    .unwrap_or_default(),
+                run_id: run_tags.run_id.clone(),
+                source_platform: run_tags.source_platform.clone(),
+                case_id: run_tags.case_id.clone(),
+                runner_model: run_tags.runner_model.clone(),
+                provider_id: run_tags.provider_id.clone(),
+                turn_index: run_tags.turn_index,
+                model: public_model.clone(),
+                public_model: public_model.clone(),
+                upstream_model: err.upstream_model.clone(),
+                protocol: if path == "messages" {
+                    "anthropic_messages".to_string()
+                } else {
+                    "openai_chat_completions".to_string()
+                },
+                client_id: client_id.to_string(),
+                path: path.to_string(),
+                method: method.to_string(),
+                is_streaming: streaming,
+                node_url: err.node_url_redacted.clone().unwrap_or_default(),
+                selected_node_id: err.selected_node_id.clone().unwrap_or_default(),
+                selected_node_url_redacted: err.node_url_redacted.clone().unwrap_or_default(),
+                observed_exit_ip: String::new(),
+                outcome: err.outcome.clone(),
+                pool: "dispatch".to_string(),
+                exit_ip: String::new(),
+                status: err.status.as_u16(),
+                rate_limited: err.was_rate_limited,
+                retry_count: err.retry_count,
+                latency_total_ms: latency,
+                upstream_ms: err.upstream_ms,
+                ttft_ms: 0,
+                timings: RequestTimings {
+                    upstream_response_ms: err.upstream_ms,
+                    total_ms: latency,
+                    ..RequestTimings::default()
+                },
+                affinity_key: request_affinity_key.clone(),
+                affinity_hit: false,
+                affinity_node_id: String::new(),
+                body_size_bucket: request_body_bucket.clone(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                cached_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_miss_input_tokens: 0,
+                session_id: ccp_snap_preflight.session_id.clone(),
+                usk: ccp_snap_preflight.usk.clone(),
+                icp_scope: ccp_snap_preflight.icp_scope.clone(),
+                prefix_32k_hash: ccp_snap_preflight.prefix_32k_hash.clone(),
+                cache_forensics: cache_forensics.clone(),
+                prefix_drift: ccp_snap_preflight.prefix_drift,
+                session_pin_hit: false,
+                thinking_policy: thinking_policy.clone(),
+                prompt_cache_key: ccp_snap_preflight.prompt_cache_key.clone(),
+                provider_cache_observation: String::new(),
+                warmup_state: ccp_snap_preflight.warmup_state.clone(),
+                bytes_sent: effective_body_len,
+                bytes_received: 0,
+                failure_kind: err.failure_kind.clone(),
+                failure_message: err.message.clone(),
+                empty_output_class: if err.failure_kind == "empty_output" {
+                    "empty".to_string()
+                } else {
+                    String::new()
+                },
+                raw_tool_format: String::new(),
+                text_chars: 0,
+                reasoning_chars: 0,
+                retry_chain: err.retry_chain.clone(),
+                context: Some(context_telemetry.clone()),
+                protocol_guard: protocol_guard_summary.clone(),
+            });
             record_dynamic_model_traffic(
                 state,
                 &public_model,
@@ -559,9 +577,11 @@ fn traffic_status_for_telemetry(telemetry: &RequestTelemetry) -> u16 {
 
 fn classify_traffic_fallback_failure(status: u16, message: &str) -> String {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("no proxy resources available") {
+    if lower.contains("no proxy resources available")
+        || lower.contains("service temporarily unavailable")
+    {
         "proxy_pool_exhausted".to_string()
-    } else if lower.contains("circuit open") {
+    } else if lower.contains("circuit open") || lower.contains("rate limiting") {
         "circuit_open".to_string()
     } else if lower.contains("request exceeds proxy node budget") {
         "request_too_large".to_string()
@@ -839,9 +859,16 @@ fn build_cache_forensics(
         final_provider_cache_control_block_hashes: String::new(),
         final_provider_cache_policy_match: false,
         final_provider_cache_segment_hash: String::new(),
+        static_cache_material_bytes: 0,
+        dynamic_cache_material_bytes: 0,
+        raw_cacheable_segment_hash: String::new(),
         fork_key,
         fork_reason: String::new(),
     };
+    let split = translate::request_cache_material_split(&request);
+    telemetry.static_cache_material_bytes = split.static_material_bytes as u64;
+    telemetry.dynamic_cache_material_bytes = split.dynamic_material_bytes as u64;
+    telemetry.raw_cacheable_segment_hash = format!("{:016x}", split.raw_cacheable_segment_hash);
     telemetry.ccp_raw_prefix_match_32k =
         telemetry.ccp_prefix_32k_hash == telemetry.raw_body_prefix_32k_hash;
     telemetry.fork_reason = classify_cache_fork(&telemetry);
@@ -1498,6 +1525,14 @@ struct UpstreamCallContext<'a> {
 
 impl V4CallError {
     fn before_dispatch(status: StatusCode, message: impl Into<String>) -> Self {
+        Self::before_dispatch_with_kind(status, message, "")
+    }
+
+    fn before_dispatch_with_kind(
+        status: StatusCode,
+        message: impl Into<String>,
+        failure_kind: impl Into<String>,
+    ) -> Self {
         Self {
             status,
             message: message.into(),
@@ -1510,7 +1545,7 @@ impl V4CallError {
             retry_count: 0,
             was_rate_limited: false,
             upstream_ms: 0,
-            failure_kind: String::new(),
+            failure_kind: failure_kind.into(),
             retry_chain: Vec::new(),
         }
     }
@@ -1564,13 +1599,16 @@ async fn call_with_retry(
     let base_max = conf.pool_max_retries;
     let configured_empty_upstream_max = conf.v4_empty_upstream_max_retries.max(base_max);
     let empty_upstream_max =
-        effective_empty_upstream_max_retries(path, &request_meta, configured_empty_upstream_max);
+        effective_empty_upstream_max_retries(path, &request_meta, configured_empty_upstream_max, &upstream_body, call_context.source_client);
+    let stream_probe_class =
+        stream_probe_class(path, &request_meta, &upstream_body, call_context.source_client);
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut was_rate_limited = false;
     let mut dispatch_wait_ms = 0u64;
     let mut retry_chain = Vec::new();
-    let retry_budget_ms = effective_retry_budget_ms(path, &request_meta, conf.v4_retry_budget_ms);
+    let retry_budget_ms = effective_retry_budget_ms(path, &request_meta, conf.v4_retry_budget_ms, &upstream_body, call_context.source_client);
     let mut force_direct_next = false;
+    let mut last_node_id = String::new();
 
     for attempt in 0..=empty_upstream_max {
         let dispatch_start = Instant::now();
@@ -1582,6 +1620,11 @@ async fn call_with_retry(
                     "direct fallback is not available",
                 )
             })?
+        } else if attempt > 0 && !last_node_id.is_empty() {
+            match state.pool_manager.dispatch_sticky(&request_meta, &last_node_id) {
+                Ok(result) => result,
+                Err(_) => dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?,
+            }
         } else {
             dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?
         };
@@ -1589,6 +1632,7 @@ async fn call_with_retry(
             dispatch_wait_ms.saturating_add(dispatch_start.elapsed().as_millis() as u64);
 
         let node_id = dispatch_result.node.id.clone();
+        last_node_id = node_id.clone();
         let node_url = dispatch_result.url.clone();
         let request_id = uuid::Uuid::new_v4().to_string();
         let kernel = FreeModelKernel::new(KernelConfig {
@@ -1668,7 +1712,8 @@ async fn call_with_retry(
                         .and_then(|value| value.to_str().ok())
                         .map(ToOwned::to_owned);
                     let (response, body_bytes_len, usage, has_output) = if request_meta.stream {
-                        match precheck_stream_first_output(response, path).await {
+                        let precheck_timeout = stream_probe_precheck_timeout(stream_probe_class);
+                        match precheck_stream_first_output(response, path, precheck_timeout).await {
                             StreamPrecheck::HasOutput(resp) => {
                                 (resp, 0, UsageCounts::default(), true)
                             }
@@ -1683,10 +1728,86 @@ async fn call_with_retry(
                         buffered_response_with_usage(response, path, public_model).await?
                     };
                     if !has_output {
-                        crate::pool::session_pin::clear(
-                            &request_meta.upstream_model,
-                            &request_meta.session_id,
-                        );
+                        if let Some(local_response) = build_stream_probe_local_fallback(
+                            path,
+                            &upstream_body,
+                            call_context.source_client,
+                            public_model,
+                            stream_probe_class,
+                        ) {
+                            state.pool_manager.report(
+                                node_id.clone(),
+                                ResultKind::SoftFailure {
+                                    kind: ErrorKind::Other,
+                                },
+                                latency,
+                            );
+                            record_ledger(
+                                state,
+                                conf,
+                                &request_id,
+                                "probe_local_fallback",
+                                &node_id,
+                                &node_url,
+                                public_model,
+                                upstream_model,
+                                StatusCode::OK.as_u16(),
+                                None,
+                                Some("probe_local_fallback"),
+                                latency,
+                                attempt,
+                                request_meta.stream,
+                            );
+                            retry_chain.push(RequestAttemptTelemetry {
+                                attempt,
+                                node_id: node_id.clone(),
+                                node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                                status: StatusCode::OK.as_u16(),
+                                latency_ms: latency,
+                                outcome: "probe_local_fallback".to_string(),
+                                error_type: "empty_output".to_string(),
+                            });
+                            return Ok(V4CallResult {
+                                response: local_response,
+                                request_id,
+                                selected_node_id: node_id,
+                                node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                                observed_exit_ip,
+                                upstream_model: upstream_model.to_string(),
+                                outcome: "probe_local_fallback".to_string(),
+                                retry_count: attempt,
+                                was_rate_limited,
+                                upstream_ms: latency,
+                                ttft_ms: Some(latency),
+                                timings: RequestTimings {
+                                    dispatch_wait_ms,
+                                    upstream_response_ms: latency,
+                                    first_chunk_ms: latency,
+                                    protocol_first_byte_ms: latency,
+                                    stream_complete_ms: latency,
+                                    total_ms: latency,
+                                    ..RequestTimings::default()
+                                },
+                                affinity_hit: dispatch_result.affinity_hit,
+                                affinity_node_id: dispatch_result.affinity_node_id,
+                                session_pin_hit: dispatch_result.session_pin_hit,
+                                retry_chain,
+                                body_bytes_len: 0,
+                                usage: UsageCounts {
+                                    prompt_tokens: request_meta.estimated_input_tokens() as u32,
+                                    completion_tokens: 1,
+                                    total_tokens: request_meta.estimated_input_tokens() as u32 + 1,
+                                    ..UsageCounts::default()
+                                },
+                                final_provider_cache: final_provider_cache,
+                            });
+                        }
+                        if request_meta.estimated_input_tokens() < 50_000 {
+                            crate::pool::session_pin::clear(
+                                &request_meta.upstream_model,
+                                &request_meta.session_id,
+                            );
+                        }
                         state.pool_manager.report(
                             node_id.clone(),
                             ResultKind::EmptyOutput,
@@ -1742,19 +1863,55 @@ async fn call_with_retry(
                             ));
                         }
                         if attempt >= empty_upstream_max {
+                            let status = if request_meta.estimated_input_tokens() >= 100_000
+                                && retry_chain
+                                    .iter()
+                                    .any(|chain_attempt| chain_attempt.error_type == "empty_output")
+                            {
+                                StatusCode::TOO_MANY_REQUESTS
+                            } else {
+                                StatusCode::BAD_GATEWAY
+                            };
+                            let message = if status == StatusCode::TOO_MANY_REQUESTS {
+                                "upstream provider rate limited the request (large session empty retry guard)"
+                            } else {
+                                "upstream returned no assistant content or tool call"
+                            };
+                            let failure_kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                                "upstream_429"
+                            } else {
+                                "empty_output"
+                            };
                             return Err(V4CallError::after_dispatch(
-                                StatusCode::BAD_GATEWAY,
-                                "upstream returned no assistant content or tool call",
+                                status,
+                                message,
                                 None,
                                 request_id,
                                 node_id,
                                 &node_url,
                                 upstream_model,
-                                "empty_output",
+                                failure_kind,
                                 attempt,
-                                was_rate_limited,
+                                status == StatusCode::TOO_MANY_REQUESTS,
                                 latency,
-                                "empty_output",
+                                failure_kind,
+                                retry_chain,
+                            ));
+                        }
+                        if repeated_large_session_empty_attempts(&retry_chain, &request_meta) {
+                            return Err(V4CallError::after_dispatch(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "upstream provider rate limited the request (large session retry guard)",
+                                None,
+                                request_id,
+                                node_id,
+                                &node_url,
+                                upstream_model,
+                                "upstream_429",
+                                attempt,
+                                true,
+                                latency,
+                                "upstream_429",
                                 retry_chain,
                             ));
                         }
@@ -2106,7 +2263,25 @@ fn effective_empty_upstream_max_retries(
     path: &str,
     request_meta: &RequestMeta,
     configured_max: u32,
+    upstream_body: &Value,
+    source_client: &str,
 ) -> u32 {
+    let probe_class = stream_probe_class(path, request_meta, upstream_body, source_client);
+    if probe_class == StreamProbeClass::Micro {
+        return configured_max.min(2);
+    }
+    if probe_class == StreamProbeClass::Small {
+        return configured_max.min(3);
+    }
+    if path == "messages" && !is_mimo_messages_request(path, request_meta) {
+        let estimated_tokens = request_meta.estimated_input_tokens();
+        if estimated_tokens >= 100_000 {
+            return configured_max.min(1);
+        }
+        if estimated_tokens >= 50_000 {
+            return configured_max.min(2);
+        }
+    }
     if !is_mimo_messages_request(path, request_meta) {
         return configured_max;
     }
@@ -2120,11 +2295,31 @@ fn effective_retry_budget_ms(
     path: &str,
     request_meta: &RequestMeta,
     configured_budget_ms: u64,
+    upstream_body: &Value,
+    source_client: &str,
 ) -> u64 {
-    if configured_budget_ms == 0 || !is_mimo_messages_request(path, request_meta) {
+    if configured_budget_ms == 0 {
         return configured_budget_ms;
     }
+    let probe_class = stream_probe_class(path, request_meta, upstream_body, source_client);
+    if probe_class == StreamProbeClass::Micro {
+        return configured_budget_ms.min(15_000);
+    }
+    if probe_class == StreamProbeClass::Small {
+        return configured_budget_ms.min(25_000);
+    }
     let estimated_tokens = request_meta.estimated_input_tokens();
+    if path == "messages" && !is_mimo_messages_request(path, request_meta) {
+        if estimated_tokens >= 100_000 {
+            return configured_budget_ms.min(45_000);
+        }
+        if estimated_tokens >= 50_000 {
+            return configured_budget_ms.min(55_000);
+        }
+    }
+    if !is_mimo_messages_request(path, request_meta) {
+        return configured_budget_ms;
+    }
     if estimated_tokens >= 50_000 {
         return configured_budget_ms.min(20_000);
     }
@@ -2132,6 +2327,172 @@ fn effective_retry_budget_ms(
         return configured_budget_ms.min(30_000);
     }
     configured_budget_ms
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamProbeClass {
+    None,
+    Micro,
+    Small,
+}
+
+fn stream_probe_class(
+    path: &str,
+    request_meta: &RequestMeta,
+    upstream_body: &Value,
+    source_client: &str,
+) -> StreamProbeClass {
+    if !request_meta.stream {
+        return StreamProbeClass::None;
+    }
+    if matches!(path, "messages" | "chat/completions") {
+        if let Some(chat_request) =
+            chat_request_for_probe_classification(path, upstream_body, request_meta.stream)
+        {
+            let is_claude_code = normalize_source_client(source_client) == "claude-code";
+            if translate::is_claude_code_stream_low_budget_probe(&chat_request, is_claude_code) {
+                return StreamProbeClass::Micro;
+            }
+        }
+    }
+    if is_stream_micro_probe_request(path, request_meta) {
+        return StreamProbeClass::Micro;
+    }
+    if is_stream_small_probe_request(path, request_meta) {
+        return StreamProbeClass::Small;
+    }
+    StreamProbeClass::None
+}
+
+fn stream_probe_precheck_timeout(probe_class: StreamProbeClass) -> u64 {
+    if probe_class == StreamProbeClass::Micro {
+        STREAM_MICRO_PROBE_PRECHECK_TIMEOUT_SECS
+    } else {
+        STREAM_EMPTY_PRECHECK_TIMEOUT_SECS
+    }
+}
+
+fn chat_request_for_probe_classification(
+    path: &str,
+    upstream_body: &Value,
+    stream: bool,
+) -> Option<ChatRequest> {
+    match path {
+        "chat/completions" => serde_json::from_value(upstream_body.clone()).ok(),
+        "messages" => anthropic_request_to_probe_chat_request(upstream_body, stream),
+        _ => None,
+    }
+}
+
+fn anthropic_request_to_probe_chat_request(
+    upstream_body: &Value,
+    stream: bool,
+) -> Option<ChatRequest> {
+    let request: AnthropicRequest = serde_json::from_value(upstream_body.clone()).ok()?;
+    let tools = request.tools.as_ref().map(|tool_defs| {
+        tool_defs
+            .iter()
+            .map(|tool| free_model_client_rs::protocol::types::OpenAITool {
+                tool_type: "function".to_string(),
+                function: free_model_client_rs::protocol::types::OpenAIToolFunction {
+                    name: tool.name.clone(),
+                    description: Some(tool.description.clone()),
+                    parameters: None,
+                },
+            })
+            .collect()
+    });
+    Some(ChatRequest {
+        model: request.model,
+        messages: request
+            .messages
+            .iter()
+            .map(|message| free_model_client_rs::protocol::types::Message {
+                role: message.role.clone(),
+                content: message.content.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            })
+            .collect(),
+        stream: Some(stream),
+        max_tokens: request.max_tokens,
+        temperature: request.temperature,
+        top_p: None,
+        tools,
+        tool_choice: request.tool_choice,
+    })
+}
+
+fn build_stream_probe_local_fallback(
+    path: &str,
+    upstream_body: &Value,
+    source_client: &str,
+    public_model: &str,
+    probe_class: StreamProbeClass,
+) -> Option<Response> {
+    if probe_class == StreamProbeClass::None {
+        return None;
+    }
+    if let Some(chat_request) = chat_request_for_probe_classification(path, upstream_body, true) {
+        let is_claude_code = normalize_source_client(source_client) == "claude-code";
+        if translate::claude_code_low_budget_empty_fallback_text(&chat_request, is_claude_code)
+            .is_none()
+            && !translate::short_no_tool_empty_fallback_text(&chat_request).is_some()
+        {
+            return None;
+        }
+    }
+    match path {
+        "messages" => Some(build_anthropic_probe_ok_stream_response(public_model)),
+        "chat/completions" => Some(build_openai_probe_ok_stream_response(public_model)),
+        _ => None,
+    }
+}
+
+fn build_anthropic_probe_ok_stream_response(model: &str) -> Response {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let body = format!(
+        "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_{ts}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"{model}\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":0}}}}}}\n\n\
+event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"ok\"}}}}\n\n\
+event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
+event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .expect("valid probe fallback response")
+}
+
+fn build_openai_probe_ok_stream_response(model: &str) -> Response {
+    let body = format!(
+        "data: {{\"id\":\"chatcmpl-probe\",\"object\":\"chat.completion.chunk\",\"model\":\"{model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\"}},\"finish_reason\":null}}]}}\n\n\
+data: {{\"id\":\"chatcmpl-probe\",\"object\":\"chat.completion.chunk\",\"model\":\"{model}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+data: [DONE]\n\n"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .expect("valid probe fallback response")
+}
+
+fn is_stream_micro_probe_request(path: &str, request_meta: &RequestMeta) -> bool {
+    path == "messages"
+        && request_meta.stream
+        && request_meta.body_size <= 2_048
+}
+
+fn is_stream_small_probe_request(path: &str, request_meta: &RequestMeta) -> bool {
+    path == "messages"
+        && request_meta.stream
+        && request_meta.body_size <= 8_192
 }
 
 fn is_mimo_messages_request(path: &str, request_meta: &RequestMeta) -> bool {
@@ -2166,9 +2527,10 @@ async fn dispatch_or_wait(
 ) -> Result<crate::pool::DispatchResult, V4CallError> {
     match state.pool_manager.dispatch(request_meta) {
         Ok(result) => Ok(result),
-        Err(DispatchError::CircuitOpen) => Err(V4CallError::before_dispatch(
+        Err(DispatchError::CircuitOpen) => Err(V4CallError::before_dispatch_with_kind(
             StatusCode::SERVICE_UNAVAILABLE,
-            "circuit open: upstream rate limit detected",
+            PUBLIC_PROXY_CIRCUIT_OPEN_MESSAGE,
+            "circuit_open",
         )),
         Err(DispatchError::RequestTooLarge) => Err(V4CallError::before_dispatch(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -2178,15 +2540,17 @@ async fn dispatch_or_wait(
             if attempt < max {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 state.pool_manager.dispatch(request_meta).map_err(|_| {
-                    V4CallError::before_dispatch(
+                    V4CallError::before_dispatch_with_kind(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "no proxy resources available",
+                        PUBLIC_PROXY_POOL_EXHAUSTED_MESSAGE,
+                        "proxy_pool_exhausted",
                     )
                 })
             } else {
-                Err(V4CallError::before_dispatch(
+                Err(V4CallError::before_dispatch_with_kind(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "no proxy resources available",
+                    PUBLIC_PROXY_POOL_EXHAUSTED_MESSAGE,
+                    "proxy_pool_exhausted",
                 ))
             }
         }
@@ -2697,6 +3061,21 @@ fn normalize_downstream_usage_value(path: &str, value: &mut Value) -> bool {
     changed
 }
 
+/// Marginal miss tokens on the wire. NewAPI `UsageFromClaudeAPIUsage` maps this to
+/// `PromptTokens`, then `buildOpenAIStyleUsageFromClaudeUsage` sets client-visible
+/// `prompt_tokens = wire_miss + cache_read`. Gate metric is `cache_read / prompt_tokens`.
+fn newapi_complement_wire_miss_tokens(
+    billed_input: u32,
+    cache_read: u32,
+    cache_creation: u32,
+    usage: &Value,
+) -> u32 {
+    if cache_read == 0 {
+        return billed_input.saturating_sub(cache_creation);
+    }
+    openai_marginal_uncached_input_tokens(billed_input, cache_read, cache_creation, usage)
+}
+
 fn normalize_downstream_usage_object(path: &str, usage: &mut Value) -> bool {
     if !usage.is_object() {
         return false;
@@ -2707,13 +3086,13 @@ fn normalize_downstream_usage_object(path: &str, usage: &mut Value) -> bool {
         let output_tokens = usage_u32(usage, "output_tokens");
         let cache_read = usage_cache_read_u32(usage).unwrap_or(0);
         let cache_creation = usage_u32(usage, "cache_creation_input_tokens");
-        let uncached_input =
-            downstream_uncached_input_tokens(provider_input, cache_read, cache_creation, usage);
-        usage["input_tokens"] = Value::from(provider_input);
+        let wire_input =
+            newapi_complement_wire_miss_tokens(provider_input, cache_read, cache_creation, usage);
+        usage["input_tokens"] = Value::from(wire_input);
         usage["output_tokens"] = Value::from(output_tokens);
         usage["cache_read_input_tokens"] = Value::from(cache_read);
-        usage["cache_miss_input_tokens"] = Value::from(uncached_input);
-        usage["zenproxy_billable_input_tokens"] = Value::from(uncached_input);
+        usage["cache_miss_input_tokens"] = Value::from(wire_input);
+        usage["zenproxy_billable_input_tokens"] = Value::from(wire_input);
         usage["zenproxy_provider_input_tokens"] = Value::from(provider_input);
         usage["zenproxy_cache_r2_basis_tokens"] = Value::from(provider_input);
         usage["zenproxy_true_cache_read_ratio"] =
@@ -2726,20 +3105,153 @@ fn normalize_downstream_usage_object(path: &str, usage: &mut Value) -> bool {
     let completion_tokens = usage_u32(usage, "completion_tokens");
     let cache_read = usage_cache_read_u32(usage).unwrap_or(0);
     let cache_creation = usage_u32(usage, "cache_creation_input_tokens");
-    let uncached_prompt =
-        downstream_uncached_input_tokens(provider_prompt, cache_read, cache_creation, usage);
-    usage["prompt_tokens"] = Value::from(provider_prompt);
+    let wire_prompt =
+        newapi_complement_wire_miss_tokens(provider_prompt, cache_read, cache_creation, usage);
+    let wire_cached = cache_read;
+    usage["prompt_tokens"] = Value::from(wire_prompt);
     usage["completion_tokens"] = Value::from(completion_tokens);
-    usage["total_tokens"] = Value::from(provider_prompt.saturating_add(completion_tokens));
-    usage["cache_read_input_tokens"] = Value::from(cache_read);
-    usage["cache_miss_input_tokens"] = Value::from(uncached_prompt);
-    usage["zenproxy_billable_input_tokens"] = Value::from(uncached_prompt);
-    usage["zenproxy_provider_prompt_tokens"] = Value::from(provider_prompt);
-    usage["zenproxy_cache_r2_basis_tokens"] = Value::from(provider_prompt);
-    usage["zenproxy_true_cache_read_ratio"] = Value::from(cache_ratio(provider_prompt, cache_read));
-    usage["zenproxy_cache_contract_version"] = Value::from(2);
-    ensure_prompt_tokens_details_cached_tokens(usage, cache_read);
-    cache_read > 0 || usage_cache_miss_u32(usage).is_some()
+    usage["total_tokens"] = Value::from(wire_prompt.saturating_add(completion_tokens));
+    ensure_prompt_tokens_details_cached_tokens(usage, wire_cached);
+    sanitize_openai_usage_for_newapi_client(usage);
+    attach_openai_billing_usage_for_newapi_client(usage, wire_prompt, wire_cached, completion_tokens);
+    wire_cached > 0 || usage_cache_miss_u32(usage).is_some()
+}
+
+fn attach_openai_billing_usage_for_newapi_client(
+    usage: &mut Value,
+    wire_prompt: u32,
+    wire_cached: u32,
+    completion_tokens: u32,
+) {
+    let total = wire_prompt.saturating_add(completion_tokens);
+    usage["usage_semantic"] = Value::from("openai");
+    usage["usage_source"] = Value::from("oai_chat");
+    usage["billing_usage"] = serde_json::json!({
+        "source": "oai_chat",
+        "semantic": "openai",
+        "openai_usage": {
+            "prompt_tokens": wire_prompt,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total,
+            "prompt_tokens_details": {
+                "cached_tokens": wire_cached
+            }
+        }
+    });
+}
+
+/// NewAPI OpenAI relay treats Anthropic-shaped fields as billing metadata and may
+/// rewrite client-visible usage (e.g. prompt_tokens = input_tokens + cache_read).
+/// Downstream OpenAI clients should only receive canonical OpenAI usage plus
+/// `prompt_tokens_details.cached_tokens` for cache ratio.
+fn sanitize_openai_usage_for_newapi_client(usage: &mut Value) {
+    if let Some(obj) = usage.as_object_mut() {
+        for key in [
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_miss_input_tokens",
+            "input_tokens",
+            "output_tokens",
+            "billing_usage",
+            "usage_semantic",
+            "usage_source",
+            "input_tokens_details",
+            "completion_tokens_details",
+            "claude_cache_creation_5_m_tokens",
+            "claude_cache_creation_1_h_tokens",
+            "zenproxy_billable_input_tokens",
+            "zenproxy_provider_prompt_tokens",
+            "zenproxy_cache_r2_basis_tokens",
+            "zenproxy_true_cache_read_ratio",
+            "zenproxy_cache_contract_version",
+            "zenproxy_provider_input_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+            "cached_tokens",
+        ] {
+            obj.remove(key);
+        }
+    }
+}
+
+fn openai_usage_has_scale_mismatch(
+    provider_prompt: u32,
+    cache_read: u32,
+    cache_creation: u32,
+) -> bool {
+    if cache_read == 0 {
+        return false;
+    }
+    let marginal_billable = cache_read.saturating_add(cache_creation);
+    provider_prompt > marginal_billable.saturating_add(512) && provider_prompt > marginal_billable * 2
+}
+
+fn usage_marginal_input_tokens(usage: &Value, provider_prompt: u32) -> Option<u32> {
+    let from_billing = usage
+        .get("billing_usage")
+        .and_then(|billing| billing.get("claude_usage"))
+        .and_then(|claude| usage_u32_opt(claude, "input_tokens"));
+    if let Some(marginal) = from_billing {
+        if marginal > 0 && marginal < provider_prompt {
+            return Some(marginal);
+        }
+    }
+    usage_u32_opt(usage, "input_tokens").filter(|tokens| *tokens > 0 && *tokens < provider_prompt)
+}
+
+fn openai_marginal_uncached_input_tokens(
+    provider_prompt: u32,
+    cache_read: u32,
+    cache_creation: u32,
+    usage: &Value,
+) -> u32 {
+    if !openai_usage_has_scale_mismatch(provider_prompt, cache_read, cache_creation) {
+        return downstream_uncached_input_tokens(
+            provider_prompt,
+            cache_read,
+            cache_creation,
+            usage,
+        );
+    }
+
+    if let Some(miss) = usage_cache_miss_u32(usage) {
+        let full_scale_miss = provider_prompt
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_creation);
+        if miss < full_scale_miss && miss <= provider_prompt / 4 {
+            return miss;
+        }
+    }
+
+    if let Some(marginal_input) = usage_marginal_input_tokens(usage, provider_prompt) {
+        return marginal_input
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_creation);
+    }
+
+  // Provider often reports cache_read on marginal scale while prompt_tokens stays
+  // full-context; miss may be marginal_input (= prompt - cache_read) not marginal miss.
+  let inferred_marginal_miss = provider_prompt.saturating_sub(cache_read.saturating_mul(2));
+  if inferred_marginal_miss > 0 && inferred_marginal_miss < provider_prompt / 4 {
+        return inferred_marginal_miss;
+    }
+
+    downstream_uncached_input_tokens(provider_prompt, cache_read, cache_creation, usage)
+}
+
+fn openai_newapi_cached_tokens(
+    provider_prompt: u32,
+    cache_read: u32,
+    cache_creation: u32,
+    usage: &Value,
+) -> u32 {
+    if openai_usage_has_scale_mismatch(provider_prompt, cache_read, cache_creation) {
+        let marginal_uncached =
+            openai_marginal_uncached_input_tokens(provider_prompt, cache_read, cache_creation, usage);
+        provider_prompt.saturating_sub(marginal_uncached)
+    } else {
+        cache_read
+    }
 }
 
 fn downstream_uncached_input_tokens(
@@ -2826,7 +3338,11 @@ enum StreamPrecheck {
 /// byte sequence it would have without this precheck. When the stream ends
 /// (or times out) with zero output, return Empty so call_with_retry can switch
 /// nodes instead of failing the client with an empty 200.
-async fn precheck_stream_first_output(response: Response, path: &str) -> StreamPrecheck {
+async fn precheck_stream_first_output(
+    response: Response,
+    path: &str,
+    timeout_secs: u64,
+) -> StreamPrecheck {
     let status = response.status();
     let headers = response.headers().clone();
     let mut upstream = response.into_body().into_data_stream();
@@ -2839,7 +3355,10 @@ async fn precheck_stream_first_output(response: Response, path: &str) -> StreamP
             match upstream.next().await {
                 Some(Ok(bytes)) => {
                     metrics.ingest(path, &bytes);
-                    if metrics.has_content_signal() || metrics.has_tool_signal() {
+                    if metrics.has_content_signal()
+                        || metrics.has_tool_signal()
+                        || metrics.has_rate_limited_error()
+                    {
                         buffered.push(bytes);
                         has_output = true;
                         break;
@@ -2856,11 +3375,14 @@ async fn precheck_stream_first_output(response: Response, path: &str) -> StreamP
             }
         }
     };
-    match tokio::time::timeout(Duration::from_secs(STREAM_EMPTY_PRECHECK_TIMEOUT_SECS), peek).await {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), peek).await {
         Ok(_) => {}
         Err(_) => {
             // Timed out without a content/tool signal: treat as slow-or-empty.
         }
+    }
+    if !has_output && metrics.has_rate_limited_error() {
+        has_output = true;
     }
     if !has_output {
         return StreamPrecheck::Empty;
@@ -3012,9 +3534,10 @@ fn metered_stream_response(
         telemetry.timings.first_tool_call_ms = first_tool_call_ms;
         telemetry.timings.stream_complete_ms = stream_complete_ms;
         telemetry.timings.total_ms = stream_complete_ms;
-        let empty_output = stream_error.is_none()
-            && usage.completion_tokens == 0
-            && !metrics.has_assistant_output();
+        telemetry.raw_tool_format = metrics.raw_tool_format().to_string();
+        telemetry.text_chars = metrics.text_chars as u32;
+        telemetry.reasoning_chars = metrics.reasoning_chars as u32;
+        let empty_output = stream_error.is_none() && !metrics.has_assistant_output();
         if client_gone {
             telemetry.outcome = "client_gone".to_string();
             telemetry.failure_kind = "client_gone".to_string();
@@ -3073,6 +3596,7 @@ fn metered_stream_response(
             );
             lease_guard.mark_released();
         } else if metrics.has_rate_limited_error() && !metrics.has_assistant_output() {
+            telemetry.status = StatusCode::TOO_MANY_REQUESTS.as_u16();
             telemetry.outcome = "rate_limited".to_string();
             telemetry.failure_kind = "upstream_429".to_string();
             telemetry.failure_message =
@@ -3093,10 +3617,18 @@ fn metered_stream_response(
             );
             lease_guard.mark_released();
         } else if empty_output {
+            telemetry.empty_output_class = classify_empty_output_class(
+                metrics.has_assistant_output(),
+                metrics.reasoning_chars,
+                metrics.finish_reason.as_deref(),
+                usage.completion_tokens,
+            );
             telemetry.outcome = "empty_output".to_string();
             telemetry.failure_kind = "empty_output".to_string();
-            telemetry.failure_message =
-                "upstream returned no assistant content or tool call".to_string();
+            telemetry.failure_message = format!(
+                "upstream returned no assistant content or tool call (class={})",
+                telemetry.empty_output_class
+            );
             crate::pool::session_pin::clear(&telemetry.upstream_model, &telemetry.session_id);
             telemetry.retry_chain.push(RequestAttemptTelemetry {
                 attempt: telemetry.retry_count,
@@ -3222,6 +3754,43 @@ fn classify_stream_body_error(err: &axum::Error) -> &'static str {
     classify_stream_error_message(&err.to_string())
 }
 
+fn classify_empty_output_class(
+    has_assistant_output: bool,
+    reasoning_chars: usize,
+    finish_reason: Option<&str>,
+    completion_tokens: u32,
+) -> String {
+    if has_assistant_output {
+        return String::new();
+    }
+    if reasoning_chars > 0 {
+        if finish_reason == Some("length") {
+            return "reasoning_only_length".to_string();
+        }
+        return "reasoning_only".to_string();
+    }
+    if completion_tokens > 0 {
+        return "reasoning_only".to_string();
+    }
+    "empty".to_string()
+}
+
+fn repeated_large_session_empty_attempts(
+    retry_chain: &[RequestAttemptTelemetry],
+    request_meta: &RequestMeta,
+) -> bool {
+    if request_meta.estimated_input_tokens() < 100_000 {
+        return false;
+    }
+    retry_chain
+        .iter()
+        .filter(|attempt| {
+            attempt.error_type == "empty_output" || attempt.outcome == "empty_output"
+        })
+        .count()
+        >= 2
+}
+
 fn classify_stream_error_message(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
     if lower.contains("rate limit") || lower.contains("rate_limit") || lower.contains("429") {
@@ -3245,7 +3814,12 @@ struct StreamMetrics {
     completion_text: String,
     tool_output_chunks: u64,
     text_output_chunks: u64,
+    thinking_output_chunks: u64,
     rate_limited_error_chunks: u64,
+    reasoning_chars: usize,
+    text_chars: usize,
+    dsml_leak_detected: bool,
+    finish_reason: Option<String>,
     buffer: String,
 }
 
@@ -3301,12 +3875,23 @@ impl StreamMetrics {
                 }
                 Some("content_block_delta") => {
                     if let Some(delta) = value.get("delta") {
-                        if delta
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| !text.trim().is_empty())
-                        {
-                            self.text_output_chunks = self.text_output_chunks.saturating_add(1);
+                        if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                            if !thinking.trim().is_empty() {
+                                self.reasoning_chars =
+                                    self.reasoning_chars.saturating_add(thinking.trim().len());
+                                self.thinking_output_chunks =
+                                    self.thinking_output_chunks.saturating_add(1);
+                            }
+                        }
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            self.text_chars = self.text_chars.saturating_add(text.len());
+                            if sse_text_contains_dsml_tool_leak(text) {
+                                self.dsml_leak_detected = true;
+                            }
+                            self.completion_text.push_str(text);
+                            if !text.trim().is_empty() {
+                                self.text_output_chunks = self.text_output_chunks.saturating_add(1);
+                            }
                         }
                         if delta
                             .get("partial_json")
@@ -3314,6 +3899,13 @@ impl StreamMetrics {
                             .is_some_and(|json| !json.trim().is_empty())
                         {
                             self.tool_output_chunks = self.tool_output_chunks.saturating_add(1);
+                        }
+                    }
+                }
+                Some("message_delta") => {
+                    if let Some(delta) = value.get("delta") {
+                        if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str) {
+                            self.finish_reason = Some(stop_reason.to_string());
                         }
                     }
                 }
@@ -3364,10 +3956,36 @@ impl StreamMetrics {
             .and_then(|delta| delta.get("content"))
             .and_then(|content| content.as_str())
         {
+            self.text_chars = self.text_chars.saturating_add(text.len());
+            if sse_text_contains_dsml_tool_leak(text) {
+                self.dsml_leak_detected = true;
+            }
             self.completion_text.push_str(text);
             if !text.trim().is_empty() {
                 self.text_output_chunks = self.text_output_chunks.saturating_add(1);
             }
+        }
+        if let Some(reasoning) = value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("reasoning_content"))
+            .and_then(|content| content.as_str())
+        {
+            if !reasoning.trim().is_empty() {
+                self.reasoning_chars =
+                    self.reasoning_chars.saturating_add(reasoning.trim().len());
+            }
+        }
+        if let Some(finish_reason) = value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = Some(finish_reason.to_string());
         }
         if value
             .get("choices")
@@ -3463,10 +4081,13 @@ impl StreamMetrics {
         !self.completion_text.trim().is_empty()
             || self.text_output_chunks > 0
             || self.tool_output_chunks > 0
+            || self.thinking_output_chunks > 0
     }
 
     fn has_content_signal(&self) -> bool {
-        !self.completion_text.trim().is_empty() || self.text_output_chunks > 0
+        !self.completion_text.trim().is_empty()
+            || self.text_output_chunks > 0
+            || self.thinking_output_chunks > 0
     }
 
     fn has_tool_signal(&self) -> bool {
@@ -3476,6 +4097,31 @@ impl StreamMetrics {
     fn has_rate_limited_error(&self) -> bool {
         self.rate_limited_error_chunks > 0
     }
+
+    fn raw_tool_format(&self) -> &str {
+        if self.tool_output_chunks > 0 {
+            "anthropic"
+        } else if self.dsml_leak_detected {
+            "dsml"
+        } else {
+            ""
+        }
+    }
+}
+
+fn sse_text_contains_dsml_tool_leak(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "DSML|tool_calls",
+        "DSML｜tool_calls",
+        "｜DSML｜",
+        "|DSML|",
+        "<｜DSML｜",
+        "<|DSML|",
+        "invoke name=",
+        "</｜DSML｜",
+        "</|DSML|",
+    ];
+    MARKERS.iter().any(|marker| text.contains(marker))
 }
 
 fn value_has_rate_limit_error(value: &Value) -> bool {
@@ -3666,42 +4312,121 @@ mod tests {
     }
 
     #[test]
-    fn mimo_large_messages_caps_empty_output_retries() {
-        let meta = request_meta("mimo-v2.5", "mimo-v2.5-free", 40_000);
+    fn stream_micro_probe_caps_empty_output_retries_and_budget() {
+        let meta = request_meta("deepseek-v4-flash", "deepseek-v4-flash-free", 960);
+        let body = serde_json::json!({});
 
         assert_eq!(
-            effective_empty_upstream_max_retries("messages", &meta, 12),
+            effective_empty_upstream_max_retries("messages", &meta, 12, &body, "claude-code"),
             2
         );
-        assert_eq!(effective_retry_budget_ms("messages", &meta, 45_000), 30_000);
+        assert_eq!(
+            effective_retry_budget_ms("messages", &meta, 45_000, &body, "claude-code"),
+            15_000
+        );
+    }
+
+    #[test]
+    fn stream_micro_probe_by_max_tokens_caps_retries_even_with_huge_body() {
+        let meta = request_meta("deepseek-v4-flash", "deepseek-v4-flash-free", 400_000);
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "stream": true,
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": "ping"}
+            ],
+            "tools": [{"name": "Read", "description": "read", "input_schema": {"type": "object"}}]
+        });
+
+        assert_eq!(
+            effective_empty_upstream_max_retries("messages", &meta, 12, &body, "claude-code"),
+            2
+        );
+        assert_eq!(
+            effective_retry_budget_ms("messages", &meta, 45_000, &body, "claude-code"),
+            15_000
+        );
+    }
+
+    #[test]
+    fn stream_small_probe_caps_empty_output_retries_more_than_micro() {
+        let meta = request_meta("deepseek-v4-flash", "deepseek-v4-flash-free", 6_000);
+        let body = serde_json::json!({});
+
+        assert_eq!(
+            effective_empty_upstream_max_retries("messages", &meta, 12, &body, "claude-code"),
+            3
+        );
+        assert_eq!(
+            effective_retry_budget_ms("messages", &meta, 45_000, &body, "claude-code"),
+            25_000
+        );
+    }
+
+    #[test]
+    fn mimo_large_messages_caps_empty_output_retries() {
+        let meta = request_meta("mimo-v2.5", "mimo-v2.5-free", 40_000);
+        let body = serde_json::json!({});
+
+        assert_eq!(
+            effective_empty_upstream_max_retries("messages", &meta, 12, &body, "claude-code"),
+            2
+        );
+        assert_eq!(
+            effective_retry_budget_ms("messages", &meta, 45_000, &body, "claude-code"),
+            30_000
+        );
     }
 
     #[test]
     fn mimo_huge_messages_caps_retry_budget_more_aggressively() {
         let meta = request_meta("mimo-v2.5", "mimo-v2.5-free", 220_000);
+        let body = serde_json::json!({});
 
         assert_eq!(
-            effective_empty_upstream_max_retries("messages", &meta, 12),
+            effective_empty_upstream_max_retries("messages", &meta, 12, &body, "claude-code"),
             2
         );
-        assert_eq!(effective_retry_budget_ms("messages", &meta, 45_000), 20_000);
+        assert_eq!(
+            effective_retry_budget_ms("messages", &meta, 45_000, &body, "claude-code"),
+            20_000
+        );
     }
 
     #[test]
     fn mimo_retry_cap_does_not_affect_chat_or_other_models() {
         let mimo = request_meta("mimo-v2.5", "mimo-v2.5-free", 220_000);
         let deepseek = request_meta("deepseek-v4-flash", "deepseek-v4-flash-free", 220_000);
+        let body = serde_json::json!({});
 
         assert_eq!(
-            effective_empty_upstream_max_retries("chat/completions", &mimo, 12),
+            effective_empty_upstream_max_retries("chat/completions", &mimo, 12, &body, "claude-code"),
             12
         );
         assert_eq!(
-            effective_empty_upstream_max_retries("messages", &deepseek, 12),
-            12
+            effective_empty_upstream_max_retries("messages", &deepseek, 12, &body, "claude-code"),
+            2
         );
         assert_eq!(
-            effective_retry_budget_ms("messages", &deepseek, 45_000),
+            effective_retry_budget_ms("messages", &deepseek, 45_000, &body, "claude-code"),
+            45_000
+        );
+    }
+
+    #[test]
+    fn deepseek_huge_messages_caps_empty_output_retries() {
+        let meta = request_meta("deepseek-v4-flash", "deepseek-v4-flash-free", 420_000);
+        let body = serde_json::json!({});
+
+        assert_eq!(
+            effective_empty_upstream_max_retries("messages", &meta, 12, &body, "claude-code"),
+            1
+        );
+        assert_eq!(
+            effective_retry_budget_ms("messages", &meta, 90_000, &body, "claude-code"),
             45_000
         );
     }
@@ -3964,18 +4689,99 @@ mod tests {
         let value: Value = serde_json::from_slice(&rewritten).unwrap();
 
         assert_eq!(value["model"], "deepseek");
-        assert_eq!(value["usage"]["prompt_tokens"], 1000);
+        assert_eq!(value["usage"]["prompt_tokens"], 100);
         assert_eq!(value["usage"]["completion_tokens"], 10);
-        assert_eq!(value["usage"]["total_tokens"], 1010);
+        assert_eq!(value["usage"]["total_tokens"], 110);
         assert_eq!(
             value["usage"]["prompt_tokens_details"]["cached_tokens"],
             900
         );
-        assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
-        assert_eq!(value["usage"]["cache_miss_input_tokens"], 100);
-        assert_eq!(value["usage"]["zenproxy_billable_input_tokens"], 100);
-        assert_eq!(value["usage"]["zenproxy_provider_prompt_tokens"], 1000);
-        assert_eq!(value["usage"]["zenproxy_cache_contract_version"], 2);
+        assert!(value["usage"].get("cache_read_input_tokens").is_none());
+        assert_eq!(value["usage"]["usage_semantic"], "openai");
+        assert_eq!(
+            value["usage"]["billing_usage"]["source"],
+            "oai_chat"
+        );
+        assert!(value["usage"].get("zenproxy_billable_input_tokens").is_none());
+    }
+
+    #[test]
+    fn rewrites_openai_usage_for_newapi_cache_ratio_when_prompt_and_cache_read_differ_in_scale() {
+        let body = Bytes::from_static(
+            br#"{"model":"deepseek-v4-flash-free","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":16284,"completion_tokens":10,"total_tokens":16294,"prompt_tokens_details":{"cached_tokens":8064},"cache_read_input_tokens":8064,"billing_usage":{"claude_usage":{"input_tokens":8220,"cache_read_input_tokens":8064,"output_tokens":10}}}}"#,
+        );
+
+        let rewritten = rewrite_nonstream_response_model("chat/completions", body, "deepseek");
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(value["usage"]["prompt_tokens"], 156);
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cached_tokens"],
+            8064
+        );
+        assert!(value["usage"].get("cache_read_input_tokens").is_none());
+        assert_eq!(value["usage"]["billing_usage"]["source"], "oai_chat");
+        assert!(value["usage"].get("cache_miss_input_tokens").is_none());
+    }
+
+    #[test]
+    fn rewrites_openai_usage_for_newapi_marginal_scale_when_prompt_near_cached_scale() {
+        let body = Bytes::from_static(
+            br#"{"model":"deepseek-v4-flash-free","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":20099,"completion_tokens":10,"total_tokens":20109,"prompt_tokens_details":{"cached_tokens":20096},"cache_read_input_tokens":20096}}"#,
+        );
+
+        let rewritten = rewrite_nonstream_response_model("chat/completions", body, "deepseek");
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(value["usage"]["prompt_tokens"], 3);
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cached_tokens"],
+            20096
+        );
+        assert_eq!(value["usage"]["total_tokens"], 13);
+        assert_eq!(value["usage"]["billing_usage"]["source"], "oai_chat");
+    }
+
+    #[test]
+    fn rewrites_openai_stream_usage_for_newapi_cache_ratio_when_prompt_and_cache_read_differ_in_scale(
+    ) {
+        let body = Bytes::from_static(
+            b"data: {\"id\":\"chatcmpl_1\",\"model\":\"mimo-v2.5-free\",\"choices\":[],\"usage\":{\"prompt_tokens\":16284,\"completion_tokens\":10,\"total_tokens\":16294,\"prompt_tokens_details\":{\"cached_tokens\":8064},\"cache_read_input_tokens\":8064,\"input_tokens\":8220}}\n\n",
+        );
+
+        let rewritten = rewrite_stream_response_model("chat/completions", body, "mimo");
+        let text = std::str::from_utf8(&rewritten).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let value: Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(value["usage"]["prompt_tokens"], 156);
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cached_tokens"],
+            8064
+        );
+        assert!(value["usage"].get("input_tokens").is_none());
+        assert!(value["usage"].get("cache_read_input_tokens").is_none());
+        assert_eq!(value["usage"]["billing_usage"]["source"], "oai_chat");
+    }
+
+    #[test]
+    fn rewrites_openai_usage_without_billing_usage_using_marginal_miss_inference() {
+        let body = Bytes::from_static(
+            br#"{"model":"deepseek-v4-flash-free","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":16412,"completion_tokens":128,"total_tokens":16540,"prompt_tokens_details":{"cached_tokens":8192},"cache_read_input_tokens":8192,"cache_miss_input_tokens":8220}}"#,
+        );
+
+        let rewritten = rewrite_nonstream_response_model("chat/completions", body, "deepseek");
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cached_tokens"],
+            8192
+        );
+        assert_eq!(value["usage"]["billing_usage"]["source"], "oai_chat");
+        assert!(value["usage"].get("cache_miss_input_tokens").is_none());
     }
 
     #[test]
@@ -3988,7 +4794,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&rewritten).unwrap();
 
         assert_eq!(value["model"], "mimo");
-        assert_eq!(value["usage"]["input_tokens"], 1000);
+        assert_eq!(value["usage"]["input_tokens"], 100);
         assert_eq!(value["usage"]["output_tokens"], 10);
         assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
         assert_eq!(value["usage"]["cache_miss_input_tokens"], 100);
@@ -4042,6 +4848,25 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_anthropic_message_delta_usage_for_newapi_complement_miss_encoding() {
+        let body = Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":8220,\"output_tokens\":88,\"cache_read_input_tokens\":8192,\"cache_creation_input_tokens\":0}}\n\n",
+        );
+
+        let rewritten = rewrite_stream_response_model("messages", body, "deepseek");
+        let text = std::str::from_utf8(&rewritten).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let value: Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(value["usage"]["input_tokens"], 28);
+        assert_eq!(value["usage"]["cache_read_input_tokens"], 8192);
+        assert_eq!(value["usage"]["cache_miss_input_tokens"], 28);
+    }
+
+    #[test]
     fn rewrites_anthropic_nonstream_model_to_public_model() {
         let body = Bytes::from_static(
             br#"{"type":"message","model":"mimo-v2.5-free","usage":{"input_tokens":100,"output_tokens":5,"cache_read_input_tokens":70,"cache_miss_input_tokens":30}}"#,
@@ -4084,7 +4909,7 @@ mod tests {
         let value: Value = serde_json::from_str(data).unwrap();
 
         assert_eq!(value["message"]["model"], "deepseek");
-        assert_eq!(value["message"]["usage"]["input_tokens"], 1000);
+        assert_eq!(value["message"]["usage"]["input_tokens"], 100);
         assert_eq!(value["message"]["usage"]["cache_read_input_tokens"], 900);
         assert_eq!(value["message"]["usage"]["cache_miss_input_tokens"], 100);
         assert_eq!(
@@ -4125,13 +4950,14 @@ mod tests {
         let value: Value = serde_json::from_str(data).unwrap();
 
         assert_eq!(value["model"], "mimo");
-        assert_eq!(value["usage"]["prompt_tokens"], 1000);
+        assert_eq!(value["usage"]["prompt_tokens"], 100);
         assert_eq!(value["usage"]["completion_tokens"], 10);
-        assert_eq!(value["usage"]["total_tokens"], 1010);
-        assert_eq!(value["usage"]["cache_read_input_tokens"], 900);
-        assert_eq!(value["usage"]["cache_miss_input_tokens"], 100);
-        assert_eq!(value["usage"]["zenproxy_billable_input_tokens"], 100);
-        assert_eq!(value["usage"]["zenproxy_provider_prompt_tokens"], 1000);
+        assert_eq!(value["usage"]["total_tokens"], 110);
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cached_tokens"],
+            900
+        );
+        assert!(value["usage"].get("cache_read_input_tokens").is_none());
     }
 
     #[test]
@@ -4366,6 +5192,45 @@ mod tests {
             ),
         );
         assert!(metrics.has_tool_signal());
+    }
+
+    #[test]
+    fn stream_metrics_labels_dsml_and_anthropic_tool_formats() {
+        let mut metrics = StreamMetrics::new(UsageCounts::default());
+
+        metrics.ingest(
+            "messages",
+            &Bytes::from_static(
+                b"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"DSML|tool_calls\"}}\n\n",
+            ),
+        );
+        assert_eq!(metrics.raw_tool_format(), "dsml");
+        assert!(metrics.dsml_leak_detected);
+
+        metrics.ingest(
+            "messages",
+            &Bytes::from_static(
+                b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\"}}\n\n",
+            ),
+        );
+        assert_eq!(metrics.raw_tool_format(), "anthropic");
+    }
+
+    #[test]
+    fn classify_empty_output_class_covers_reasoning_only() {
+        assert_eq!(
+            classify_empty_output_class(false, 12, Some("stop"), 0),
+            "reasoning_only"
+        );
+        assert_eq!(
+            classify_empty_output_class(false, 0, Some("length"), 42),
+            "reasoning_only"
+        );
+        assert_eq!(
+            classify_empty_output_class(false, 8, Some("length"), 0),
+            "reasoning_only_length"
+        );
+        assert_eq!(classify_empty_output_class(true, 0, None, 0), "");
     }
 
     #[test]
@@ -4934,7 +5799,7 @@ data: [DONE]
         drop(tx);
         let resp = Response::new(Body::from_stream(ReceiverStream::new(rx)));
 
-        let verdict = precheck_stream_first_output(resp, "chat/completions").await;
+        let verdict = precheck_stream_first_output(resp, "chat/completions", STREAM_EMPTY_PRECHECK_TIMEOUT_SECS).await;
         assert!(matches!(verdict, StreamPrecheck::Empty));
     }
 
@@ -4955,7 +5820,7 @@ data: [DONE]
         });
         let resp = Response::new(Body::from_stream(ReceiverStream::new(rx)));
 
-        let verdict = precheck_stream_first_output(resp, "chat/completions").await;
+        let verdict = precheck_stream_first_output(resp, "chat/completions", STREAM_EMPTY_PRECHECK_TIMEOUT_SECS).await;
         match verdict {
             StreamPrecheck::HasOutput(rebuild) => {
                 let body = axum::body::to_bytes(rebuild.into_body(), 1024 * 1024)
@@ -4966,5 +5831,48 @@ data: [DONE]
             }
             _ => panic!("expected HasOutput"),
         }
+    }
+
+    #[tokio::test]
+    async fn stream_precheck_forwards_rate_limit_error_within_budget() {
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+        let rate_limit = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"upstream provider rate limited the request\"}}\n\n"
+            .to_vec();
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(Bytes::from(rate_limit))).await;
+        });
+        let resp = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+
+        let verdict =
+            precheck_stream_first_output(resp, "messages", STREAM_EMPTY_PRECHECK_TIMEOUT_SECS).await;
+        match verdict {
+            StreamPrecheck::HasOutput(rebuild) => {
+                let body = axum::body::to_bytes(rebuild.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let s = String::from_utf8_lossy(&body);
+                assert!(s.contains("rate_limit_error"), "{s}");
+            }
+            _ => panic!("expected HasOutput for rate limit SSE"),
+        }
+    }
+
+    #[test]
+    fn stream_metrics_thinking_only_counts_as_assistant_output() {
+        let mut metrics = StreamMetrics::new(UsageCounts::default());
+        metrics.ingest(
+            "messages",
+            &Bytes::from_static(
+                br#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"planning"}}
+
+"#,
+            ),
+        );
+
+        assert!(metrics.has_assistant_output());
+        assert!(metrics.has_content_signal());
     }
 }
