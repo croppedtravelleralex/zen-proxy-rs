@@ -1,0 +1,15 @@
+{
+  "label": "pi-daily-session-cache-v5",
+  "deploy_stamp": "test-20260804-cache-v5",
+  "route": "closeTest -> NewAPI ch109 -> panda :4010 -> zen-proxy-test :4011",
+  "run_dir": "pi-daily-session-20260804-1004",
+  "probe_total": 126,
+  "pi_cache_pct": {
+    "p50": 99.5,
+    "p95": 99.83,
+    "min": 0.0,
+    "mean": 91.03
+  },
+  "short_ping_probe_0_pct": 98.92,
+  "notes": "FMC first-user pin + short followup breakpoint fix; p50 99.5% vs v4 ~61%"
+}

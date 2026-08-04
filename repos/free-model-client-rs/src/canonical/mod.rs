@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 
 use serde_json::{json, Map, Value};
@@ -37,7 +37,7 @@ pub fn apply_tools_epoch(model: &str, session_scope: &str, tools: &[OpenAITool])
     let key = tools_epoch_key(model, session_scope);
     if let Ok(guard) = tools_epoch_store().read() {
         if let Some(frozen) = guard.get(&key) {
-            if tools_semantically_compatible(tools, frozen) {
+            if tools_semantically_compatible(tools, frozen) || trf_transient_tools_only_drift(tools, frozen) {
                 return frozen.clone();
             }
         }
@@ -51,6 +51,41 @@ pub fn apply_tools_epoch(model: &str, session_scope: &str, tools: &[OpenAITool])
 
 fn tools_semantically_compatible(current: &[OpenAITool], frozen: &Value) -> bool {
     canonical_tools_value(current) == *frozen
+}
+
+fn is_trf_transient_tool_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "toolsearch" | "websearch" | "webfetch"
+    )
+}
+
+fn trf_transient_tools_only_drift(current: &[OpenAITool], frozen: &Value) -> bool {
+    let frozen_tools = tools_from_canonical_value(frozen);
+    if frozen_tools.is_empty() {
+        return false;
+    }
+    let frozen_names: HashSet<String> = frozen_tools
+        .iter()
+        .map(|tool| tool.function.name.to_ascii_lowercase())
+        .collect();
+    let current_names: HashSet<String> = current
+        .iter()
+        .map(|tool| tool.function.name.to_ascii_lowercase())
+        .collect();
+    if frozen_names == current_names {
+        return false;
+    }
+    if !frozen_names.is_subset(&current_names) {
+        return false;
+    }
+    current_names
+        .difference(&frozen_names)
+        .all(|name| is_trf_transient_tool_name(name))
+}
+
+fn tools_from_canonical_value(value: &Value) -> Vec<OpenAITool> {
+    serde_json::from_value(value.clone()).unwrap_or_default()
 }
 
 pub fn canonical_tools_value(tools: &[OpenAITool]) -> Value {
@@ -442,6 +477,31 @@ fn apply_anthropic_cache_breakpoints(body: &mut Value, request: &ChatRequest, fl
         return;
     }
 
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "user")
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let last_user_idx = user_indices.last().copied();
+
+    if user_indices.len() > 1 && remaining > 0 {
+        if let Some(last_user_idx) = last_user_idx {
+            if let Some(anchor_idx) = find_last_conversation_anchor_before(messages, last_user_idx) {
+                if let Some(object) = messages[anchor_idx].as_object_mut() {
+                    if add_cache_control_to_message(object) {
+                        remaining -= 1;
+                    }
+                }
+            }
+        }
+    }
+
     if remaining > 0 {
         add_cache_control_to_last_role(messages, "user");
     }
@@ -456,19 +516,298 @@ fn model_supports_anthropic_breakpoints(model: &str) -> bool {
     matches!(normalized.as_str(), "bigpickle" | "mimov25" | "mimov25free")
 }
 
+/// Anthropic/opencode upstream allows up to four ephemeral cache_control markers.
+const DEEPSEEK_MAX_CACHE_BREAKPOINTS: usize = 4;
+
 pub fn apply_deepseek_stable_cache_breakpoints(body: &mut Value, request: &ChatRequest) -> usize {
     if !model_is_deepseek_flash(&request.model) {
         return 0;
     }
     let mut applied = 0usize;
+    let mut remaining = DEEPSEEK_MAX_CACHE_BREAKPOINTS;
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-        applied += usize::from(add_cache_control_to_last_object(tools));
+        if remaining > 0 && add_cache_control_to_last_object(tools) {
+            applied += 1;
+            remaining -= 1;
+        }
     }
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return applied;
     };
-    applied += usize::from(add_cache_control_to_last_role(messages, "system"));
-    applied + usize::from(add_cache_control_to_last_role(messages, "user"))
+    if remaining > 0 && add_cache_control_to_last_role(messages, "system") {
+        applied += 1;
+        remaining -= 1;
+    }
+    if remaining > 0 {
+        applied += apply_deepseek_user_cache_breakpoints_on_messages(messages, remaining);
+    }
+    applied
+}
+
+/// Minimum user payload before splitting stable cache prefix from mutable tail.
+const DEEPSEEK_USER_CACHE_CHUNK_MIN_BYTES: usize = 65_536;
+/// Target stable prefix (~32k tokens at ~4 bytes/token).
+const DEEPSEEK_USER_CACHE_STABLE_TARGET_BYTES: usize = 131_072;
+
+fn split_user_text_stable_tail(text: &str) -> (String, Option<String>) {
+    if let Some(split_at) = find_rust_codeblock_tail_split(text) {
+        let stable = text[..split_at].to_string();
+        let tail = text[split_at..].to_string();
+        // Prefer structural split for any tier (incl. 10k) when bulk lives in ```rust fence.
+        if !tail.is_empty() && stable.len() >= 1024 {
+            return (stable, Some(tail));
+        }
+    }
+    if text.len() < DEEPSEEK_USER_CACHE_CHUNK_MIN_BYTES {
+        return (text.to_string(), None);
+    }
+    let split_idx = find_utf8_byte_split_index(text, DEEPSEEK_USER_CACHE_STABLE_TARGET_BYTES);
+    if split_idx < text.len() {
+        let stable = text[..split_idx].to_string();
+        let tail = text[split_idx..].to_string();
+        if !tail.is_empty() {
+            return (stable, Some(tail));
+        }
+    }
+    (text.to_string(), None)
+}
+
+fn find_rust_codeblock_tail_split(text: &str) -> Option<usize> {
+    let start = text.find("```rust")?;
+    let after_open = start + "```rust".len();
+    let rest = text.get(after_open..)?;
+    let close_rel = rest.find("\n```")?;
+    let mut idx = after_open + close_rel + "\n```".len();
+    while idx < text.len() {
+        match text.as_bytes().get(idx) {
+            Some(b'\n' | b'\r') => idx += 1,
+            _ => break,
+        }
+    }
+    if idx > start && idx < text.len() {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+fn find_utf8_byte_split_index(text: &str, target_bytes: usize) -> usize {
+    if text.len() <= target_bytes {
+        return text.len();
+    }
+    let mut idx = target_bytes.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn add_cache_control_to_last_user_with_intelligent_chunking(messages: &mut [Value]) -> bool {
+    apply_deepseek_user_cache_breakpoints_on_messages(messages, DEEPSEEK_MAX_CACHE_BREAKPOINTS) > 0
+}
+
+/// Short follow-up user turns in the same session (daily dev probes).
+const DEEPSEEK_SHORT_FOLLOWUP_MAX_BYTES: usize = 8192;
+
+/// Multi-turn: short follow-ups cache latest user; long tails anchor assistant before user;
+/// single-turn bulk uses primary user chunking.
+fn apply_deepseek_user_cache_breakpoints_on_messages(
+    messages: &mut [Value],
+    mut remaining: usize,
+) -> usize {
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role == "user")
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if user_indices.is_empty() || remaining == 0 {
+        return 0;
+    }
+    let primary_idx = user_indices
+        .iter()
+        .copied()
+        .max_by_key(|index| user_message_byte_len(&messages[*index]))
+        .unwrap_or(user_indices[0]);
+    let last_user_idx = user_indices[user_indices.len() - 1];
+    let last_user_bytes = user_message_byte_len(&messages[last_user_idx]);
+    let multi_turn = user_indices.len() > 1;
+    let first_user_idx = user_indices[0];
+    let primary_has_bulk_fixture = user_message_has_bulk_fixture(&messages[primary_idx]);
+    let short_followup = multi_turn
+        && last_user_bytes <= DEEPSEEK_SHORT_FOLLOWUP_MAX_BYTES
+        && !primary_has_bulk_fixture
+        && !user_message_has_bulk_fixture(&messages[last_user_idx]);
+    let mut applied = 0usize;
+
+    // Keep the opening user turn pinned so turn-2+ requests can still read turn-1 cache.
+    if multi_turn && remaining > 0 && first_user_idx != last_user_idx {
+        if let Some(object) = messages[first_user_idx].as_object_mut() {
+            if add_cache_control_to_user_message_with_chunking(object) {
+                applied += 1;
+                remaining -= 1;
+            }
+        }
+    }
+
+    if multi_turn && short_followup && remaining > 0 {
+        if let Some(object) = messages[last_user_idx].as_object_mut() {
+            if add_cache_control_to_message(object) {
+                applied += 1;
+                remaining -= 1;
+            }
+        }
+    } else if multi_turn && remaining > 0 {
+        if let Some(anchor_idx) = find_last_conversation_anchor_before(messages, last_user_idx) {
+            if let Some(object) = messages[anchor_idx].as_object_mut() {
+                if add_cache_control_to_message(object) {
+                    applied += 1;
+                    remaining -= 1;
+                }
+            }
+        }
+        if let Some(object) = messages[last_user_idx].as_object_mut() {
+            strip_cache_control_from_message_object(object);
+        }
+    }
+
+    if remaining > 0
+        && (!multi_turn
+            || (primary_idx != last_user_idx
+                && primary_idx != first_user_idx
+                && !short_followup))
+    {
+        if let Some(object) = messages[primary_idx].as_object_mut() {
+            if add_cache_control_to_user_message_with_chunking(object) {
+                applied += 1;
+            }
+        }
+    }
+    applied
+}
+
+fn user_message_has_bulk_fixture(message: &Value) -> bool {
+    message
+        .as_object()
+        .and_then(|object| object.get("content"))
+        .is_some_and(|content| match content {
+            Value::String(text) => text.contains("```rust"),
+            Value::Array(items) => items.iter().any(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("```rust"))
+            }),
+            _ => false,
+        })
+}
+
+fn find_last_conversation_anchor_before(messages: &[Value], before_idx: usize) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .take(before_idx)
+        .rev()
+        .find_map(|(idx, message)| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .filter(|role| matches!(*role, "assistant" | "tool"))
+                .map(|_| idx)
+        })
+}
+
+fn user_message_byte_len(message: &Value) -> usize {
+    message
+        .as_object()
+        .and_then(|object| object.get("content"))
+        .map(content_byte_len)
+        .unwrap_or(0)
+}
+
+fn content_byte_len(content: &Value) -> usize {
+    match content {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(content_byte_len).sum(),
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn strip_cache_control_from_message_object(object: &mut Map<String, Value>) {
+    object.remove("cache_control");
+    if let Some(content) = object.get_mut("content") {
+        strip_cache_control_from_content(content);
+    }
+}
+
+fn strip_cache_control_from_content(content: &mut Value) {
+    match content {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(object) = item.as_object_mut() {
+                    object.remove("cache_control");
+                }
+            }
+        }
+        Value::Object(object) => {
+            object.remove("cache_control");
+        }
+        _ => {}
+    }
+}
+
+fn add_cache_control_to_user_message_with_chunking(object: &mut Map<String, Value>) -> bool {
+    if let Some(content) = object.get_mut("content") {
+        if add_cache_control_to_user_content_with_chunking(content) {
+            return true;
+        }
+    }
+    add_cache_control(object)
+}
+
+fn add_cache_control_to_user_content_with_chunking(content: &mut Value) -> bool {
+    match content {
+        Value::String(text) => {
+            let text = std::mem::take(text);
+            write_chunked_user_text_content(content, &text);
+            true
+        }
+        Value::Array(items) => add_cache_control_to_last_object(items),
+        Value::Object(object) => add_cache_control(object),
+        _ => false,
+    }
+}
+
+fn write_chunked_user_text_content(content: &mut Value, text: &str) {
+    let (stable, tail) = split_user_text_stable_tail(text);
+    if let Some(tail) = tail {
+        *content = json!([
+            {
+                "type": "text",
+                "text": stable,
+                "cache_control": {"type": "ephemeral"}
+            },
+            {
+                "type": "text",
+                "text": tail
+            }
+        ]);
+    } else {
+        *content = json!([{
+            "type": "text",
+            "text": stable,
+            "cache_control": {"type": "ephemeral"}
+        }]);
+    }
 }
 
 fn model_is_deepseek_flash(model: &str) -> bool {
@@ -617,6 +956,35 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(second, canonical_tools_value(&changed));
+    }
+
+    #[test]
+    fn tools_epoch_ignores_trf_transient_toolsearch_drift() {
+        let core = vec![OpenAITool {
+            tool_type: "function".into(),
+            function: OpenAIToolFunction {
+                name: "Bash".into(),
+                description: Some("run".into()),
+                parameters: Some(
+                    json!({"type":"object","properties":{"command":{"type":"string"}}}),
+                ),
+            },
+        }];
+        let with_toolsearch = vec![
+            core[0].clone(),
+            OpenAITool {
+                tool_type: "function".into(),
+                function: OpenAIToolFunction {
+                    name: "ToolSearch".into(),
+                    description: Some("search".into()),
+                    parameters: Some(json!({"type":"object","properties":{"query":{"type":"string"}}})),
+                },
+            },
+        ];
+
+        let frozen = freeze_tools_epoch("deepseek-v4-flash", "sess-trf-a", &core);
+        let applied = apply_tools_epoch("deepseek-v4-flash", "sess-trf-a", &with_toolsearch);
+        assert_eq!(frozen, applied);
     }
 
     #[test]
@@ -970,6 +1338,341 @@ mod tests {
         );
         assert_eq!(
             body["messages"][1]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+    }
+
+    #[test]
+    fn deepseek_intelligent_chunking_splits_rust_bulk_from_suffix() {
+        let bulk = "x".repeat(80_000);
+        let prefix = format!(
+            "以下是需要通读的大型 Rust 模块源码（测试夹具）：\n\n```rust\n{bulk}\n```\n\n"
+        );
+        let suffix_q1 = "编程题1：validate_session 返回什么？";
+        let suffix_q2 = "编程题2：input==0 时返回什么？";
+        let request = ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: Value::String(format!("{prefix}{suffix_q1}")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: Some(true),
+            max_tokens: Some(2048),
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let package = prepare_icp_upstream_request(
+            &request,
+            "scope",
+            "deepseek-v4-flash-free",
+            &UskContext {
+                api_key_id: "key",
+                public_model: "deepseek-v4-flash",
+                upstream_model: "deepseek-v4-flash-free",
+                source_client: "claude-code",
+            },
+            &CcpFlags {
+                icp_enabled: true,
+                prompt_cache_key: true,
+                anthropic_breakpoints: true,
+                reasoning_sidecar: true,
+                trf_strict: true,
+            },
+        );
+        let mut body = package.body;
+        assert_eq!(apply_deepseek_stable_cache_breakpoints(&mut body, &request), 1);
+        let user_content = &body["messages"][0]["content"];
+        assert_eq!(user_content.as_array().unwrap().len(), 2);
+        assert_eq!(
+            user_content[0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert!(user_content[0]["text"].as_str().unwrap().contains("```rust"));
+        assert!(user_content[1].get("cache_control").is_none());
+        assert_eq!(user_content[1]["text"], json!(suffix_q1));
+
+        let request_q2 = ChatRequest {
+            model: request.model.clone(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: Value::String(format!("{prefix}{suffix_q2}")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: request.stream,
+            max_tokens: request.max_tokens,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let package_q2 = prepare_icp_upstream_request(
+            &request_q2,
+            "scope",
+            "deepseek-v4-flash-free",
+            &UskContext {
+                api_key_id: "key",
+                public_model: "deepseek-v4-flash",
+                upstream_model: "deepseek-v4-flash-free",
+                source_client: "claude-code",
+            },
+            &CcpFlags {
+                icp_enabled: true,
+                prompt_cache_key: true,
+                anthropic_breakpoints: true,
+                reasoning_sidecar: true,
+                trf_strict: true,
+            },
+        );
+        let mut body_q2 = package_q2.body;
+        apply_deepseek_stable_cache_breakpoints(&mut body_q2, &request_q2);
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            body_q2["messages"][0]["content"][0]["text"]
+        );
+        assert_eq!(body_q2["messages"][0]["content"][1]["text"], json!(suffix_q2));
+    }
+
+    #[test]
+    fn deepseek_intelligent_chunking_short_user_stays_single_block() {
+        let request = ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: Value::String("hello".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: Some(true),
+            max_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let package = prepare_icp_upstream_request(
+            &request,
+            "scope",
+            "deepseek-v4-flash-free",
+            &UskContext {
+                api_key_id: "key",
+                public_model: "deepseek-v4-flash",
+                upstream_model: "deepseek-v4-flash-free",
+                source_client: "claude-code",
+            },
+            &CcpFlags {
+                icp_enabled: true,
+                prompt_cache_key: true,
+                anthropic_breakpoints: true,
+                reasoning_sidecar: true,
+                trf_strict: true,
+            },
+        );
+        let mut body = package.body;
+        assert_eq!(apply_deepseek_stable_cache_breakpoints(&mut body, &request), 1);
+        let user_content = &body["messages"][0]["content"];
+        assert_eq!(user_content.as_array().unwrap().len(), 1);
+        assert_eq!(
+            user_content[0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+    }
+
+    #[test]
+    fn deepseek_intelligent_chunking_splits_small_rust_bulk_via_fence() {
+        let bulk = "z".repeat(30_000);
+        let prefix = format!(
+            "以下是需要通读的大型 Rust 模块源码（测试夹具）：\n\n```rust\n{bulk}\n```\n\n"
+        );
+        let request = ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: Value::String(format!("{prefix}probe suffix")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            stream: Some(true),
+            max_tokens: Some(128),
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let package = prepare_icp_upstream_request(
+            &request,
+            "scope",
+            "deepseek-v4-flash-free",
+            &UskContext {
+                api_key_id: "key",
+                public_model: "deepseek-v4-flash",
+                upstream_model: "deepseek-v4-flash-free",
+                source_client: "claude-code",
+            },
+            &CcpFlags {
+                icp_enabled: true,
+                prompt_cache_key: true,
+                anthropic_breakpoints: true,
+                reasoning_sidecar: true,
+                trf_strict: true,
+            },
+        );
+        let mut body = package.body;
+        apply_deepseek_stable_cache_breakpoints(&mut body, &request);
+        let user_content = &body["messages"][0]["content"];
+        assert_eq!(user_content.as_array().unwrap().len(), 2);
+        assert!(user_content[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn deepseek_multiturn_chunks_primary_user_not_tail_question() {
+        let bulk = "y".repeat(80_000);
+        let prefix = format!(
+            "以下是需要通读的大型 Rust 模块源码（测试夹具）：\n\n```rust\n{bulk}\n```\n\n"
+        );
+        let load_suffix = "通读上述源码。只回复：PROG_LOADED_01";
+        let q_suffix = "编程题1：validate_session 返回什么错误？";
+        let request = ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: Value::String(format!("{prefix}{load_suffix}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: Value::String("PROG_LOADED_01".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "user".into(),
+                    content: Value::String(q_suffix.into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+            ],
+            stream: Some(true),
+            max_tokens: Some(2048),
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let package = prepare_icp_upstream_request(
+            &request,
+            "scope",
+            "deepseek-v4-flash-free",
+            &UskContext {
+                api_key_id: "key",
+                public_model: "deepseek-v4-flash",
+                upstream_model: "deepseek-v4-flash-free",
+                source_client: "claude-code",
+            },
+            &CcpFlags {
+                icp_enabled: true,
+                prompt_cache_key: true,
+                anthropic_breakpoints: true,
+                reasoning_sidecar: true,
+                trf_strict: true,
+            },
+        );
+        let mut body = package.body;
+        assert_eq!(apply_deepseek_stable_cache_breakpoints(&mut body, &request), 2);
+        let bulk_user = &body["messages"][0]["content"];
+        assert_eq!(bulk_user.as_array().unwrap().len(), 2);
+        assert_eq!(
+            bulk_user[0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert!(bulk_user[1].get("cache_control").is_none());
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        let tail_user = &body["messages"][2]["content"];
+        assert!(tail_user.get("cache_control").is_none());
+        if tail_user.is_array() {
+            assert!(tail_user[0].get("cache_control").is_none());
+        }
+    }
+
+    #[test]
+    fn deepseek_multiturn_short_probe_pins_first_user_and_latest_followup() {
+        let warmup = "不要工具。只回复一行：MATRIX_CASE_01_OK";
+        let probe = "基于上文，用一句话确认任务已完成。最后一行只写：SESSION_PROBE_OK";
+        let request = ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: Value::String(warmup.into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: Value::String("MATRIX_CASE_01_OK".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "user".into(),
+                    content: Value::String(probe.into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+            ],
+            stream: Some(true),
+            max_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let package = prepare_icp_upstream_request(
+            &request,
+            "scope",
+            "deepseek-v4-flash-free",
+            &UskContext {
+                api_key_id: "key",
+                public_model: "deepseek-v4-flash",
+                upstream_model: "deepseek-v4-flash-free",
+                source_client: "claude-code",
+            },
+            &CcpFlags {
+                icp_enabled: true,
+                prompt_cache_key: true,
+                anthropic_breakpoints: true,
+                reasoning_sidecar: true,
+                trf_strict: true,
+            },
+        );
+        let mut body = package.body;
+        assert_eq!(apply_deepseek_stable_cache_breakpoints(&mut body, &request), 2);
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert!(body["messages"][1].get("cache_control").is_none());
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"],
             json!({"type":"ephemeral"})
         );
     }

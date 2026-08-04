@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "min_probe_cache_pct": 99.0,
+  "cases": [
+    {
+      "id": "short_ping",
+      "tier": "short",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-20260801\\case_01_ping",
+      "target_context_tokens": 4000,
+      "timeout_s": 300,
+      "warmup_turns": [
+        {
+          "id": "ping",
+          "prompt": "不要工具。只回复一行：MATRIX_CASE_01_OK"
+        }
+      ],
+      "probe_prompt": "基于上文，用一句话确认任务已完成。最后一行只写：SESSION_PROBE_OK"
+    },
+    {
+      "id": "short_read",
+      "tier": "short",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-20260801\\case_02_read_version",
+      "target_context_tokens": 6000,
+      "timeout_s": 300,
+      "warmup_turns": [
+        {
+          "id": "read",
+          "prompt": "只读。用 read 打开 manifest.json，最终回复精确一行：VERSION=2.4.1"
+        }
+      ],
+      "probe_prompt": "不重读文件。根据已读内容，再写一行 VERSION=2.4.1 并加 SESSION_PROBE_OK"
+    },
+    {
+      "id": "short_bash",
+      "tier": "short",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-20260801\\case_03_bash_count",
+      "target_context_tokens": 6000,
+      "timeout_s": 300,
+      "warmup_turns": [
+        {
+          "id": "bash",
+          "prompt": "只读。bash 列出当前目录文件（不含子目录），统计个数，回复：FILE_COUNT=3"
+        }
+      ],
+      "probe_prompt": "不重跑命令。根据上文回复 FILE_COUNT=3 并 SESSION_PROBE_OK"
+    },
+    {
+      "id": "mid_read_multi",
+      "tier": "mid",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-20260801\\case_03_bash_count",
+      "target_context_tokens": 15000,
+      "timeout_s": 420,
+      "warmup_turns": [
+        {
+          "id": "bash",
+          "prompt": "只读。bash 列出 a.txt b.txt c.txt 并 head -1 每个文件，回复三行 FILE= 前缀"
+        },
+        {
+          "id": "read",
+          "prompt": "只读。read b.txt 全文，在回复里包含字母 b"
+        }
+      ],
+      "probe_prompt": "不重读。根据上文确认 FILE_COUNT=3 且读过 b.txt。最后一行 SESSION_PROBE_OK"
+    },
+    {
+      "id": "mid_bash_hash",
+      "tier": "mid",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-20260801\\case_07_bash_hash",
+      "target_context_tokens": 12000,
+      "timeout_s": 420,
+      "warmup_turns": [
+        {
+          "id": "hash",
+          "prompt": "只读。bash 计算 target.txt 的 sha256，回复一行 TARGET_SHA256=..."
+        }
+      ],
+      "probe_prompt": "不重算。根据上文复述 hash 行并 SESSION_PROBE_OK"
+    },
+    {
+      "id": "long_100k",
+      "tier": "long",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-bulk-quality-20260801\\case_01_100k",
+      "target_context_tokens": 100000,
+      "timeout_s": 1200,
+      "warmup_turns": [
+        {
+          "id": "load",
+          "prompt": "用 read 从 offset=0 连续读取 context_bulk.txt 直至 EOF（多次 read 增大 offset）。禁止 scout/bash。只回复：BULK_LOADED_01",
+          "min_context_tokens": 85000
+        }
+      ],
+      "probe_prompt": "基于已加载全文，用两句话说明 ALPHA 港口 TEU。最后一行 SESSION_PROBE_OK"
+    },
+    {
+      "id": "long_200k",
+      "tier": "long",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-bulk-quality-20260801\\case_03_200k",
+      "target_context_tokens": 200000,
+      "timeout_s": 1200,
+      "warmup_turns": [
+        {
+          "id": "load",
+          "prompt": "用 read 从 offset=0 连续读取 context_bulk.txt 直至 EOF。禁止 scout/bash。只回复：BULK_LOADED_03",
+          "min_context_tokens": 170000
+        }
+      ],
+      "probe_prompt": "基于全文，说明 ALPHA 路线天数与 BETA 路线天数。最后一行 SESSION_PROBE_OK"
+    },
+    {
+      "id": "long_350k",
+      "tier": "long",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-bulk-quality-20260801\\case_06_350k",
+      "target_context_tokens": 350000,
+      "timeout_s": 1500,
+      "warmup_turns": [
+        {
+          "id": "load",
+          "prompt": "用 read 从 offset=0 连续读取 context_bulk.txt 直至 EOF。禁止 scout/bash。只回复：BULK_LOADED_06",
+          "min_context_tokens": 300000
+        }
+      ],
+      "probe_prompt": "基于全文，比较 ALPHA 与 BETA 电池循环次数。最后一行 SESSION_PROBE_OK"
+    }
+  ]
+}

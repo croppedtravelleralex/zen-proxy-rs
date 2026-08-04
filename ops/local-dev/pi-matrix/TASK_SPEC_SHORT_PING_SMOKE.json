@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "min_probe_cache_pct": 99.0,
+  "cases": [
+    {
+      "id": "short_ping",
+      "tier": "short",
+      "cwd": "D:\\SelfMadeTool\\pi-matrix-20260801\\case_01_ping",
+      "target_context_tokens": 4000,
+      "timeout_s": 300,
+      "warmup_turns": [
+        {
+          "id": "ping",
+          "prompt": "不要工具。只回复一行：MATRIX_CASE_01_OK"
+        }
+      ],
+      "probe_prompt": "基于上文，用一句话确认任务已完成。最后一行只写：SESSION_PROBE_OK"
+    }
+  ]
+}
