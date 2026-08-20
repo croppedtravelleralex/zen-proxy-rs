@@ -30,6 +30,7 @@ use crate::v4::model::{
     EffectiveModelRegistry, ModelCompatibilityProfile, ModelError, ModelRegistry,
 };
 use crate::v4::protocol_guard::{self, GuardPhase};
+use crate::v4::request_repair;
 
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// How long to buffer a streaming upstream before its first content/tool signal
@@ -1500,6 +1501,7 @@ struct UsageCounts {
     cache_miss_input_tokens: Option<u32>,
 }
 
+#[derive(Debug)]
 struct V4CallError {
     status: StatusCode,
     message: String,
@@ -1584,6 +1586,98 @@ impl V4CallError {
     }
 }
 
+/// Upstream request deserialized once per call instead of once per retry attempt.
+///
+/// Hoisting this out of the retry loop keeps a malformed body from leasing a proxy
+/// node it can never use, and avoids re-cloning multi-hundred-KB bodies on every attempt.
+#[derive(Debug)]
+enum PreparedRequest {
+    OpenAi {
+        request: ChatRequest,
+        profile: ClientProfile,
+    },
+    Anthropic {
+        request: AnthropicRequest,
+        profile: ClientProfile,
+    },
+}
+
+// `V4CallError` is the error type every fallible function in this module returns and
+// propagates unboxed; boxing it only here would force an unwrap at the single call site.
+#[allow(clippy::result_large_err)]
+fn prepare_upstream_request(
+    path: &str,
+    upstream_body: &Value,
+    source_client: &str,
+    compatibility_profile: ModelCompatibilityProfile,
+) -> Result<PreparedRequest, V4CallError> {
+    match path {
+        "chat/completions" => {
+            let request =
+                serde_json::from_value::<ChatRequest>(upstream_body.clone()).map_err(|err| {
+                    V4CallError::before_dispatch(
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid OpenAI chat request: {err}"),
+                    )
+                })?;
+            let profile =
+                profile_for_openai_request(source_client, &request, compatibility_profile);
+            Ok(PreparedRequest::OpenAi { request, profile })
+        }
+        "messages" => {
+            let mut repaired = upstream_body.clone();
+            let report = request_repair::repair_anthropic_request(&mut repaired);
+            let request = serde_json::from_value::<AnthropicRequest>(repaired).map_err(|err| {
+                // Attach the (value-free) repair report so a rejected body is diagnosable
+                // from the audit log without ever logging user content.
+                let diagnostics = report
+                    .summary()
+                    .map(|summary| format!(" [{summary}]"))
+                    .unwrap_or_default();
+                V4CallError::before_dispatch(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid Anthropic messages request: {err}{diagnostics}"),
+                )
+            })?;
+            let profile =
+                profile_for_anthropic_request(source_client, &request, compatibility_profile);
+            Ok(PreparedRequest::Anthropic { request, profile })
+        }
+        _ => Err(V4CallError::before_dispatch(
+            StatusCode::NOT_FOUND,
+            format!("unsupported V4 path: {path}"),
+        )),
+    }
+}
+
+/// Budget left for the next upstream attempt, or `None` when no budget is configured.
+fn remaining_retry_budget_ms(
+    retry_budget_ms: u64,
+    retry_chain: &[RequestAttemptTelemetry],
+) -> Option<u64> {
+    if retry_budget_ms == 0 {
+        return None;
+    }
+    Some(retry_budget_ms.saturating_sub(retry_chain_latency_ms(retry_chain)))
+}
+
+/// Clamp the stream precheck window so a single attempt cannot overrun the retry budget.
+///
+/// Without this the budget is only observed *between* attempts, which let real traffic
+/// run to the 300s nginx read timeout despite a 240s budget.
+fn cap_precheck_timeout_secs(
+    base_timeout_secs: u64,
+    retry_budget_ms: u64,
+    retry_chain: &[RequestAttemptTelemetry],
+    elapsed_call_ms: u64,
+) -> u64 {
+    let Some(remaining) = remaining_retry_budget_ms(retry_budget_ms, retry_chain) else {
+        return base_timeout_secs;
+    };
+    let left_secs = remaining.saturating_sub(elapsed_call_ms) / 1000;
+    base_timeout_secs.min(left_secs.max(1))
+}
+
 async fn call_with_retry(
     state: &Arc<AppState>,
     path: &str,
@@ -1598,17 +1692,39 @@ async fn call_with_retry(
     let source_client = call_context.source_client;
     let base_max = conf.pool_max_retries;
     let configured_empty_upstream_max = conf.v4_empty_upstream_max_retries.max(base_max);
-    let empty_upstream_max =
-        effective_empty_upstream_max_retries(path, &request_meta, configured_empty_upstream_max, &upstream_body, call_context.source_client);
-    let stream_probe_class =
-        stream_probe_class(path, &request_meta, &upstream_body, call_context.source_client);
+    let empty_upstream_max = effective_empty_upstream_max_retries(
+        path,
+        &request_meta,
+        configured_empty_upstream_max,
+        &upstream_body,
+        call_context.source_client,
+    );
+    let stream_probe_class = stream_probe_class(
+        path,
+        &request_meta,
+        &upstream_body,
+        call_context.source_client,
+    );
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut was_rate_limited = false;
     let mut dispatch_wait_ms = 0u64;
     let mut retry_chain = Vec::new();
-    let retry_budget_ms = effective_retry_budget_ms(path, &request_meta, conf.v4_retry_budget_ms, &upstream_body, call_context.source_client);
+    let retry_budget_ms = effective_retry_budget_ms(
+        path,
+        &request_meta,
+        conf.v4_retry_budget_ms,
+        &upstream_body,
+        call_context.source_client,
+    );
     let mut force_direct_next = false;
     let mut last_node_id = String::new();
+    // Nodes that already returned empty output for this request. Retrying them is
+    // near-certain to fail again (production: 395/401 same-node retries all failed),
+    // so they are excluded from subsequent dispatch.
+    let mut empty_output_nodes: Vec<String> = Vec::new();
+
+    let prepared =
+        prepare_upstream_request(path, &upstream_body, source_client, compatibility_profile)?;
 
     for attempt in 0..=empty_upstream_max {
         let dispatch_start = Instant::now();
@@ -1620,10 +1736,21 @@ async fn call_with_retry(
                     "direct fallback is not available",
                 )
             })?
+        } else if !empty_output_nodes.is_empty() {
+            state
+                .pool_manager
+                .dispatch_excluding(&request_meta, &empty_output_nodes)
+                .or_else(|_| state.pool_manager.dispatch(&request_meta))
+                .map_err(dispatch_error_to_call_error)?
         } else if attempt > 0 && !last_node_id.is_empty() {
-            match state.pool_manager.dispatch_sticky(&request_meta, &last_node_id) {
+            match state
+                .pool_manager
+                .dispatch_sticky(&request_meta, &last_node_id)
+            {
                 Ok(result) => result,
-                Err(_) => dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?,
+                Err(_) => {
+                    dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?
+                }
             }
         } else {
             dispatch_or_wait(state, &request_meta, attempt, empty_upstream_max).await?
@@ -1662,41 +1789,98 @@ async fn call_with_retry(
             claude_code_stream_max_wait_forwardable_secs: 60,
         });
         let call_start = Instant::now();
-        let response = match path {
-            "chat/completions" => {
-                let request = serde_json::from_value::<ChatRequest>(upstream_body.clone())
-                    .map_err(|err| {
-                        V4CallError::before_dispatch(
-                            StatusCode::BAD_REQUEST,
-                            format!("invalid OpenAI chat request: {err}"),
+        let attempt_deadline_ms = remaining_retry_budget_ms(retry_budget_ms, &retry_chain);
+        if attempt_deadline_ms == Some(0) {
+            let elapsed_ms = retry_chain_latency_ms(&retry_chain);
+            return Err(V4CallError::after_dispatch(
+                last_status,
+                retry_budget_message(elapsed_ms, last_status, "provider_error", &retry_chain),
+                None,
+                request_id,
+                node_id,
+                &node_url,
+                upstream_model,
+                "retry_budget_exhausted",
+                attempt,
+                was_rate_limited,
+                0,
+                "retry_budget_exhausted",
+                retry_chain,
+            ));
+        }
+
+        let call_future = async {
+            match &prepared {
+                PreparedRequest::OpenAi { request, profile } => {
+                    kernel
+                        .openai_chat_with_profile(
+                            &dispatch_result.client,
+                            request.clone(),
+                            *profile,
                         )
-                    })?;
-                let profile =
-                    profile_for_openai_request(source_client, &request, compatibility_profile);
-                kernel
-                    .openai_chat_with_profile(&dispatch_result.client, request, profile)
-                    .await
-            }
-            "messages" => {
-                let request = serde_json::from_value::<AnthropicRequest>(upstream_body.clone())
-                    .map_err(|err| {
-                        V4CallError::before_dispatch(
-                            StatusCode::BAD_REQUEST,
-                            format!("invalid Anthropic messages request: {err}"),
+                        .await
+                }
+                PreparedRequest::Anthropic { request, profile } => {
+                    kernel
+                        .anthropic_messages_with_profile(
+                            &dispatch_result.client,
+                            request.clone(),
+                            *profile,
                         )
-                    })?;
-                let profile =
-                    profile_for_anthropic_request(source_client, &request, compatibility_profile);
-                kernel
-                    .anthropic_messages_with_profile(&dispatch_result.client, request, profile)
-                    .await
+                        .await
+                }
             }
-            _ => {
-                return Err(V4CallError::before_dispatch(
-                    StatusCode::NOT_FOUND,
-                    format!("unsupported V4 path: {path}"),
-                ))
+        };
+
+        let response = match attempt_deadline_ms {
+            Some(budget_ms) => {
+                match tokio::time::timeout(Duration::from_millis(budget_ms), call_future).await {
+                    Ok(response) => response,
+                    Err(_elapsed) => {
+                        // The single attempt outran the whole remaining budget. Stop here
+                        // instead of letting it run to the downstream read timeout.
+                        let latency = call_start.elapsed().as_millis() as u64;
+                        state.pool_manager.report(
+                            node_id.clone(),
+                            ResultKind::SoftFailure {
+                                kind: ErrorKind::Timeout,
+                            },
+                            latency,
+                        );
+                        retry_chain.push(RequestAttemptTelemetry {
+                            attempt,
+                            node_id: node_id.clone(),
+                            node_url_redacted: LedgerEvent::redact_node_url(&node_url),
+                            status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                            latency_ms: latency,
+                            outcome: "retry_budget_exhausted".to_string(),
+                            error_type: "timeout".to_string(),
+                        });
+                        let elapsed_ms = retry_chain_latency_ms(&retry_chain);
+                        return Err(V4CallError::after_dispatch(
+                            StatusCode::GATEWAY_TIMEOUT,
+                            retry_budget_message(
+                                elapsed_ms,
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "attempt_deadline",
+                                &retry_chain,
+                            ),
+                            None,
+                            request_id,
+                            node_id,
+                            &node_url,
+                            upstream_model,
+                            "retry_budget_exhausted",
+                            attempt,
+                            was_rate_limited,
+                            latency,
+                            "retry_budget_exhausted",
+                            retry_chain,
+                        ));
+                    }
+                }
             }
+            None => call_future.await,
         };
         let latency = call_start.elapsed().as_millis() as u64;
 
@@ -1712,7 +1896,12 @@ async fn call_with_retry(
                         .and_then(|value| value.to_str().ok())
                         .map(ToOwned::to_owned);
                     let (response, body_bytes_len, usage, has_output) = if request_meta.stream {
-                        let precheck_timeout = stream_probe_precheck_timeout(stream_probe_class);
+                        let precheck_timeout = cap_precheck_timeout_secs(
+                            stream_probe_precheck_timeout(stream_probe_class),
+                            retry_budget_ms,
+                            &retry_chain,
+                            latency,
+                        );
                         match precheck_stream_first_output(response, path, precheck_timeout).await {
                             StreamPrecheck::HasOutput(resp) => {
                                 (resp, 0, UsageCounts::default(), true)
@@ -1799,7 +1988,7 @@ async fn call_with_retry(
                                     total_tokens: request_meta.estimated_input_tokens() as u32 + 1,
                                     ..UsageCounts::default()
                                 },
-                                final_provider_cache: final_provider_cache,
+                                final_provider_cache,
                             });
                         }
                         if request_meta.estimated_input_tokens() < 50_000 {
@@ -1807,6 +1996,12 @@ async fn call_with_retry(
                                 &request_meta.upstream_model,
                                 &request_meta.session_id,
                             );
+                        }
+                        // Large sessions keep their session pin to preserve cache affinity,
+                        // so the pin alone would send the retry straight back to this node.
+                        // Track it explicitly and exclude it from the next dispatch.
+                        if !empty_output_nodes.iter().any(|id| id == &node_id) {
+                            empty_output_nodes.push(node_id.clone());
                         }
                         state.pool_manager.report(
                             node_id.clone(),
@@ -2438,7 +2633,7 @@ fn build_stream_probe_local_fallback(
         let is_claude_code = normalize_source_client(source_client) == "claude-code";
         if translate::claude_code_low_budget_empty_fallback_text(&chat_request, is_claude_code)
             .is_none()
-            && !translate::short_no_tool_empty_fallback_text(&chat_request).is_some()
+            && translate::short_no_tool_empty_fallback_text(&chat_request).is_none()
         {
             return None;
         }
@@ -2484,15 +2679,11 @@ data: [DONE]\n\n"
 }
 
 fn is_stream_micro_probe_request(path: &str, request_meta: &RequestMeta) -> bool {
-    path == "messages"
-        && request_meta.stream
-        && request_meta.body_size <= 2_048
+    path == "messages" && request_meta.stream && request_meta.body_size <= 2_048
 }
 
 fn is_stream_small_probe_request(path: &str, request_meta: &RequestMeta) -> bool {
-    path == "messages"
-        && request_meta.stream
-        && request_meta.body_size <= 8_192
+    path == "messages" && request_meta.stream && request_meta.body_size <= 8_192
 }
 
 fn is_mimo_messages_request(path: &str, request_meta: &RequestMeta) -> bool {
@@ -2519,6 +2710,25 @@ fn retry_budget_message(
     )
 }
 
+fn dispatch_error_to_call_error(err: DispatchError) -> V4CallError {
+    match err {
+        DispatchError::CircuitOpen => V4CallError::before_dispatch_with_kind(
+            StatusCode::SERVICE_UNAVAILABLE,
+            PUBLIC_PROXY_CIRCUIT_OPEN_MESSAGE,
+            "circuit_open",
+        ),
+        DispatchError::RequestTooLarge => V4CallError::before_dispatch(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request exceeds proxy node budget",
+        ),
+        DispatchError::NoResource => V4CallError::before_dispatch_with_kind(
+            StatusCode::SERVICE_UNAVAILABLE,
+            PUBLIC_PROXY_POOL_EXHAUSTED_MESSAGE,
+            "proxy_pool_exhausted",
+        ),
+    }
+}
+
 async fn dispatch_or_wait(
     state: &Arc<AppState>,
     request_meta: &RequestMeta,
@@ -2527,15 +2737,12 @@ async fn dispatch_or_wait(
 ) -> Result<crate::pool::DispatchResult, V4CallError> {
     match state.pool_manager.dispatch(request_meta) {
         Ok(result) => Ok(result),
-        Err(DispatchError::CircuitOpen) => Err(V4CallError::before_dispatch_with_kind(
-            StatusCode::SERVICE_UNAVAILABLE,
-            PUBLIC_PROXY_CIRCUIT_OPEN_MESSAGE,
-            "circuit_open",
-        )),
-        Err(DispatchError::RequestTooLarge) => Err(V4CallError::before_dispatch(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request exceeds proxy node budget",
-        )),
+        Err(DispatchError::CircuitOpen) => {
+            Err(dispatch_error_to_call_error(DispatchError::CircuitOpen))
+        }
+        Err(DispatchError::RequestTooLarge) => {
+            Err(dispatch_error_to_call_error(DispatchError::RequestTooLarge))
+        }
         Err(DispatchError::NoResource) => {
             if attempt < max {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3113,7 +3320,12 @@ fn normalize_downstream_usage_object(path: &str, usage: &mut Value) -> bool {
     usage["total_tokens"] = Value::from(wire_prompt.saturating_add(completion_tokens));
     ensure_prompt_tokens_details_cached_tokens(usage, wire_cached);
     sanitize_openai_usage_for_newapi_client(usage);
-    attach_openai_billing_usage_for_newapi_client(usage, wire_prompt, wire_cached, completion_tokens);
+    attach_openai_billing_usage_for_newapi_client(
+        usage,
+        wire_prompt,
+        wire_cached,
+        completion_tokens,
+    );
     wire_cached > 0 || usage_cache_miss_u32(usage).is_some()
 }
 
@@ -3183,7 +3395,8 @@ fn openai_usage_has_scale_mismatch(
         return false;
     }
     let marginal_billable = cache_read.saturating_add(cache_creation);
-    provider_prompt > marginal_billable.saturating_add(512) && provider_prompt > marginal_billable * 2
+    provider_prompt > marginal_billable.saturating_add(512)
+        && provider_prompt > marginal_billable * 2
 }
 
 fn usage_marginal_input_tokens(usage: &Value, provider_prompt: u32) -> Option<u32> {
@@ -3229,10 +3442,10 @@ fn openai_marginal_uncached_input_tokens(
             .saturating_sub(cache_creation);
     }
 
-  // Provider often reports cache_read on marginal scale while prompt_tokens stays
-  // full-context; miss may be marginal_input (= prompt - cache_read) not marginal miss.
-  let inferred_marginal_miss = provider_prompt.saturating_sub(cache_read.saturating_mul(2));
-  if inferred_marginal_miss > 0 && inferred_marginal_miss < provider_prompt / 4 {
+    // Provider often reports cache_read on marginal scale while prompt_tokens stays
+    // full-context; miss may be marginal_input (= prompt - cache_read) not marginal miss.
+    let inferred_marginal_miss = provider_prompt.saturating_sub(cache_read.saturating_mul(2));
+    if inferred_marginal_miss > 0 && inferred_marginal_miss < provider_prompt / 4 {
         return inferred_marginal_miss;
     }
 
@@ -3246,8 +3459,12 @@ fn openai_newapi_cached_tokens(
     usage: &Value,
 ) -> u32 {
     if openai_usage_has_scale_mismatch(provider_prompt, cache_read, cache_creation) {
-        let marginal_uncached =
-            openai_marginal_uncached_input_tokens(provider_prompt, cache_read, cache_creation, usage);
+        let marginal_uncached = openai_marginal_uncached_input_tokens(
+            provider_prompt,
+            cache_read,
+            cache_creation,
+            usage,
+        );
         provider_prompt.saturating_sub(marginal_uncached)
     } else {
         cache_read
@@ -3405,7 +3622,11 @@ async fn precheck_stream_first_output(
                 }
                 Err(err) => {
                     let message = format!("upstream stream error: {err}");
-                    if tx.send(Ok(stream_error_frame(&path_owned, &message))).await.is_err() {
+                    if tx
+                        .send(Ok(stream_error_frame(&path_owned, &message)))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     break;
@@ -3784,9 +4005,7 @@ fn repeated_large_session_empty_attempts(
     }
     retry_chain
         .iter()
-        .filter(|attempt| {
-            attempt.error_type == "empty_output" || attempt.outcome == "empty_output"
-        })
+        .filter(|attempt| attempt.error_type == "empty_output" || attempt.outcome == "empty_output")
         .count()
         >= 2
 }
@@ -3904,7 +4123,8 @@ impl StreamMetrics {
                 }
                 Some("message_delta") => {
                     if let Some(delta) = value.get("delta") {
-                        if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str) {
+                        if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str)
+                        {
                             self.finish_reason = Some(stop_reason.to_string());
                         }
                     }
@@ -3974,8 +4194,7 @@ impl StreamMetrics {
             .and_then(|content| content.as_str())
         {
             if !reasoning.trim().is_empty() {
-                self.reasoning_chars =
-                    self.reasoning_chars.saturating_add(reasoning.trim().len());
+                self.reasoning_chars = self.reasoning_chars.saturating_add(reasoning.trim().len());
             }
         }
         if let Some(finish_reason) = value
@@ -4269,6 +4488,214 @@ fn estimate_text_tokens(text: &str) -> u32 {
 }
 
 #[cfg(test)]
+mod retry_budget_and_prepare_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn attempt(latency_ms: u64) -> RequestAttemptTelemetry {
+        RequestAttemptTelemetry {
+            attempt: 0,
+            node_id: "node".to_string(),
+            node_url_redacted: "redacted".to_string(),
+            status: 502,
+            latency_ms,
+            outcome: "empty_output".to_string(),
+            error_type: "empty_output".to_string(),
+        }
+    }
+
+    #[test]
+    fn remaining_budget_is_none_when_budget_disabled() {
+        assert_eq!(remaining_retry_budget_ms(0, &[]), None);
+        assert_eq!(remaining_retry_budget_ms(0, &[attempt(5_000)]), None);
+    }
+
+    #[test]
+    fn remaining_budget_subtracts_elapsed_attempts() {
+        assert_eq!(remaining_retry_budget_ms(90_000, &[]), Some(90_000));
+        assert_eq!(
+            remaining_retry_budget_ms(90_000, &[attempt(30_000)]),
+            Some(60_000)
+        );
+        assert_eq!(
+            remaining_retry_budget_ms(90_000, &[attempt(30_000), attempt(20_000)]),
+            Some(40_000)
+        );
+    }
+
+    #[test]
+    fn remaining_budget_saturates_at_zero_instead_of_underflowing() {
+        assert_eq!(
+            remaining_retry_budget_ms(10_000, &[attempt(30_000)]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn precheck_timeout_untouched_when_budget_disabled() {
+        assert_eq!(cap_precheck_timeout_secs(30, 0, &[], 0), 30);
+    }
+
+    #[test]
+    fn precheck_timeout_capped_by_remaining_budget() {
+        // 90s budget, 75s already burned, 5s into this call => 10s left.
+        assert_eq!(
+            cap_precheck_timeout_secs(30, 90_000, &[attempt(75_000)], 5_000),
+            10
+        );
+    }
+
+    #[test]
+    fn precheck_timeout_never_drops_below_one_second() {
+        assert_eq!(
+            cap_precheck_timeout_secs(30, 90_000, &[attempt(90_000)], 0),
+            1
+        );
+        assert_eq!(
+            cap_precheck_timeout_secs(30, 10_000, &[attempt(99_000)], 5_000),
+            1
+        );
+    }
+
+    #[test]
+    fn precheck_timeout_keeps_base_when_budget_is_ample() {
+        assert_eq!(cap_precheck_timeout_secs(30, 240_000, &[], 0), 30);
+        assert_eq!(cap_precheck_timeout_secs(10, 240_000, &[], 0), 10);
+    }
+
+    #[test]
+    fn prepare_rejects_unsupported_path() {
+        let err = prepare_upstream_request(
+            "embeddings",
+            &json!({}),
+            "claude-code",
+            ModelCompatibilityProfile::StaticFlash,
+        )
+        .expect_err("unsupported path must fail");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn prepare_builds_openai_request() {
+        let prepared = prepare_upstream_request(
+            "chat/completions",
+            &json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            "claude-code",
+            ModelCompatibilityProfile::StaticFlash,
+        )
+        .expect("valid openai request");
+        assert!(matches!(prepared, PreparedRequest::OpenAi { .. }));
+    }
+
+    #[test]
+    fn prepare_surfaces_openai_deserialize_error_as_400() {
+        let err = prepare_upstream_request(
+            "chat/completions",
+            &json!({"model": "deepseek-v4-flash"}),
+            "claude-code",
+            ModelCompatibilityProfile::StaticFlash,
+        )
+        .expect_err("missing messages must fail");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("invalid OpenAI chat request"));
+    }
+
+    #[test]
+    fn prepare_builds_anthropic_request() {
+        let prepared = prepare_upstream_request(
+            "messages",
+            &json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            "claude-code",
+            ModelCompatibilityProfile::StaticFlash,
+        )
+        .expect("valid anthropic request");
+        assert!(matches!(prepared, PreparedRequest::Anthropic { .. }));
+    }
+
+    #[test]
+    fn prepare_repairs_tool_missing_name_instead_of_rejecting() {
+        // Real production shape: tool carries description + input_schema but no `name`,
+        // which previously produced `missing field \`name\`` and a hard 400.
+        let prepared = prepare_upstream_request(
+            "messages",
+            &json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "description": "# SendMessage\n\nSend a message to another agent.",
+                    "input_schema": {"type": "object", "properties": {}}
+                }]
+            }),
+            "claude-code",
+            ModelCompatibilityProfile::StaticFlash,
+        )
+        .expect("tool without name must be repaired, not rejected");
+        let PreparedRequest::Anthropic { request, .. } = prepared else {
+            panic!("expected anthropic request");
+        };
+        let tools = request.tools.expect("tools preserved");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "SendMessage");
+    }
+
+    #[test]
+    fn prepare_attaches_repair_diagnostics_when_body_still_invalid() {
+        let err = prepare_upstream_request(
+            "messages",
+            &json!({"model": "deepseek-v4-flash", "system": "hi"}),
+            "claude-code",
+            ModelCompatibilityProfile::StaticFlash,
+        )
+        .expect_err("missing messages must still fail");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("invalid Anthropic messages request"));
+        // Diagnostics must name the keys we did receive, so the failure is actionable
+        // from the audit log without logging any user content.
+        assert!(
+            err.message.contains("missing_messages=true"),
+            "expected repair diagnostics, got: {}",
+            err.message
+        );
+        assert!(!err.message.contains("hi"), "must not leak body values");
+    }
+
+    #[test]
+    fn dispatch_errors_map_to_expected_statuses() {
+        assert_eq!(
+            dispatch_error_to_call_error(DispatchError::CircuitOpen).status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            dispatch_error_to_call_error(DispatchError::RequestTooLarge).status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            dispatch_error_to_call_error(DispatchError::NoResource).status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn dispatch_error_messages_do_not_leak_internals() {
+        for err in [
+            DispatchError::CircuitOpen,
+            DispatchError::RequestTooLarge,
+            DispatchError::NoResource,
+        ] {
+            let mapped = dispatch_error_to_call_error(err);
+            assert!(!mapped.message.contains("socks5"));
+            assert!(!mapped.message.contains("127.0.0.1"));
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Bytes;
@@ -4403,7 +4830,13 @@ mod tests {
         let body = serde_json::json!({});
 
         assert_eq!(
-            effective_empty_upstream_max_retries("chat/completions", &mimo, 12, &body, "claude-code"),
+            effective_empty_upstream_max_retries(
+                "chat/completions",
+                &mimo,
+                12,
+                &body,
+                "claude-code"
+            ),
             12
         );
         assert_eq!(
@@ -4698,11 +5131,10 @@ mod tests {
         );
         assert!(value["usage"].get("cache_read_input_tokens").is_none());
         assert_eq!(value["usage"]["usage_semantic"], "openai");
-        assert_eq!(
-            value["usage"]["billing_usage"]["source"],
-            "oai_chat"
-        );
-        assert!(value["usage"].get("zenproxy_billable_input_tokens").is_none());
+        assert_eq!(value["usage"]["billing_usage"]["source"], "oai_chat");
+        assert!(value["usage"]
+            .get("zenproxy_billable_input_tokens")
+            .is_none());
     }
 
     #[test]
@@ -5799,7 +6231,12 @@ data: [DONE]
         drop(tx);
         let resp = Response::new(Body::from_stream(ReceiverStream::new(rx)));
 
-        let verdict = precheck_stream_first_output(resp, "chat/completions", STREAM_EMPTY_PRECHECK_TIMEOUT_SECS).await;
+        let verdict = precheck_stream_first_output(
+            resp,
+            "chat/completions",
+            STREAM_EMPTY_PRECHECK_TIMEOUT_SECS,
+        )
+        .await;
         assert!(matches!(verdict, StreamPrecheck::Empty));
     }
 
@@ -5813,14 +6250,20 @@ data: [DONE]
         let tx2 = tx.clone();
         let content = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}
 
-".to_vec();
+"
+        .to_vec();
         tokio::spawn(async move {
             let _ = tx.send(Ok(Bytes::from(content))).await;
             drop(tx2);
         });
         let resp = Response::new(Body::from_stream(ReceiverStream::new(rx)));
 
-        let verdict = precheck_stream_first_output(resp, "chat/completions", STREAM_EMPTY_PRECHECK_TIMEOUT_SECS).await;
+        let verdict = precheck_stream_first_output(
+            resp,
+            "chat/completions",
+            STREAM_EMPTY_PRECHECK_TIMEOUT_SECS,
+        )
+        .await;
         match verdict {
             StreamPrecheck::HasOutput(rebuild) => {
                 let body = axum::body::to_bytes(rebuild.into_body(), 1024 * 1024)
@@ -5846,7 +6289,8 @@ data: [DONE]
         let resp = Response::new(Body::from_stream(ReceiverStream::new(rx)));
 
         let verdict =
-            precheck_stream_first_output(resp, "messages", STREAM_EMPTY_PRECHECK_TIMEOUT_SECS).await;
+            precheck_stream_first_output(resp, "messages", STREAM_EMPTY_PRECHECK_TIMEOUT_SECS)
+                .await;
         match verdict {
             StreamPrecheck::HasOutput(rebuild) => {
                 let body = axum::body::to_bytes(rebuild.into_body(), 1024 * 1024)

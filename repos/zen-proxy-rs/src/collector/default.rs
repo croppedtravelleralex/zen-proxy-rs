@@ -575,6 +575,10 @@ mod tests {
             bytes_received: 0,
             failure_kind: failure_kind.to_string(),
             failure_message: String::new(),
+            empty_output_class: String::new(),
+            raw_tool_format: String::new(),
+            text_chars: 0,
+            reasoning_chars: 0,
             retry_chain: Vec::new(),
             context: None,
         }

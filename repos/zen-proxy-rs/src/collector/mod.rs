@@ -105,6 +105,14 @@ pub struct RequestTelemetry {
     #[serde(default)]
     pub failure_message: String,
     #[serde(default)]
+    pub empty_output_class: String,
+    #[serde(default)]
+    pub raw_tool_format: String,
+    #[serde(default)]
+    pub text_chars: u32,
+    #[serde(default)]
+    pub reasoning_chars: u32,
+    #[serde(default)]
     pub retry_chain: Vec<RequestAttemptTelemetry>,
     pub context: Option<ContextTelemetry>,
 }
@@ -148,6 +156,12 @@ pub struct CacheForensicsTelemetry {
     pub final_provider_cache_policy_match: bool,
     #[serde(default)]
     pub final_provider_cache_segment_hash: String,
+    #[serde(default)]
+    pub static_cache_material_bytes: u64,
+    #[serde(default)]
+    pub dynamic_cache_material_bytes: u64,
+    #[serde(default)]
+    pub raw_cacheable_segment_hash: String,
     pub fork_key: String,
     pub fork_reason: String,
 }

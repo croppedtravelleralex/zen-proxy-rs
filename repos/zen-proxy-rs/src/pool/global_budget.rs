@@ -368,7 +368,10 @@ mod tests {
             b.try_acquire(&node_id, &meta()).unwrap_err(),
             "max_concurrent"
         );
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        // Wait long enough for the 1 s lease TTL to expire on the Redis side.
+        // 2500 ms gives 1500 ms of headroom against system load; 1200 ms was
+        // occasionally tight when the context-compaction tests ran in parallel.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
         let recovered = b.try_acquire(&node_id, &meta()).unwrap();
 
         b.release(&recovered.node_id, &recovered.lease_id).unwrap();

@@ -438,7 +438,7 @@ async fn handle_non_stream(
         Duration::from_secs(config.claude_code_stream_no_forwardable_retry_secs.max(1)),
         request_shape.estimated_total_tokens,
     );
-    let (collected, content) = {
+    let (mut collected, content) = {
         let mut last_empty = false;
         let mut last_empty_class = None;
         let mut last_incomplete_tool_arguments = false;
@@ -446,6 +446,7 @@ async fn handle_non_stream(
         let mut used_thinking_disabled_retry = false;
         let mut used_missing_reasoning_enrich_retry = false;
         let mut used_provider_invalid_enrich_retry = false;
+        let mut used_provider_invalid_compat_retry = false;
         let mut used_provider_invalid_text_retry = false;
         let mut used_stream_mode_retry = false;
         let mut attempt_body = zb.clone();
@@ -490,11 +491,15 @@ async fn handle_non_stream(
                         profile,
                         tool_history_repair,
                         used_provider_invalid_enrich_retry || used_missing_reasoning_enrich_retry,
+                        used_provider_invalid_compat_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
                             super::ProviderInvalidRetryMode::EnrichReasoning => {
                                 used_provider_invalid_enrich_retry = true;
+                            }
+                            super::ProviderInvalidRetryMode::CompatToolUse => {
+                                used_provider_invalid_compat_retry = true;
                             }
                             super::ProviderInvalidRetryMode::TextOnly => {
                                 used_provider_invalid_text_retry = true;
@@ -519,7 +524,7 @@ async fn handle_non_stream(
             };
             let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
             observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
-            let collected = match collect_anthropic_non_stream_parts_with_guard(
+            let mut collected = match collect_anthropic_non_stream_parts_with_guard(
                 resp,
                 cr,
                 profile,
@@ -530,7 +535,7 @@ async fn handle_non_stream(
             {
                 NonStreamCollectOutcome::Collected(collected) => collected,
                 NonStreamCollectOutcome::RetryNoForwardable {
-                    collected,
+                    mut collected,
                     reasoning_chars,
                     upstream_event_count,
                     elapsed_ms,
@@ -551,7 +556,21 @@ async fn handle_non_stream(
                         tool_count = request_shape.tool_count,
                         "ClaudeCode non-stream guard retrying after reasoning-only/no-forwardable upstream output"
                     );
-                    if !collected.reasoning.trim().is_empty() {
+                    if collected.tool_calls.is_empty()
+                        && try_repair_dsml_invoke_leak(
+                            &collected.content,
+                            &collected.reasoning,
+                            &mut collected.tool_calls,
+                            cr,
+                            profile,
+                        )
+                    {
+                        collected.content.clear();
+                        collected
+                    } else if !collected.reasoning.trim().is_empty()
+                        && !super::dsml_guard::contains_dsml_tool_leak(&collected.reasoning)
+                        && !super::dsml_guard::contains_dsml_tool_leak(&collected.content)
+                    {
                         tracing::warn!(
                             protocol = "anthropic",
                             model = %cr.model,
@@ -617,6 +636,56 @@ async fn handle_non_stream(
                 attempt + 1,
                 NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
             );
+            if collected.tool_calls.is_empty()
+                && try_repair_dsml_invoke_leak(
+                    &collected.content,
+                    &collected.reasoning,
+                    &mut collected.tool_calls,
+                    cr,
+                    profile,
+                )
+            {
+                collected.content.clear();
+            } else if collected.tool_calls.is_empty()
+                && (super::dsml_guard::contains_dsml_tool_leak(&collected.content)
+                    || super::dsml_guard::contains_dsml_tool_leak(&collected.reasoning))
+            {
+                last_empty = true;
+                last_empty_class = Some(super::OutputClass::Empty);
+                tracing::warn!(
+                    protocol = "anthropic",
+                    model = %cr.model,
+                    source_client = ?profile.kind,
+                    attempt = attempt + 1,
+                    "ClaudeCode non-stream guard retrying after unrepaired DSML tool leak"
+                );
+                continue;
+            }
+            if collected.tool_calls.is_empty()
+                && super::unfinished_intent::should_retry_unfinished_tool_intent(
+                    profile,
+                    attempt,
+                    NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+                    super::collected_visible_text(&collected),
+                    true,
+                    cr,
+                )
+            {
+                last_empty = true;
+                last_empty_class = Some(super::OutputClass::NoForwardable);
+                tracing::warn!(
+                    protocol = "anthropic",
+                    model = %cr.model,
+                    source_client = ?profile.kind,
+                    attempt = attempt + 1,
+                    "ClaudeCode non-stream guard retrying after unfinished tool-intent announcement without a tool call"
+                );
+                if !used_reasoning_enrich_retry {
+                    used_reasoning_enrich_retry = true;
+                    attempt_body = super::reasoning_retry_body(zb, profile);
+                }
+                continue;
+            }
             let content =
                 response_text_for_profile(profile, super::collected_visible_text(&collected));
             let output_class = super::classify_collected_output(&collected, &content);
@@ -719,7 +788,14 @@ async fn handle_non_stream(
         } else if last_incomplete_tool_arguments {
             return Err(incomplete_tool_arguments_error());
         } else if let Some(fallback_text) = last_empty
-            .then(|| non_stream_empty_fallback_text(cr, short_request_kind, &request_shape))
+            .then(|| {
+                non_stream_empty_fallback_text(
+                    cr,
+                    profile.kind == ClientKind::ClaudeCode,
+                    short_request_kind,
+                    &request_shape,
+                )
+            })
             .flatten()
         {
             tracing::warn!(
@@ -752,6 +828,13 @@ async fn handle_non_stream(
             ));
         }
     };
+    if profile.kind == ClientKind::ClaudeCode
+        && collected.tool_calls.is_empty()
+        && super::unfinished_intent::request_offers_tools(cr)
+        && super::unfinished_intent::looks_like_unfinished_tool_intent(&content)
+    {
+        collected.finish_reason = Some("length".to_string());
+    }
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -822,6 +905,7 @@ async fn handle_non_stream(
                 observed_exit_ip,
             ));
         }
+        return Err(incomplete_tool_arguments_error());
     }
     let input_tokens = collected
         .usage
@@ -951,12 +1035,17 @@ fn is_truncated_stream_error(err: &AppError) -> bool {
 
 fn non_stream_empty_fallback_text(
     body: &ChatRequest,
+    is_claude_code: bool,
     short_request_kind: translate::ShortNonStreamRequestKind,
     request_shape: &translate::RequestShape,
 ) -> Option<&'static str> {
-    translate::short_no_tool_empty_fallback_text(body).or_else(|| {
-        mimo_internal_probe_empty_fallback_text(body, short_request_kind, request_shape)
-    })
+    translate::short_no_tool_empty_fallback_text(body)
+        .or_else(|| {
+            translate::claude_code_low_budget_empty_fallback_text(body, is_claude_code)
+        })
+        .or_else(|| {
+            mimo_internal_probe_empty_fallback_text(body, short_request_kind, request_shape)
+        })
 }
 
 fn mimo_internal_probe_empty_fallback_text(
@@ -1008,7 +1097,16 @@ fn is_mimo_v25_model(model: &str) -> bool {
 }
 
 fn text_resp(ts: u128, model: &str, text: &str, input_tokens: u64, output_tokens: u64) -> Response {
-    text_resp_with_usage(ts, model, text, input_tokens, output_tokens, None, None, None)
+    text_resp_with_usage(
+        ts,
+        model,
+        text,
+        input_tokens,
+        output_tokens,
+        None,
+        None,
+        None,
+    )
 }
 
 fn response_text_for_profile(profile: ClientProfile, text: &str) -> String {
@@ -1163,15 +1261,15 @@ fn cache_miss_tokens(
 
 fn anthropic_stop_reason(
     upstream_finish_reason: Option<&str>,
-    has_tool_calls: bool,
+    has_emitted_tool_calls: bool,
 ) -> &'static str {
-    if has_tool_calls {
+    if has_emitted_tool_calls {
         return "tool_use";
     }
     match upstream_finish_reason {
         Some("length") => "max_tokens",
         Some("stop") => "end_turn",
-        Some("content_filter") => "end_turn",
+        Some("content_filter") | Some("refusal") => "refusal",
         _ => "end_turn",
     }
 }
@@ -1211,8 +1309,7 @@ fn should_retry_stream_without_forwardable_output(
         return false;
     }
     // Reasoning is still growing => upstream is alive, just thinking. Wait longer.
-    let reasoning_alive = reasoning_len > 0
-        && reasoning_last_progress.elapsed() < stall_window;
+    let reasoning_alive = reasoning_len > 0 && reasoning_last_progress.elapsed() < stall_window;
     if reasoning_alive && elapsed < max_wait {
         return false;
     }
@@ -1245,6 +1342,36 @@ fn should_retry_stream_error_before_output(
         && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
         && text.trim().is_empty()
         && tool_calls.is_empty()
+}
+
+fn thinking_text_duplicate_overlap(content: &str, reasoning: &str) -> usize {
+    let trimmed = content.trim();
+    if trimmed.len() < 32 || reasoning.len() < 32 {
+        return 0;
+    }
+    if reasoning.contains(trimmed) {
+        trimmed.len()
+    } else {
+        0
+    }
+}
+
+fn should_retry_dsml_tool_leak(
+    profile: ClientProfile,
+    attempt: usize,
+    dsml_leak_detected: bool,
+    text: &str,
+    reasoning: &str,
+    tool_calls: &[crate::zen::client::CollectedToolCall],
+    emitted_tool_call_indexes: &std::collections::HashSet<i64>,
+) -> bool {
+    profile.kind == ClientKind::ClaudeCode
+        && (dsml_leak_detected
+            || super::dsml_guard::contains_dsml_tool_leak(text)
+            || super::dsml_guard::contains_dsml_tool_leak(reasoning))
+        && tool_calls.is_empty()
+        && emitted_tool_call_indexes.is_empty()
+        && attempt + 1 < CLAUDE_CODE_STREAM_GUARD_ATTEMPTS
 }
 
 fn has_unemitted_streamable_tool_call(
@@ -1372,8 +1499,7 @@ fn claude_code_upstream_wait_interval(
 
     // While reasoning is still growing, upstream is alive: wait up to max_wait,
     // pinging at the standard idle interval so the client sees liveness.
-    let reasoning_alive = reasoning_len > 0
-        && reasoning_last_progress.elapsed() < stall_window;
+    let reasoning_alive = reasoning_len > 0 && reasoning_last_progress.elapsed() < stall_window;
     let horizon = if reasoning_alive {
         max_wait
     } else {
@@ -1580,12 +1706,45 @@ fn schema_allows_empty_tool_input(body: &ChatRequest, name: &str, profile: Clien
     required_fields_for_tool(body, name, profile).is_empty()
 }
 
+fn try_repair_dsml_invoke_leak(
+    text: &str,
+    reasoning: &str,
+    tool_calls: &mut Vec<crate::zen::client::CollectedToolCall>,
+    body: &ChatRequest,
+    profile: ClientProfile,
+) -> bool {
+    if !tool_calls.is_empty() {
+        return false;
+    }
+    let blob = super::dsml_guard::dsml_source_blob(reasoning, text);
+    if !super::dsml_guard::contains_dsml_tool_leak(&blob) {
+        return false;
+    }
+    let Some((name, args)) = super::dsml_repair::repair_invoke_leak(&blob) else {
+        return false;
+    };
+    let candidate = crate::zen::client::CollectedToolCall {
+        index: 0,
+        id: None,
+        name,
+        arguments: args,
+    };
+    if streamable_anthropic_tool_call(&candidate, body, profile).is_none() {
+        return false;
+    }
+    tool_calls.push(candidate);
+    true
+}
+
 fn streamable_anthropic_tool_call(
     tool: &crate::zen::client::CollectedToolCall,
     body: &ChatRequest,
     profile: ClientProfile,
 ) -> Option<(ToolCall, Value)> {
     let tc = anthropic_tool_call_identity(tool, body)?;
+    if !tool.arguments.trim().is_empty() && serde_json::from_str::<Value>(&tool.arguments).is_err() {
+        return None;
+    }
     let tc = ToolCall {
         function: ToolFunction {
             arguments: tool.arguments.clone(),
@@ -1602,6 +1761,16 @@ fn streamable_anthropic_tool_call(
         return None;
     }
     let required = required_fields_for_tool(body, &ct.function.name, profile);
+    let original_input = if tool.arguments.trim().is_empty() {
+        Value::Object(Default::default())
+    } else {
+        serde_json::from_str(&tool.arguments).ok()?
+    };
+    if profile.kind == ClientKind::ClaudeCode
+        && !tool_input_has_required_fields(&original_input, &required)
+    {
+        return None;
+    }
     let mut input = if ct.function.arguments.trim().is_empty() {
         Value::Object(Default::default())
     } else {
@@ -1763,11 +1932,8 @@ async fn handle_stream(
         Duration::from_secs(config.claude_code_stream_no_forwardable_retry_secs.max(1)),
         request_shape.estimated_total_tokens,
     );
-    let reasoning_stall_window = Duration::from_secs(
-        config
-            .claude_code_stream_reasoning_stall_window_secs
-            .max(1),
-    );
+    let reasoning_stall_window =
+        Duration::from_secs(config.claude_code_stream_reasoning_stall_window_secs.max(1));
     let reasoning_max_wait = Duration::from_secs(
         config
             .claude_code_stream_max_wait_forwardable_secs
@@ -1798,8 +1964,10 @@ async fn handle_stream(
         let mut attempts_used = 0_usize;
         let mut used_enrich_reasoning_retry = false;
         let mut used_provider_invalid_enrich_retry = false;
+        let mut used_provider_invalid_compat_retry = false;
         let mut used_provider_invalid_text_retry = false;
         let mut text = String::new();
+        let mut held_visible = String::new();
         let mut reasoning = String::new();
         let mut attempt_reasoning_len = 0_usize;
         let mut reasoning_progress_updated = Instant::now();
@@ -1825,6 +1993,12 @@ async fn handle_stream(
         let mut emitted_tool_call_signatures = std::collections::HashSet::<String>::new();
         let mut emitted_tool_call_blocks = 0_u64;
         let mut first_tool_emit_ms = 0_u64;
+        let mut dsml_leak_detected = false;
+        let mut dsml_text_holdback = String::new();
+        let mut dsml_reasoning_holdback = String::new();
+        let mut dsml_leak_blob = String::new();
+        let mut anthropic_tool_format_seen = false;
+        let mut text_chars_would_suppress_dupe = 0_usize;
         let mut attempt_body = base_body.clone();
         let mut first_upstream_response_ms = 0_u64;
         let mut first_upstream_event_ms = 0_u64;
@@ -1841,6 +2015,8 @@ async fn handle_stream(
                     upstream_finish_reason = None;
                     usage = None;
                     cache_signals = ProviderCacheSignals::ignored();
+                    text.clear();
+                    held_visible.clear();
                     reasoning.clear();
                     attempt_reasoning_len = 0;
                     reasoning_progress_updated = Instant::now();
@@ -1849,6 +2025,10 @@ async fn handle_stream(
                     started_tool_call_indexes.clear();
                     started_tool_block_indexes.clear();
                     tool_argument_offsets.clear();
+                    dsml_text_holdback.clear();
+                    dsml_reasoning_holdback.clear();
+                    dsml_leak_blob.clear();
+                    dsml_leak_detected = false;
                 }
                 let fetch = crate::zen::client::fetch_zen_stream_with_headers(
                     &client,
@@ -1947,11 +2127,15 @@ async fn handle_stream(
                         profile,
                         tool_history_repair,
                         used_provider_invalid_enrich_retry || used_enrich_reasoning_retry,
+                        used_provider_invalid_compat_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
                             super::ProviderInvalidRetryMode::EnrichReasoning => {
                                 used_provider_invalid_enrich_retry = true;
+                            }
+                            super::ProviderInvalidRetryMode::CompatToolUse => {
+                                used_provider_invalid_compat_retry = true;
                             }
                             super::ProviderInvalidRetryMode::TextOnly => {
                                 used_provider_invalid_text_retry = true;
@@ -1989,7 +2173,7 @@ async fn handle_stream(
                         profile,
                         attempt,
                         !started_tool_call_indexes.is_empty(),
-                        &text,
+                        super::unfinished_intent::progress_text(&text, &held_visible),
                         &tool_calls,
                         attempt_started.elapsed(),
                         no_forwardable_retry_after,
@@ -2033,7 +2217,7 @@ async fn handle_stream(
                                 && should_retry_stream_without_forwardable_output(
                                     profile,
                                     attempt,
-                                    &text,
+                                    super::unfinished_intent::progress_text(&text, &held_visible),
                                     &tool_calls,
                                     attempt_started.elapsed(),
                                     no_forwardable_retry_after,
@@ -2123,6 +2307,57 @@ async fn handle_stream(
                             } else {
                                 content
                             };
+                            let emit_content = if tool_calls.is_empty() {
+                                let (maybe_emit, leaked) = super::dsml_guard::take_emittable_text(
+                                    &mut dsml_text_holdback,
+                                    &content,
+                                );
+                                if leaked {
+                                    dsml_leak_detected = true;
+                                    dsml_leak_blob.push_str(&dsml_text_holdback);
+                                    tracing::warn!(
+                                        protocol = "anthropic",
+                                        model = %body.model,
+                                        source_client = ?profile.kind,
+                                        prompt_hash,
+                                        prompt_hash_hex = %prompt_hash_hex,
+                                        attempt = attempts_used,
+                                        content_len = content.len(),
+                                        "withheld upstream DSML tool markup from text stream"
+                                    );
+                                    None
+                                } else {
+                                    maybe_emit.filter(|emit| {
+                                        !emit.trim().is_empty()
+                                            || (profile.preserves_stream_whitespace()
+                                                && !emit.is_empty())
+                                    })
+                                }
+                            } else {
+                                Some(content)
+                            };
+                            if let Some(content) = emit_content {
+                                if tool_calls.is_empty()
+                                    && super::dsml_guard::contains_dsml_tool_leak(&content)
+                                {
+                                    dsml_leak_detected = true;
+                                    dsml_leak_blob.push_str(&content);
+                                    tracing::warn!(
+                                        protocol = "anthropic",
+                                        model = %body.model,
+                                        source_client = ?profile.kind,
+                                        prompt_hash,
+                                        prompt_hash_hex = %prompt_hash_hex,
+                                        attempt = attempts_used,
+                                        content_len = content.len(),
+                                        "withheld upstream DSML tool markup from text stream"
+                                    );
+                                } else {
+                            let overlap = thinking_text_duplicate_overlap(&content, &reasoning);
+                            if overlap > 0 {
+                                text_chars_would_suppress_dupe =
+                                    text_chars_would_suppress_dupe.saturating_add(overlap);
+                            }
                             let should_emit =
                                 !content.trim().is_empty()
                                     || (profile.preserves_stream_whitespace() && !content.is_empty());
@@ -2130,6 +2365,15 @@ async fn handle_stream(
                                 if first_content_ms == 0 {
                                     first_content_ms = stream_started.elapsed().as_millis() as u64;
                                 }
+                                emitted_downstream_event = true;
+                                if let Some(flush) = super::unfinished_intent::push_visible_chunk(
+                                    &mut held_visible,
+                                    &text,
+                                    &content,
+                                    profile,
+                                    &body,
+                                    tool_calls.is_empty(),
+                                ) {
                                 if !message_started {
                                     yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
                                     message_started = true;
@@ -2139,22 +2383,42 @@ async fn handle_stream(
                                     text_block_index = emitted_tool_call_blocks;
                                     yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":text_block_index,"content_block":{"type":"text","text":""}}).to_string()));
                                 }
-                                text.push_str(&content);
-                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":content}}).to_string()));
-                                emitted_downstream_event = true;
+                                text.push_str(&flush);
+                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":flush}}).to_string()));
+                                }
+                            }
+                                }
                             }
                         }
                         if let Some(reasoning_content) = delta.reasoning_content {
                             if first_reasoning_ms == 0 {
                                 first_reasoning_ms = stream_started.elapsed().as_millis() as u64;
                             }
-                            reasoning.push_str(&reasoning_content);
+                            let (maybe_emit, leaked) = super::dsml_guard::take_emittable_text(
+                                &mut dsml_reasoning_holdback,
+                                &reasoning_content,
+                            );
+                            if leaked {
+                                dsml_leak_detected = true;
+                                dsml_leak_blob.push_str(&dsml_reasoning_holdback);
+                                tracing::warn!(
+                                    protocol = "anthropic",
+                                    model = %body.model,
+                                    source_client = ?profile.kind,
+                                    prompt_hash,
+                                    prompt_hash_hex = %prompt_hash_hex,
+                                    attempt = attempts_used,
+                                    content_len = reasoning_content.len(),
+                                    "withheld upstream DSML tool markup from thinking stream"
+                                );
+                            } else if let Some(emit) = maybe_emit {
+                            reasoning.push_str(&emit);
                             if reasoning.len() > attempt_reasoning_len {
                                 attempt_reasoning_len = reasoning.len();
                                 reasoning_progress_updated = Instant::now();
                             }
                             // === thinking passthrough ===
-                            if !reasoning_content.trim().is_empty() {
+                            if !emit.trim().is_empty() {
                                 if !message_started {
                                     yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
                                     message_started = true;
@@ -2165,13 +2429,17 @@ async fn handle_stream(
                                     yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":thinking_block_index,"content_block":{"type":"thinking","thinking":""}}).to_string()));
                                     emitted_tool_call_blocks = emitted_tool_call_blocks.saturating_add(1);
                                 }
-                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":thinking_block_index,"delta":{"type":"thinking_delta","thinking":reasoning_content}}).to_string()));
+                                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":thinking_block_index,"delta":{"type":"thinking_delta","thinking":emit}}).to_string()));
                                 emitted_downstream_event = true;
+                            }
                             }
                         }
                             if let Some(items) = delta.tool_calls {
                                 let had_tool_calls = !tool_calls.is_empty();
                                 merge_tool_deltas(&mut tool_calls, items);
+                                if !tool_calls.is_empty() {
+                                    anthropic_tool_format_seen = true;
+                                }
                                 if first_tool_call_ms == 0 && !had_tool_calls && !tool_calls.is_empty() {
                                     first_tool_call_ms = stream_started.elapsed().as_millis() as u64;
                                 }
@@ -2212,7 +2480,7 @@ async fn handle_stream(
                         && should_retry_stream_without_forwardable_output(
                         profile,
                         attempt,
-                        &text,
+                        super::unfinished_intent::progress_text(&text, &held_visible),
                         &tool_calls,
                         attempt_started.elapsed(),
                         no_forwardable_retry_after,
@@ -2244,6 +2512,170 @@ async fn handle_stream(
                 }
             }
             if completed_upstream {
+                let (text_tail, text_leaked) =
+                    super::dsml_guard::flush_holdback(&mut dsml_text_holdback);
+                if text_leaked {
+                    dsml_leak_detected = true;
+                    dsml_leak_blob.push_str(&dsml_text_holdback);
+                } else if let Some(tail) = text_tail.filter(|tail| !tail.is_empty()) {
+                    if let Some(flush) = super::unfinished_intent::push_visible_chunk(
+                        &mut held_visible,
+                        &text,
+                        &tail,
+                        profile,
+                        &body,
+                        tool_calls.is_empty(),
+                    ) {
+                    if !message_started {
+                        yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                        message_started = true;
+                    }
+                    if !text_block_open {
+                        text_block_open = true;
+                        text_block_index = emitted_tool_call_blocks;
+                        yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":text_block_index,"content_block":{"type":"text","text":""}}).to_string()));
+                    }
+                    text.push_str(&flush);
+                    yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":flush}}).to_string()));
+                    }
+                }
+                let (reason_tail, reason_leaked) =
+                    super::dsml_guard::flush_holdback(&mut dsml_reasoning_holdback);
+                if reason_leaked {
+                    dsml_leak_detected = true;
+                    dsml_leak_blob.push_str(&dsml_reasoning_holdback);
+                } else if let Some(tail) = reason_tail.filter(|tail| !tail.trim().is_empty()) {
+                    reasoning.push_str(&tail);
+                    if !message_started {
+                        yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                        message_started = true;
+                    }
+                    if !thinking_block_open {
+                        thinking_block_open = true;
+                        thinking_block_index = emitted_tool_call_blocks;
+                        yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":thinking_block_index,"content_block":{"type":"thinking","thinking":""}}).to_string()));
+                        emitted_tool_call_blocks = emitted_tool_call_blocks.saturating_add(1);
+                    }
+                    yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":thinking_block_index,"delta":{"type":"thinking_delta","thinking":tail}}).to_string()));
+                }
+                let dsml_blob = super::dsml_guard::dsml_source_blob(&reasoning, &dsml_leak_blob);
+                if tool_calls.is_empty()
+                    && try_repair_dsml_invoke_leak(&text, &dsml_blob, &mut tool_calls, &body, profile)
+                {
+                    dsml_leak_detected = false;
+                    text.clear();
+                    held_visible.clear();
+                    text_block_open = false;
+                    dsml_text_holdback.clear();
+                    dsml_reasoning_holdback.clear();
+                    dsml_leak_blob.clear();
+                    tracing::info!(
+                        protocol = "anthropic",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        prompt_hash,
+                        prompt_hash_hex = %prompt_hash_hex,
+                        attempt = attempts_used,
+                        tool_name = %tool_calls[0].name,
+                        "repaired upstream DSML invoke XML leak into anthropic tool_use"
+                    );
+                } else if !message_started
+                    && should_retry_dsml_tool_leak(
+                    profile,
+                    attempt,
+                    dsml_leak_detected,
+                    &text,
+                    &dsml_blob,
+                    &tool_calls,
+                    &emitted_tool_call_indexes,
+                ) {
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        prompt_hash,
+                        prompt_hash_hex = %prompt_hash_hex,
+                        attempt = attempts_used,
+                        max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                        elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                        upstream_event_count,
+                        text_chars = text.len(),
+                        reasoning_chars = reasoning.len(),
+                        raw_tool_format = "dsml",
+                        "ClaudeCode stream guard retrying after upstream DSML tool leak in text stream"
+                    );
+                    if !used_provider_invalid_compat_retry {
+                        used_provider_invalid_compat_retry = true;
+                        attempt_body = super::compat_tool_use_retry_body(&attempt_body);
+                    }
+                    text.clear();
+                    held_visible.clear();
+                    text_block_open = false;
+                    dsml_leak_detected = false;
+                    dsml_text_holdback.clear();
+                    dsml_reasoning_holdback.clear();
+                    dsml_leak_blob.clear();
+                    reasoning.clear();
+                    thinking_block_open = false;
+                    completed_upstream = false;
+                    upstream_finish_reason = None;
+                    usage = None;
+                    cache_signals = ProviderCacheSignals::ignored();
+                    continue;
+                } else if (dsml_leak_detected
+                    || super::dsml_guard::contains_dsml_tool_leak(&text)
+                    || super::dsml_guard::contains_dsml_tool_leak(&dsml_blob))
+                    && tool_calls.is_empty()
+                    && emitted_tool_call_indexes.is_empty()
+                {
+                    final_stream_error =
+                        Some("upstream returned DSML tool markup in text stream".to_string());
+                }
+                let combined_visible =
+                    super::unfinished_intent::combined_visible_text(&text, &held_visible);
+                if !thinking_block_open
+                    && !text_block_open
+                    && super::unfinished_intent::should_retry_unfinished_tool_intent(
+                        profile,
+                        attempt,
+                        CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                        &combined_visible,
+                        tool_calls.is_empty() && emitted_tool_call_indexes.is_empty(),
+                        &body,
+                    )
+                {
+                    tracing::warn!(
+                        protocol = "anthropic",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        prompt_hash,
+                        prompt_hash_hex = %prompt_hash_hex,
+                        attempt = attempts_used,
+                        max_attempts = CLAUDE_CODE_STREAM_GUARD_ATTEMPTS,
+                        elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+                        upstream_event_count,
+                        text_chars = combined_visible.len(),
+                        "ClaudeCode stream guard retrying after unfinished tool-intent announcement without a tool call"
+                    );
+                    if !used_enrich_reasoning_retry {
+                        used_enrich_reasoning_retry = true;
+                        attempt_body = super::reasoning_retry_body_with_scope(
+                            &base_body,
+                            profile,
+                            &reasoning_scope,
+                        );
+                    }
+                    text.clear();
+                    held_visible.clear();
+                    text_block_open = false;
+                    reasoning.clear();
+                    thinking_block_open = false;
+                    completed_upstream = false;
+                    upstream_finish_reason = None;
+                    usage = None;
+                    cache_signals = ProviderCacheSignals::ignored();
+                    continue;
+                }
                 if started_tool_call_indexes.is_empty()
                     && !has_forwardable_anthropic_output(
                     &text,
@@ -2382,6 +2814,41 @@ async fn handle_stream(
             }
             break;
         }
+        let leftover_unfinished = profile.kind == ClientKind::ClaudeCode
+            && tool_calls.is_empty()
+            && emitted_tool_call_indexes.is_empty()
+            && super::unfinished_intent::looks_like_unfinished_tool_intent(
+                &super::unfinished_intent::combined_visible_text(&text, &held_visible),
+            )
+            && super::unfinished_intent::request_offers_tools(&body);
+        if leftover_unfinished && final_stream_error.is_none() {
+            tracing::warn!(
+                protocol = "anthropic",
+                model = %body.model,
+                source_client = ?profile.kind,
+                prompt_hash,
+                prompt_hash_hex = %prompt_hash_hex,
+                attempts_used,
+                "ClaudeCode stream guard mapping unfinished tool-intent announcement to max_tokens instead of end_turn"
+            );
+            upstream_finish_reason = Some("length".to_string());
+        } else if upstream_finish_reason.is_none()
+            && !text.trim().is_empty()
+            && final_stream_error.is_none()
+            && !dsml_leak_detected
+        {
+            upstream_finish_reason = Some("end_turn".to_string());
+        }
+        if final_stream_error.is_some()
+            && (dsml_leak_detected
+                || super::dsml_guard::contains_dsml_tool_leak(&text)
+                || super::dsml_guard::contains_dsml_tool_leak(&dsml_leak_blob))
+            && tool_calls.is_empty()
+            && emitted_tool_call_indexes.is_empty()
+        {
+            yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":final_stream_error.clone().unwrap_or_else(||"upstream returned DSML tool markup in text stream".to_string())}}).to_string()));
+            return;
+        }
         if final_stream_error.is_some() && !tool_calls.is_empty() && emitted_tool_call_indexes.is_empty() {
             tracing::warn!(
                 protocol = "anthropic",
@@ -2415,6 +2882,9 @@ async fn handle_stream(
             );
         }
         if final_stream_error.is_some() && !text.trim().is_empty() {
+            let dsml_text_leak =
+                dsml_leak_detected || super::dsml_guard::contains_dsml_tool_leak(&text);
+            if !dsml_text_leak {
             tracing::warn!(
                 protocol = "anthropic",
                 model = %body.model,
@@ -2428,6 +2898,21 @@ async fn handle_stream(
                 "ClaudeCode stream guard closing partial text stream with max_tokens stop reason after upstream truncation"
             );
             upstream_finish_reason = Some("length".to_string());
+            }
+        }
+        if !held_visible.is_empty() && final_stream_error.is_none() {
+            let flush = std::mem::take(&mut held_visible);
+            if !message_started {
+                yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                message_started = true;
+            }
+            if !text_block_open {
+                text_block_open = true;
+                text_block_index = emitted_tool_call_blocks;
+                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":text_block_index,"content_block":{"type":"text","text":""}}).to_string()));
+            }
+            text.push_str(&flush);
+            yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":flush}}).to_string()));
         }
         let final_markdown = markdown_guard
             .as_mut()
@@ -2445,12 +2930,53 @@ async fn handle_stream(
             text.push_str(&final_markdown);
             yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":final_markdown}}).to_string()));
         }
+        if let Some(bridge_text) = super::stream_reasoning_visible_text_bridge(
+            &text,
+            &reasoning,
+            tool_calls.len(),
+        ) {
+            tracing::info!(
+                protocol = "anthropic",
+                model = %body.model,
+                source_client = ?profile.kind,
+                prompt_hash,
+                prompt_hash_hex = %prompt_hash_hex,
+                reasoning_chars = reasoning.len(),
+                text_chars = text.len(),
+                bridge_chars = bridge_text.len(),
+                "bridging streamed reasoning into visible text block"
+            );
+            if !message_started {
+                yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
+                message_started = true;
+            }
+            if !text_block_open {
+                text_block_open = true;
+                text_block_index = emitted_tool_call_blocks;
+                yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":text_block_index,"content_block":{"type":"text","text":""}}).to_string()));
+            }
+            if text.trim().is_empty() {
+                text.push_str(&bridge_text);
+                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":bridge_text}}).to_string()));
+            } else {
+                let delta = format!("\n\n{bridge_text}");
+                text.push_str(&delta);
+                yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":delta}}).to_string()));
+            }
+        }
         if text.trim().is_empty() && tool_calls.is_empty() {
-            if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body) {
+            if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body)
+                .or_else(|| {
+                    translate::claude_code_low_budget_empty_fallback_text(
+                        &body,
+                        profile.kind == ClientKind::ClaudeCode,
+                    )
+                })
+            {
                 tracing::warn!(
                     model = body.model,
                     source_client = ?profile.kind,
-                    "short channel-test probe received empty upstream; returning local ok"
+                    "ClaudeCode low-budget probe received empty upstream stream; returning local ok"
                 );
                 if !message_started {
                     yield Ok(Event::default().event("message_start").data(serde_json::json!({"type":"message_start","message":{"id":msg_id,"type":"message","role":"assistant","model":m,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":initial_input_tokens,"output_tokens":0}}}).to_string()));
@@ -2461,6 +2987,26 @@ async fn handle_stream(
                 text.push_str(fallback_text);
                 yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":text_block_index,"content_block":{"type":"text","text":""}}).to_string()));
                 yield Ok(Event::default().event("content_block_delta").data(serde_json::json!({"type":"content_block_delta","index":text_block_index,"delta":{"type":"text_delta","text":fallback_text}}).to_string()));
+            } else if (thinking_block_open || !reasoning.trim().is_empty())
+                && !dsml_leak_detected
+                && !super::dsml_guard::contains_dsml_tool_leak(&reasoning)
+                && !super::dsml_guard::contains_dsml_tool_leak(&dsml_leak_blob)
+                && final_stream_error.is_none()
+            {
+                tracing::info!(
+                    protocol = "anthropic",
+                    model = %body.model,
+                    source_client = ?profile.kind,
+                    prompt_hash,
+                    prompt_hash_hex = %prompt_hash_hex,
+                    reasoning_chars = reasoning.len(),
+                    text_chars_would_suppress_dupe,
+                    finish_reason = ?upstream_finish_reason,
+                    "completing stream with reasoning-only assistant output"
+                );
+                if upstream_finish_reason.is_none() {
+                    upstream_finish_reason = Some("end_turn".to_string());
+                }
             } else {
                 let empty_output_class = if !reasoning.trim().is_empty() {
                     if upstream_finish_reason.as_deref() == Some("length") {
@@ -2550,6 +3096,7 @@ async fn handle_stream(
                         );
                     }
                     let tidx = emitted_tool_call_blocks;
+                    anthropic_tool_format_seen = true;
                     yield Ok(Event::default().event("content_block_start").data(serde_json::json!({"type":"content_block_start","index":tidx,"content_block":{"type":"tool_use","id":ct.id,"name":ct.function.name,"input":{}}}).to_string()));
                     emitted_tool_call_blocks = emitted_tool_call_blocks.saturating_add(1);
                     if first_tool_emit_ms == 0 {
@@ -2576,7 +3123,14 @@ async fn handle_stream(
                 emitted_tool_call_indexes.insert(tool.index);
             }
         }
-        let stop_reason = anthropic_stop_reason(upstream_finish_reason.as_deref(), !tool_calls.is_empty());
+        if !tool_calls.is_empty() && emitted_tool_call_indexes.is_empty() {
+            yield Ok(Event::default().event("error").data(serde_json::json!({"type":"error","error":{"type":"api_error","message":"upstream returned incomplete tool call arguments"}}).to_string()));
+            return;
+        }
+        let stop_reason = anthropic_stop_reason(
+            upstream_finish_reason.as_deref(),
+            !emitted_tool_call_indexes.is_empty(),
+        );
         let output_tokens = usage
             .as_ref()
             .and_then(|usage| usage.completion_tokens)
@@ -2629,6 +3183,11 @@ async fn handle_stream(
             idle_ping_count,
             text_chars = text.len(),
             reasoning_chars = reasoning.len(),
+            text_chars_would_suppress_dupe,
+            raw_tool_format = super::dsml_guard::raw_tool_format_label(
+                if anthropic_tool_format_seen { 1 } else { 0 },
+                dsml_leak_detected,
+            ),
             tool_call_count = tool_calls.len(),
             emitted_tool_call_count = emitted_tool_call_indexes.len(),
             output_tokens,
@@ -2669,6 +3228,7 @@ async fn handle_buffered_claude_code_huge_stream(
     let mut used_thinking_disabled_retry = false;
     let mut used_missing_reasoning_enrich_retry = false;
     let mut used_provider_invalid_enrich_retry = false;
+    let mut used_provider_invalid_compat_retry = false;
     let mut used_provider_invalid_text_retry = false;
 
     for attempt in 0..CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
@@ -2709,11 +3269,15 @@ async fn handle_buffered_claude_code_huge_stream(
                     profile,
                     tool_history_repair,
                     used_provider_invalid_enrich_retry || used_missing_reasoning_enrich_retry,
+                    used_provider_invalid_compat_retry,
                     used_provider_invalid_text_retry,
                 ) {
                     match mode {
                         super::ProviderInvalidRetryMode::EnrichReasoning => {
                             used_provider_invalid_enrich_retry = true;
+                        }
+                        super::ProviderInvalidRetryMode::CompatToolUse => {
+                            used_provider_invalid_compat_retry = true;
                         }
                         super::ProviderInvalidRetryMode::TextOnly => {
                             used_provider_invalid_text_retry = true;
@@ -2741,7 +3305,7 @@ async fn handle_buffered_claude_code_huge_stream(
         };
 
         let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
-        let collected = match crate::zen::client::collect_stream_parts(resp).await {
+        let mut collected = match crate::zen::client::collect_stream_parts(resp).await {
             Ok(collected) => collected,
             Err(err) => {
                 tracing::warn!(
@@ -2765,6 +3329,58 @@ async fn handle_buffered_claude_code_huge_stream(
             attempt + 1,
             CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
         );
+        if collected.tool_calls.is_empty()
+            && try_repair_dsml_invoke_leak(
+                &collected.content,
+                &collected.reasoning,
+                &mut collected.tool_calls,
+                cr,
+                profile,
+            )
+        {
+            collected.content.clear();
+        } else if collected.tool_calls.is_empty()
+            && (super::dsml_guard::contains_dsml_tool_leak(&collected.content)
+                || super::dsml_guard::contains_dsml_tool_leak(&collected.reasoning))
+        {
+            tracing::warn!(
+                protocol = "anthropic_buffered",
+                model = %cr.model,
+                source_client = ?profile.kind,
+                attempt = attempt + 1,
+                "ClaudeCode buffered stream guard retrying after unrepaired DSML tool leak"
+            );
+            if attempt + 1 >= CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS {
+                return Err(AppError::new(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    "upstream returned DSML tool markup in text stream",
+                ));
+            }
+            continue;
+        }
+        if collected.tool_calls.is_empty()
+            && super::unfinished_intent::should_retry_unfinished_tool_intent(
+                profile,
+                attempt,
+                CLAUDE_CODE_BUFFERED_STREAM_ATTEMPTS,
+                super::collected_visible_text(&collected),
+                true,
+                cr,
+            )
+        {
+            tracing::warn!(
+                protocol = "anthropic_buffered",
+                model = %cr.model,
+                source_client = ?profile.kind,
+                attempt = attempt + 1,
+                "ClaudeCode buffered stream guard retrying after unfinished tool-intent announcement without a tool call"
+            );
+            if !used_reasoning_enrich_retry {
+                used_reasoning_enrich_retry = true;
+                attempt_body = super::reasoning_retry_body(zb, profile);
+            }
+            continue;
+        }
         let content = response_text_for_profile(profile, super::collected_visible_text(&collected));
         let output_class = super::classify_collected_output(&collected, &content);
         if output_class != super::OutputClass::Valid {
@@ -2931,6 +3547,13 @@ async fn handle_buffered_claude_code_huge_stream(
             .unwrap_or_default()
             .as_millis();
         let has_tool_calls = has_streamable_anthropic_tool_call(&collected.tool_calls, cr, profile);
+        if profile.kind == ClientKind::ClaudeCode
+            && !has_tool_calls
+            && super::unfinished_intent::request_offers_tools(cr)
+            && super::unfinished_intent::looks_like_unfinished_tool_intent(&content)
+        {
+            collected.finish_reason = Some("length".to_string());
+        }
         return Ok(anthropic_buffered_stream_resp(
             ts,
             &cr.model,
@@ -3902,6 +4525,17 @@ mod tests {
     }
 
     #[test]
+    fn thinking_text_duplicate_overlap_detects_substrings_only() {
+        let reasoning = "A".repeat(40);
+        assert_eq!(thinking_text_duplicate_overlap(&reasoning, &reasoning), 40);
+        assert_eq!(thinking_text_duplicate_overlap("short", &reasoning), 0);
+        assert_eq!(
+            thinking_text_duplicate_overlap(&format!("{} tail", reasoning), &reasoning),
+            0
+        );
+    }
+
+    #[test]
     fn stream_guard_retries_completed_reasoning_only_output() {
         let profile = claude_code_profile();
         let no_emitted = std::collections::HashSet::<i64>::new();
@@ -3916,7 +4550,12 @@ mod tests {
         ));
         // No reasoning at all -> plain empty output, not this retry path.
         assert!(!should_retry_stream_completed_reasoning_only(
-            profile, 0, "", &[], &no_emitted, "   "
+            profile,
+            0,
+            "",
+            &[],
+            &no_emitted,
+            "   "
         ));
         // Visible text present -> valid output, never retry.
         assert!(!should_retry_stream_completed_reasoning_only(

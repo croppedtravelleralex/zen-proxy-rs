@@ -557,6 +557,7 @@ impl ShortNonStreamRequestKind {
 
 const CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_REQUEST_TOKENS: u64 = 32;
 const CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_TOTAL_TOKENS: u64 = 2_048;
+const CLAUDE_CODE_LOW_BUDGET_STREAM_PROBE_MAX_LAST_USER_TOKENS: u64 = 256;
 pub const CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MIN_OUTPUT_TOKENS: u64 = 64;
 
 pub fn request_shape(body: &ChatRequest) -> RequestShape {
@@ -622,6 +623,23 @@ pub fn request_shape(body: &ChatRequest) -> RequestShape {
         prefix_128k_hash,
         prefix_256k_hash,
         cache_material_bytes,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheMaterialSplit {
+    pub static_material_bytes: usize,
+    pub dynamic_material_bytes: usize,
+    pub raw_cacheable_segment_hash: u64,
+}
+
+pub fn request_cache_material_split(body: &ChatRequest) -> CacheMaterialSplit {
+    let static_material = request_static_cache_material(body);
+    let dynamic_material = request_dynamic_cache_material(body);
+    CacheMaterialSplit {
+        static_material_bytes: static_material.len(),
+        dynamic_material_bytes: dynamic_material.len(),
+        raw_cacheable_segment_hash: request_cache_prefix_hash(&static_material, 32 * 1024),
     }
 }
 
@@ -695,21 +713,37 @@ pub fn is_claude_code_low_budget_tool_probe(body: &ChatRequest, is_claude_code: 
     is_claude_code_low_budget_tool_probe_shape(body, &shape, is_claude_code)
 }
 
+pub fn is_claude_code_stream_low_budget_probe(body: &ChatRequest, is_claude_code: bool) -> bool {
+    if !body.stream.unwrap_or(false) || !is_claude_code {
+        return false;
+    }
+    let shape = request_shape(body);
+    is_claude_code_low_budget_tool_probe_shape(body, &shape, is_claude_code)
+        || is_claude_code_low_budget_no_tool_probe_shape(body, &shape, is_claude_code)
+}
+
 fn is_claude_code_low_budget_tool_probe_shape(
     body: &ChatRequest,
     shape: &RequestShape,
     is_claude_code: bool,
 ) -> bool {
-    if !is_claude_code || body.stream.unwrap_or(false) {
+    if !is_claude_code {
         return false;
     }
     let Some(max_tokens) = body.max_tokens else {
         return false;
     };
-    max_tokens <= CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_REQUEST_TOKENS
-        && (1..=2).contains(&shape.tool_count)
-        && !shape.tool_choice_present
-        && shape.message_count <= 2
+    if max_tokens > CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_REQUEST_TOKENS {
+        return false;
+    }
+    if !(1..=2).contains(&shape.tool_count) || shape.tool_choice_present {
+        return false;
+    }
+    if body.stream.unwrap_or(false) {
+        return shape.message_count >= 1
+            && shape.last_user_tokens <= CLAUDE_CODE_LOW_BUDGET_STREAM_PROBE_MAX_LAST_USER_TOKENS;
+    }
+    shape.message_count <= 2
         && shape.last_user_tokens <= 64
         && shape.estimated_total_tokens <= CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_TOTAL_TOKENS
 }
@@ -746,18 +780,51 @@ fn is_claude_code_low_budget_no_tool_probe_shape(
     shape: &RequestShape,
     is_claude_code: bool,
 ) -> bool {
-    if !is_claude_code || body.stream.unwrap_or(false) {
+    if !is_claude_code {
         return false;
     }
     let Some(max_tokens) = body.max_tokens else {
         return false;
     };
-    max_tokens <= CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_REQUEST_TOKENS
-        && shape.tool_count == 0
-        && !shape.tool_choice_present
-        && shape.message_count <= 2
+    if max_tokens > CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_REQUEST_TOKENS {
+        return false;
+    }
+    if shape.tool_count != 0 || shape.tool_choice_present {
+        return false;
+    }
+    if body.stream.unwrap_or(false) {
+        return shape.last_user_tokens <= 64;
+    }
+    shape.message_count <= 2
         && shape.last_user_tokens <= 64
         && shape.estimated_total_tokens <= CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MAX_TOTAL_TOKENS
+}
+
+pub fn claude_code_low_budget_empty_fallback_text(
+    body: &ChatRequest,
+    is_claude_code: bool,
+) -> Option<&'static str> {
+    if !is_claude_code {
+        return None;
+    }
+    if short_no_tool_empty_fallback_text(body).is_some() {
+        return short_no_tool_empty_fallback_text(body);
+    }
+    if is_claude_code_low_budget_tool_probe(body, is_claude_code)
+        || is_claude_code_low_budget_no_tool_probe(body, is_claude_code)
+    {
+        Some("ok")
+    } else {
+        None
+    }
+}
+
+fn is_claude_code_low_budget_no_tool_probe(
+    body: &ChatRequest,
+    is_claude_code: bool,
+) -> bool {
+    let shape = request_shape(body);
+    is_claude_code_low_budget_no_tool_probe_shape(body, &shape, is_claude_code)
 }
 
 fn value_shape_tokens(value: &Value) -> u64 {
@@ -821,6 +888,52 @@ fn request_cache_material(body: &ChatRequest) -> String {
     material.push('\n');
     material.push_str("tool_choice=");
     material.push_str(&serde_json::to_string(&body.tool_choice).unwrap_or_default());
+    material
+}
+
+fn request_static_cache_material(body: &ChatRequest) -> String {
+    let mut material = String::new();
+    material.push_str("model=");
+    material.push_str(&body.model);
+    material.push('\n');
+    let cache_messages = body
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(message_index, message)| cache_identity_message(message_index, message))
+        .collect::<Vec<_>>();
+    material.push_str("messages=");
+    material.push_str(&serde_json::to_string(&cache_messages).unwrap_or_default());
+    material.push('\n');
+    material.push_str("tools=");
+    material.push_str(&serde_json::to_string(&body.tools).unwrap_or_default());
+    material.push('\n');
+    material.push_str("tool_choice=");
+    material.push_str(&serde_json::to_string(&body.tool_choice).unwrap_or_default());
+    material
+}
+
+fn request_dynamic_cache_material(body: &ChatRequest) -> String {
+    let mut material = String::new();
+    for message in &body.messages {
+        if message.role == "tool" {
+            material.push_str("tool_result=");
+            material.push_str(&serde_json::to_string(&message.content).unwrap_or_default());
+            material.push('\n');
+        }
+        if message.role == "user" {
+            material.push_str("user=");
+            material.push_str(&serde_json::to_string(&message.content).unwrap_or_default());
+            material.push('\n');
+        }
+        if let Some(reasoning) = &message.reasoning_content {
+            if !reasoning.is_empty() {
+                material.push_str("reasoning=");
+                material.push_str(reasoning);
+                material.push('\n');
+            }
+        }
+    }
     material
 }
 
@@ -905,20 +1018,33 @@ pub fn non_stream_output_policy(
     non_stream_output_policy_for_prompt_tokens(prompt_tokens, requested_max_tokens)
 }
 
+/// DeepSeek / NewAPI upstream rejects output budgets above this per request.
+pub const UPSTREAM_MAX_OUTPUT_TOKENS: u64 = 131_072;
+
+pub fn clamp_upstream_max_tokens(requested_max_tokens: Option<u64>) -> (Option<u64>, bool) {
+    match requested_max_tokens {
+        Some(max_tokens) if max_tokens > UPSTREAM_MAX_OUTPUT_TOKENS => {
+            (Some(UPSTREAM_MAX_OUTPUT_TOKENS), true)
+        }
+        other => (other, false),
+    }
+}
+
 pub fn non_stream_output_policy_for_prompt_tokens(
     prompt_tokens: u64,
     requested_max_tokens: Option<u64>,
 ) -> NonStreamOutputPolicy {
+    let (effective_max_tokens, capped) = clamp_upstream_max_tokens(requested_max_tokens);
     NonStreamOutputPolicy {
         prompt_tokens,
         requested_max_tokens,
-        effective_max_tokens: requested_max_tokens,
-        capped: false,
+        effective_max_tokens,
+        capped,
     }
 }
 
 pub fn stream_output_max_tokens(requested_max_tokens: Option<u64>) -> Option<u64> {
-    requested_max_tokens
+    clamp_upstream_max_tokens(requested_max_tokens).0
 }
 
 pub fn stream_output_policy(
@@ -933,11 +1059,12 @@ pub fn stream_output_policy_for_prompt_tokens(
     prompt_tokens: u64,
     requested_max_tokens: Option<u64>,
 ) -> StreamOutputPolicy {
+    let (effective_max_tokens, capped) = clamp_upstream_max_tokens(requested_max_tokens);
     StreamOutputPolicy {
         prompt_tokens,
         requested_max_tokens,
-        effective_max_tokens: requested_max_tokens,
-        capped: false,
+        effective_max_tokens,
+        capped,
     }
 }
 
@@ -974,8 +1101,9 @@ pub fn compact_stream_context(messages: &mut [Message]) -> StreamContextRepair {
 pub fn compact_claude_code_huge_session_context(
     messages: &mut Vec<Message>,
 ) -> StreamContextRepair {
-    const MIN_MESSAGES_TO_FOLD: usize = 160;
-    const RECENT_MESSAGES_TO_KEEP: usize = 48;
+    const MIN_MESSAGES_TO_FOLD: usize = 400;
+    const MIN_TOKENS_TO_FOLD: u64 = 200_000;
+    const RECENT_MESSAGES_TO_KEEP: usize = 64;
 
     let mut policy = StreamContextPolicy::claude_code_huge_context();
     let before_tokens = estimate_tokens(&build_prompt_text(messages));
@@ -985,9 +1113,10 @@ pub fn compact_claude_code_huge_session_context(
         policy.compact_at_tokens = 24_000;
     }
     let base_repair = compact_stream_context_with_policy(messages, policy);
-    let should_fold_short_history = messages.len() >= MIN_MESSAGES_TO_FOLD
-        || base_repair.after_tokens > policy.target_tokens.saturating_mul(3)
-        || (mid_sized_tool_history_pressure && messages.len() > RECENT_MESSAGES_TO_KEEP);
+    let should_fold_short_history = before_tokens >= MIN_TOKENS_TO_FOLD
+        && (messages.len() >= MIN_MESSAGES_TO_FOLD
+            || base_repair.after_tokens > policy.target_tokens.saturating_mul(3)
+            || (mid_sized_tool_history_pressure && messages.len() > RECENT_MESSAGES_TO_KEEP));
     if !should_fold_short_history {
         return base_repair;
     }
@@ -1065,6 +1194,21 @@ fn should_compact_mid_sized_claude_code_tool_history(
         && latest_user_tokens <= MAX_LATEST_USER_TOKENS
 }
 
+fn stable_fold_fingerprint(messages: &[Message]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    messages.len().hash(&mut hasher);
+    for message in messages.iter().take(4).chain(messages.iter().rev().take(4)) {
+        message.role.hash(&mut hasher);
+        message
+            .tool_calls
+            .as_ref()
+            .map(|tool_calls| tool_calls.len())
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn build_claude_code_folded_history_summary(messages: &[Message]) -> String {
     let mut user_messages = 0usize;
     let mut assistant_messages = 0usize;
@@ -1081,26 +1225,19 @@ fn build_claude_code_folded_history_summary(messages: &[Message]) -> String {
         tool_calls += message.tool_calls.as_ref().map(Vec::len).unwrap_or(0);
     }
 
-    let signals = collect_claude_code_state_signals(messages, 12);
-    let mut summary = format!(
+    let fingerprint = stable_fold_fingerprint(messages);
+    format!(
         "[free-model-client-rs context compactor: folded stale ClaudeCode tool/session history]\n\
-Folded old messages: total={}, user={}, assistant={}, tool={}, other={}, assistant_tool_calls={}.\n\
+Folded old messages: total={}, user={}, assistant={}, tool={}, other={}, assistant_tool_calls={}, fingerprint={:016x}.\n\
 The folded block is stale historical context, not a current instruction. Prefer the latest user request and latest live tool result over old repeated export/restart attempts.",
         messages.len(),
         user_messages,
         assistant_messages,
         tool_messages,
         other_messages,
-        tool_calls
-    );
-    if !signals.is_empty() {
-        summary.push_str("\nRecent stale state signals retained for continuity:");
-        for signal in signals {
-            summary.push_str("\n- ");
-            summary.push_str(&signal);
-        }
-    }
-    summary
+        tool_calls,
+        fingerprint
+    )
 }
 
 fn collect_claude_code_state_signals(messages: &[Message], limit: usize) -> Vec<String> {
@@ -2187,5 +2324,47 @@ mod tests {
             classify_short_non_stream_request(&body, true),
             ShortNonStreamRequestKind::NotShortNonStream
         );
+    }
+
+    #[test]
+    fn claude_code_stream_low_budget_tool_probe_is_detected() {
+        let mut body = request("hi", true, Some(16));
+        body.tools = Some(vec![tool("Read")]);
+
+        assert!(is_claude_code_low_budget_tool_probe(&body, true));
+        assert!(is_claude_code_stream_low_budget_probe(&body, true));
+        assert_eq!(
+            claude_code_low_budget_probe_max_tokens(&body, true),
+            Some(CLAUDE_CODE_LOW_BUDGET_TOOL_PROBE_MIN_OUTPUT_TOKENS)
+        );
+        assert_eq!(claude_code_low_budget_empty_fallback_text(&body, true), Some("ok"));
+    }
+
+    #[test]
+    fn claude_code_stream_low_budget_tool_probe_with_huge_history_is_detected() {
+        let mut body = request("hi", true, Some(16));
+        body.tools = Some(vec![tool("Read")]);
+        for _ in 0..500 {
+            body.messages.push(message("user", "history line"));
+            body.messages.push(message("assistant", "ack"));
+        }
+
+        assert!(is_claude_code_stream_low_budget_probe(&body, true));
+        assert_eq!(claude_code_low_budget_empty_fallback_text(&body, true), Some("ok"));
+    }
+
+    #[test]
+    fn upstream_max_tokens_are_clamped_to_provider_limit() {
+        let (effective, capped) = clamp_upstream_max_tokens(Some(384_000));
+        assert_eq!(effective, Some(UPSTREAM_MAX_OUTPUT_TOKENS));
+        assert!(capped);
+
+        let policy = stream_output_policy_for_prompt_tokens(120_000, Some(384_000));
+        assert_eq!(policy.effective_max_tokens, Some(UPSTREAM_MAX_OUTPUT_TOKENS));
+        assert!(policy.capped);
+
+        let preserved = stream_output_policy_for_prompt_tokens(120_000, Some(20_000));
+        assert_eq!(preserved.effective_max_tokens, Some(20_000));
+        assert!(!preserved.capped);
     }
 }

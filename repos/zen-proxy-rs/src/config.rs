@@ -329,6 +329,7 @@ pub struct Config {
     pub probe_timeout_secs: u64,
     pub probe_connect_timeout_secs: u64,
     pub pool_warm_interval_secs: u64,
+    pub ratelimited_probe_interval_secs: u64,
     pub probe_batch_size: usize,
     pub dispatch_capacity: usize,
     pub active_capacity: usize,
@@ -445,6 +446,12 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
+        let zen_provider_mode = load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy);
+        let protocol_guard_synthetic_ids = if zen_provider_mode == ProviderMode::FreeModelKernel {
+            false
+        } else {
+            load_env_var("PROTOCOL_GUARD_SYNTHETIC_IDS", true)
+        };
         Self {
             port: load_env_var("PORT", 4000u16),
             bind_address: load_env_var("BIND_ADDRESS", "127.0.0.1".to_string()),
@@ -467,6 +474,7 @@ impl Config {
             probe_timeout_secs: load_env_var("PROBE_TIMEOUT_SECS", 30u64),
             probe_connect_timeout_secs: load_env_var("PROBE_CONNECT_TIMEOUT_SECS", 10u64),
             pool_warm_interval_secs: load_env_var("POOL_WARM_INTERVAL_SECS", 10u64),
+            ratelimited_probe_interval_secs: load_env_var("RATELIMITED_PROBE_INTERVAL_SECS", 60u64),
             probe_batch_size: load_env_var("PROBE_BATCH_SIZE", 5usize),
             dispatch_capacity: load_env_var("DISPATCH_CAPACITY", 100usize),
             active_capacity: load_env_var("ACTIVE_CAPACITY", 100usize),
@@ -510,7 +518,7 @@ impl Config {
             audit_log_enabled: load_env_var("AUDIT_LOG_ENABLED", true),
             audit_log_dir: env::var("AUDIT_LOG_DIR")
                 .unwrap_or_else(|_| "/tmp/zen-proxy-audit".into()),
-            zen_provider_mode: load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy),
+            zen_provider_mode,
             free_model_true_first_token_frt: load_env_var("FREE_MODEL_TRUE_FIRST_TOKEN_FRT", true),
             free_model_claude_code_stream_initial_fetch_timeout_secs: load_env_var(
                 "FREE_MODEL_CLAUDE_CODE_STREAM_INITIAL_FETCH_TIMEOUT_SECS",
@@ -654,7 +662,7 @@ impl Config {
                 "PROTOCOL_GUARD_ORPHAN_POLICY",
                 ProtocolGuardOrphanPolicy::Downgrade,
             ),
-            protocol_guard_synthetic_ids: load_env_var("PROTOCOL_GUARD_SYNTHETIC_IDS", true),
+            protocol_guard_synthetic_ids,
             protocol_guard_log_sample_rate: load_env_var("PROTOCOL_GUARD_LOG_SAMPLE_RATE", 1.0f64),
             protocol_guard_max_ms: load_env_var("PROTOCOL_GUARD_MAX_MS", 30u64),
             protocol_guard_max_graph_messages: load_env_var(
@@ -751,6 +759,10 @@ impl Config {
 
     pub fn pool_warm_interval(&self) -> Duration {
         Duration::from_secs(self.pool_warm_interval_secs)
+    }
+
+    pub fn ratelimited_probe_interval(&self) -> Duration {
+        Duration::from_secs(self.ratelimited_probe_interval_secs.max(30))
     }
 
     pub fn sticky_ttl(&self) -> Duration {

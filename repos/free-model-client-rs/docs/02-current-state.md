@@ -1,7 +1,14 @@
 # 当前状态
 
-更新时间：2026-07-15
-分支：`codex/cache-lane-85plus`
+更新时间：2026-08-04
+分支：以本地 `zen-free-model-suite` 工作区为准
+
+## 2026-08-04 panda test（:4011）frt 截断 / empty_output 修复
+
+1. 线上包 **`test-20260804-frt-v5`**，SHA256 `ed6ba3dadb27c82b1af1bc4ca1c017401421cafbfc7fb2adf8a5ccf54834198f`，`dispatch=100, dead=0`（部署后快照）。
+2. 关键修复：`max_tokens` clamp 131072；`EmptyOutput` 不进 dead；移除 `[prior assistant tool call summarized]`；`provider_missing` 恢复 enrich 链；大会话 fold 推迟。
+3. 全量说明见 `docs/diagnosis-2026-08-04-frt-truncation-empty-output-fix.md`。
+4. 约束：仅改 ZenProxy 侧，不改 NewAPI / Pi / Claude Code 端侧。
 
 ## 2026-07-15 ClaudeCode 三模型稳定性
 

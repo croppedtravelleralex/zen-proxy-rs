@@ -146,6 +146,18 @@ pub async fn handle_openai_chat(
     let icp_package =
         super::build_icp_upstream_package(&cr, &upstream_model, profile, &config.zen_api_key);
     let mut zb = icp_package.body;
+    let deepseek_stable_breakpoints =
+        crate::canonical::apply_deepseek_stable_cache_breakpoints(&mut zb, &cr);
+    if deepseek_stable_breakpoints > 0 {
+        tracing::info!(
+            protocol = "openai",
+            model = %cr.model,
+            upstream_model = %upstream_model,
+            source_client = ?profile.kind,
+            cache_control_breakpoints = deepseek_stable_breakpoints,
+            "applied deepseek stable cache_control breakpoints"
+        );
+    }
     let zen_headers = super::zen_session_headers(&icp_package.identity);
     let upstream_headers = super::merge_extra_headers(&config.extra_headers, &zen_headers);
     let thinking_policy = super::apply_initial_thinking_policy(&mut zb, &cr, profile);
@@ -253,12 +265,13 @@ async fn handle_oa_non_stream(
     let request_shape = translate::request_shape(cr);
     let short_request_kind =
         translate::classify_short_non_stream_request(cr, profile.kind == ClientKind::ClaudeCode);
-    let (collected, content) = {
+    let (mut collected, content) = {
         let mut last_empty = false;
         let mut last_empty_class = None;
         let mut used_reasoning_enrich_retry = false;
         let mut used_missing_reasoning_enrich_retry = false;
         let mut used_provider_invalid_enrich_retry = false;
+        let mut used_provider_invalid_compat_retry = false;
         let mut used_provider_invalid_text_retry = false;
         let mut attempt_body = zb.clone();
         let mut output = None;
@@ -294,11 +307,15 @@ async fn handle_oa_non_stream(
                         profile,
                         tool_history_repair,
                         used_provider_invalid_enrich_retry || used_missing_reasoning_enrich_retry,
+                        used_provider_invalid_compat_retry,
                         used_provider_invalid_text_retry,
                     ) {
                         match mode {
                             super::ProviderInvalidRetryMode::EnrichReasoning => {
                                 used_provider_invalid_enrich_retry = true;
+                            }
+                            super::ProviderInvalidRetryMode::CompatToolUse => {
+                                used_provider_invalid_compat_retry = true;
                             }
                             super::ProviderInvalidRetryMode::TextOnly => {
                                 used_provider_invalid_text_retry = true;
@@ -323,7 +340,7 @@ async fn handle_oa_non_stream(
             };
             let cache_signals = ProviderCacheSignals::from_response_headers(resp.headers());
             observed_exit_ip = resp.headers().get("x-zen-observed-exit-ip").cloned();
-            let collected = crate::zen::client::collect_stream_parts(resp).await?;
+            let mut collected = crate::zen::client::collect_stream_parts(resp).await?;
             let cache_signals = cache_signals.with_body_usage(collected.usage.as_ref());
             super::log_provider_cache_observation(
                 "openai",
@@ -333,6 +350,54 @@ async fn handle_oa_non_stream(
                 attempt + 1,
                 NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
             );
+            if collected.tool_calls.is_empty()
+                && try_repair_openai_dsml_invoke_leak(
+                    &collected.content,
+                    &collected.reasoning,
+                    &mut collected.tool_calls,
+                )
+            {
+                collected.content.clear();
+            } else if collected.tool_calls.is_empty()
+                && (super::dsml_guard::contains_dsml_tool_leak(&collected.content)
+                    || super::dsml_guard::contains_dsml_tool_leak(&collected.reasoning))
+            {
+                last_empty = true;
+                last_empty_class = Some(super::OutputClass::Empty);
+                tracing::warn!(
+                    protocol = "openai",
+                    model = %cr.model,
+                    source_client = ?profile.kind,
+                    attempt = attempt + 1,
+                    "retrying after unrepaired DSML tool leak"
+                );
+                continue;
+            }
+            if collected.tool_calls.is_empty()
+                && super::unfinished_intent::should_retry_unfinished_tool_intent(
+                    profile,
+                    attempt,
+                    NON_STREAM_EMPTY_UPSTREAM_ATTEMPTS,
+                    super::collected_visible_text(&collected),
+                    true,
+                    cr,
+                )
+            {
+                last_empty = true;
+                last_empty_class = Some(super::OutputClass::NoForwardable);
+                tracing::warn!(
+                    protocol = "openai",
+                    model = %cr.model,
+                    source_client = ?profile.kind,
+                    attempt = attempt + 1,
+                    "retrying after unfinished tool-intent announcement without a tool call"
+                );
+                if !used_reasoning_enrich_retry {
+                    used_reasoning_enrich_retry = true;
+                    attempt_body = super::reasoning_retry_body(zb, profile);
+                }
+                continue;
+            }
             let content =
                 response_text_for_profile(profile, super::collected_visible_text(&collected));
             let output_class = super::classify_collected_output(&collected, &content);
@@ -408,6 +473,13 @@ async fn handle_oa_non_stream(
             ));
         }
     };
+    if profile.kind == ClientKind::ClaudeCode
+        && collected.tool_calls.is_empty()
+        && super::unfinished_intent::request_offers_tools(cr)
+        && super::unfinished_intent::looks_like_unfinished_tool_intent(&content)
+    {
+        collected.finish_reason = Some("length".to_string());
+    }
     let prompt = translate::build_prompt_text(&cr.messages);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -598,14 +670,15 @@ fn append_openai_usage_metadata(
     let Some(usage) = usage else {
         return;
     };
+    let prompt_tokens = usage_json
+        .get("prompt_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| usage.prompt_tokens.unwrap_or(0));
     if let Some(details) = usage.prompt_tokens_details.clone() {
         usage_json["prompt_tokens_details"] = details;
     }
     if let Some(cache_read) = cache_read_tokens(Some(usage)) {
-        usage_json["cache_read_input_tokens"] = serde_json::json!(cache_read);
-        // OpenAI-compatible aggregation: new-api / one-api parse cache hits
-        // exclusively from prompt_tokens_details.cached_tokens. Upstream reports
-        // hits via cache_read_input_tokens; mirror into the standard field.
+        // NewAPI / CCSwitch: cache_tokens / prompt_tokens from prompt_tokens_details.cached_tokens.
         let details_obj = if let Some(existing) = usage_json
             .get_mut("prompt_tokens_details")
             .and_then(serde_json::Value::as_object_mut)
@@ -618,15 +691,64 @@ fn append_openai_usage_metadata(
                 .and_then(serde_json::Value::as_object_mut)
         };
         if let Some(obj) = details_obj {
-            obj.insert("cached_tokens".into(), serde_json::json!(cache_read));
+            let cached = newapi_cached_tokens_for_prompt(prompt_tokens, usage).unwrap_or(cache_read);
+            obj.insert("cached_tokens".into(), serde_json::json!(cached));
         }
     }
-    if let Some(cache_creation) = usage.cache_creation_input_tokens {
-        usage_json["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
+}
+
+fn openai_usage_has_scale_mismatch(
+    prompt_tokens: u64,
+    cache_read: u64,
+    cache_creation: u64,
+) -> bool {
+    if cache_read == 0 {
+        return false;
     }
-    if let Some(cache_miss) = cache_miss_tokens(Some(usage)) {
-        usage_json["cache_miss_input_tokens"] = serde_json::json!(cache_miss);
+    let billable_sum = cache_read + cache_creation;
+    prompt_tokens > billable_sum.saturating_add(512) && prompt_tokens > billable_sum * 2
+}
+
+fn openai_marginal_uncached_tokens(
+    prompt_tokens: u64,
+    usage: &crate::zen::client::ZenUsage,
+) -> Option<u64> {
+    let cache_read = usage.cache_read_tokens().unwrap_or(0);
+    let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
+    if !openai_usage_has_scale_mismatch(prompt_tokens, cache_read, cache_creation) {
+        return cache_miss_tokens(Some(usage));
     }
+    if let Some(miss) = cache_miss_tokens(Some(usage)) {
+        let full_scale_miss = prompt_tokens
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_creation);
+        if miss < full_scale_miss && miss <= prompt_tokens / 4 {
+            return Some(miss);
+        }
+    }
+    let inferred_marginal_miss = prompt_tokens.saturating_sub(cache_read.saturating_mul(2));
+    if inferred_marginal_miss > 0 && inferred_marginal_miss < prompt_tokens / 4 {
+        return Some(inferred_marginal_miss);
+    }
+    None
+}
+
+fn newapi_cached_tokens_for_prompt(
+    prompt_tokens: u64,
+    usage: &crate::zen::client::ZenUsage,
+) -> Option<u64> {
+    let cache_read = usage.cache_read_tokens().unwrap_or(0);
+    let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
+    if cache_read == 0 {
+        return usage.prompt_cached_tokens();
+    }
+    if let Some(marginal_uncached) = openai_marginal_uncached_tokens(prompt_tokens, usage) {
+        return Some(prompt_tokens.saturating_sub(marginal_uncached));
+    }
+    if !openai_usage_has_scale_mismatch(prompt_tokens, cache_read, cache_creation) {
+        return Some(cache_read);
+    }
+    None
 }
 
 fn cache_read_tokens(usage: Option<&crate::zen::client::ZenUsage>) -> Option<u64> {
@@ -758,6 +880,7 @@ async fn handle_oa_stream(
                 role_sent = true;
             }
             let mut text = String::new();
+            let mut held_visible = String::new();
             let mut reasoning = String::new();
             let mut markdown_guard = if profile.preserves_model_text_exactly() {
                 None
@@ -768,6 +891,10 @@ async fn handle_oa_stream(
             let mut usage: Option<crate::zen::client::ZenUsage> = None;
             let mut upstream_finish_reason: Option<String> = None;
             let mut stream_error: Option<String> = None;
+            let mut dsml_text_holdback = String::new();
+            let mut dsml_reasoning_holdback = String::new();
+            let mut dsml_leak_blob = String::new();
+            let mut dsml_leak_detected = false;
             while let Some(event) = upstream.next().await {
                 let event = match event {
                     Ok(event) => event,
@@ -786,6 +913,21 @@ async fn handle_oa_stream(
                         }
                         let Some(delta) = choice.delta else { continue; };
                         if let Some(content) = delta.content {
+                            let (maybe_emit, leaked) = super::dsml_guard::take_emittable_text(
+                                &mut dsml_text_holdback,
+                                &content,
+                            );
+                            if leaked {
+                                dsml_leak_detected = true;
+                                dsml_leak_blob.push_str(&dsml_text_holdback);
+                                tracing::warn!(
+                                    protocol = "openai",
+                                    model = %body.model,
+                                    source_client = ?profile.kind,
+                                    content_len = content.len(),
+                                    "withheld upstream DSML tool markup from text stream"
+                                );
+                            } else if let Some(content) = maybe_emit {
                             let content = if let Some(markdown_guard) = markdown_guard.as_mut() {
                                 markdown_guard.push(&crate::redact::redact_text(&content))
                             } else {
@@ -795,16 +937,42 @@ async fn handle_oa_stream(
                                 !content.trim().is_empty()
                                     || (profile.preserves_stream_whitespace() && !content.is_empty());
                             if should_emit {
+                                if let Some(flush) = super::unfinished_intent::push_visible_chunk(
+                                    &mut held_visible,
+                                    &text,
+                                    &content,
+                                    profile,
+                                    &body,
+                                    tool_calls.is_empty(),
+                                ) {
                                 if !role_sent {
                                     yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
                                     role_sent = true;
                                 }
-                                text.push_str(&content);
-                                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}).to_string()));
+                                text.push_str(&flush);
+                                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":flush},"finish_reason":null}]}).to_string()));
+                                }
+                            }
                             }
                         }
                         if let Some(reasoning_content) = delta.reasoning_content {
-                            reasoning.push_str(&reasoning_content);
+                            let (maybe_emit, leaked) = super::dsml_guard::take_emittable_text(
+                                &mut dsml_reasoning_holdback,
+                                &reasoning_content,
+                            );
+                            if leaked {
+                                dsml_leak_detected = true;
+                                dsml_leak_blob.push_str(&dsml_reasoning_holdback);
+                                tracing::warn!(
+                                    protocol = "openai",
+                                    model = %body.model,
+                                    source_client = ?profile.kind,
+                                    content_len = reasoning_content.len(),
+                                    "withheld upstream DSML tool markup from reasoning stream"
+                                );
+                            } else if let Some(emit) = maybe_emit {
+                                reasoning.push_str(&emit);
+                            }
                         }
                         if let Some(items) = delta.tool_calls {
                             merge_tool_deltas(&mut tool_calls, items);
@@ -829,6 +997,45 @@ async fn handle_oa_stream(
                 yield Ok(Event::default().data("[DONE]"));
                 return;
             }
+            let (text_tail, text_leaked) =
+                super::dsml_guard::flush_holdback(&mut dsml_text_holdback);
+            if text_leaked {
+                dsml_leak_detected = true;
+                dsml_leak_blob.push_str(&dsml_text_holdback);
+            } else if let Some(tail) = text_tail.filter(|tail| !tail.is_empty()) {
+                let tail = if let Some(markdown_guard) = markdown_guard.as_mut() {
+                    markdown_guard.push(&crate::redact::redact_text(&tail))
+                } else {
+                    tail
+                };
+                let should_emit = !tail.trim().is_empty()
+                    || (profile.preserves_stream_whitespace() && !tail.is_empty());
+                if should_emit {
+                    if let Some(flush) = super::unfinished_intent::push_visible_chunk(
+                        &mut held_visible,
+                        &text,
+                        &tail,
+                        profile,
+                        &body,
+                        tool_calls.is_empty(),
+                    ) {
+                    if !role_sent {
+                        yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                        role_sent = true;
+                    }
+                    text.push_str(&flush);
+                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":flush},"finish_reason":null}]}).to_string()));
+                    }
+                }
+            }
+            let (reason_tail, reason_leaked) =
+                super::dsml_guard::flush_holdback(&mut dsml_reasoning_holdback);
+            if reason_leaked {
+                dsml_leak_detected = true;
+                dsml_leak_blob.push_str(&dsml_reasoning_holdback);
+            } else if let Some(tail) = reason_tail {
+                reasoning.push_str(&tail);
+            }
             let final_markdown = markdown_guard
                 .as_mut()
                 .map(crate::proxy::markdown::MarkdownFenceGuard::finish)
@@ -840,6 +1047,73 @@ async fn handle_oa_stream(
                 }
                 text.push_str(&final_markdown);
                 yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":final_markdown},"finish_reason":null}]}).to_string()));
+            }
+            let dsml_blob = super::dsml_guard::dsml_source_blob(&reasoning, &dsml_leak_blob);
+            if try_repair_openai_dsml_invoke_leak(&text, &dsml_blob, &mut tool_calls) {
+                tracing::info!(
+                    protocol = "openai",
+                    model = %body.model,
+                    source_client = ?profile.kind,
+                    attempt,
+                    tool_name = %tool_calls[0].name,
+                    "repaired upstream DSML invoke XML leak into openai tool_calls"
+                );
+            } else if (dsml_leak_detected
+                || super::dsml_guard::contains_dsml_tool_leak(&text)
+                || super::dsml_guard::contains_dsml_tool_leak(&dsml_blob))
+                && tool_calls.is_empty()
+            {
+                if !role_sent && attempt < max_attempts {
+                    tracing::warn!(
+                        protocol = "openai",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        attempt,
+                        max_attempts,
+                        "retrying openai stream after unrepaired DSML tool leak"
+                    );
+                    if profile.kind == ClientKind::ClaudeCode {
+                        attempt_body = super::compat_tool_use_retry_body(&attempt_body);
+                    }
+                    continue;
+                }
+                yield Ok(Event::default().data(serde_json::json!({"error":{"message":"upstream returned DSML tool markup in text stream"}}).to_string()));
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
+            let combined_visible =
+                super::unfinished_intent::combined_visible_text(&text, &held_visible);
+            if text.trim().is_empty()
+                && super::unfinished_intent::should_retry_unfinished_tool_intent(
+                    profile,
+                    attempt.saturating_sub(1),
+                    max_attempts,
+                    &combined_visible,
+                    tool_calls.is_empty(),
+                    &body,
+                )
+            {
+                tracing::warn!(
+                    protocol = "openai",
+                    model = %body.model,
+                    source_client = ?profile.kind,
+                    attempt,
+                    max_attempts,
+                    "retrying openai stream after unfinished tool-intent announcement without a tool call"
+                );
+                if profile.kind == ClientKind::ClaudeCode {
+                    attempt_body = super::reasoning_retry_body(&base_body, profile);
+                }
+                continue;
+            }
+            if !held_visible.is_empty() {
+                let flush = std::mem::take(&mut held_visible);
+                if !role_sent {
+                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                    role_sent = true;
+                }
+                text.push_str(&flush);
+                yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":flush},"finish_reason":null}]}).to_string()));
             }
             if text.trim().is_empty() && tool_calls.is_empty() {
                 let empty_output_class = if !reasoning.trim().is_empty() {
@@ -857,7 +1131,24 @@ async fn handle_oa_stream(
                 } else {
                     super::log_provider_cache_observation("openai", &body, profile, &cache_signals, attempt, max_attempts);
                 }
-                if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body) {
+                if let Some(bridge_text) =
+                    super::stream_reasoning_visible_text_bridge(&text, &reasoning, 0)
+                {
+                    tracing::info!(
+                        protocol = "openai",
+                        model = %body.model,
+                        source_client = ?profile.kind,
+                        reasoning_chars = reasoning.len(),
+                        bridge_chars = bridge_text.len(),
+                        "bridging streamed reasoning into visible openai content"
+                    );
+                    if !role_sent {
+                        yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":m,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}).to_string()));
+                        role_sent = true;
+                    }
+                    text.push_str(&bridge_text);
+                    yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"content":bridge_text},"finish_reason":null}]}).to_string()));
+                } else if let Some(fallback_text) = translate::short_no_tool_empty_fallback_text(&body) {
                     tracing::warn!(
                         model = body.model,
                         source_client = ?profile.kind,
@@ -918,6 +1209,13 @@ async fn handle_oa_stream(
                 let tc = synthesis::tool::canonicalize_tool_call_name(&tc, &body);
                 yield Ok(Event::default().data(serde_json::json!({"id":id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"tool_calls":[{"index":tool.index,"id":tc.id,"type":"function","function":{"name":tc.function.name,"arguments":tc.function.arguments}}]},"finish_reason":null}]}).to_string()));
             }
+            if profile.kind == ClientKind::ClaudeCode
+                && tool_calls.is_empty()
+                && super::unfinished_intent::request_offers_tools(&body)
+                && super::unfinished_intent::looks_like_unfinished_tool_intent(&text)
+            {
+                upstream_finish_reason = Some("length".to_string());
+            }
             let finish_reason = openai_finish_reason(upstream_finish_reason.as_deref(), !tool_calls.is_empty());
             let mut final_chunk = serde_json::json!({
                 "id": id, "object": "chat.completion.chunk", "created": created,
@@ -930,18 +1228,7 @@ async fn handle_oa_stream(
                 let ct = usage.completion_tokens.unwrap_or_else(|| if !text.trim().is_empty() { estimate(&text) } else { estimate(&tool_calls.iter().map(|tool| format!("{} {}", tool.name, tool.arguments)).collect::<Vec<_>>().join("\n")).max(1) });
                 let total = usage.total_tokens.unwrap_or(pt + ct);
                 final_chunk["usage"] = serde_json::json!({"prompt_tokens":pt,"completion_tokens":ct,"total_tokens":total});
-                if let Some(ref details) = usage.prompt_tokens_details {
-                    final_chunk["usage"]["prompt_tokens_details"] = details.clone();
-                }
-                if let Some(cache_read) = cache_read_tokens(Some(&usage)) {
-                    final_chunk["usage"]["cache_read_input_tokens"] = serde_json::json!(cache_read);
-                }
-                if let Some(cache_creation) = usage.cache_creation_input_tokens {
-                    final_chunk["usage"]["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
-                }
-                if let Some(cache_miss) = cache_miss_tokens(Some(&usage)) {
-                    final_chunk["usage"]["cache_miss_input_tokens"] = serde_json::json!(cache_miss);
-                }
+                append_openai_usage_metadata(&mut final_chunk["usage"], Some(&usage));
             } else {
                 super::log_provider_cache_observation("openai", &body, profile, &cache_signals, attempt, max_attempts);
             }
@@ -977,6 +1264,36 @@ fn is_mimo_v25_model(model: &str) -> bool {
         .map(|ch| ch.to_ascii_lowercase())
         .collect();
     matches!(normalized.as_str(), "mimov25" | "mimov25free")
+}
+
+fn try_repair_openai_dsml_invoke_leak(
+    text: &str,
+    reasoning: &str,
+    tool_calls: &mut Vec<crate::zen::client::CollectedToolCall>,
+) -> bool {
+    if !tool_calls.is_empty() {
+        return false;
+    }
+    let blob = super::dsml_guard::dsml_source_blob(reasoning, text);
+    if !super::dsml_guard::contains_dsml_tool_leak(&blob) {
+        return false;
+    }
+    let Some((name, arguments)) = super::dsml_repair::repair_invoke_leak(&blob) else {
+        return false;
+    };
+    if name.trim().is_empty() {
+        return false;
+    }
+    if serde_json::from_str::<Value>(&arguments).is_err() {
+        return false;
+    }
+    tool_calls.push(crate::zen::client::CollectedToolCall {
+        index: 0,
+        id: None,
+        name,
+        arguments,
+    });
+    true
 }
 
 fn merge_tool_deltas(

@@ -184,6 +184,9 @@ fn provider_error_message_summary(body_text: &str) -> Option<String> {
     if ["opencode", "zen", "internal proxy", "proxy route"]
         .iter()
         .any(|marker| normalized.contains(marker))
+        || normalized.contains("no proxy resources")
+        || normalized.contains("circuit open")
+        || normalized.contains("proxy node budget")
     {
         return None;
     }
@@ -200,6 +203,20 @@ fn public_upstream_message(
     body_text: &str,
     upstream_error_kind: UpstreamErrorKind,
 ) -> String {
+    let lower = body_text.to_ascii_lowercase();
+    if lower.contains("no proxy resources available") {
+        return "upstream proxy pool temporarily unavailable (code=proxy_pool_exhausted)"
+            .to_string();
+    }
+    if lower.contains("circuit open") {
+        return "upstream proxy circuit open due to rate limiting (code=proxy_circuit_open)"
+            .to_string();
+    }
+    if lower.contains("service temporarily unavailable") {
+        return format!(
+            "upstream proxy temporarily unavailable (status={status}, code=proxy_unavailable)"
+        );
+    }
     match upstream_error_kind {
         UpstreamErrorKind::MissingReasoningContent => {
             "upstream provider rejected transformed tool-history request (code=provider_missing_reasoning_content)".to_string()

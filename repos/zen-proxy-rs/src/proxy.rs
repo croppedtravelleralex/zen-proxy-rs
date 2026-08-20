@@ -268,6 +268,10 @@ pub async fn proxy_handler(
                     "upstream_error".to_string()
                 },
                 failure_message: String::new(),
+                empty_output_class: String::new(),
+                raw_tool_format: String::new(),
+                text_chars: 0,
+                reasoning_chars: 0,
                 retry_chain: Vec::new(),
                 context: None,
             };
@@ -295,12 +299,13 @@ pub async fn proxy_handler(
                 999 => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     -999,
-                    "no proxy resources available".into(),
+                    "Service temporarily unavailable; retry later".into(),
                 ),
                 998 => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     -998,
-                    "circuit open: upstream rate limit detected".into(),
+                    "Service temporarily unavailable due to upstream rate limiting; retry later"
+                        .into(),
                 ),
                 _ => (
                     StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),

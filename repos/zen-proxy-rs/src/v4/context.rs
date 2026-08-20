@@ -315,7 +315,13 @@ fn should_compact(conf: &Config, profile: &ContextProfile) -> bool {
 fn model_disables_input_compaction(body: &Value) -> bool {
     matches!(
         body.get("model").and_then(Value::as_str),
-        Some("deepseek-v4-flash" | "deepseek-v4-flash-free")
+        Some(
+            "deepseek-v4-flash"
+                | "deepseek-v4-flash-free"
+                | "big-pickle"
+                | "mimo-v2.5"
+                | "mimo-v2.5-free"
+        )
     )
 }
 
@@ -430,7 +436,7 @@ fn collapse_old_prefix(conf: &Config, body: &mut Value, trace: &mut Vec<String>)
         rebuilt.push(json!({
             "role": "user",
             "content": format!(
-                "[ZenProxy context compactor: omitted {} older messages; bytes={}; sha256={}]",
+                "[context compacted: omitted {} older messages; bytes={}; id={}]",
                 omitted_count,
                 old_bytes,
                 short_hash(&old_hash)
@@ -645,7 +651,7 @@ fn replacement_text(
         ),
     );
     format!(
-        "[ZenProxy context compactor: omitted old {}; bytes={}; sha256={}; cache={}]\n{}\n...\n{}",
+        "[context compacted: omitted old {}; bytes={}; id={}; cache={}]\n{}\n...\n{}",
         kind,
         original.len(),
         short_hash(&hash),
@@ -996,7 +1002,7 @@ mod tests {
         let cfg = test_config(CompactorMode::Observe);
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "big-pickle",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "tool", "content": big},
                 {"role": "user", "content": "latest"}
@@ -1048,7 +1054,7 @@ mod tests {
         let cfg = test_config(CompactorMode::Enforce);
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "big-pickle",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "tool", "content": big},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1067,7 +1073,7 @@ mod tests {
         assert!(messages[0]["content"]
             .as_str()
             .unwrap()
-            .contains("ZenProxy context compactor"));
+            .contains("[context compacted"));
     }
 
     #[test]
@@ -1076,7 +1082,7 @@ mod tests {
         cfg.context_preserve_recent_messages = 8;
         let big = "x".repeat(2 * MIB);
         let body = json!({
-            "model": "big-pickle",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "tool", "content": big, "tool_call_id": "old-tool"},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1091,7 +1097,7 @@ mod tests {
         assert!(messages[0]["content"]
             .as_str()
             .unwrap()
-            .contains("ZenProxy context compactor"));
+            .contains("[context compacted"));
     }
 
     #[test]
@@ -1103,7 +1109,7 @@ mod tests {
             "x".repeat(2 * MIB)
         );
         let body = json!({
-            "model": "big-pickle",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "tool", "content": big, "tool_call_id": "old-tool"},
                 {"role": "assistant", "content": "recent assistant"},
@@ -1113,7 +1119,7 @@ mod tests {
         let original = serialized_len(&body);
         let plan = govern_request(&cfg, "chat/completions", body, original).unwrap();
         let compacted = plan.body["messages"][0]["content"].as_str().unwrap();
-        assert!(compacted.contains("ZenProxy context compactor"));
+        assert!(compacted.contains("[context compacted"));
         assert!(compacted.contains("[markdown fence backticks x3]"));
         assert!(compacted.contains("[markdown fence tildes x3]"));
         assert!(!compacted.contains("```"));
@@ -1126,7 +1132,7 @@ mod tests {
         cfg.context_token_target = 100;
         cfg.context_token_compact = 100;
         let body = json!({
-            "model": "big-pickle",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "user", "content": "x".repeat(2 * 1024)}
             ]
@@ -1144,7 +1150,7 @@ mod tests {
         cfg.context_token_target = 1_000;
         cfg.context_token_compact = 100;
         let body = json!({
-            "model": "big-pickle",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "user", "content": "x".repeat(2 * MIB)},
                 {"role": "assistant", "content": "old assistant"},
@@ -1159,7 +1165,7 @@ mod tests {
         assert!(messages[0]["content"]
             .as_str()
             .unwrap()
-            .contains("ZenProxy context compactor"));
+            .contains("[context compacted"));
     }
 
     #[test]
@@ -1181,7 +1187,7 @@ mod tests {
         assert_eq!(plan.before.body_bytes, plan.after.body_bytes);
         assert!(!plan.telemetry().trimmed);
         let content = plan.body["messages"][0]["content"].as_str().unwrap();
-        assert!(!content.contains("ZenProxy context compactor"));
+        assert!(!content.contains("[context compacted"));
     }
 
     #[test]
@@ -1206,6 +1212,42 @@ mod tests {
             plan.body["messages"][0]["content"].as_str().unwrap().len(),
             2 * 1024
         );
+    }
+
+    #[test]
+    fn newly_disabled_models_skip_input_compaction_and_token_wall() {
+        for model in ["big-pickle", "mimo-v2.5", "mimo-v2.5-free"] {
+            let mut cfg = test_config(CompactorMode::Enforce);
+            cfg.context_preserve_recent_messages = 8;
+            cfg.context_token_target = 100;
+            cfg.context_token_compact = 100;
+            let big = "x".repeat(2 * MIB);
+            let body = json!({
+                "model": model,
+                "messages": [
+                    {"role": "tool", "content": big, "tool_call_id": "old-tool"},
+                    {"role": "assistant", "content": "recent assistant"},
+                    {"role": "user", "content": "x".repeat(2 * 1024)}
+                ]
+            });
+            let original_body = body.clone();
+            let original = serialized_len(&body);
+            let plan = govern_request(&cfg, "chat/completions", body, original).unwrap();
+            assert_eq!(plan.action, ContextAction::Warn, "{model}");
+            assert!(
+                plan.before.estimated_prompt_tokens > cfg.context_token_target,
+                "{model}"
+            );
+            assert_eq!(plan.before.body_bytes, plan.after.body_bytes, "{model}");
+            assert_eq!(plan.body, original_body, "{model}");
+            assert!(!plan.telemetry().trimmed, "{model}");
+            assert!(
+                plan.trace
+                    .iter()
+                    .any(|item| item.contains("input compaction/token wall")),
+                "{model}"
+            );
+        }
     }
 
     #[test]

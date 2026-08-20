@@ -29,3 +29,23 @@ test-records/runs/
 # Artifact drop zone; keep the directory documented but do not commit raw outputs.
 artifacts/*
 !artifacts/README.md
+
+# Open-source export lives in its own git repo under dist/zen-proxy-rs
+dist/
+
+# Local scratch / one-off deploy probes (never commit)
+.panda_*.sh
+.panda_check.sh
+.panda_tmp.sh
+tmp_test_*.sh
+panda_audit_*.py
+panda_query_out.txt
+commit_msg_*.txt
+commit_result.txt
+last_commit.txt
+git_diff.txt
+git_log.txt
+git_report.txt
+git_staged.txt
+status_sb.txt
+nul

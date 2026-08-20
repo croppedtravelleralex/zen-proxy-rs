@@ -612,3 +612,22 @@
   - 这说明当前 10k no-session 独立 ClaudeCode 进程的主要瓶颈不是 header/session affinity 已完全失效，而是 provider 所见 cache material 前缀仍含动态内容或工具 envelope 分组不稳；必须先定位请求体动态前缀来源。
 - 风险：Windows bridge 的 `mimo-v2.5` smoke 报告为 pass/slow_pass，但远端 ingress 仍是 `deepseek-v4-flash`，不能作为真实 mimo 验收；WSL `claude` 当前是 clawgod launcher，不是 official ClaudeCode。
 - 下一步：用有效且不泄露的 admin/audit 或日志链路补 affinity_hit 真实统计；固定真实 mimo ClaudeCode 入口；重跑 mimo Bash/WebFetch/WebSearch x text/json/stream-json；单独分析 `max_tokens=64` reasoning-only 请求是否有不降质的窄处理空间；另外针对 Windows ClaudeCode no-session 独立进程，优先做请求体动态前缀 diff/canonicalization 研究，只有 `prefix_4k/32k` 在远端稳定后再升 50rpm 或进入 50k/100k/200k 桶。
+
+### FMC 智能分块（DeepSeek 长 user cache 天花板）
+
+- 状态：✅ **已部署 panda test :4011**（`test-20260801-fmc-chunking`，2026-08-01 20:58 CST）；⏳ Round3 回归。
+- 背景：prog-bulk Round2 ch109 cache **69.7%**；题轮 API `cache_read/prompt` 稳定 **~50%**。根因是 bulk+suffix 在同一条 user 块且整条打 `cache_control`，不是缺 TRF。
+- 已实现：`canonical/mod.rs` — `split_user_text_stable_tail`、`add_cache_control_to_last_user_with_intelligent_chunking`（64KB 阈值、` ```rust ` 围栏优先、128KB 回退切分）。
+- 待办：
+  1. 构建并部署 FMC 到 panda **zen-proxy-rs-test :4011**（单变量，不与 TRF/async/late-EO 打包）。
+  2. Round3：`run_prog_bulk_context_gate.py` 回归，目标 ch109 cache ≥85%、gate_pass 保持 true。
+  3. 2h ch109 窗口验收后再 prod 三实例。
+- 非目标：不改验收脚本冒充生产修复；不与 TRF/async audit/late-EO 打包。
+
+### zen-proxy-rs-test（:4011）502 empty_output / 截断
+
+- 状态：**frt-v6 已部署 panda :4011**（2026-08-04 18:01 CST）。详见 `docs/diagnosis-2026-08-04-frt-truncation-empty-output-fix.md`。
+- **DSML / invoke（frt-v6）**：holdback、`subagent_type`、invoke XML → `tool_use`。
+- **502 深入排查（2026-08-04 19:21，ch189）**：CloseAPI `502 upstream returned no assistant content` **主因 = 上游 429 限流**（~211k 会话），ZenProxy 误标 `empty_output`；待 frt-v7 将 SSE `rate_limit_error` 映射为 **429**。
+- **用户验收（frt-v5 窗口）**：Claude / Pi 无截断体感；大会话仍可能遇限流 502 串。
+- **替换生产**：可 canary；限流误报 + type5 压降后再全量。

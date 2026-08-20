@@ -7,3 +7,4 @@ pub mod model_probe;
 pub mod model_probe_runner;
 pub mod protocol_guard;
 pub mod provider;
+pub mod request_repair;

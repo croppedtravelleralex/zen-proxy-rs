@@ -697,6 +697,7 @@ impl DispatchPool {
         nodes: &[PoolNode],
         meta: &RequestMeta,
         now: i64,
+        exclude: &[NodeId],
     ) -> Option<NodeRef> {
         let sample_count = nodes.len().min(8);
         if sample_count == 0 {
@@ -708,6 +709,9 @@ impl DispatchPool {
         for _ in 0..sample_count {
             let idx = fastrand::usize(..nodes.len());
             let node = &nodes[idx];
+            if !exclude.is_empty() && exclude.contains(&node.node.id) {
+                continue;
+            }
             let concurrent_now = node.active_leases.load(Ordering::Relaxed);
             let max_concurrent = node.max_concurrent.load(Ordering::Relaxed);
             if node
@@ -750,19 +754,23 @@ impl DispatchPool {
         shard_idx: usize,
         meta: &RequestMeta,
         now: i64,
+        exclude: &[NodeId],
     ) -> Option<NodeRef> {
         let nodes = self.shards[shard_idx].nodes.read().unwrap();
         if nodes.is_empty() {
             return None;
         }
 
-        if let Some(node) = self.try_sampled_acquire(&nodes, meta, now) {
+        if let Some(node) = self.try_sampled_acquire(&nodes, meta, now, exclude) {
             return Some(node);
         }
 
         let eligible: Vec<&PoolNode> = nodes
             .iter()
             .filter(|node| {
+                if !exclude.is_empty() && exclude.contains(&node.node.id) {
+                    return false;
+                }
                 let concurrent_now = node.active_leases.load(Ordering::Relaxed);
                 let max_concurrent = node.max_concurrent.load(Ordering::Relaxed);
                 node.budget
@@ -773,7 +781,12 @@ impl DispatchPool {
             })
             .collect();
         if eligible.is_empty() {
-            for node in nodes.iter() {
+            // Trigger cooldown state transitions on non-excluded nodes that are
+            // over budget so diagnostics reflect the real blocking reason.
+            for node in nodes
+                .iter()
+                .filter(|n| exclude.is_empty() || !exclude.contains(&n.node.id))
+            {
                 let _ = node.try_admit(meta, now);
             }
             return None;
@@ -803,11 +816,19 @@ impl DispatchPool {
         None
     }
 
-    fn acquire_best_global(&self, meta: &RequestMeta, now: i64) -> Option<NodeRef> {
+    fn acquire_best_global(
+        &self,
+        meta: &RequestMeta,
+        now: i64,
+        exclude: &[NodeId],
+    ) -> Option<NodeRef> {
         let mut candidates = Vec::new();
         for shard in &self.shards {
             let nodes = shard.nodes.read().unwrap();
             for node in nodes.iter() {
+                if !exclude.is_empty() && exclude.contains(&node.node.id) {
+                    continue;
+                }
                 let concurrent_now = node.active_leases.load(Ordering::Relaxed);
                 let max_concurrent = node.max_concurrent.load(Ordering::Relaxed);
                 if node
@@ -887,6 +908,10 @@ impl Pool for DispatchPool {
     }
 
     fn acquire_for(&self, meta: &RequestMeta) -> Option<NodeRef> {
+        self.acquire_for_excluding(meta, &[])
+    }
+
+    fn acquire_for_excluding(&self, meta: &RequestMeta, exclude: &[NodeId]) -> Option<NodeRef> {
         if self.request_exceeds_single_node_budget(meta) {
             return None;
         }
@@ -895,15 +920,23 @@ impl Pool for DispatchPool {
         let start = fastrand::usize(..self.shards.len());
         for offset in 0..self.shards.len() {
             let idx = (start + offset) % self.shards.len();
-            if let Some(node) = self.acquire_from_shard(idx, meta, now) {
+            if let Some(node) = self.acquire_from_shard(idx, meta, now, exclude) {
                 return Some(node);
             }
         }
 
-        self.acquire_best_global(meta, now)
+        self.acquire_best_global(meta, now, exclude)
     }
 
     fn try_acquire_affinity(&self, meta: &RequestMeta) -> Result<(NodeRef, NodeId), DispatchError> {
+        self.try_acquire_affinity_excluding(meta, &[])
+    }
+
+    fn try_acquire_affinity_excluding(
+        &self,
+        meta: &RequestMeta,
+        exclude: &[NodeId],
+    ) -> Result<(NodeRef, NodeId), DispatchError> {
         if meta.affinity_key.is_empty() || self.request_exceeds_single_node_budget(meta) {
             return Err(DispatchError::NoResource);
         }
@@ -915,6 +948,9 @@ impl Pool for DispatchPool {
             .cloned()
             .unwrap_or_default();
         for node_id in candidates {
+            if !exclude.is_empty() && exclude.contains(&node_id) {
+                continue;
+            }
             if let Ok(node) = self.try_acquire_sticky(meta, &node_id) {
                 return Ok((node, node_id));
             }
@@ -1462,5 +1498,113 @@ mod tests {
             assert_eq!(snapshot.node_state, "dispatch");
             assert_eq!(snapshot.budget_hit_reason, None);
         }
+    }
+
+    // ── acquire_for_excluding / try_acquire_affinity_excluding tests ───────────
+
+    #[test]
+    fn acquire_for_excluding_empty_slice_is_identical_to_acquire_for() {
+        let pool = DispatchPool::new();
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:4000".to_string());
+        pool.add(node.clone());
+
+        let acquired = pool.acquire_for(&meta(100)).unwrap();
+        pool.release(&acquired.id, &ResultKind::Success(200));
+
+        let excluding = pool.acquire_for_excluding(&meta(100), &[]).unwrap();
+        assert_eq!(excluding.id, node.id);
+    }
+
+    #[test]
+    fn acquire_for_excluding_skips_named_node() {
+        let pool =
+            DispatchPool::new_with_options(NodeBudgetLimits::default(), AimdConfig::default(), 1);
+        let first = NodeRef::new("socks5h://user:pass@127.0.0.1:4001".to_string());
+        let second = NodeRef::new("socks5h://user:pass@127.0.0.1:4002".to_string());
+        pool.add(first.clone());
+        pool.add(second.clone());
+
+        // Exclude first — must get second.
+        let got = pool
+            .acquire_for_excluding(&meta(100), std::slice::from_ref(&first.id))
+            .unwrap();
+        assert_eq!(got.id, second.id);
+    }
+
+    #[test]
+    fn acquire_for_excluding_returns_none_when_all_nodes_excluded() {
+        let pool = DispatchPool::new();
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:4003".to_string());
+        pool.add(node.clone());
+
+        let result = pool.acquire_for_excluding(&meta(100), std::slice::from_ref(&node.id));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn acquire_for_excluding_respects_budget_guard() {
+        let pool = DispatchPool::new_with_limits(NodeBudgetLimits {
+            max_kb_per_window: 1,
+            ..NodeBudgetLimits::default()
+        });
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:4004".to_string());
+        pool.add(node.clone());
+
+        // Oversized request: excluded slice is empty, but budget guard fires.
+        let result = pool.acquire_for_excluding(&meta(1_200), &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn acquire_for_excluding_unknown_node_ids_are_noop() {
+        let pool = DispatchPool::new();
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:4005".to_string());
+        pool.add(node.clone());
+
+        // Exclude a node id that does not exist in the pool — must still dispatch.
+        let got = pool
+            .acquire_for_excluding(&meta(100), &["nonexistent-node-id".to_string()])
+            .unwrap();
+        assert_eq!(got.id, node.id);
+    }
+
+    #[test]
+    fn try_acquire_affinity_excluding_empty_is_identical_to_try_acquire_affinity() {
+        let pool = DispatchPool::new();
+        let node = NodeRef::new("socks5h://user:pass@127.0.0.1:4006".to_string());
+        pool.add(node.clone());
+        pool.record_affinity_success("model-x", &node.id);
+
+        let mut m = meta(100);
+        m.affinity_key = "model-x".to_string();
+
+        let (normal, _) = pool.try_acquire_affinity(&m).unwrap();
+        pool.release(&normal.id, &ResultKind::Success(200));
+
+        let (excluding, affinity_id) = pool.try_acquire_affinity_excluding(&m, &[]).unwrap();
+        assert_eq!(excluding.id, node.id);
+        assert_eq!(affinity_id, node.id);
+    }
+
+    #[test]
+    fn try_acquire_affinity_excluding_skips_excluded_head_node() {
+        let pool =
+            DispatchPool::new_with_options(NodeBudgetLimits::default(), AimdConfig::default(), 1);
+        let head = NodeRef::new("socks5h://user:pass@127.0.0.1:4007".to_string());
+        let fallback = NodeRef::new("socks5h://user:pass@127.0.0.1:4008".to_string());
+        pool.add(head.clone());
+        pool.add(fallback.clone());
+
+        // Record both in affinity with head at front.
+        pool.record_affinity_success("model-y", &fallback.id);
+        pool.record_affinity_success("model-y", &head.id);
+
+        let mut m = meta(100);
+        m.affinity_key = "model-y".to_string();
+
+        let (selected, _) = pool
+            .try_acquire_affinity_excluding(&m, std::slice::from_ref(&head.id))
+            .unwrap();
+        assert_eq!(selected.id, fallback.id);
     }
 }

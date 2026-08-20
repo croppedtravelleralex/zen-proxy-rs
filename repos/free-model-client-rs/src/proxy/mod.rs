@@ -1,7 +1,10 @@
 pub mod anthropic;
+pub mod dsml_guard;
+pub mod dsml_repair;
 pub mod markdown;
 pub mod openai;
 pub mod sse;
+pub mod unfinished_intent;
 
 use crate::canonical;
 use crate::ccp::{self, CcpFlags, UskContext};
@@ -16,6 +19,8 @@ use serde_json::{json, Value};
 const PROVIDER_INVALID_RETRY_LARGE_USER_BYTES: usize = 12 * 1024;
 const PROVIDER_INVALID_RETRY_HEAD_CHARS: usize = 6 * 1024;
 const PROVIDER_INVALID_RETRY_TAIL_CHARS: usize = 2 * 1024;
+const TEXT_ONLY_TOOL_ARGS_PREVIEW_CHARS: usize = 240;
+const TEXT_ONLY_TOOL_RESULT_PREVIEW_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputClass {
@@ -60,14 +65,54 @@ pub(crate) fn classify_collected_output(
 }
 
 pub(crate) fn collected_visible_text(collected: &CollectedStream) -> &str {
-    if collected.content.trim().is_empty()
-        && collected.tool_calls.is_empty()
-        && !collected.reasoning.trim().is_empty()
+    if !collected.content.trim().is_empty()
+        && !dsml_guard::contains_dsml_tool_leak(&collected.content)
     {
-        &collected.reasoning
+        return &collected.content;
+    }
+    if collected.tool_calls.is_empty()
+        && !collected.reasoning.trim().is_empty()
+        && !dsml_guard::contains_dsml_tool_leak(&collected.reasoning)
+    {
+        return &collected.reasoning;
+    }
+    if collected.content.trim().is_empty()
+        || dsml_guard::contains_dsml_tool_leak(&collected.content)
+    {
+        ""
     } else {
         &collected.content
     }
+}
+
+/// When upstream streams thinking but little/no assistant text, bridge reasoning into the
+/// visible text block so Claude Code's main panel is not blank.
+pub(crate) fn stream_reasoning_visible_text_bridge(
+    text: &str,
+    reasoning: &str,
+    tool_call_count: usize,
+) -> Option<String> {
+    if tool_call_count > 0 {
+        return None;
+    }
+    if dsml_guard::contains_dsml_tool_leak(text) || dsml_guard::contains_dsml_tool_leak(reasoning) {
+        return None;
+    }
+    let reasoning_trim = reasoning.trim();
+    if reasoning_trim.is_empty() {
+        return None;
+    }
+    let text_trim = text.trim();
+    if text_trim.is_empty() {
+        return Some(reasoning_trim.to_string());
+    }
+    if reasoning_trim.len() > 300 && text_trim.len() * 5 < reasoning_trim.len() {
+        if text_trim.contains(reasoning_trim) || reasoning_trim.contains(text_trim) {
+            return None;
+        }
+        return Some(reasoning_trim.to_string());
+    }
+    None
 }
 
 pub(crate) fn apply_initial_thinking_policy(
@@ -302,7 +347,14 @@ pub(crate) fn enrich_tool_call_reasoning_body(
         })
         .collect::<Vec<_>>();
     let enriched = canonical::enrich_messages_with_tool_call_reasoning(&mut typed, &session_scope);
-    if enriched > 0 {
+    if profile.kind == ClientKind::ClaudeCode {
+        canonical::enrich_messages_with_reasoning_mode(
+            &mut typed,
+            &session_scope,
+            canonical::ReasoningEnrichMode::AllHistorical,
+        );
+    }
+    if enriched > 0 || profile.kind == ClientKind::ClaudeCode {
         *messages = typed
             .into_iter()
             .map(|message| canonical::message_to_upstream_json(&message))
@@ -314,6 +366,7 @@ pub(crate) fn enrich_tool_call_reasoning_body(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderInvalidRetryMode {
     EnrichReasoning,
+    CompatToolUse,
     TextOnly,
 }
 
@@ -325,6 +378,7 @@ impl ProviderInvalidRetryMode {
     const fn as_str(self) -> &'static str {
         match self {
             Self::EnrichReasoning => "enrich_reasoning",
+            Self::CompatToolUse => "compat_tool_use",
             Self::TextOnly => "text_only",
         }
     }
@@ -344,6 +398,7 @@ pub(crate) fn provider_invalid_tool_history_retry_mode(
     profile: ClientProfile,
     repair: translate::ToolHistoryRepair,
     used_enriched_retry: bool,
+    used_compat_tool_retry: bool,
     used_text_only_retry: bool,
 ) -> Option<ProviderInvalidRetryMode> {
     let missing_reasoning = err.is_missing_reasoning_content();
@@ -354,8 +409,11 @@ pub(crate) fn provider_invalid_tool_history_retry_mode(
     if !is_risky_claude_code_tool_history_request(request, profile, repair, missing_reasoning) {
         return None;
     }
-    if profile.kind == ClientKind::ClaudeCode && !used_enriched_retry {
+    if missing_reasoning && !used_enriched_retry {
         return Some(ProviderInvalidRetryMode::EnrichReasoning);
+    }
+    if !used_compat_tool_retry {
+        return Some(ProviderInvalidRetryMode::CompatToolUse);
     }
     if !used_text_only_retry {
         return Some(ProviderInvalidRetryMode::TextOnly);
@@ -375,6 +433,7 @@ pub(crate) fn provider_invalid_tool_history_retry_body(
                 crate::client_profile::ClientProfileSource::Unknown,
             ),
         ),
+        ProviderInvalidRetryMode::CompatToolUse => compat_tool_use_retry_body(body),
         ProviderInvalidRetryMode::TextOnly => body.clone(),
     };
     let sanitized_tools = sanitize_upstream_tools(&mut retry);
@@ -573,12 +632,7 @@ fn flatten_tool_history_for_text_only_retry(body: &mut Value) -> usize {
                 };
                 object.insert(
                     "content".to_string(),
-                    Value::String(if flattened.trim().is_empty() {
-                        "[provider text-only retry: previous assistant tool call omitted]"
-                            .to_string()
-                    } else {
-                        flattened
-                    }),
+                    Value::String(flattened),
                 );
                 object.remove("tool_calls");
                 object.remove("function_call");
@@ -597,8 +651,9 @@ fn flatten_tool_history_for_text_only_retry(body: &mut Value) -> usize {
                 object.insert("role".to_string(), Value::String("user".to_string()));
                 object.insert(
                     "content".to_string(),
-                    Value::String(format!(
-                        "[provider text-only retry: previous {tool_name} result]\n{content}"
+                    Value::String(summarize_tool_result_for_text_only_retry(
+                        &tool_name,
+                        &content,
                     )),
                 );
                 object.remove("tool_call_id");
@@ -637,30 +692,75 @@ fn value_to_text(value: &Value) -> Option<String> {
 
 fn summarize_tool_calls_for_text_only_retry(tool_calls: &Value) -> String {
     let Some(calls) = tool_calls.as_array() else {
-        return "[provider text-only retry: previous assistant tool call omitted]".to_string();
+        return String::new();
     };
-    let summaries = calls
+    let names = calls
         .iter()
         .filter_map(|call| {
-            let function = call.get("function")?;
-            let name = function
-                .get("name")
+            call.get("function")
+                .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
-                .unwrap_or("tool");
-            let args = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            Some(format!(
-                "[provider text-only retry: previous assistant requested tool {name} with arguments {args}]"
-            ))
         })
         .collect::<Vec<_>>();
-    if summaries.is_empty() {
-        "[provider text-only retry: previous assistant tool call omitted]".to_string()
+    if names.is_empty() {
+        String::new()
     } else {
-        summaries.join("\n")
+        names.join(", ")
     }
+}
+
+fn summarize_tool_result_for_text_only_retry(_tool_name: &str, content: &str) -> String {
+    preview_text(content, TEXT_ONLY_TOOL_RESULT_PREVIEW_CHARS)
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let head = trimmed.chars().take(max_chars).collect::<String>();
+    format!("{head}…")
+}
+
+fn short_content_fingerprint(text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn compat_tool_use_retry_body(body: &Value) -> Value {
+    let mut retry = body.clone();
+    if translate::disable_thinking_for_tool_use(&mut retry) {
+        tracing::warn!("compat tool-use retry disabled thinking for ClaudeCode tool history");
+    }
+    let session_scope = reasoning_scope_from_upstream_body(&retry);
+    if let Some(messages) = retry.get_mut("messages").and_then(Value::as_array_mut) {
+        let mut typed = messages
+            .iter()
+            .filter_map(|value| {
+                serde_json::from_value::<crate::protocol::types::Message>(value.clone()).ok()
+            })
+            .collect::<Vec<_>>();
+        canonical::enrich_messages_with_tool_call_reasoning(&mut typed, &session_scope);
+        canonical::enrich_messages_with_reasoning_mode(
+            &mut typed,
+            &session_scope,
+            canonical::ReasoningEnrichMode::AllHistorical,
+        );
+        translate::canonicalize_openai_tool_history_with_policy(
+            &mut typed,
+            translate::ToolHistoryPolicy::Compat,
+        );
+        *messages = typed
+            .into_iter()
+            .map(|message| canonical::message_to_upstream_json(&message))
+            .collect();
+    }
+    retry
 }
 
 fn compact_text_for_provider_invalid_retry(text: &str) -> String {
@@ -675,8 +775,9 @@ fn compact_text_for_provider_invalid_retry(text: &str) -> String {
         .collect::<String>();
     let tail = tail_reversed.chars().rev().collect::<String>();
     format!(
-        "{head}\n[free-model-client-rs provider-invalid retry: omitted stale recovered tool context; original_bytes={}]\n{tail}",
-        text.len()
+        "{head}\n[context trimmed; original_bytes={} id={}]\n{tail}",
+        text.len(),
+        short_content_fingerprint(text),
     )
 }
 
@@ -1189,6 +1290,38 @@ mod tests {
     }
 
     #[test]
+    fn stream_reasoning_visible_text_bridge_prefers_reasoning_when_text_empty() {
+        assert_eq!(
+            stream_reasoning_visible_text_bridge("", "hidden chain", 0),
+            Some("hidden chain".to_string())
+        );
+        assert_eq!(stream_reasoning_visible_text_bridge("answer", "hidden", 0), None);
+        assert_eq!(stream_reasoning_visible_text_bridge("tiny", "hidden", 1), None);
+    }
+
+    #[test]
+    fn stream_reasoning_visible_text_bridge_handles_reasoning_heavy_ratio() {
+        let reasoning = "x".repeat(2000);
+        assert_eq!(
+            stream_reasoning_visible_text_bridge("short", &reasoning, 0),
+            Some(reasoning)
+        );
+    }
+
+    #[test]
+    fn stream_reasoning_visible_text_bridge_refuses_dsml_markup() {
+        let dsml = "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        assert_eq!(stream_reasoning_visible_text_bridge("", dsml, 0), None);
+        assert_eq!(
+            collected_visible_text(&CollectedStream {
+                reasoning: dsml.to_string(),
+                ..CollectedStream::default()
+            }),
+            ""
+        );
+    }
+
+    #[test]
     fn claude_code_auto_tool_choice_keeps_default_thinking() {
         let request = request_with_tool_choice(Some(Value::String("auto".to_string())));
         let mut body = serde_json::json!({});
@@ -1376,6 +1509,7 @@ mod tests {
             repair,
             false,
             false,
+            false,
         );
 
         assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
@@ -1389,6 +1523,7 @@ mod tests {
             &request,
             ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
             translate::ToolHistoryRepair::default(),
+            false,
             false,
             false,
         );
@@ -1434,6 +1569,7 @@ mod tests {
             translate::ToolHistoryRepair::default(),
             false,
             false,
+            false,
         );
 
         assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
@@ -1460,6 +1596,7 @@ mod tests {
             &request,
             ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
             translate::ToolHistoryRepair::default(),
+            false,
             false,
             false,
         );
@@ -1495,7 +1632,7 @@ mod tests {
         assert!(retry["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("provider-invalid retry"));
+            .contains("context trimmed"));
         assert!(stats.sanitized_tools > 0);
         assert_eq!(stats.compacted_user_messages, 1);
         assert!(!stats.stripped_tools);
@@ -1568,7 +1705,11 @@ mod tests {
         assert!(retry["messages"][2]["content"]
             .as_str()
             .unwrap()
-            .contains("previous assistant requested tool Read"));
+            .contains("Read"));
+        assert!(!retry["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("README.md"));
         assert_eq!(
             retry["messages"][3]["role"],
             Value::String("user".to_string())
@@ -1589,6 +1730,7 @@ mod tests {
                 downgraded_tool_results: 1,
                 ..Default::default()
             },
+            false,
             false,
             false,
         );
@@ -1622,6 +1764,7 @@ mod tests {
             translate::ToolHistoryRepair::default(),
             false,
             false,
+            false,
         );
 
         assert_eq!(mode, Some(ProviderInvalidRetryMode::EnrichReasoning));
@@ -1653,13 +1796,46 @@ mod tests {
             translate::ToolHistoryRepair::default(),
             true,
             false,
+            false,
+        );
+
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::CompatToolUse));
+    }
+
+    #[test]
+    fn missing_reasoning_uses_text_only_after_compat_retry() {
+        let mut request = repaired_claude_code_nonstream_tool_request();
+        request.messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::Null,
+            tool_calls: Some(vec![crate::protocol::types::ToolCall {
+                id: Some("call_1".to_string()),
+                call_type: "function".to_string(),
+                function: crate::protocol::types::ToolFunction {
+                    name: "Read".to_string(),
+                    arguments: r#"{"file_path":"docs/OPERATING_RULES.md"}"#.to_string(),
+                },
+                index: Some(0),
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+
+        let mode = provider_invalid_tool_history_retry_mode(
+            &missing_reasoning_error(),
+            &request,
+            ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header),
+            translate::ToolHistoryRepair::default(),
+            true,
+            true,
+            false,
         );
 
         assert_eq!(mode, Some(ProviderInvalidRetryMode::TextOnly));
     }
 
     #[test]
-    fn missing_reasoning_tool_request_uses_text_only_even_without_visible_tool_calls() {
+    fn missing_reasoning_tool_request_uses_compat_even_without_visible_tool_calls() {
         let request = repaired_claude_code_nonstream_tool_request();
 
         let mode = provider_invalid_tool_history_retry_mode(
@@ -1669,8 +1845,59 @@ mod tests {
             translate::ToolHistoryRepair::default(),
             true,
             false,
+            false,
         );
 
-        assert_eq!(mode, Some(ProviderInvalidRetryMode::TextOnly));
+        assert_eq!(mode, Some(ProviderInvalidRetryMode::CompatToolUse));
+    }
+
+    #[test]
+    fn text_only_retry_summarizes_large_write_arguments_without_dumping_json() {
+        let huge_args = format!(r#"{{"file_path":"scan.ps1","content":"{}"}}"#, "x".repeat(20_000));
+        let request = repaired_claude_code_nonstream_tool_request();
+        let body = serde_json::json!({
+            "messages": [
+                request.messages[0],
+                request.messages[1],
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_write",
+                        "type": "function",
+                        "function": {
+                            "name": "Write",
+                            "arguments": huge_args
+                        }
+                    }]
+                }
+            ],
+            "tools": request.tools,
+            "tool_choice": request.tool_choice
+        });
+        let (retry, _) =
+            provider_invalid_tool_history_retry_body(&body, ProviderInvalidRetryMode::TextOnly);
+        let flattened = retry["messages"][2]["content"].as_str().unwrap_or_default();
+        assert!(flattened.contains("Write"));
+        assert!(!flattened.contains("xxxx"));
+        assert!(!flattened.contains("prior assistant tool call summarized"));
+        assert!(!flattened.contains("provider text-only retry"));
+        assert!(!flattened.contains("ZenProxy"));
+    }
+
+    #[test]
+    fn compat_tool_use_retry_keeps_tools_and_disables_thinking() {
+        let request = repaired_claude_code_nonstream_tool_request();
+        let body = serde_json::json!({
+            "messages": request.messages,
+            "tools": request.tools,
+            "tool_choice": request.tool_choice,
+            "thinking": {"type":"enabled"}
+        });
+        let (retry, stats) =
+            provider_invalid_tool_history_retry_body(&body, ProviderInvalidRetryMode::CompatToolUse);
+        assert!(retry["tools"].is_array());
+        assert_eq!(retry["thinking"]["type"], "disabled");
+        assert!(!stats.stripped_tools);
     }
 }

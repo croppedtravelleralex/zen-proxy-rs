@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::collector::RequestFilter;
 use crate::ledger::{sanitize_json_value, sanitize_text};
+use crate::version;
 
 use crate::state::AppState;
 use crate::v4::model::{EffectiveModelRegistry, ModelCompatibilityProfile, ModelRegistry};
@@ -115,7 +116,10 @@ impl AdminService {
     pub fn health(state: &AppState) -> Response {
         let pools = state.pool_manager.pool_stats();
         Self::ok_response(json!({
-            "status":"ok", "version": env!("CARGO_PKG_VERSION"),
+            "status":"ok",
+            "version": version::PKG_VERSION,
+            "git_hash": version::GIT_HASH,
+            "build_time": version::BUILD_TIME,
             "uptime_secs": state.startup_time.elapsed().as_secs(),
             "pid": std::process::id(),
             "pools": {
@@ -1552,14 +1556,14 @@ impl AdminService {
     // --- System ---
     pub fn system_uptime(state: &AppState) -> Response {
         Self::ok_response(
-            json!({"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"version":env!("CARGO_PKG_VERSION")}),
+            json!({"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"version":version::PKG_VERSION,"git_hash":version::GIT_HASH,"build_time":version::BUILD_TIME}),
         )
     }
     pub fn system_info(state: &AppState) -> Response {
         let p = state.pool_manager.pool_stats();
         let s = state.collector.snapshot();
         Self::ok_response(
-            json!({"version":env!("CARGO_PKG_VERSION"),"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size,"cooldown":p.cooldown_size,"budget_limited":p.budget_limited_size,"leased":p.leased_count,"fuse":p.fuse},"requests":{"total":s.requests.total,"success":s.requests.success,"rpm":s.requests.rpm},"upstream":{"backoff":state.upstream_health.is_backoff()}}),
+            json!({"version":version::PKG_VERSION,"git_hash":version::GIT_HASH,"build_time":version::BUILD_TIME,"uptime_secs":state.startup_time.elapsed().as_secs(),"pid":std::process::id(),"pools":{"dispatch":p.dispatch_size,"active":p.active_size,"ratelimited":p.ratelimited_size,"dead":p.dead_size,"cooldown":p.cooldown_size,"budget_limited":p.budget_limited_size,"leased":p.leased_count,"fuse":p.fuse},"requests":{"total":s.requests.total,"success":s.requests.success,"rpm":s.requests.rpm},"upstream":{"backoff":state.upstream_health.is_backoff()}}),
         )
     }
     pub fn system_log_level(level: &str) -> Response {

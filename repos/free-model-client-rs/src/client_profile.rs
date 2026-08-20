@@ -61,7 +61,10 @@ impl ClientProfile {
     }
 
     pub fn uses_compat_tool_history(self) -> bool {
-        matches!(self.kind, ClientKind::Hermes | ClientKind::OpenClaw)
+        matches!(
+            self.kind,
+            ClientKind::Hermes | ClientKind::OpenClaw | ClientKind::ClaudeCode
+        )
     }
 
     pub fn protects_recovery_safe_markers(self) -> bool {
@@ -501,6 +504,15 @@ mod tests {
             assert!(profile.disables_thinking_for_tool_use());
             assert!(profile.uses_compat_tool_history());
         }
+    }
+
+    #[test]
+    fn deepseek_flash_claude_code_uses_compat_tool_history() {
+        let profile = ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+            .effective_for_model("deepseek-v4-flash-free");
+
+        assert_eq!(profile.kind, ClientKind::ClaudeCode);
+        assert!(profile.uses_compat_tool_history());
     }
 
     #[test]

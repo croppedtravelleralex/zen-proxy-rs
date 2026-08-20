@@ -616,6 +616,7 @@ pub fn stream_sse_events(
         let mut byte_stream = Box::pin(byte_stream);
         let mut parser = SseParser::default();
         let mut complete = false;
+        let mut saw_output = false;
         loop {
             match byte_stream.next().await {
                 Some(Ok(chunk)) => {
@@ -634,6 +635,9 @@ pub fn stream_sse_events(
                             Ok(Some(ParsedZenFrame::Event(event))) => {
                                 if event_has_finish_reason(&event) {
                                     complete = true;
+                                }
+                                if event_has_output_signal(&event) {
+                                    saw_output = true;
                                 }
                                 yield Ok(*event);
                             }
@@ -654,11 +658,23 @@ pub fn stream_sse_events(
                 }
                 None => {
                     if let Err(err) = parser.finish() {
-                        yield Err(err);
+                        if !saw_output {
+                            yield Err(err);
+                        } else {
+                            tracing::warn!(
+                                "accepting truncated upstream sse tail because parsed output is already usable"
+                            );
+                        }
                         return;
                     }
                     if !complete {
-                        yield Err(truncated_stream_error());
+                        if saw_output {
+                            tracing::warn!(
+                                "upstream stream ended without DONE or finish_reason but parsed output is usable; closing gracefully"
+                            );
+                        } else {
+                            yield Err(truncated_stream_error());
+                        }
                     }
                     return;
                 }
@@ -809,6 +825,29 @@ fn event_has_finish_reason(event: &ZenSseEvent) -> bool {
         .choices
         .as_ref()
         .is_some_and(|choices| choices.iter().any(|choice| choice.finish_reason.is_some()))
+}
+
+fn event_has_output_signal(event: &ZenSseEvent) -> bool {
+    event
+        .choices
+        .as_ref()
+        .is_some_and(|choices| choices.iter().any(|choice| {
+            let Some(delta) = choice.delta.as_ref() else {
+                return false;
+            };
+            delta
+                .content
+                .as_ref()
+                .is_some_and(|content| !content.is_empty())
+                || delta
+                    .reasoning_content
+                    .as_ref()
+                    .is_some_and(|reasoning| !reasoning.trim().is_empty())
+                || delta
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|items| !items.is_empty())
+        }))
 }
 
 pub fn merge_collected_tool_deltas(

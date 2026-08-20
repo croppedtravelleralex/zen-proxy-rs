@@ -153,18 +153,118 @@ fn start_mock_zen() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                 }));
-                if body
-                    .get("messages")
-                    .and_then(|messages| messages.as_array())
-                    .and_then(|messages| messages.last())
-                    .and_then(|message| message.get("content"))
-                    .and_then(|content| content.as_str())
-                    == Some("rate-limit")
-                {
+                let request_count = observed.lock().unwrap().len();
+                // Probe markers are matched against the whole serialized body rather than
+                // `messages.last().content` as a string: the kernel may rewrite user content
+                // into an array of blocks (e.g. to attach a `cache_control` breakpoint), which
+                // silently defeats an exact string match and makes the mock stop responding.
+                let wire_body = body.to_string();
+                if wire_body.contains("rate-limit") {
                     return (
                         StatusCode::TOO_MANY_REQUESTS,
                         [("retry-after", "60")],
                         "FreeUsageLimitError",
+                    )
+                        .into_response();
+                }
+                // Deliberately outlast any sane retry budget so the per-attempt deadline
+                // is the thing that ends the request.
+                if wire_body.contains("attempt-deadline-probe") {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+                if wire_body.contains("dsml-truncation-retry") {
+                    let chunk = if request_count == 1 {
+                        serde_json::json!({
+                            "choices": [{
+                                "delta": {
+                                    "reasoning_content": "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+                                },
+                                "finish_reason": "stop"
+                            }]
+                        })
+                    } else {
+                        serde_json::json!({
+                            "choices": [{
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": "call_dsml_retry_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": "{\"command\":\"pwd\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        })
+                    };
+                    let body = format!("data: {}\n\ndata: [DONE]\n\n", chunk);
+                    return (
+                        StatusCode::OK,
+                        [
+                            ("content-type", "text/event-stream"),
+                            ("x-zen-observed-exit-ip", "direct"),
+                        ],
+                        body,
+                    )
+                        .into_response();
+                }
+                if wire_body.contains("dsml-full-repair") {
+                    let chunk = serde_json::json!({
+                        "choices": [{
+                            "delta": {
+                                "reasoning_content": "<｜DSML｜tool_calls><｜DSML｜invoke name=\"Bash\"><｜DSML｜parameter name=\"command\">pwd && ls</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    });
+                    let body = format!("data: {}\n\ndata: [DONE]\n\n", chunk);
+                    return (
+                        StatusCode::OK,
+                        [
+                            ("content-type", "text/event-stream"),
+                            ("x-zen-observed-exit-ip", "direct"),
+                        ],
+                        body,
+                    )
+                        .into_response();
+                }
+                if wire_body.contains("unfinished-tool-intent-retry") {
+                    let chunk = if request_count == 1 {
+                        serde_json::json!({
+                            "choices": [{
+                                "delta": { "content": "命令超时。检查输出文件是否已生成" },
+                                "finish_reason": "stop"
+                            }]
+                        })
+                    } else {
+                        serde_json::json!({
+                            "choices": [{
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": "call_intent_retry_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Bash",
+                                            "arguments": "{\"command\":\"test -f /tmp/admin_disk_check.txt\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }]
+                        })
+                    };
+                    let body = format!("data: {}\n\ndata: [DONE]\n\n", chunk);
+                    return (
+                        StatusCode::OK,
+                        [
+                            ("content-type", "text/event-stream"),
+                            ("x-zen-observed-exit-ip", "direct"),
+                        ],
+                        body,
                     )
                         .into_response();
                 }
@@ -2369,6 +2469,179 @@ mod e2e {
         stop_server(child, port);
     }
 
+    fn claude_code_dsml_messages_body(prompt: &str, stream: bool) -> serde_json::Value {
+        serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 64,
+            "stream": stream,
+            "tools": [{
+                "name": "Bash",
+                "description": "Run a shell command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn test_v4_claude_code_anthropic_stream_retries_truncated_dsml() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19850,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&claude_code_dsml_messages_body(
+                "dsml-truncation-retry",
+                true,
+            ))
+            .send()
+            .expect("dsml truncation retry request");
+        let status = resp.status();
+        let body = resp.text().unwrap();
+        assert_eq!(status, 200, "stream response body: {body}");
+        assert!(!body.contains("DSML"), "{body}");
+        assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+        assert!(body.contains("\"name\":\"Bash\""), "{body}");
+        assert!(body.contains("pwd"), "{body}");
+        assert!(body.contains("\"stop_reason\":\"tool_use\""), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
+        assert!(observed.lock().unwrap().len() >= 2);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_claude_code_anthropic_stream_repairs_full_dsml() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19851,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&claude_code_dsml_messages_body("dsml-full-repair", true))
+            .send()
+            .expect("dsml full repair request");
+        let status = resp.status();
+        let body = resp.text().unwrap();
+        assert_eq!(status, 200, "stream response body: {body}");
+        assert!(!body.contains("DSML"), "{body}");
+        assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+        assert!(body.contains("pwd && ls"), "{body}");
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_claude_code_openai_stream_retries_truncated_dsml() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19852,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "dsml-truncation-retry"}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"]
+                        }
+                    }
+                }]
+            }))
+            .send()
+            .expect("openai dsml truncation retry request");
+        let status = resp.status();
+        let body = resp.text().unwrap();
+        assert_eq!(status, 200, "stream response body: {body}");
+        assert!(!body.contains("DSML"), "{body}");
+        assert!(body.contains("\"name\":\"Bash\""), "{body}");
+        assert!(body.contains("pwd"), "{body}");
+        assert!(observed.lock().unwrap().len() >= 2);
+        stop_server(child, port);
+    }
+
+    #[test]
+    fn test_v4_claude_code_anthropic_stream_retries_unfinished_tool_intent() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19853,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&claude_code_dsml_messages_body(
+                "unfinished-tool-intent-retry",
+                true,
+            ))
+            .send()
+            .expect("unfinished tool intent retry request");
+        let status = resp.status();
+        let body = resp.text().unwrap();
+        assert_eq!(status, 200, "stream response body: {body}");
+        assert!(!body.contains("命令超时"), "{body}");
+        assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+        assert!(body.contains("\"name\":\"Bash\""), "{body}");
+        assert!(body.contains("admin_disk_check.txt"), "{body}");
+        assert!(body.contains("\"stop_reason\":\"tool_use\""), "{body}");
+        assert!(!body.contains("event: error"), "{body}");
+        assert!(observed.lock().unwrap().len() >= 2);
+        stop_server(child, port);
+    }
+
     #[test]
     fn test_v4_proxy_api_key_accepts_x_api_key_header() {
         let (upstream_base, observed) = start_mock_zen();
@@ -2451,8 +2724,12 @@ mod e2e {
         let client = reqwest::blocking::Client::new();
         let resp = client
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            // `hy3` is the only public model that still has input compaction enabled;
+            // deepseek-v4-flash, big-pickle and mimo-v2.5 are all in
+            // `model_disables_input_compaction`, so using them here would exercise the
+            // "compaction skipped" path instead of the compactor this test is about.
             .json(&serde_json::json!({
-                "model": "big-pickle",
+                "model": "hy3",
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "old-tool", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]},
                     {"role": "tool", "content": "x".repeat(2 * 1024 * 1024), "tool_call_id": "old-tool"},
@@ -2479,7 +2756,7 @@ mod e2e {
 
         let seen = observed.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0]["body"]["model"], "big-pickle");
+        assert_eq!(seen[0]["body"]["model"], "hy3-free");
         let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
         assert_eq!(
             message_content_text(&upstream_messages.last().unwrap()["content"]),
@@ -2490,7 +2767,7 @@ mod e2e {
             .find(|message| message["role"] == "tool")
             .and_then(|message| message["content"].as_str())
             .expect("paired tool result should remain protocol-shaped");
-        assert!(compacted_tool.contains("ZenProxy context compactor"));
+        assert!(compacted_tool.contains("[context compacted"));
         assert!(compacted_tool.len() < 16 * 1024);
         stop_server(child, port);
     }
@@ -2549,16 +2826,18 @@ mod e2e {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0]["body"]["model"], "deepseek-v4-flash-free");
         let upstream_messages = seen[0]["body"]["messages"].as_array().unwrap();
+        // The kernel may wrap the last user message into content blocks to attach a
+        // `cache_control` breakpoint, so compare the extracted text rather than the raw value.
         assert_eq!(
-            upstream_messages.last().unwrap()["content"],
-            "y".repeat(2 * 1024)
+            message_content_text(&upstream_messages.last().unwrap()["content"]),
+            Some("y".repeat(2 * 1024).as_str())
         );
         let tool_content = upstream_messages
             .iter()
             .find(|message| message["role"] == "tool")
             .and_then(|message| message["content"].as_str())
             .expect("paired tool result should remain protocol-shaped");
-        assert!(!tool_content.contains("ZenProxy context compactor"));
+        assert!(!tool_content.contains("[context compacted"));
         assert_eq!(tool_content.len(), 2 * 1024 * 1024);
         stop_server(child, port);
     }
@@ -2760,6 +3039,268 @@ mod e2e {
         assert!(seen[1]["body"]["thinking"].is_null());
         assert_eq!(seen[2]["body"]["model"], "big-pickle");
         assert!(seen[2]["body"]["thinking"].is_null());
+        stop_server(child, port);
+    }
+
+    /// Production 2026-08-08..12: 151 requests were hard-rejected with
+    /// `missing field \`name\`` because a tool carried description + input_schema
+    /// but no name. The gateway now recovers the name instead of returning 400.
+    #[test]
+    fn test_v4_anthropic_tool_missing_name_is_repaired_not_rejected() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19841,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "use tool"}],
+                "tools": [
+                    {
+                        "name": "Bash",
+                        "description": "Run a command.",
+                        "input_schema": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "description": "# SendMessage\n\nSend a message to another agent.",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }
+                ],
+                "stream": false
+            }))
+            .send()
+            .expect("anthropic tools request");
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "a tool without `name` must be repaired, not rejected with 400"
+        );
+
+        let seen = observed.lock().unwrap();
+        let tools = seen[0]["body"]["tools"]
+            .as_array()
+            .expect("tools forwarded upstream");
+        assert_eq!(tools.len(), 2, "both tools must survive the repair");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .or_else(|| tool.get("name"))
+                    .and_then(|name| name.as_str())
+            })
+            .collect();
+        assert!(
+            names.contains(&"Bash"),
+            "existing name untouched: {names:?}"
+        );
+        assert!(
+            names.contains(&"SendMessage"),
+            "name recovered from the description heading: {names:?}"
+        );
+        drop(seen);
+        stop_server(child, port);
+    }
+
+    /// Two nameless tools whose descriptions resolve to the same heading must not
+    /// collapse into one ambiguous upstream tool name.
+    #[test]
+    fn test_v4_anthropic_repaired_tool_names_are_unique() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19842,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "use tool"}],
+                "tools": [
+                    {
+                        "description": "# SendMessage\n\nfirst",
+                        "input_schema": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "description": "# SendMessage\n\nsecond",
+                        "input_schema": {"type": "object", "properties": {}}
+                    }
+                ],
+                "stream": false
+            }))
+            .send()
+            .expect("anthropic duplicate tool request");
+        assert_eq!(resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        let tools = seen[0]["body"]["tools"].as_array().expect("tools");
+        let mut names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .or_else(|| tool.get("name"))
+                    .and_then(|name| name.as_str())
+            })
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            2,
+            "repaired names must stay distinct: {names:?}"
+        );
+        drop(seen);
+        stop_server(child, port);
+    }
+
+    /// A body with no `messages` still cannot be served, but the 400 must now say
+    /// enough to identify the offending client without logging user content.
+    #[test]
+    fn test_v4_anthropic_missing_messages_returns_diagnosable_400() {
+        let (upstream_base, _observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19843,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "system": "secret-user-content-must-not-leak",
+                "stream": false
+            }))
+            .send()
+            .expect("anthropic missing-messages request");
+
+        assert_eq!(resp.status(), 400);
+        let text = resp.text().expect("error body");
+        assert!(
+            text.contains("missing_messages=true"),
+            "400 must carry repair diagnostics: {text}"
+        );
+        assert!(
+            !text.contains("secret-user-content-must-not-leak"),
+            "diagnostics must never echo request values: {text}"
+        );
+        stop_server(child, port);
+    }
+
+    /// Well-formed tools must be byte-for-byte unaffected by the repair pass.
+    #[test]
+    fn test_v4_anthropic_valid_tools_pass_through_unchanged() {
+        let (upstream_base, observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19844,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+            ],
+        );
+        let client = reqwest::blocking::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .header("x-fmc-client", "claude-code")
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "use tool"}],
+                "tools": [{
+                    "name": "Grep",
+                    "description": "Search files.",
+                    "input_schema": {"type": "object", "properties": {}}
+                }],
+                "stream": false
+            }))
+            .send()
+            .expect("anthropic valid tools request");
+        assert_eq!(resp.status(), 200);
+
+        let seen = observed.lock().unwrap();
+        let tools = seen[0]["body"]["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        let name = tools[0]
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .or_else(|| tools[0].get("name"))
+            .and_then(|name| name.as_str());
+        assert_eq!(name, Some("Grep"));
+        drop(seen);
+        stop_server(child, port);
+    }
+
+    /// The retry budget used to be checked only *between* attempts, so a single slow
+    /// attempt ran to the downstream read timeout (observed 274-300s against a 240s
+    /// budget). The per-attempt deadline must now end the request near the budget.
+    #[test]
+    fn test_v4_attempt_deadline_bounds_a_single_slow_attempt() {
+        let (upstream_base, _observed) = start_mock_zen();
+        let (child, port) = start_server_with_env(
+            19845,
+            &[
+                ("ZEN_PROVIDER_MODE", "free_model_kernel"),
+                ("UPSTREAM_BASE", upstream_base.as_str()),
+                ("POOL_MAX_RETRIES", "0"),
+                ("ALLOW_DIRECT_FALLBACK", "true"),
+                ("V4_RETRY_BUDGET_MS", "1500"),
+            ],
+        );
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("client");
+
+        let started = Instant::now();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "attempt-deadline-probe"}],
+                "stream": false
+            }))
+            .send()
+            .expect("slow upstream request");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resp.status(),
+            504,
+            "an attempt that outruns the budget must return 504, not hang"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "must abort near the 1.5s budget rather than waiting out the 10s upstream, took {elapsed:?}"
+        );
+        let text = resp.text().expect("error body");
+        assert!(
+            text.contains("retry budget exhausted"),
+            "error must name the budget as the cause: {text}"
+        );
         stop_server(child, port);
     }
 

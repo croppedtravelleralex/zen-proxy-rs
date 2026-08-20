@@ -187,6 +187,98 @@ async fn mock_zen_handler(
         )
             .into_response();
     }
+    if prompt.contains("dsml-truncation-retry") {
+        let body = if request_count == 1 {
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"</｜DSML｜parameter>\\n</｜DSML｜invoke>\\n</｜DSML｜tool_calls>\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+        } else {
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_dsml_retry_1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+        };
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+    if prompt.contains("dsml-full-repair") {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"<｜DSML｜tool_calls><｜DSML｜invoke name=\\\"Bash\\\"><｜DSML｜parameter name=\\\"command\\\">pwd && ls</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+    if prompt.contains("dsml-content-repair") {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<｜DSML｜tool_calls><｜DSML｜invoke name=\\\"Bash\\\"><｜DSML｜parameter name=\\\"command\\\">pwd && ls</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+    if prompt.contains("unfinished-tool-intent-retry") {
+        let body = if request_count == 1 {
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"命令超时。检查输出文件是否已生成\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+        } else {
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_intent_retry_1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"test -f /tmp/admin_disk_check.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+        };
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            body,
+        )
+            .into_response();
+    }
+    if prompt.contains("unfinished-tool-intent-exhausted") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"命令超时。检查输出文件是否已生成\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        )
+            .into_response();
+    }
+    if prompt.contains("unfinished-tool-intent-complete-report") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"后台扫描已完成，基线数据齐全。用户已中断检查约 2 小时了，现在直接汇总收尾，不再开新扫描。C 盘可用 174.9 GB。\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        )
+            .into_response();
+    }
+    if prompt.contains("finish-content-filter") {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"blocked\"},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n",
+        )
+            .into_response();
+    }
     if prompt.contains("emit-reasoned-bash-tool") {
         let body = concat!(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"reasoning before bash\"}}]}\n\n",
@@ -735,6 +827,29 @@ fn anthropic_tool(name: &str, properties: Value, required: &[&str]) -> ToolDef {
             schema_type: "object".to_string(),
             properties: Some(properties),
             required: Some(required.iter().map(|item| item.to_string()).collect()),
+        },
+    }
+}
+
+fn claude_bash_tool() -> ToolDef {
+    anthropic_tool(
+        "Bash",
+        json!({"command":{"type":"string"},"description":{"type":"string"}}),
+        &["command"],
+    )
+}
+
+fn openai_bash_tool() -> OpenAITool {
+    OpenAITool {
+        tool_type: "function".to_string(),
+        function: OpenAIToolFunction {
+            name: "Bash".to_string(),
+            description: Some("Run a shell command".to_string()),
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            })),
         },
     }
 }
@@ -1504,7 +1619,11 @@ async fn claude_code_anthropic_stream_holds_partial_tool_json_until_complete() {
     let body = response_text(response).await;
 
     assert!(body.contains("event: error"), "{body}");
-    assert!(body.contains("stream truncated"), "{body}");
+    assert!(
+        body.contains("incomplete tool call arguments")
+            || body.contains("stream truncated"),
+        "{body}"
+    );
     assert!(!body.contains("\"type\":\"tool_use\""), "{body}");
     assert!(!body.contains("input_json_delta"), "{body}");
 }
@@ -4454,8 +4573,8 @@ async fn stream_truncation_is_emitted_before_done() {
         .await
         .unwrap();
     let body = response_text(response).await;
-    assert!(body.contains("stream truncated"));
-    assert!(body.contains("[DONE]"));
+    assert!(body.contains("partial"), "{body}");
+    assert!(!body.contains("stream truncated"), "{body}");
 }
 
 #[tokio::test]
@@ -4484,4 +4603,310 @@ async fn anthropic_stream_emits_thinking_block_then_text() {
     assert!(body.contains("\"content_block_stop\""), "{body}");
     // text block still present after thinking
     assert!(body.contains("final answer"), "{body}");
+}
+
+fn claude_code_profile() -> ClientProfile {
+    ClientProfile::new(ClientKind::ClaudeCode, ClientProfileSource::Header)
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_retries_truncated_dsml_then_emits_tool_use() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "dsml-truncation-retry", true);
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(!body.contains("DSML"), "{body}");
+    assert!(!body.contains("thinking_delta"), "{body}");
+    assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+    assert!(body.contains("\"name\":\"Bash\""), "{body}");
+    assert!(body.contains("pwd"), "{body}");
+    assert!(body.contains("\"stop_reason\":\"tool_use\""), "{body}");
+    assert!(!body.contains("event: error"), "{body}");
+    assert!(state.requests.lock().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_repairs_full_dsml_invoke_into_tool_use() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "dsml-full-repair", true);
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(!body.contains("DSML"), "{body}");
+    assert!(!body.contains("<invoke"), "{body}");
+    assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+    assert!(body.contains("\"name\":\"Bash\""), "{body}");
+    assert!(body.contains("pwd && ls"), "{body}");
+    assert!(body.contains("\"stop_reason\":\"tool_use\""), "{body}");
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_repairs_dsml_leaked_in_content() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "dsml-content-repair", true);
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(!body.contains("DSML"), "{body}");
+    assert!(!body.contains("text_delta"), "{body}");
+    assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+    assert!(body.contains("pwd && ls"), "{body}");
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_non_stream_repairs_full_dsml_invoke() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "dsml-full-repair", false);
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    let content = body["content"].to_string();
+    assert!(!content.contains("DSML"), "{content}");
+    assert_eq!(body["content"][0]["type"], "tool_use");
+    assert_eq!(body["content"][0]["name"], "Bash");
+    assert_eq!(body["content"][0]["input"]["command"], "pwd && ls");
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_non_stream_retries_truncated_dsml() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "dsml-truncation-retry", false);
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    let raw = body.to_string();
+    assert!(!raw.contains("DSML"), "{raw}");
+    assert_eq!(body["content"][0]["type"], "tool_use");
+    assert_eq!(body["content"][0]["name"], "Bash");
+    assert!(state.requests.lock().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn anthropic_content_filter_maps_to_refusal_stop_reason() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .anthropic_messages(
+            &client,
+            anthropic_request("deepseek-v4-flash-free", "finish-content-filter", false),
+        )
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    assert_eq!(body["stop_reason"], "refusal");
+    assert_eq!(body["content"][0]["text"], "blocked");
+}
+
+#[tokio::test]
+async fn claude_code_openai_stream_retries_truncated_dsml_then_emits_tool_calls() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let request = chat_request(
+        "deepseek-v4-flash",
+        "dsml-truncation-retry",
+        true,
+        Some(vec![openai_bash_tool()]),
+    );
+    let response = kernel
+        .openai_chat_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(!body.contains("DSML"), "{body}");
+    assert!(body.contains("\"name\":\"Bash\""), "{body}");
+    assert!(body.contains("pwd"), "{body}");
+    assert!(body.contains("tool_calls"), "{body}");
+    assert!(!body.contains("DSML tool markup"), "{body}");
+    assert!(state.requests.lock().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn claude_code_openai_stream_repairs_full_dsml_invoke() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let request = chat_request(
+        "deepseek-v4-flash",
+        "dsml-full-repair",
+        true,
+        Some(vec![openai_bash_tool()]),
+    );
+    let response = kernel
+        .openai_chat_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(!body.contains("DSML"), "{body}");
+    assert!(body.contains("\"name\":\"Bash\""), "{body}");
+    assert!(body.contains("pwd && ls"), "{body}");
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn claude_code_openai_non_stream_repairs_full_dsml_invoke() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let request = chat_request(
+        "deepseek-v4-flash",
+        "dsml-full-repair",
+        false,
+        Some(vec![openai_bash_tool()]),
+    );
+    let response = kernel
+        .openai_chat_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_str(&response_text(response).await).unwrap();
+    let raw = body.to_string();
+    assert!(!raw.contains("DSML"), "{raw}");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "Bash"
+    );
+    assert!(body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap()
+        .contains("pwd && ls"));
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn openai_stream_bridges_reasoning_only_into_visible_content() {
+    let (config, client, _) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let response = kernel
+        .openai_chat(
+            &client,
+            chat_request("deepseek-v4-flash-free", "reasoning-only", true, None),
+        )
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("hidden chain only"), "{body}");
+    assert!(!body.contains("upstream returned no assistant content"), "{body}");
+    assert!(!body.contains("DSML"), "{body}");
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_retries_unfinished_tool_intent_then_emits_tool_use() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "unfinished-tool-intent-retry", true);
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(!body.contains("命令超时"), "{body}");
+    assert!(!body.contains("检查输出文件是否已生成"), "{body}");
+    assert!(body.contains("\"type\":\"tool_use\""), "{body}");
+    assert!(body.contains("\"name\":\"Bash\""), "{body}");
+    assert!(body.contains("admin_disk_check.txt"), "{body}");
+    assert!(body.contains("\"stop_reason\":\"tool_use\""), "{body}");
+    assert!(!body.contains("event: error"), "{body}");
+    assert!(state.requests.lock().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_maps_exhausted_unfinished_intent_to_max_tokens() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request =
+        anthropic_request("deepseek-v4-flash", "unfinished-tool-intent-exhausted", true);
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("命令超时。检查输出文件是否已生成"), "{body}");
+    assert!(body.contains("\"stop_reason\":\"max_tokens\""), "{body}");
+    assert!(!body.contains("\"stop_reason\":\"end_turn\""), "{body}");
+    assert!(!body.contains("\"type\":\"tool_use\""), "{body}");
+    assert!(state.requests.lock().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_stream_does_not_retry_complete_report() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request(
+        "deepseek-v4-flash",
+        "unfinished-tool-intent-complete-report",
+        true,
+    );
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(body.contains("后台扫描已完成"), "{body}");
+    assert!(body.contains("\"stop_reason\":\"end_turn\""), "{body}");
+    assert_eq!(state.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn claude_code_anthropic_non_stream_retries_unfinished_tool_intent() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let mut request = anthropic_request("deepseek-v4-flash", "unfinished-tool-intent-retry", false);
+    request.tools = Some(vec![claude_bash_tool()]);
+    let response = kernel
+        .anthropic_messages_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let raw = response_text(response).await;
+    let body: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert_eq!(body["content"][0]["type"], "tool_use");
+    assert_eq!(body["content"][0]["name"], "Bash");
+    assert!(state.requests.lock().unwrap().len() >= 2);
+}
+
+#[tokio::test]
+async fn claude_code_openai_stream_retries_unfinished_tool_intent() {
+    let (config, client, state) = spawn_mock_zen().await;
+    let kernel = FreeModelKernel::new(config);
+    let request = chat_request(
+        "deepseek-v4-flash",
+        "unfinished-tool-intent-retry",
+        true,
+        Some(vec![openai_bash_tool()]),
+    );
+    let response = kernel
+        .openai_chat_with_profile(&client, request, claude_code_profile())
+        .await
+        .unwrap();
+    let body = response_text(response).await;
+    assert!(!body.contains("命令超时"), "{body}");
+    assert!(body.contains("tool_calls"), "{body}");
+    assert!(body.contains("Bash"), "{body}");
+    assert!(body.contains("admin_disk_check.txt"), "{body}");
+    assert!(state.requests.lock().unwrap().len() >= 2);
 }

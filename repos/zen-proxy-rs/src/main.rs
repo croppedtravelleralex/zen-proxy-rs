@@ -16,9 +16,10 @@ mod sse;
 mod state;
 mod utils;
 mod v4;
+mod version;
 
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
@@ -75,7 +76,9 @@ async fn health_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
     let backoff = st.upstream_health.is_backoff();
     Json(json!({
         "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": version::PKG_VERSION,
+        "git_hash": version::GIT_HASH,
+        "build_time": version::BUILD_TIME,
         "uptime_secs": uptime,
         "pid": std::process::id(),
         "pools": {
@@ -488,6 +491,34 @@ async fn async_main() {
                 };
                 tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
                 discover_dynamic_models_once(&state).await;
+            }
+        });
+    }
+
+    // Background: periodic ratelimited-pool recovery (stuck 429 nodes).
+    {
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            loop {
+                let pools = state.pool_manager.pool_stats();
+                if pools.ratelimited_size > 0 {
+                    tracing::info!(
+                        ratelimited = pools.ratelimited_size,
+                        dispatch = pools.dispatch_size,
+                        "probing ratelimited pool for recovery"
+                    );
+                    state.pool_manager.probe_ratelimited_periodic();
+                }
+                let interval = {
+                    let cfg = state.config.read().unwrap();
+                    let base = cfg.ratelimited_probe_interval();
+                    if pools.ratelimited_size >= cfg.ratelimited_capacity / 4 {
+                        Duration::from_secs(base.as_secs().max(30) / 2)
+                    } else {
+                        base
+                    }
+                };
+                tokio::time::sleep(interval).await;
             }
         });
     }
