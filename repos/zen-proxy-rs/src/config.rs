@@ -1070,7 +1070,7 @@ mod tests {
         assert_eq!(cfg.v4_retry_budget_ms, 45_000);
         assert_eq!(cfg.connect_timeout_secs, 5);
         assert_eq!(cfg.request_timeout_secs, 120);
-        assert!(!cfg.v4_model_registry_active());
+        assert!(cfg.v4_model_registry_active());
         assert_eq!(cfg.node_max_calls_per_window, 100);
         assert_eq!(cfg.node_max_tokens_per_window, 10_000_000);
         assert_eq!(cfg.node_max_kb_per_window, 64 * 1024);
@@ -1100,7 +1100,7 @@ mod tests {
             cfg.protocol_guard_orphan_policy,
             ProtocolGuardOrphanPolicy::Downgrade
         );
-        assert!(cfg.protocol_guard_synthetic_ids);
+        assert!(!cfg.protocol_guard_synthetic_ids);
         assert_eq!(cfg.protocol_guard_log_sample_rate, 1.0);
         assert_eq!(cfg.protocol_guard_max_ms, 30);
         assert_eq!(cfg.protocol_guard_max_graph_messages, 2000);
