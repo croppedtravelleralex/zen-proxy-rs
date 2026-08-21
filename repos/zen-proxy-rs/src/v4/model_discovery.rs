@@ -895,7 +895,10 @@ pub fn is_free_candidate(id: &str) -> bool {
 }
 
 pub fn is_reserved_static_upstream(id: &str) -> bool {
-    matches!(id, "deepseek-v4-flash-free" | "big-pickle")
+    matches!(
+        id,
+        "deepseek-v4-flash-free" | "big-pickle" | "mimo-v2.5-free" | "hy3-free"
+    )
 }
 
 fn now_unix() -> u64 {
@@ -998,6 +1001,8 @@ mod tests {
         assert!(is_free_candidate("big-pickle"));
         assert!(is_reserved_static_upstream("deepseek-v4-flash-free"));
         assert!(is_reserved_static_upstream("big-pickle"));
+        assert!(is_reserved_static_upstream("mimo-v2.5-free"));
+        assert!(is_reserved_static_upstream("hy3-free"));
         assert!(!is_free_candidate("gpt-5.5"));
         assert!(!is_free_candidate("claude-sonnet-4-6"));
     }

@@ -834,4 +834,47 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn effective_registry_exposes_current_opencode_free_models_snapshot() {
+        let discovery = DynamicModelRegistry::new(true, "url".into());
+        discovery
+            .update_from_opencode_json(
+                r#"{"object":"list","data":[
+                    {"id":"deepseek-v4-flash-free"},
+                    {"id":"big-pickle"},
+                    {"id":"x-preview-f-free"},
+                    {"id":"muse-spark-1.2-contributor-free"},
+                    {"id":"mimo-v2.5-free"},
+                    {"id":"hy3-free"},
+                    {"id":"nemotron-3-ultra-free"},
+                    {"id":"nemotron-3.5-lightning-free"},
+                    {"id":"laguna-s-2.1-free"}
+                ]}"#,
+            )
+            .unwrap();
+        let registry = EffectiveModelRegistry::new(
+            DynamicModelPublicMode::CandidateCanaryOrActive,
+            discovery.snapshot(),
+        );
+        let ids: Vec<String> = registry
+            .public_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "hy3",
+                "x-preview-f",
+                "muse-spark-1.2-contributor",
+                "nemotron-3-ultra",
+                "nemotron-3.5-lightning",
+                "laguna-s-2.1",
+            ]
+        );
+    }
 }

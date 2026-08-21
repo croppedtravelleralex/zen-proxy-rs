@@ -2,6 +2,7 @@
 """Flush GitHub homepage sidebar contributor cache by toggling default branch."""
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
@@ -20,42 +21,63 @@ def gh_field(path: str, field: str) -> str:
     return gh("api", path, "--jq", field).strip('"')
 
 
-def gh_api(method: str, path: str, **fields: str) -> None:
+def gh_input(method: str, path: str, payload: dict | None = None) -> None:
     cmd = [GH, "api", "-X", method, path]
-    for k, v in fields.items():
-        cmd.extend(["-f", f"{k}={v}"])
-    subprocess.check_call(cmd)
+    if payload is not None:
+        cmd.extend(["--input", "-"])
+        stdin = json.dumps(payload)
+    else:
+        stdin = None
+    subprocess.run(cmd, input=stdin, text=True, check=True)
+
+
+def ensure_temp_branch(main_sha: str) -> None:
+    try:
+        gh_input(
+            "POST",
+            f"repos/{REPO}/git/refs",
+            {"ref": f"refs/heads/{TEMP_BRANCH}", "sha": main_sha},
+        )
+        print(f"created branch {TEMP_BRANCH}")
+    except subprocess.CalledProcessError:
+        gh_input(
+            "PATCH",
+            f"repos/{REPO}/git/refs/heads/{TEMP_BRANCH}",
+            {"sha": main_sha, "force": True},
+        )
+        print(f"updated branch {TEMP_BRANCH}")
 
 
 def run() -> int:
     default = gh_field(f"repos/{REPO}", ".default_branch")
-    print(f"current default={default}")
-
     main_sha = gh_field(f"repos/{REPO}/git/ref/heads/{MAIN}", ".object.sha")
-    print(f"main sha={main_sha[:12]}")
-    try:
-        gh_api("POST", f"repos/{REPO}/git/refs", ref=f"refs/heads/{TEMP_BRANCH}", sha=main_sha)
-        print(f"created branch {TEMP_BRANCH}")
-    except subprocess.CalledProcessError:
-        gh_api("PATCH", f"repos/{REPO}/git/refs/heads/{TEMP_BRANCH}", sha=main_sha, force="true")
-        print(f"updated branch {TEMP_BRANCH}")
+    print(f"current default={default} main={main_sha[:12]}")
+
+    ensure_temp_branch(main_sha)
 
     if default != TEMP_BRANCH:
-        gh_api("PATCH", f"repos/{REPO}", default_branch=TEMP_BRANCH)
+        gh_input("PATCH", f"repos/{REPO}", {"default_branch": TEMP_BRANCH})
         print(f"default -> {TEMP_BRANCH}")
         time.sleep(45)
+    else:
+        print("default already temp; will switch back to main")
 
-    gh_api("PATCH", f"repos/{REPO}", default_branch=MAIN)
+    gh_input("PATCH", f"repos/{REPO}", {"default_branch": MAIN})
     print(f"default -> {MAIN}")
     time.sleep(45)
 
     try:
-        gh_api("DELETE", f"repos/{REPO}/git/refs/heads/{TEMP_BRANCH}")
+        subprocess.run(
+            [GH, "api", "-X", "DELETE", f"repos/{REPO}/git/refs/heads/{TEMP_BRANCH}"],
+            check=True,
+        )
         print(f"deleted temp branch {TEMP_BRANCH}")
     except subprocess.CalledProcessError as exc:
-        print(f"warn: could not delete temp branch: {exc}")
+        print(f"warn: delete temp branch failed: {exc}")
 
+    final_default = gh_field(f"repos/{REPO}", ".default_branch")
     logins = gh("api", f"repos/{REPO}/contributors", "--jq", ".[].login")
+    print("final default:", final_default)
     print("contributors api:", logins)
     return 0
 
