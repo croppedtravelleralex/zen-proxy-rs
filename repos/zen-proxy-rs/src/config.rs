@@ -446,7 +446,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let zen_provider_mode = load_env_var("ZEN_PROVIDER_MODE", ProviderMode::Legacy);
+        let zen_provider_mode = load_env_var("ZEN_PROVIDER_MODE", ProviderMode::FreeModelKernel);
         let protocol_guard_synthetic_ids = if zen_provider_mode == ProviderMode::FreeModelKernel {
             false
         } else {
@@ -534,7 +534,7 @@ impl Config {
             )
             .max(1),
             v4_model_registry_enabled: load_env_var("V4_MODEL_REGISTRY_ENABLED", false),
-            dynamic_model_discovery_enabled: load_env_var("DYNAMIC_MODEL_DISCOVERY_ENABLED", false),
+            dynamic_model_discovery_enabled: load_env_var("DYNAMIC_MODEL_DISCOVERY_ENABLED", true),
             dynamic_model_discovery_url: env::var("DYNAMIC_MODEL_DISCOVERY_URL")
                 .unwrap_or_else(|_| format!("{}{}", Self::default_upstream_base(), "/v1/models")),
             dynamic_model_discovery_interval_secs: load_env_var(
@@ -544,7 +544,7 @@ impl Config {
             .max(60),
             dynamic_model_public_mode: load_env_var(
                 "DYNAMIC_MODEL_PUBLIC_MODE",
-                DynamicModelPublicMode::StaticOnly,
+                DynamicModelPublicMode::CandidateCanaryOrActive,
             ),
             dynamic_model_public_allowlist: parse_csv_list_env("DYNAMIC_MODEL_PUBLIC_ALLOWLIST"),
             dynamic_model_claudecode_compat_allowlist: parse_csv_list_env(
@@ -1033,10 +1033,10 @@ mod tests {
         assert_eq!(cfg.opencode_client_name, "cli");
         assert_eq!(cfg.opencode_project_seed, "zen-proxy-rs");
         assert_eq!(cfg.opencode_session_ttl_secs, 1800);
-        assert_eq!(cfg.zen_provider_mode, ProviderMode::Legacy);
+        assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
         assert!(cfg.free_model_true_first_token_frt);
         assert!(!cfg.v4_model_registry_enabled);
-        assert!(!cfg.dynamic_model_discovery_enabled);
+        assert!(cfg.dynamic_model_discovery_enabled);
         assert_eq!(
             cfg.dynamic_model_discovery_url,
             "https://opencode.ai/zen/v1/models"
@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(cfg.dynamic_model_discovery_interval_secs, 1800);
         assert_eq!(
             cfg.dynamic_model_public_mode,
-            DynamicModelPublicMode::StaticOnly
+            DynamicModelPublicMode::CandidateCanaryOrActive
         );
         assert!(cfg.dynamic_model_public_allowlist.is_empty());
         assert!(!cfg.dynamic_model_allow_direct_fallback);
